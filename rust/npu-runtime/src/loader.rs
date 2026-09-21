@@ -137,9 +137,29 @@ impl EngineLoader {
     }
 }
 
+/// `npu_sr::SrEngine` already implements `Servable`; the default `generate_stream`/`run_cancellable`
+/// are correct for it (single-shot image in, image out -- nothing to stream, nothing to cancel
+/// mid-request).
+impl StreamServable for npu_sr::SrEngine {}
+
+/// image-sr's scenario kind: not an `npu_engine::ModelKind` (see the Cargo.toml comment on the
+/// `npu-sr` dependency), so it is intercepted here before `npu_engine::Model::load_in` -- which
+/// would otherwise reject it as an unknown scenario kind.
+const IMAGE_SR_KIND: &str = "image-sr";
+
 impl ModelLoader for EngineLoader {
     fn load(&self, cfg: &ModelCfg) -> Result<Box<dyn StreamServable>, EngineError> {
-        let model = npu_engine::Model::load_in(self.scenario_path(cfg), &self.root)?;
+        let path = self.scenario_path(cfg);
+        let sc = npu_engine::config::ScenarioConfig::load(&path)
+            .map_err(|e| EngineError::Load(format!("scenario {}: {e}", path.display())))?;
+        if sc.scenario.kind == IMAGE_SR_KIND {
+            let sched = self.root.join(&sc.artifacts.weights);
+            let wa = npu_asr::kernel_registry::resolve_kernel_dir(&self.root, npu_dispatch::WA_SUBDIR);
+            let eng = npu_sr::SrEngine::load_with(&sched, true, Some(&wa))
+                .map_err(|e| EngineError::Load(e.to_string()))?;
+            return Ok(Box::new(eng));
+        }
+        let model = npu_engine::Model::load_in(path, &self.root)?;
         Ok(Box::new(EngineModel { model }))
     }
     /// Read the scenario's `[scenario] kind`. Parsing one small TOML costs nothing next to a load,
@@ -225,6 +245,10 @@ pub mod mock {
                 (Capability::GENERATE, Request::Text(_)) => Ok(Response::Text("mock-completion".into())),
                 (Capability::TTS, Request::Text(_)) =>
                     Ok(Response::Audio { pcm: vec![0i16; 8], sample_rate: 24_000 }),
+                // Echoes the image unchanged (dims included) -- enough to prove the request/response
+                // shape round-trips end to end; no mock net to actually upscale with.
+                (Capability::IMAGE_SR, Request::Image { rgb, w, h }) =>
+                    Ok(Response::Image { rgb: rgb.clone(), w: *w, h: *h }),
                 (cap, _) => Err(EngineError::Unsupported(format!("{cap} cannot serve this request shape"))),
             }
         }
@@ -406,5 +430,35 @@ mod tests {
             Err(EngineError::Unsupported(_)) => {}
             other => panic!("expected TTS's own Unsupported, not embed's WrongKind: {other:?}"),
         }
+    }
+
+    fn write_image_sr_scenario(root: &std::path::Path, weights: &str) {
+        std::fs::write(root.join("scenario.toml"), format!(
+            "[scenario]\nkind = \"image-sr\"\nname = \"espcn\"\n[artifacts]\nweights = \"{weights}\"\n"
+        )).unwrap();
+    }
+
+    #[test]
+    fn declared_capability_reports_image_sr_for_the_image_sr_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        write_image_sr_scenario(dir.path(), "artifacts/espcn/espcn.json");
+        let l = EngineLoader { root: dir.path().to_path_buf() };
+        assert_eq!(l.declared_capability(&cfg()), Some(Capability::IMAGE_SR));
+    }
+
+    /// `image-sr` is not an `npu_engine::ModelKind` -- `load()` must intercept it before
+    /// `npu_engine::Model::load_in`, which would otherwise reject it as an unknown scenario kind.
+    /// Proven here without a device: a missing schedule file fails inside `SrEngine::load_with`
+    /// (naming the schedule path) before anything checks for an NPU.
+    #[test]
+    fn an_image_sr_scenario_routes_to_sr_engine_not_the_generic_model_loader() {
+        let dir = tempfile::tempdir().unwrap();
+        write_image_sr_scenario(dir.path(), "no-such-schedule.json");
+        let l = EngineLoader { root: dir.path().to_path_buf() };
+        // `unwrap_err` needs `T: Debug`; `Box<dyn StreamServable>` has none, so `.err()` instead.
+        let err = l.load(&cfg()).err().expect("a missing schedule file must fail to load");
+        let msg = err.to_string();
+        assert!(msg.contains("no-such-schedule.json"), "{msg}");
+        assert!(!msg.contains("unknown scenario kind"), "{msg}");
     }
 }

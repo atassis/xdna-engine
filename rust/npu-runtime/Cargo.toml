@@ -9,6 +9,14 @@ testkit = []
 
 [dependencies]
 npu-engine = { path = "../npu-engine" }
+# SR (`image-sr`) is not a `npu_engine::ModelKind`/`Scenario` variant -- `npu_sr` depends on
+# `npu_engine`, so the reverse dependency would cycle. Wired directly here instead: `EngineLoader`
+# constructs `npu_sr::SrEngine` for scenario kind `image-sr`; `npu-asr`/`npu-dispatch` give it the
+# same `resolve_kernel_dir`/`WA_SUBDIR` every other on-device model resolves its whole_array kernel
+# dir with.
+npu-sr = { path = "../npu-sr" }
+npu-asr = { path = "../npu-asr" }
+npu-dispatch = { path = "../npu-dispatch" }
 serde = { version = "1", features = ["derive"] }
 # preserve_order: a TypeSafe `choice`'s criteria object is ORDERED -- its key order assigns the
 # answer letters, and a sorted map would put a different prompt in front of the model.

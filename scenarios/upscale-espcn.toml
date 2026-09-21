@@ -1,0 +1,9 @@
+# Video/image super-resolution. No [model] block: ESPCN is a small conv net, not a transformer --
+# its whole graph (conv2d/pixel_shuffle/skip ops) lives in the schedule JSON `artifacts.weights`
+# points at, not in this file.
+[scenario]
+kind = "image-sr"
+name = "espcn"
+
+[artifacts]
+weights = "artifacts/espcn/espcn.json"

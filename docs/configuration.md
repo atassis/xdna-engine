@@ -62,8 +62,8 @@ diarize = "pyannote-3.1"
 generate = "qwen3-0.6b"
 ```
 
-The capability names are `asr`, `embed`, `diarize`, `generate` (also `tts` and
-`image-sr`, which no shipped model currently implements). **Note the one mismatch**: the
+The capability names are `asr`, `embed`, `diarize`, `generate`, `image-sr` (also `tts`,
+which no shipped model currently implements). **Note the one mismatch**: the
 capability is `embed`, but an embeddings scenario's own `[scenario] kind` is
 `"embeddings"` -- those are two different vocabularies (scenario kind selects which
 pipeline builder runs; capability is what request routing matches on).
@@ -77,6 +77,10 @@ One entry per model this install knows about.
 name = "parakeet"
 scenario = "scenarios/asr.toml"
 resident = false
+
+[[model]]
+name = "espcn"
+scenario = "scenarios/upscale-espcn.toml"
 ```
 
 - `name` -- an arbitrary label. This is what `--model`, a request's `"model"` field, and

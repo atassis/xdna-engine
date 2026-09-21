@@ -45,18 +45,24 @@ pub enum Body {
     /// channel it feeds, plus what the socket loop needs to render each item into a `data:` frame.
     /// No `Debug`/`PartialEq`: a `Receiver` has neither, and nothing needs to compare a stream body.
     Stream(SseStream),
+    /// `/v1/images/upscale`'s success body: 4 bytes LE width, 4 bytes LE height, then raw RGB8
+    /// pixels (`docs/api.md` documents the layout). A header-before-pixels encoding rather than a
+    /// response header, since `Response` here is `(status, Body)` with no header map -- the same
+    /// reason `Wav`/`Pcm` are pre-rendered byte blobs rather than a body plus side-channel metadata.
+    Image(Vec<u8>),
 }
 
 impl Body {
     /// The body as text -- the JSON for a JSON body, empty otherwise. For tests and logging.
     pub fn text(&self) -> &str {
-        match self { Body::Json(s) => s, Body::Wav(_) | Body::Pcm(_) | Body::Stream(_) => "" }
+        match self { Body::Json(s) => s, Body::Wav(_) | Body::Pcm(_) | Body::Stream(_) | Body::Image(_) => "" }
     }
     pub fn content_type(&self) -> &'static str {
         match self {
             Body::Json(_) => "application/json",
             Body::Wav(_) => "audio/wav",
             Body::Pcm(_) => "audio/pcm",
+            Body::Image(_) => "application/octet-stream",
             // Ollama's stream is newline-delimited JSON, not SSE -- a client that got
             // `text/event-stream` here would look for `data:` prefixes that are not coming.
             Body::Stream(st) => match st.kind {
@@ -68,9 +74,17 @@ impl Body {
     pub fn bytes(&self) -> &[u8] {
         match self {
             Body::Json(s) => s.as_bytes(),
-            Body::Wav(v) | Body::Pcm(v) => v,
+            Body::Wav(v) | Body::Pcm(v) | Body::Image(v) => v,
             Body::Stream(_) => &[],
         }
+    }
+    /// Encode `/v1/images/upscale`'s success body: 4 bytes LE width, 4 bytes LE height, then `rgb`.
+    pub fn image(w: usize, h: usize, rgb: &[u8]) -> Body {
+        let mut v = Vec::with_capacity(8 + rgb.len());
+        v.extend_from_slice(&(w as u32).to_le_bytes());
+        v.extend_from_slice(&(h as u32).to_le_bytes());
+        v.extend_from_slice(rgb);
+        Body::Image(v)
     }
 }
 impl std::fmt::Display for Body {
@@ -79,6 +93,7 @@ impl std::fmt::Display for Body {
             Body::Json(s) => f.write_str(s),
             Body::Wav(v) => write!(f, "<{} bytes of audio/wav>", v.len()),
             Body::Pcm(v) => write!(f, "<{} bytes of audio/pcm>", v.len()),
+            Body::Image(v) => write!(f, "<{} bytes of image>", v.len()),
             Body::Stream(_) => f.write_str("<event-stream>"),
         }
     }
@@ -263,6 +278,7 @@ pub fn route(req: &Request, handle: &Handle, cfg_path: &Path) -> Response {
         ("POST", "/v1/audio/speech") => audio_speech(req, handle),
         ("POST", "/v1/audio/transcriptions") => transcriptions(req, handle),
         ("POST", "/v1/audio/diarizations") => diarizations(req, handle),
+        ("POST", "/v1/images/upscale") => images_upscale(req, handle),
         // Deliberately BEFORE the reload/model routes and deliberately not going through the
         // actor: this is the one command whose whole purpose is to be answerable while the actor
         // is busy.
@@ -729,6 +745,42 @@ fn diarizations(req: &Request, handle: &Handle) -> Response {
     match handle.diarize(model.as_deref(), samples, 16_000) {
         Ok(s) => (200, segments_json(&s.model, &s.value).into()),
         Err(e) => engine_err(&e),
+    }
+}
+
+/// One video frame, one request (`npu upscale` calls this once per frame -- see `docs/api.md`):
+/// multipart `w`/`h` fields + an `image` part of exactly `w*h*3` raw RGB8 bytes. Response is
+/// `Body::image` (dims header + upscaled RGB8), never JSON, so the wire cost stays one copy of the
+/// pixels each way.
+fn images_upscale(req: &Request, handle: &Handle) -> Response {
+    let bad = |m: String| -> Response { (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&m)).into()) };
+    let dim = |field: &str| -> Result<usize, Response> {
+        parse::extract_form_field(&req.body, &req.boundary, field)
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .ok_or_else(|| bad(format!("missing or invalid {field}")))
+    };
+    let w = match dim("w") { Ok(w) => w, Err(r) => return r };
+    let h = match dim("h") { Ok(h) => h, Err(r) => return r };
+    let image = match parse::extract_named_file_part(&req.body, &req.boundary, "image") {
+        Some(b) => b, None => return bad("no image part".into()),
+    };
+    let want = match w.checked_mul(h).and_then(|n| n.checked_mul(3)) {
+        Some(n) => n, None => return bad(format!("w={w} h={h} overflows")),
+    };
+    if image.len() != want {
+        return bad(format!("image is {} bytes, want w*h*3={want}", image.len()));
+    }
+    let model = parse::extract_form_field(&req.body, &req.boundary, "model");
+    let served = match handle.serve(Capability::IMAGE_SR, model.as_deref(),
+        EngineReq::Image { rgb: image.to_vec(), w, h }) {
+        Ok(s) => s,
+        Err(e) => return engine_err(&e),
+    };
+    match served.value {
+        EngineResp::Image { rgb, w, h } => (200, Body::image(w, h, &rgb)),
+        other => (500, format!("{{\"error\":\"{} returned a {} response\"}}",
+            parse::json_escape(&served.model), other.shape()).into()),
     }
 }
 
@@ -1835,12 +1887,18 @@ pub mod parse {
         o
     }
     pub fn extract_file_part<'a>(body: &'a [u8], boundary: &str) -> Option<&'a [u8]> {
+        extract_named_file_part(body, boundary, "file")
+    }
+    /// Like `extract_file_part`, for an upload part under a field name other than `file` (e.g.
+    /// `/v1/images/upscale`'s `image` part).
+    pub fn extract_named_file_part<'a>(body: &'a [u8], boundary: &str, field: &str) -> Option<&'a [u8]> {
         if boundary.is_empty() { return None; }
         let delim = format!("--{boundary}");
+        let want = format!("name=\"{}\"", field.to_ascii_lowercase());
         for part in split_on(body, delim.as_bytes()) {
             let hdr_end = match find(part, b"\r\n\r\n") { Some(h) => h, None => continue };
             let headers = String::from_utf8_lossy(&part[..hdr_end]).to_ascii_lowercase();
-            if headers.contains("name=\"file\"") {
+            if headers.contains(&want) {
                 let mut data = &part[hdr_end + 4..];
                 if data.ends_with(b"\r\n") { data = &data[..data.len() - 2]; }
                 return Some(data);
@@ -2511,6 +2569,84 @@ mod route_tests {
     #[test]
     fn an_empty_diarization_is_a_valid_empty_list_not_an_error() {
         assert_eq!(segments_json("m", &[]), "{\"model\":\"m\",\"segments\":[]}");
+    }
+
+    /// Builds the exact multipart body `npu-cli`'s `call_multipart_bytes` sends: optional `model`,
+    /// then `w`/`h` fields, then the `image` part.
+    fn upscale_multipart(w: usize, ht: usize, model: Option<&str>, image: &[u8]) -> Request {
+        const B: &str = "X";
+        let mut body = Vec::new();
+        if let Some(m) = model {
+            body.extend_from_slice(
+                format!("--{B}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{m}\r\n").as_bytes());
+        }
+        for (k, v) in [("w", w), ("h", ht)] {
+            body.extend_from_slice(
+                format!("--{B}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n").as_bytes());
+        }
+        body.extend_from_slice(
+            format!("--{B}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"f.rgb\"\r\n\r\n").as_bytes());
+        body.extend_from_slice(image);
+        body.extend_from_slice(format!("\r\n--{B}--\r\n").as_bytes());
+        Request { method: "POST".into(), path: "/v1/images/upscale".into(), boundary: B.into(), body }
+    }
+
+    #[test]
+    fn images_upscale_round_trips_through_the_mock_servable() {
+        let mut t = BTreeMap::new();
+        t.insert("espcn".to_string(), Ok((Capability::IMAGE_SR, 1)));
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("engine.toml");
+        let cfg = Config {
+            server: ServerCfg::default(),
+            models: vec![ModelCfg { name: "espcn".into(), scenario: "x".into(), resident: false }],
+            ..Default::default()
+        };
+        cfg.save(&p).unwrap();
+        let (h, j) = start(cfg, Box::new(MockLoader { table: t })).unwrap();
+        let (w, ht) = (2usize, 2usize);
+        let image: Vec<u8> = (0..w * ht * 3).map(|i| i as u8).collect();
+        let (code, body) = route(&upscale_multipart(w, ht, Some("espcn"), &image), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(body.content_type(), "application/octet-stream");
+        let bytes = body.bytes();
+        assert_eq!(&bytes[0..4], &(w as u32).to_le_bytes(), "width header");
+        assert_eq!(&bytes[4..8], &(ht as u32).to_le_bytes(), "height header");
+        assert_eq!(&bytes[8..], &image[..], "mock echoes the image unchanged");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn images_upscale_rejects_an_image_whose_length_disagrees_with_w_times_h_times_3() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("engine.toml");
+        let cfg = Config::default();
+        cfg.save(&p).unwrap();
+        let (h, j) = start(cfg, Box::new(MockLoader { table: BTreeMap::new() })).unwrap();
+        let (code, body) = route(&upscale_multipart(2, 2, None, &[0u8; 5]), &h, &p);
+        assert_eq!(code, 400, "{body}");
+        assert!(body.text().contains("want w*h*3"), "{body}");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn images_upscale_rejects_a_missing_dimension_field() {
+        const B: &str = "X";
+        let body = format!(
+            "--{B}\r\nContent-Disposition: form-data; name=\"h\"\r\n\r\n2\r\n\
+             --{B}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"f.rgb\"\r\n\r\n\
+             \r\n--{B}--\r\n"
+        ).into_bytes();
+        let req = Request { method: "POST".into(), path: "/v1/images/upscale".into(), boundary: B.into(), body };
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("engine.toml");
+        let cfg = Config::default();
+        cfg.save(&p).unwrap();
+        let (h, j) = start(cfg, Box::new(MockLoader { table: BTreeMap::new() })).unwrap();
+        let (code, body) = route(&req, &h, &p);
+        assert_eq!(code, 400, "{body}");
+        assert!(body.text().contains("missing or invalid w"), "{body}");
+        h.shutdown(); j.join().unwrap();
     }
 }
 

@@ -167,6 +167,12 @@ Bodies are capped at 16 MiB. Streaming responses use Server-Sent Events with no
   `prefill_ms`, `readout_ms`. On a model with recurrent state (Qwen3.5's DeltaNet layers) the
   questions share one prefill of their common prompt prefix; `NPU_DECIDE_SHARED_STATE=0`
   turns that off. A malformed body or question is a 400.
+- `POST /v1/images/upscale` -- not an OpenAI endpoint; serves `Capability::IMAGE_SR`. One video
+  frame per request (`npu upscale` calls it once per decoded frame). Multipart body: `model`
+  (optional), `w`/`h` (the frame's width/height), `image` (raw interleaved RGB8, exactly
+  `w*h*3` bytes -- any other length is 400). Response is not JSON: `application/octet-stream`,
+  4 bytes little-endian width, 4 bytes little-endian height, then the upscaled RGB8 pixels
+  (`w`/`h` scaled by the model's integer scale factor, e.g. 3x for ESPCN).
 
 Shared sampling fields (chat and text completions): `temperature`, `top_p`, `top_k`,
 `max_tokens`, `seed`, `stop` (string or array of strings), `presence_penalty`,
@@ -246,8 +252,9 @@ examples across every kind.
 
 ## What is not documented here
 
-Two crates expose their own device-facing ABIs that do not go through `npu-engine` or
-`npu-runtime` at all: `npu-sr` (frame-in/frame-out video super-resolution, its own `SrEngine`
-type and error) and `npu-sr-capi` (a C ABI over it, `libxdna_sr.so`, for the ffmpeg
-`vf_xdna_sr` filter). They are real, shipped surfaces, but a separate one from everything
-above -- see [general-engine.md](general-engine.md) for why they sit outside this pipeline.
+`npu-sr-capi` (a C ABI over `npu-sr`'s `SrEngine`, `libxdna_sr.so`, for the ffmpeg `vf_xdna_sr`
+filter) is a real, shipped surface that does not go through `npu-engine` or `npu-runtime` at
+all -- it opens its own device handle in-process, the same shape `npu-engine`'s Rust API above
+does. `SrEngine` itself is also reachable through the service (`/v1/images/upscale` above,
+`npu upscale`); the filter is a separate integration, not a second route to the same server --
+see [general-engine.md](general-engine.md).

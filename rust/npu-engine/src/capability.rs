@@ -1,12 +1,9 @@
 //! The open request surface (`engine-open-capability-contract`, task family `substrate`).
 //!
-//! PROBE, not the finished contract: derived from adapting exactly two real instances --
-//! `bert::EmbedPipeline` (text in, vector out, genuinely `&self`, already inside the engine) and
-//! `npu_sr::SrEngine` (image in, image out, genuinely `&mut self`, currently a full island: its own
-//! `SrError`, its own `load`/`upscale_*` ABI, zero wiring into `npu-runtime`'s `Inference`/
-//! `ModelLoader`/`Cmd`/`resolve()`). Per the doctrine's "earn generality from instances" rule this
-//! module does NOT wire into `npu-runtime` yet and does NOT enumerate capabilities beyond the two
-//! that are earned -- that is next work, once a third instance actually asks for it.
+//! Derived from adapting real instances -- `bert::EmbedPipeline` (text in, vector out, genuinely
+//! `&self`) and `npu_sr::SrEngine` (image in, image out, genuinely `&mut self`, wired into
+//! `npu-runtime`'s `EngineLoader` for scenario kind `image-sr`, since `npu_engine` cannot depend on
+//! `npu_sr` for a `ModelKind`/`Scenario` variant the way the other capabilities are).
 //!
 //! Named `Servable`, not `Model`: the task's own `next` field proposed `trait Model { .. }` as a
 //! candidate name, but `npu_engine::api::Model` (the loaded-scenario struct every caller already
