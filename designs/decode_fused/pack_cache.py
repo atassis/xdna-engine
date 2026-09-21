@@ -2,17 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Content-addressed cache for prefill's packed quantized weight buffers.
 
-`iron.common.quant.repack_gemm_weight` is a pure byte-permutation of one row-packed `.npy` dump
-into GEMM's tile-planar layout (see gen_llm_prefill.py's quant_pack loop) -- no requantization, so
-every build from the same dump + packing params reproduces the same bytes. Every build re-derives
-them anyway: a 48-layer gemma4-12b build repacks 480 buffers (~6.5 GB) every time, ~2.6 min of a
-19 min build.
-
-Keyed on content, not path/mtime: the key must name every input that changes the bytes, or a
-stale hit is possible. Here that is the dumped weight's own bytes, every repack_gemm_weight
-parameter, and a digest of the two Python sources that decide them (this module's packer identity
-is `quant.py`'s own content, not a git SHA -- IRON is ancestry-pinned, not exact-SHA-pinned, so a
-local commit can move `repack_gemm_weight` without moving toolchain.lock).
+`repack_gemm_weight` is a pure byte permutation, so a dump and its packing params always yield the
+same bytes. The key names every input that changes them: the dump's content, each repack parameter,
+and digests of `quant.py` (IRON is ancestry-pinned, so the packer can move without the lock) and of
+the generator.
 """
 import hashlib
 import json
@@ -35,15 +28,7 @@ def sha256_file(path, chunk_size=1 << 20):
 
 
 def content_key(entry, src_digest, packer_digest, generator_digest):
-    """entry: one gen_llm_prefill.py `quant_pack` dict (buf/src_dir/src_file/N/K/tile_k/tile_n/
-    group_size/weight_dtype/cols/scale_dtype/mmul).
-
-    Every field `repack_gemm_weight` reads is in the key, plus the two source files whose bytes
-    its OUTPUT depends on: the dumped weight (content, not path) and the packer module. `buf` and
-    `src_dir`/`src_file` are identity, not content, and are deliberately excluded -- two different
-    files with the same bytes and params must collide (that is the win), and a renamed buffer with
-    unchanged content must still hit.
-    """
+    # `buf` and the source path are identity, not content: equal bytes and params must collide.
     payload = {
         "v": CACHE_FORMAT_VERSION,
         "op": "repack_gemm_weight",
@@ -61,13 +46,8 @@ def content_key(entry, src_digest, packer_digest, generator_digest):
 
 
 class ContentStore:
-    """Flat content-addressed store: `<root>/objects/<key[:2]>/<key>.bin`.
-
-    `put` is atomic (mkstemp + os.replace) so a killed build cannot leave a truncated object that
-    a later `get` would then serve. Nothing downstream of a materialized buffer opens it for write
-    (rust/npu-engine only ever `std::fs::read`s `buffers/*.bin`, verified against every call site
-    in llm/artifact.rs and llm/npu_decode.rs), so `materialize`'s hardlink cannot corrupt the store.
-    """
+    """Objects at `<root>/objects/<key[:2]>/<key>.bin`. `put` is atomic, so a killed build never
+    leaves a truncated object; nothing opens a materialized buffer for write, so hardlinks are safe."""
 
     def __init__(self, root):
         self.root = root
@@ -99,8 +79,7 @@ class ContentStore:
         return dst
 
     def materialize(self, key, dest_path):
-        """Populate `dest_path` from the cached object at `key`. Hardlink when the store and
-        `dest_path` share a filesystem, copy otherwise. Returns False on a miss (caller packs)."""
+        """Hardlink the object to `dest_path` (copy across filesystems); False on a miss."""
         src = self.get(key)
         if src is None:
             return False
