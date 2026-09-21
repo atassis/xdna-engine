@@ -1119,7 +1119,7 @@ impl FusedDecoder {
             let sp_head_dim = sp["head_dim"].as_u64().unwrap_or(HEAD_DIM as u64) as u32;
             let res = dev
                 .open_elf_resident(&base_elf, Some("main:sequence"))
-                .map_err(|e| EngineError::Load(format!("open_elf_resident: decode ELF lacks a ctrl scratchpad (rebuild gen_decode.py): {e}")))?;
+                .map_err(|e| EngineError::Load(format!("open_elf_resident (decode): {e}")))?;
             arena.bind_resident(&res).map_err(|e| EngineError::Load(format!("bind resident arena BOs: {e}")))?;
             eprintln!(
                 "[whisper_decoder] DEEP-C resident scratchpad decode: register-once + per-token \

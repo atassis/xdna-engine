@@ -513,7 +513,7 @@ impl NpuDecodeStep {
         };
         let res = dev
             .open_elf_resident(&elf, Some(&artifact.kernel_name))
-            .map_err(|e| EngineError::Load(format!("open_elf_resident: decode ELF lacks a ctrl scratchpad: {e}")))?;
+            .map_err(|e| EngineError::Load(format!("open_elf_resident (decode): {e}")))?;
         arena.bind_resident(&res).map_err(|e| EngineError::Load(format!("bind resident arena BOs: {e}")))?;
 
         // Prefill's angle rows are computed from the DECODE artifact's bases -- it is the authority

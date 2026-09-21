@@ -372,7 +372,7 @@ impl NpuPrefill {
         let elf = std::fs::read(artifact.elf_path())
             .map_err(|e| EngineError::Load(format!("read {}: {e}", artifact.elf_path().display())))?;
         let primary = dev.open_elf_resident(&elf, Some(&artifact.kernel_name)).map_err(|e| {
-            EngineError::Load(format!("open_elf_resident: prefill ELF lacks a ctrl scratchpad: {e}"))
+            EngineError::Load(format!("open_elf_resident (prefill): {e}"))
         })?;
 
         let plan = segment_plan(&artifact.segments, &artifact.kernel_name)?;
