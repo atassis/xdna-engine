@@ -108,13 +108,19 @@ class Checker:
         # never packed; that is what makes it the anchor for the packed row-stride arithmetic below.
         for l in range(min(depth, sp.n_layers)):
             hd, kvh = sp.head_dim_for(l), sp.n_kv_heads_for(l)
+            self.check(f"L{l} ffn (gate_proj rows)",
+                       self.rows_of(self.layer(l, "mlp.gate_proj.weight"), sp.d_model), sp.ffn)
+            self.chunks(l, "mlp.down_proj.weight", k_chunks_for(sp.d_model, sp.ffn, COLS))
+            if sp.mixer_for(l) == "linear_attention":
+                self.linear_attn(l)
+                continue
             if sp.qk_norm:
                 for side in ("q", "k"):
                     s = self.shape(self.layer(l, f"self_attn.{side}_norm.weight"))
                     self.check(f"L{l} head_dim ({side}_norm)", s and s[0], hd)
             self.check(f"L{l} q_dim (q_proj rows)",
                        self.rows_of(self.layer(l, "self_attn.q_proj.weight"), sp.d_model),
-                       sp.n_q_heads * hd)
+                       sp.q_proj_rows_for(l))
             self.check(f"L{l} kv_dim (k_proj rows)",
                        self.rows_of(self.layer(l, "self_attn.k_proj.weight"), sp.d_model),
                        kvh * hd)
@@ -130,14 +136,23 @@ class Checker:
                            kvh * hd)
             self.check(f"L{l} layer_scalar present",
                        self.exists(self.layer(l, "layer_scalar")), sp.layer_scalar)
-            # ffn, and the K-split the L1 fit model predicts. The dump made its own chunking
-            # decision; if ours disagrees the generator looks for weights that are not there.
-            self.check(f"L{l} ffn (gate_proj rows)",
-                       self.rows_of(self.layer(l, "mlp.gate_proj.weight"), sp.d_model), sp.ffn)
-            self.chunks(l, "mlp.down_proj.weight", k_chunks_for(sp.d_model, sp.ffn, COLS))
+            # The K-split the L1 fit model predicts. The dump made its own chunking decision; if
+            # ours disagrees the generator looks for weights that are not there.
             self.chunks(l, "self_attn.o_proj.weight",
                         k_chunks_for(sp.d_model, sp.n_q_heads * hd, COLS))
         return self
+
+    def linear_attn(self, l):
+        """A Gated DeltaNet layer: every leaf the spec names, the projections by rows (packing-aware),
+        the rest by shape."""
+        sp = self.sp
+        for leaf, shape in sp.linear_attn_leaves(l).items():
+            name = self.layer(l, leaf)
+            if len(shape) == 2 and leaf.endswith("proj.weight") or leaf.endswith(("_a.weight", "_b.weight")):
+                self.check(f"L{l} {leaf} rows", self.rows_of(name, shape[1]), shape[0])
+            else:
+                s = self.shape(name)
+                self.check(f"L{l} {leaf} shape", s and tuple(s), shape)
 
     def unverifiable(self):
         """Axes this instrument CANNOT check, named -- because a silent gap reads as coverage.

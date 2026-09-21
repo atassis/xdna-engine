@@ -30,11 +30,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
 from llm_decode_spec import SPECS, k_chunks_for  # noqa: E402
 
 HF_REPO = {"qwen3-0.6b": "Qwen/Qwen3-0.6B", "gemma3-270m": "unsloth/gemma-3-270m-it",
-           "gemma4-12b": "unsloth/gemma-4-12b-it"}
+           "gemma4-12b": "unsloth/gemma-4-12b-it", "qwen3.5-4b": "Qwen/Qwen3.5-4B"}
 
 # The projection leaves, i.e. everything that is a [out, in] matrix rather than a norm gain or the
 # embedding table. Only these are packable.
-EXP_LEAVES = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
+EXP_LEAVES = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj",
+              "in_proj_qkv", "in_proj_z", "out_proj")
 
 # The tied embedding/lm-head. Handled separately from EXP_LEAVES: it always stays dumped f32 (the
 # host embedding-gather reads it directly), and packing it ADDS a sidecar rather than replacing
@@ -163,15 +164,20 @@ def main():
         # its sliding layers are 256 / 8, so q_proj is [8192, D] on one and [4096, D] on the other.
         # Checking both against the uniform value would reject the correct checkpoint.
         qd, kvd, hd = sp.q_dim_for(l), sp.kv_dim_for(l), sp.head_dim_for(l)
-        leaves = {"self_attn.q_proj": (qd, D_), "self_attn.k_proj": (kvd, D_),
-                  "self_attn.o_proj": (D_, qd), "mlp.gate_proj": (FF_, D_),
-                  "mlp.up_proj": (FF_, D_), "mlp.down_proj": (D_, FF_)}
-        # attention_k_eq_v: a layer whose V is the raw k projection HAS no v_proj tensor. Demanding
-        # one turns a correctly-dumped checkpoint into a KeyError.
-        if sp.has_v_proj(l):
-            leaves["self_attn.v_proj"] = (kvd, D_)
+        leaves = {"mlp.gate_proj": (FF_, D_), "mlp.up_proj": (FF_, D_), "mlp.down_proj": (D_, FF_)}
+        if sp.mixer_for(l) == "full_attention":
+            leaves.update({"self_attn.q_proj": (sp.q_proj_rows_for(l), D_),
+                           "self_attn.k_proj": (kvd, D_), "self_attn.o_proj": (D_, qd)})
+            # attention_k_eq_v: a layer whose V is the raw k projection HAS no v_proj tensor.
+            # Demanding one turns a correctly-dumped checkpoint into a KeyError.
+            if sp.has_v_proj(l):
+                leaves["self_attn.v_proj"] = (kvd, D_)
         for t, shape in leaves.items():
             key = f"{sp.weight_prefix}layers.{l}.{t}.weight"
+            want[key] = None
+            exp_per_key[key] = shape
+        for t, shape in sp.linear_attn_leaves(l).items():
+            key = f"{sp.weight_prefix}layers.{l}.{t}"
             want[key] = None
             exp_per_key[key] = shape
         for nm in sp.norm_weight_names(l).values():
