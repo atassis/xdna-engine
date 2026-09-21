@@ -53,3 +53,14 @@ def test_widths_visibility_is_causal_and_clamped(base):
 def test_ring_visibility_matches_the_ring_tests_own_mask(base):
     rows = gen.ring_mask_rows(base, M, RING)
     assert np.array_equal(visible_from_ring_rows(rows, RING + M), expand_mask(rows, RING + M))
+
+
+@pytest.mark.parametrize("base", [0, 1024, 2048 - M])
+def test_global_flash_matches_full_attention(base):
+    w, hd, heads = 2048, 512, 16
+    q, k, v = qkv(base, heads * M, w, hd)
+    vis = global_visible(base, w, heads)
+    scale = 1.0 / np.sqrt(hd)
+    out = flash_attention(q, k, v, vis, scale, b_kv=B_KV)
+    assert np.isfinite(out).all()
+    assert rel_l2(out, full_attention(q, k, v, vis, scale)) < TOL
