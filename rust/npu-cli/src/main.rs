@@ -2403,7 +2403,14 @@ mod tests {
                     }
                 }
             }).collect();
-            Ok(npu_engine::capability::Response::Decisions(answers))
+            let stats = npu_engine::DecideStats {
+                questions: d.questions.iter().map(|q| npu_engine::QuestionStats {
+                    id: q.id.clone(), prompt_tokens: 7, batched_tokens: 6, stepwise_tokens: 1,
+                    prefill_us: 1500, ..Default::default()
+                }).collect(),
+                ..Default::default()
+            };
+            Ok(npu_engine::capability::Response::Decisions(npu_engine::Decisions { answers, stats }))
         }
     }
     impl npu_runtime::loader::StreamServable for EchoDecide {}

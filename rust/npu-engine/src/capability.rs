@@ -132,8 +132,8 @@ pub enum Response {
     /// `Diarizer::diarize`'s shape: who spoke when. A distinct shape from `Text` because a
     /// transcript and a speaker timeline are not interchangeable payloads.
     Segments(Vec<Segment>),
-    /// One answer per question, in request order.
-    Decisions(Vec<crate::decide::DecideAnswer>),
+    /// One answer per question, in request order, and their cost.
+    Decisions(crate::decide::Decisions),
 }
 
 impl Response {

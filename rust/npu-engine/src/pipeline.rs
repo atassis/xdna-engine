@@ -415,7 +415,7 @@ pub trait TextGenerator {
     /// Typed decisions off the next-token logits (see `crate::decide`). Not every generator has
     /// logits to read.
     fn decide(&mut self, _req: &crate::decide::DecideRequest)
-        -> Result<Vec<crate::decide::DecideAnswer>, EngineError> {
+        -> Result<crate::decide::Decisions, EngineError> {
         Err(EngineError::Unsupported("this generator cannot answer typed decisions".to_string()))
     }
 

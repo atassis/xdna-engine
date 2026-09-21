@@ -185,7 +185,7 @@ impl Model {
     /// Typed decisions over one state (TypeSafe's `/v1/systemone`), read off a generate model's
     /// next-token logits; see `crate::decide`.
     pub fn decide(&mut self, req: &crate::decide::DecideRequest)
-        -> Result<Vec<crate::decide::DecideAnswer>, EngineError> {
+        -> Result<crate::decide::Decisions, EngineError> {
         let got = kind_of(&self.scen).capability();
         match &mut self.scen {
             Scenario::Generate(m) => m.decide(req),

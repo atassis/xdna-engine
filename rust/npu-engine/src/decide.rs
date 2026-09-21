@@ -72,6 +72,37 @@ pub enum DecideAnswer {
     Score { id: String, score: f64, probabilities: Vec<f64>, confidence: f64 },
 }
 
+/// What one question cost. `reused_tokens` were already primed when the question started (the
+/// shared prefix restored from a snapshot, or a positional cache's ledger hit).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct QuestionStats {
+    pub id: String,
+    pub prompt_tokens: usize,
+    pub reused_tokens: usize,
+    pub batched_tokens: usize,
+    pub stepwise_tokens: usize,
+    pub restore_us: u64,
+    pub prefill_us: u64,
+    pub readout_us: u64,
+}
+
+/// A decide request's measurements, questions in request order. `shared_prefix_tokens` is 0 when
+/// the questions were each primed from scratch.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DecideStats {
+    pub shared_prefix_tokens: usize,
+    pub prefix_us: u64,
+    pub snapshot_us: u64,
+    pub questions: Vec<QuestionStats>,
+}
+
+/// One answer per question in request order, and what producing them cost.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Decisions {
+    pub answers: Vec<DecideAnswer>,
+    pub stats: DecideStats,
+}
+
 /// SemIf's `direct_messages`: the user turn is Python `json.dumps(..., ensure_ascii=False)` of
 /// {evidence, criterion, options[{letter, description}]}, each description `"<key>: <desc>"`.
 pub fn messages(evidence: &Value, q: &DecideQuestion) -> Vec<ChatMessage> {

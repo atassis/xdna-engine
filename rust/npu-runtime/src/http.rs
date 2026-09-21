@@ -589,12 +589,12 @@ fn systemone(req: &Request, handle: &Handle) -> Response {
         Ok(s) => s,
         Err(e) => return engine_err(&e),
     };
-    let answers = match served.value {
-        EngineResp::Decisions(a) => a,
+    let d = match served.value {
+        EngineResp::Decisions(d) => d,
         other => return engine_err(&npu_engine::EngineError::Device(format!(
             "decide returned a {} response", other.shape()))),
     };
-    let out: serde_json::Map<String, serde_json::Value> = answers.into_iter().map(answer_json).collect();
+    let out: serde_json::Map<String, serde_json::Value> = d.answers.into_iter().map(answer_json).collect();
     (200, serde_json::json!({"model": served.model, "answers": out}).to_string().into())
 }
 

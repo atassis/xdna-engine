@@ -573,17 +573,19 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
     /// are all positional resumes the shared system/evidence prefix, one with recurrent state is
     /// primed from 0 every time (its `reset` reports `Cleared`).
     fn decide(&mut self, req: &crate::decide::DecideRequest)
-        -> Result<Vec<crate::decide::DecideAnswer>, EngineError> {
-        use crate::decide::{answer, messages, LETTERS};
+        -> Result<crate::decide::Decisions, EngineError> {
+        use crate::decide::{answer, messages, DecideStats, Decisions, QuestionStats, LETTERS};
         let need = req.questions.iter().map(|q| q.options.len()).max().unwrap_or(0).min(LETTERS.len());
         let slots = LETTERS.chars().take(need)
             .map(|c| self.cfg.tokenizer.token_to_id(&c.to_string()).ok_or_else(|| EngineError::Unsupported(
                 format!("answer slot {c:?} is not a single token of this model's vocabulary"))))
             .collect::<Result<Vec<u32>, _>>()?;
         let mut out = Vec::with_capacity(req.questions.len());
+        let mut stats = DecideStats { questions: Vec::with_capacity(req.questions.len()), ..Default::default() };
         for q in &req.questions {
             q.validate().map_err(EngineError::Unsupported)?;
             let ids = tokenize_prompt(&self.cfg, &Prompt::Chat(messages(&req.evidence, q)), Some(false), &[])?;
+            stats.questions.push(QuestionStats { id: q.id.clone(), prompt_tokens: ids.len(), ..Default::default() });
             let logits = self.prime_to_last_logits(&ids)?;
             let want = &slots[..q.options.len()];
             let picked = match self.decode.option_logits(want)? {
@@ -592,7 +594,7 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
             };
             out.push(answer(q, &picked));
         }
-        Ok(out)
+        Ok(Decisions { answers: out, stats })
     }
 
     fn bo_bytes(&self) -> u64 {
