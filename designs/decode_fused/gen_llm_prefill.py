@@ -187,6 +187,10 @@ COLS = int(os.environ.get("PREFILL_COLS", "8"))
 # comfortably inside one MemTile with room for the forwarded pair, and every tensor this file
 # copies is a multiple of it.
 XFER_ELEMS = int(os.environ.get("PREFILL_XFER_ELEMS", "16384"))
+# Per delta-rule call, the real tokens it steps: an int32 in each call's dk-wide bf16 slot.
+GDR_COUNT = "gdr_count"
+# aie.dma_bd's stride range, [1:1048576] elements: a 20-bit field of the shim BD.
+BD_STRIDE_MAX = 1 << 20
 # The causal mask, as a buffer name. One int32 per softmax row, host-written per chunk.
 SM_WIDTHS = "sm_widths"
 # Batch prefill past a sliding-window's circular KV ring. Default 0: byte-identical MLIR to
@@ -649,6 +653,13 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
                         "source": ch.source, "K": K, "N": Nout,
                         "measured": ch.measured}
         qkw = quant_kwargs(site)
+        # A bf16 [N, K] B walks N in steps of tile_n*cols rows, one BD stride of that many rows;
+        # gemm_tiling_rejection has no stride rule, and aiecc refuses the BD only at the end.
+        step = ch.tile_n * ch.cols
+        if b_col_maj and not qkw and not blocking and Nout > step and step * K > BD_STRIDE_MAX:
+            raise ValueError(f"GEMM {label} M={M} K={K} N={Nout}: tile_n({ch.tile_n})*cols({ch.cols})"
+                             f"*K = {step * K} exceeds the BD stride range {BD_STRIDE_MAX}; pick "
+                             f"tile_n*cols <= {BD_STRIDE_MAX // K}")
         blk = dict(b_block_rows=blocking[0], b_block_stride=blocking[1]) \
             if (blocking and not qkw) else {}
         blk.update(extra or {})
@@ -1321,8 +1332,11 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
 
     # Gated DeltaNet (Qwen3.5's linear attention), M tokens a chunk: the in_proj rows land in a
     # [taps-1+M, LCH] conv window `cwp` behind the history rows copied in from decode's `cw`, the
-    # conv runs in place and hands the history back, and the delta rule steps GDR_T tokens a call
-    # with its state in L1. The output lands in `cxt`, where o_proj reads it, as in decode.
+    # conv runs in place, and the delta rule steps GDR_T tokens a call with its state in L1. The
+    # output lands in `cxt`, where o_proj reads it, as in decode. A padded last chunk must not reach
+    # the state: the host writes each call's real-token count into `gdr_count`, and the history
+    # handed back is window rows [n_valid, n_valid + taps-1), picked by the `hist_off` parameter
+    # before the conv overwrites them.
     lin_layers = [l for l in range(NL) if sp.mixer_for(l) == "linear_attention"]
     if lin_layers:
         from iron.operators.conv1d_step.op import Conv1dStep
@@ -1352,14 +1366,19 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
                               output_sizes=(HIST,), output_strides=(1,), output_offset=0,
                               input_buffer_size=HIST, output_buffer_size=HIST,
                               transfer_size=pick_transfer(HIST), num_aie_channels=1, context=ctx)
+        op_hist_out = StridedCopy(input_sizes=(HIST,), input_strides=(1,), input_offset=0,
+                                  output_sizes=(HIST,), output_strides=(1,), output_offset=0,
+                                  input_buffer_size=(LTAPS - 1 + M) * LCH, output_buffer_size=HIST,
+                                  transfer_size=pick_transfer(HIST), num_aie_channels=1,
+                                  input_offset_parameter="hist_off", context=ctx)
         op_conv = Conv1dStep(channels=LCH, taps=LTAPS, tokens=M, tile_channels=conv_tc,
                              num_aie_columns=cols, context=ctx)
         op_mix_act = SiLUAct(size=M * LCH, num_aie_columns=cols, tile_size=LCH // cols,
                              context=ctx, allocation_scheme=alloc_all)
         op_gdr = GatedDeltaRule(v_heads=sp.lin_v_heads, k_heads=sp.lin_k_heads, dk=LDK, dv=LDK,
                                 ab_len=LAB, ab_off=0, mixed_len=LCH, q_off=0, k_off=LKD,
-                                v_off=2 * LKD, tokens=GDR_T, l2_qk=True, num_aie_columns=cols,
-                                context=ctx)
+                                v_off=2 * LKD, tokens=GDR_T, l2_qk=True, counted=True,
+                                num_aie_columns=cols, context=ctx)
         op_gnorm = RMSNorm(size=M * LVD, num_aie_columns=cols, num_channels=1, tile_size=LDK,
                            weighted=True, epsilon=sp.eps, context=ctx, allocation_scheme=alloc_all)
         op_z_act = SiLUAct(size=M * LVD, num_aie_columns=cols, tile_size=LVD // cols, context=ctx,
@@ -1367,7 +1386,7 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         op_o_mul = ElementwiseMul(size=M * LVD, num_aie_columns=cols, tile_size=LVD // cols,
                                   context=ctx, allocation_scheme=alloc_all)
         bufsz.update({"cwp": (LTAPS - 1 + M) * LCH * 2, "lz": M * LVD * 2, "lab": M * LAB * 2,
-                      "lo": M * LVD * 2})
+                      "lo": M * LVD * 2, GDR_COUNT: (M // GDR_T) * LDK * 2})
 
     def deltanet_rl(p, out):
         el = lambda buf, lo, n: f"{buf}[{lo * 2}:{(lo + n) * 2}]"
@@ -1375,8 +1394,8 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         rl_ = [(op_hist, el(p + "cw", 0, HIST), el("cwp", 0, HIST))]
         pre, w = weight_rows(p + "Wlqkv", LCH, 0, LCH, D)
         rl_ += pre + [(op_lqkv, "h", w, rows),
+                      (op_hist_out, "cwp", el(p + "cw", 0, HIST)),
                       (op_conv, "cwp", p + "cvw", "cwp"),
-                      (op_hist, el("cwp", 0, HIST), el(p + "cw", 0, HIST)),
                       (op_mix_act, rows, rows)]
         pre, w = weight_rows(p + "Wlzab", LZAB, 0, LVD, D)
         rl_ += pre + [(op_lz, "h", w, "lz")]
@@ -1384,6 +1403,7 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         rl_ += pre + [(op_lab, "h", w, "lab")]
         for c in range(M // GDR_T):
             rl_.append((op_gdr, el("lab", c * GDR_T * LAB, GDR_T * LAB), p + "gdp",
+                        el(GDR_COUNT, c * LDK, LDK),
                         el("cwp", HIST + c * GDR_T * LCH, GDR_T * LCH), p + "S", p + "S",
                         el("lo", c * GDR_T * LVD, GDR_T * LVD)))
         return rl_ + [(op_gnorm, "lo", p + "gnw", "lo"), (op_z_act, "lz", "lz"),
@@ -1577,7 +1597,8 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     # them: add_buffers walks input_args in order, and the host's x/rope writes are the same in
     # both arms. `sm_ring` after it for the same reason.
     inputs = ["x"] + (["rope_local", "rope_global"] if dual_rope else ["rope"]) + \
-        ([SM_WIDTHS] if causal == "rows" else []) + ([SM_RING] if uses_ring else [])
+        ([SM_WIDTHS] if causal == "rows" else []) + ([SM_RING] if uses_ring else []) + \
+        ([GDR_COUNT] if lin_layers else [])
 
     # Every buffer this graph READS and never writes has to come from somewhere -- a host input, or
     # the decode arena. One that comes from neither is a prefill-local scratch buffer nothing fills:
@@ -2285,6 +2306,12 @@ def main():
                              f"layout -- AIERuntimeArgSpec.dtype defaults to bfloat16, so this is "
                              f"what an unset dtype looks like")
         open(os.path.join(bdir, f"{SM_WIDTHS}.bin"), "wb").write(widths.tobytes())
+    if GDR_COUNT in dims["inputs"]:
+        # A full chunk: every delta-rule call steps all of its tokens.
+        n_calls = fused.get_layout_for_buffer(GDR_COUNT)[2] // (sp.lin_head_dim * 2)
+        counts = np.zeros((n_calls, sp.lin_head_dim // 2), np.int32)
+        counts[:, 0] = M // n_calls
+        open(os.path.join(bdir, f"{GDR_COUNT}.bin"), "wb").write(counts.tobytes())
     if dims["uses_ring"]:
         # One shared sm_ring, head-major like sm_widths (the triple is head-independent, sec 1.3).
         # First ring geometry's capacity -- every shipped spec has exactly one.
@@ -2460,6 +2487,11 @@ def main():
                        f"theta={sp.rope_theta_global}"}),
             **({"rope_rotary_dim": sp.rope_rotary_dim} if sp.rope_rotary_dim else {}),
             "kv_off": "base * head_dim, element units, addr kind, written raw",
+            **({GDR_COUNT: "one int32 per delta-rule call at byte c * 2 * lin_head_dim: "
+                           "clamp(n_valid - c * GDR_T, 0, GDR_T), n_valid = the chunk's real tokens",
+                "hist_off": "n_valid * (2 * lin_k_heads + lin_v_heads) * lin_head_dim, element "
+                            "units: the conv history handed back is the window rows after the last "
+                            "real token"} if GDR_COUNT in dims["inputs"] else {}),
             SM_WIDTHS: (f"[{dims['sm_rows']}] int32 = q_heads({Hq}) * M({M}), row r = h*M + i "
                         f"holding clamp(base + i + 1, 1, {S}); a plain input-arena write, not a "
                         f"scratchpad parameter" if dims["causal"] == "rows" else None),
