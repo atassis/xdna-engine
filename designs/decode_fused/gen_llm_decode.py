@@ -129,6 +129,7 @@ except ModuleNotFoundError:                                                     
             "iron.operators.gemv.quant (pre-6a347dc). Point IRON at a tree carrying one of them."
         ) from e
 import precision  # noqa: E402
+import pack_cache  # noqa: E402
 from iron.operators.rms_norm.op import RMSNorm  # noqa: E402
 from iron.operators.rope.op import RoPE  # noqa: E402
 from iron.operators.elementwise_add.op import ElementwiseAdd  # noqa: E402
@@ -255,7 +256,34 @@ def _pack(w, site):
                                            scale_dtype=_BUILD_STATE["scale_dtype"])
     if _BUILD_STATE["scale_dtype"] != "f32":
         kw["scale_dtype"] = _BUILD_STATE["scale_dtype"]
-    return quantize_weight(w, spec.group_size, spec.dtype, **kw)
+    return _quantize_cached(w, spec.group_size, spec.dtype, kw)
+
+
+def _quantize_cached(w, group_size, dtype, kw):
+    """quantize_weight through pack_cache's content store. The clip search is most of a quantized
+    build (Qwen3.5-4B int4 g32 clip: ~18 of ~20 min) and a pure function of what is keyed here:
+    the array's bytes, the packing parameters, quant.py's source and numpy's version."""
+    if os.environ.get("DECODE_PACK_CACHE", "1") != "1":
+        return quantize_weight(w, group_size, dtype, **kw)
+    w = np.ascontiguousarray(w)
+    payload = {"v": 1, "op": "quantize_weight", "w": hashlib.sha256(w.data).hexdigest(),
+               "shape": list(w.shape), "w_dtype": str(w.dtype), "group_size": group_size,
+               "dtype": dtype, "kw": kw, "numpy": np.__version__,
+               "packer": pack_cache.sha256_file(sys.modules[quantize_weight.__module__].__file__)}
+    key = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+    store = pack_cache.ContentStore(pack_cache.default_cache_dir())
+    hit = store.get(key)
+    if hit is not None:
+        return np.load(hit)
+    out = quantize_weight(w, group_size, dtype, **kw)
+    tmp = os.path.join(store.objects, f".pack-{os.getpid()}.npy")
+    os.makedirs(store.objects, exist_ok=True)
+    np.save(tmp, out)
+    try:
+        store.put(key, tmp)
+    finally:
+        os.unlink(tmp)
+    return out
 
 
 DECODE_PLACER_FLAGS_DEFAULT = "--cores-per-col 1"
