@@ -71,6 +71,7 @@ ONNX_ASR_VENV=/path/to/venv ./install.sh    # build + install the service
 npu serve                                   # start the engine
 npu transcribe audio.wav                    # run ASR
 npu embed "some text"                       # run embeddings
+npu decide "some text" --question "..."     # typed decision (qwen3.5-4b)
 npu model ls                                # list loaded models
 ```
 

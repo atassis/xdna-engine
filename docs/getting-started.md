@@ -71,18 +71,21 @@ Then, from another shell:
 ```
 npu transcribe audio.wav        # one-shot ASR, prints the transcript
 npu embed "some text"           # one-shot embedding
+npu decide "some text" --question "Is it a question?"   # a typed yes/no decision
 npu model ls                    # what this install is configured to serve
 ```
 
-`npu transcribe`/`npu embed`/`npu generate`/`npu chat`/`npu diarize` each load the model
-they need in-process and exit -- they do not require the service to be running. `npu
-serve` is the one process that owns the NPU continuously and answers HTTP requests.
+`npu transcribe`/`npu embed`/`npu generate`/`npu chat`/`npu diarize`/`npu decide` are all
+clients of the running service's control socket -- `npu serve` is the one process that
+owns the NPU and answers both the socket and HTTP requests.
 
 Every generation prints a one-line measurement to stderr (tokens/s, ms/token, the latency
 tail, and which layer the time actually went to). `npu generate --stats` prints the full
 breakdown instead. `--output json` streams the whole thing as NDJSON on stdout -- one line
 per token, carrying that token's own timing -- so `> run.jsonl` gives you a file `npu
-stats` and `npu replay` read back. See [measurement.md](measurement.md).
+stats` and `npu replay` read back. `npu decide --stats` prints the same kind of breakdown
+for a decision: queue, load, the shared prefix, and each question. See
+[measurement.md](measurement.md).
 
 `npu top` is the live view of the device: who is resident, what is serving right now,
 how much device memory each model holds, and what share of the service's uptime each one

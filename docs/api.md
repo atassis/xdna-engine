@@ -151,6 +151,22 @@ Bodies are capped at 16 MiB. Streaming responses use Server-Sent Events with no
   `/v1/audio/transcriptions` (multipart `file` + `model` form field) for
   `Capability::DIARIZE`. Response: `{"model":"...","segments":[{"start":0.500,"end":3.200,
   "speaker":"SPEAKER_00"}, ...]}`.
+- `POST /v1/systemone` -- not an OpenAI endpoint; TypeSafe's typed-decision shape, served by a
+  `generate` model (`npu decide` calls it). Body: `model` (optional), `state` (a string or any
+  JSON value, the evidence), `questions` (an object keyed by question id, answered in its order).
+  Each question has `type` (`noul`, alias `boolean`; `choice`; `score`), `instructions` (the
+  criterion) and `criteria`: for `noul` optional `true`/`false` descriptions, for `choice` an
+  object of option key to description, for `score` an array of levels, lowest first; 2 to 16
+  options. The answer is read off the next-token probabilities of the options' letters, nothing
+  is generated. Response: `{"model", "answers": {<id>: ...}, "x_npu"}` -- a noul answer is
+  `{"type":"noul","noul":<p(true)>}`, a choice `{"type":"choice","choice","probabilities",
+  "confidence"}`, a score `{"type":"score","score","probabilities","confidence"}` with
+  probabilities keyed by level index and `score` their weighted index. `x_npu` carries
+  `queue_ms`, `load_ms`, `total_ms`, `shared_prefix_tokens`, `prefix_ms`, `snapshot_ms` and per
+  question `prompt_tokens`, `reused_tokens`, `batched_tokens`, `stepwise_tokens`, `restore_ms`,
+  `prefill_ms`, `readout_ms`. On a model with recurrent state (Qwen3.5's DeltaNet layers) the
+  questions share one prefill of their common prompt prefix; `NPU_DECIDE_SHARED_STATE=0`
+  turns that off. A malformed body or question is a 400.
 
 Shared sampling fields (chat and text completions): `temperature`, `top_p`, `top_k`,
 `max_tokens`, `seed`, `stop` (string or array of strings), `presence_penalty`,
