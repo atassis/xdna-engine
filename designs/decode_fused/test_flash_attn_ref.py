@@ -62,8 +62,11 @@ def test_global_flash_matches_full_attention(base):
     vis = global_visible(base, w, heads)
     scale = 1.0 / np.sqrt(hd)
     out = flash_attention(q, k, v, vis, scale, b_kv=B_KV)
+    assert out.dtype == np.float32
     assert np.isfinite(out).all()
-    assert rel_l2(out, full_attention(q, k, v, vis, scale)) < TOL
+    ref = full_attention(q, k, v, vis, scale)
+    assert ref.dtype == np.float64
+    assert rel_l2(out, ref) < TOL
 
 
 @pytest.mark.parametrize("base", [0, 512, 1536, 2048])
@@ -73,8 +76,11 @@ def test_sliding_flash_matches_full_attention(base):
     vis = sliding_visible(base, grp)
     scale = 1.0 / np.sqrt(hd)
     out = flash_attention(q, k, v, vis, scale, b_kv=B_KV)
+    assert out.dtype == np.float32
     assert np.isfinite(out).all()
-    assert rel_l2(out, full_attention(q, k, v, vis, scale)) < TOL
+    ref = full_attention(q, k, v, vis, scale)
+    assert ref.dtype == np.float64
+    assert rel_l2(out, ref) < TOL
 
 
 def _holed_case():
@@ -123,3 +129,17 @@ def test_negative_additive_mask_lets_a_nan_key_through():
     kp = k.copy()
     kp[hidden] = np.nan
     assert np.isnan(flash_attention(q, kp, v, vis, 1 / 16, b_kv=B_KV, additive_mask=True)).any()
+
+
+def test_a_window_that_is_not_whole_blocks_is_refused():
+    q, k, v = qkv(1, M, 100, 64)
+    with pytest.raises(ValueError, match="whole number"):
+        flash_attention(q, k, v, np.ones((M, 100), bool), 1 / 8, b_kv=B_KV)
+
+
+def test_a_row_that_sees_nothing_has_no_reference():
+    q, k, v = qkv(2, 2, 64, 64)
+    vis = np.ones((2, 64), bool)
+    vis[1] = False
+    with pytest.raises(ValueError, match="no visible key"):
+        full_attention(q, k, v, vis, 1 / 8)
