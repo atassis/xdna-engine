@@ -115,8 +115,8 @@ fn run(cli: &Cli, path: &Path) -> Result<()> {
         Cmd::Chat { prompt, model, sampling, no_stream } =>
             chat(prompt.as_deref(), model.as_deref(), sampling, *no_stream, as_json),
         Cmd::Embed { text, model } => embed(text, model.as_deref(), as_json),
-        Cmd::Decide { state, question, kind, options, model } =>
-            decide(state, question, *kind, options, model, as_json),
+        Cmd::Decide { state, question, kind, options, questions, model, stats } =>
+            decide(state, question.as_deref(), *kind, options, questions.as_deref(), model, *stats, as_json),
         Cmd::Top { interval, once } => top(*interval, *once),
         Cmd::Stats { log, diff } => stats_cmd(log, diff.as_deref()),
         Cmd::Replay { log, realtime, frames } => replay_cmd(log, *realtime, *frames),
@@ -1099,15 +1099,41 @@ fn decide_human(a: &serde_json::Value) -> String {
     }
 }
 
-fn decide(state: &str, question: &str, kind: DecideType, options: &[String], model: &str, as_json: bool) -> Result<()> {
+/// A `/v1/systemone` body from a `--questions` file: the file is the request's `questions` object.
+fn questions_body(state: &str, text: &str, model: &str) -> Result<serde_json::Value> {
+    let q: serde_json::Value = serde_json::from_str(text).context("--questions is not JSON")?;
+    match q.as_object() {
+        Some(o) if !o.is_empty() => Ok(serde_json::json!({ "model": model, "state": state, "questions": q })),
+        _ => bail!("--questions must be a non-empty JSON object of questions keyed by id"),
+    }
+}
+
+fn decide(state: &str, question: Option<&str>, kind: DecideType, options: &[String],
+          questions: Option<&Path>, model: &str, stats: bool, as_json: bool) -> Result<()> {
     quiet_one_shot();
     let state = match state.strip_prefix('@') {
         Some(p) => std::fs::read_to_string(p).with_context(|| format!("read {p}"))?,
         None => state.to_string(),
     };
-    let v = socket_client::call_json("/v1/systemone", &decide_body(&state, question, kind, options, model)?)?;
-    let a = &v["answers"]["q"];
-    if as_json { println!("{a}"); } else { println!("{}", decide_human(a)); }
+    let body = match (questions, question) {
+        (Some(p), _) => questions_body(&state,
+            &std::fs::read_to_string(p).with_context(|| format!("read {}", p.display()))?, model)?,
+        (None, Some(q)) => decide_body(&state, q, kind, options, model)?,
+        (None, None) => bail!("--question or --questions is required"),
+    };
+    let v = socket_client::call_json("/v1/systemone", &body)?;
+    let answers = &v["answers"];
+    match (questions.is_some(), as_json) {
+        (false, true) => println!("{}", answers["q"]),
+        (false, false) => println!("{}", decide_human(&answers["q"])),
+        (true, true) => println!("{answers}"),
+        (true, false) => for (id, a) in answers.as_object().into_iter().flatten() {
+            println!("{id}: {}", decide_human(a));
+        },
+    }
+    if stats {
+        eprint!("{}", stats::decide_table(&v["x_npu"]));
+    }
     Ok(())
 }
 
@@ -3458,6 +3484,21 @@ mod decide_cli {
             {"type": "choice", "choice": "b", "confidence": 0.9953})), "b 0.9953");
         assert_eq!(decide_human(&serde_json::json!(
             {"type": "score", "score": 1.5, "confidence": 0.73})), "1.50 (confidence 0.7300)");
+    }
+
+    #[test]
+    fn questions_file_conflicts_with_question() {
+        assert!(Cli::try_parse_from(["npu", "decide", "s", "--questions", "q.json", "--question", "x"]).is_err());
+        assert!(Cli::try_parse_from(["npu", "decide", "s"]).is_err(), "one of --question/--questions is required");
+        assert!(Cli::try_parse_from(["npu", "decide", "s", "--questions", "q.json", "--stats"]).is_ok());
+    }
+
+    #[test]
+    fn questions_body_keeps_the_files_order() {
+        let b = questions_body("s", r#"{"z": {"type": "noul", "instructions": "a"}, "a": {"type": "noul", "instructions": "b"}}"#, "m").unwrap();
+        assert_eq!(b["questions"].as_object().unwrap().keys().collect::<Vec<_>>(), ["z", "a"]);
+        assert!(questions_body("s", "[]", "m").is_err());
+        assert!(questions_body("s", "{}", "m").is_err());
     }
 }
 

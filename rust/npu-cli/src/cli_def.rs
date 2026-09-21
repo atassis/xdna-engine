@@ -11,6 +11,21 @@ use clap::{Parser, Subcommand, ValueEnum, ValueHint};
 use clap_complete::Shell;
 use npu_engine::capability::Capability;
 
+const DECIDE_EXAMPLES: &str = "\
+Examples:
+  npu decide \"The build failed twice on the same test and passed on retry.\" \\
+      --question \"Is the test flaky?\"
+  npu decide @ticket.txt --question \"Which team owns this?\" --type choice \\
+      --option infra=\"build, CI and deploys\" --option app=\"product code\"
+  npu decide @review.txt --question \"How severe is the bug?\" --type score \\
+      --option low --option medium --option high
+  npu decide @report.txt --questions questions.json --stats
+
+questions.json:
+  {\"flaky\": {\"type\": \"noul\", \"instructions\": \"Is the failure intermittent?\"},
+   \"owner\": {\"type\": \"choice\", \"instructions\": \"Which team owns the fix?\",
+             \"criteria\": {\"infra\": \"build and CI\", \"app\": \"product code\"}}}";
+
 #[derive(Parser)]
 #[command(name = "npu", about = "XDNA2 NPU engine multitool",
           subcommand_required = true, arg_required_else_help = true)]
@@ -25,6 +40,9 @@ pub struct Cli {
     /// `chat.completion.chunk` per decoded token carrying that token's own timing under `x_npu`,
     /// then a summary -- flushed per line, so `> run.jsonl` produces a file `npu stats` and
     /// `npu replay` read. `--no-stream` writes the single `chat.completion` object instead.
+    ///
+    /// For `decide`, `json` prints the answer object, or with `--questions` the answers keyed by
+    /// id.
     // No `short = 'o'`, though the design asked for `-o`: `transcribe-media` already spells its
     // output FILE `-o`, and a global short collides with it -- clap panics there with "Short option
     // names must be unique". Freeing `-o` means renaming that one, which is a user-visible break and
@@ -115,17 +133,34 @@ pub enum Cmd {
         /// Embedding model name; omit to use the configured embed default.
         #[arg(long)] model: Option<String>,
     },
-    /// One typed decision over a state (TypeSafe's `/v1/systemone`), one question per call.
+    /// Typed decisions over a state (TypeSafe's `/v1/systemone`), read off a language model's
+    /// next-token probabilities over the options -- nothing is generated.
     ///
-    /// Prints the answer object. `@path` reads the state from a file.
+    /// Prints one line per question: a noul's likelier side and its probability (`true 0.9944`),
+    /// a choice's key and confidence, or a score's probability-weighted level. `--output json`
+    /// prints the answer object instead (the answers keyed by id with `--questions`).
+    #[command(after_long_help = DECIDE_EXAMPLES)]
     Decide {
+        /// The evidence the questions are applied to: the text itself, or `@path` to read a file.
         #[arg(allow_hyphen_values = true)] state: String,
         /// The criterion the model applies to the state.
-        #[arg(long, allow_hyphen_values = true)] question: String,
-        #[arg(long = "type", value_enum, default_value_t = DecideType::Noul)] kind: DecideType,
+        #[arg(long, allow_hyphen_values = true, required_unless_present = "questions")]
+        question: Option<String>,
+        /// `noul`: the probability that the criterion holds. `choice`: which `--option` fits.
+        /// `score`: where the state sits on the `--option` levels.
+        #[arg(long = "type", value_enum, default_value_t = DecideType::Noul, conflicts_with = "questions")]
+        kind: DecideType,
         /// Repeated. `key=description` for a choice's options (in order) or noul's `true=` /
         /// `false=`; for a score, each value is one level, lowest first.
-        #[arg(long = "option", allow_hyphen_values = true)] options: Vec<String>,
+        #[arg(long = "option", allow_hyphen_values = true, conflicts_with = "questions")]
+        options: Vec<String>,
+        /// Several questions over the one state, from a JSON file holding a `/v1/systemone`
+        /// `questions` object. On a model with recurrent state (qwen3.5-4b) they share the
+        /// state's prefill.
+        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "question")]
+        questions: Option<PathBuf>,
+        /// Print where the time went -- queue, load, the shared prefix, each question -- on stderr.
+        #[arg(long)] stats: bool,
         /// Generation model name.
         #[arg(long, default_value = "qwen3.5-4b")] model: String,
     },

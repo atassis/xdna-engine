@@ -1,4 +1,4 @@
-//! Rendering a generation's measurements for a human, and reading one back off disk.
+//! Rendering a generation's or a decision's measurements for a human, and reading one back off disk.
 //!
 //! Two forms, and the split is deliberate. Measuring is free, so it always happens; READING is not
 //! free -- a wall of numbers under every one-line answer is noise. So the compact form goes to
@@ -181,6 +181,37 @@ pub fn table(r: &GenerationReport) -> String {
     o.push_str("  clock          not independently readable on this chip (power mode above is the\n\
                  \x20                only readable proxy) -- treat any %-of-peak figure as a cycle\n\
                  \x20                ratio, not a clock-scaled one\n");
+    o
+}
+
+/// `npu decide --stats`: the `x_npu` object off a `/v1/systemone` response. `model` is the prefix
+/// restore plus every question's own restore/prefill/readout; `other` is what `total` leaves over
+/// once queue, load and model are subtracted -- host glue around the socket call.
+pub fn decide_table(x: &serde_json::Value) -> String {
+    let f = |k: &str| x[k].as_f64().unwrap_or(0.0);
+    let (queue, load, total, prefix, snapshot) =
+        (f("queue_ms"), f("load_ms"), f("total_ms"), f("prefix_ms"), f("snapshot_ms"));
+    let shared_prefix_tokens = x["shared_prefix_tokens"].as_u64().unwrap_or(0);
+    let empty = serde_json::Map::new();
+    let questions = x["questions"].as_object().unwrap_or(&empty);
+    let qf = |q: &serde_json::Value, k: &str| q[k].as_f64().unwrap_or(0.0);
+    let qu = |q: &serde_json::Value, k: &str| q[k].as_u64().unwrap_or(0);
+    let question_ms: f64 = questions.values()
+        .map(|q| qf(q, "restore_ms") + qf(q, "prefill_ms") + qf(q, "readout_ms")).sum();
+    let model = prefix + snapshot + question_ms;
+    let other = total - queue - load - model;
+
+    let mut o = format!("  total {total:.0} ms = queue {queue:.1} · load {load:.1} · model {model:.1} · other {other:.1}\n");
+    if shared_prefix_tokens != 0 {
+        o.push_str(&format!(
+            "  shared prefix {shared_prefix_tokens} tokens · primed in {prefix:.1} ms · snapshot {snapshot:.1} ms\n"));
+    }
+    for (id, q) in questions {
+        o.push_str(&format!(
+            "  {id}  {} tokens = {} restored + {} batched + {} stepwise · restore {:.1} · prefill {:.1} · readout {:.1} ms\n",
+            qu(q, "prompt_tokens"), qu(q, "reused_tokens"), qu(q, "batched_tokens"), qu(q, "stepwise_tokens"),
+            qf(q, "restore_ms"), qf(q, "prefill_ms"), qf(q, "readout_ms")));
+    }
     o
 }
 
@@ -384,5 +415,17 @@ mod tests {
         let cut: Vec<&str> = text.lines().take(3).collect();
         std::fs::write(&p, cut.join("\n")).unwrap();
         assert!(from_log(&p).unwrap().contains("truncated"));
+    }
+
+    #[test]
+    fn decide_table_renders_each_row() {
+        let x = serde_json::json!({"queue_ms": 0.1, "load_ms": 0.0, "total_ms": 5210.0,
+            "shared_prefix_tokens": 512, "prefix_ms": 2350.1, "snapshot_ms": 12.3,
+            "questions": {"flaky": {"prompt_tokens": 640, "reused_tokens": 512, "batched_tokens": 127,
+                "stepwise_tokens": 1, "restore_ms": 11.8, "prefill_ms": 1380.0, "readout_ms": 0.4}}});
+        assert_eq!(decide_table(&x), concat!(
+            "  total 5210 ms = queue 0.1 · load 0.0 · model 3754.6 · other 1455.3\n",
+            "  shared prefix 512 tokens · primed in 2350.1 ms · snapshot 12.3 ms\n",
+            "  flaky  640 tokens = 512 restored + 127 batched + 1 stepwise · restore 11.8 · prefill 1380.0 · readout 0.4 ms\n"));
     }
 }

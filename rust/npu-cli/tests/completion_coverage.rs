@@ -159,6 +159,7 @@ const FREE_FORM_ARGS: &[(&str, &str)] = &[
     ("state", "the decision's state -- arbitrary string, or `@path` to a file"),
     ("question", "the decision's criterion -- arbitrary string"),
     ("options", "`key=description` decision options -- arbitrary, repeatable strings"),
+    ("questions", "JSON file of questions for --questions -- arbitrary filesystem location"),
 ];
 
 #[test]
