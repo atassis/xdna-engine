@@ -123,20 +123,23 @@ community-1); none of the three stages currently dispatches to the NPU. `registr
 does not even open the device for a diarize scenario, on purpose, so it cannot take a hardware
 context away from a co-resident ASR model.
 
-**The capability set is closed, not open.** `ModelKind { Asr, Embed, Diarize, Generate }`
+**The capability set is closed, not open.** `ModelKind { Asr, Embed, Diarize, Generate, Tts }`
 (`api.rs`) is threaded through five places (`api`, `pipeline`, `loader`, `actor`, `select`);
-adding a fifth capability means editing all five. `rust/npu-engine/src/capability.rs`'s
-`Capability`/`Servable`/`Request`/`Response` types are an open replacement for exactly this
--- its own doc comment calls it a "PROBE, not the finished contract," validated against two
-instances (`bert::EmbedPipeline` and `npu_sr::SrEngine`) and not yet wired into the registry
-the HTTP server and CLI actually use.
+adding a sixth capability means editing all five -- which is exactly why `image-sr` is not a
+`ModelKind` variant. `rust/npu-engine/src/capability.rs`'s `Capability`/`Servable`/`Request`/
+`Response` types are the open replacement: `npu_sr::SrEngine` implements `Servable` directly
+and `npu-runtime`'s `EngineLoader` constructs one for scenario kind `image-sr`
+(`/v1/images/upscale`), bypassing `ModelKind`/`registry::try_build` entirely rather than
+adding a sixth arm to them.
 
-**Video super-resolution is a second, separate pipeline.** `npu-sr` does not implement
-`Encoder`/`Frontend`/`Head` at all. It has its own frame-in/frame-out ABI, its own error type,
-and drives `npu-xrt` directly rather than going through `npu-engine` or `npu-runtime`. It
-shares the device and the weight-loading approach, not the request path -- it is not reachable
-through the HTTP server or the `Model`/`Scenario` types described here or in
-[api.md](api.md).
+**Video super-resolution is still a second, separate pipeline for everything but routing.**
+`npu-sr` does not implement `Encoder`/`Frontend`/`Head`, has its own frame-in/frame-out ABI and
+error type, and drives `npu-xrt` directly rather than going through `npu-engine`'s own
+`Model`/`Scenario` types -- `npu-runtime` constructs an `SrEngine` beside `npu_engine::Model`,
+not through it. It IS now reachable through the HTTP server and the control socket
+(`/v1/images/upscale`, `npu upscale`; see [api.md](api.md)), the same device actor and
+single-flight serialization every other capability gets; the ffmpeg filter (`vf_xdna_sr`)
+remains a separate integration that talks to `npu-sr` directly, not through `npu serve`.
 
 **Small-LLM decode reuses primitives, not code-per-model, across models.** Qwen3, Gemma 3 and
 Gemma 4-12B are all served through the same `npu_engine::llm` path (`NpuDecodeStep` driving a

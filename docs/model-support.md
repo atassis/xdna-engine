@@ -117,13 +117,11 @@ None of these reach the NPU as a full model. What each one actually has:
   (`tests/parity_dinov2.rs`, `parity_clip.rs`). No forward pass of any kind -- host or
   NPU -- exists for either in this tree.
 
-One real NPU component does exist for this family: `rust/npu-probes/src/bin/verify_patch_embed.rs`
-has an `--npu` mode that runs the ViT/DINOv2 patch-embed convolution (the stem, not the
-transformer body) on the device in bf16 and gates it at rel-L2 <= 0.08 against an ONNX
-Conv2d oracle, across three configs (`vit_b16`, `vit_l16`, `dinov2_b14`). That is one op,
-not a model, and it does not appear in the table above for that reason. The README's
+No NPU verification path exists for ViT in this tree today: the probe that once ran the
+ViT/DINOv2 patch-embed convolution on the device (`verify_patch_embed.rs`, an `npu-probes`
+binary) was deleted when `npu-probes` became `npu-dev`, and nothing replaced it. The README's
 "Vision - ViT, DINOv2, and ResNet-18 through a general conv2d path" reads as NPU support
-for full models; what actually runs on the NPU is this one shared stem op.
+for full models; what the table above shows for this family is host-only.
 
 ## Video super-resolution
 
@@ -134,15 +132,16 @@ for full models; what actually runs on the NPU is this one shared stem op.
 
 Both nets run a real conv -> im2col -> whole-array bf16 GEMM dispatch on the NPU, gated
 against both the CPU frontier and a PyTorch oracle by relative L2 (`edsr_npu_gate.rs`
-requires < 1.5e-2 vs CPU and < 2.0e-2 vs the oracle). This is not reached through
-`npu serve` or the HTTP API at all -- it is a separate engine (`npu-sr`) with its own
-frame-in/frame-out ABI, driven by the `xdna-sr` CLI or the `vf_xdna_sr` ffmpeg filter
-(`rust/npu-sr/README.md`). The top-level README's "What works today" list omits this
-entirely, even though it is a real, NPU-verified, shipped capability. One honest
-limitation from `npu-sr`'s own README: the current NPU frontier uses a general
-whole-array GEMM that is "correct but not yet size-optimized for these shapes," so
-reported per-frame latency is a correctness baseline, not a real-time figure -- real-time
-playback is "measured as headroom, not shipped in v1."
+requires < 1.5e-2 vs CPU and < 2.0e-2 vs the oracle). ESPCN is served through `npu serve`
+(`npu upscale`, `POST /v1/images/upscale`, scenario `scenarios/upscale-espcn.toml`), the
+same device actor and control socket every other capability goes through. EDSR has no
+shipped scenario yet; both nets remain reachable directly, by schedule path, through the
+`vf_xdna_sr` ffmpeg filter (`rust/npu-sr/README.md`), a separate `npu-sr`-based ABI that
+does not go through `npu serve`. One honest limitation from `npu-sr`'s own README: the
+current NPU frontier uses a general whole-array GEMM that is "correct but not yet
+size-optimized for these shapes," so reported per-frame latency is a correctness
+baseline, not a real-time figure -- real-time playback is "measured as headroom, not
+shipped in v1."
 
 ## Diarization
 

@@ -22,8 +22,11 @@ transformer or conv model plugs into, rather than a per-model stack.
 ```
 
 `npu-sr` sits BESIDE `npu-engine`, not under it: it drives `npu-xrt` directly and has its own
-frame-in/frame-out ABI. The two stacks share the device and the weight loader but not the
-request path. Unifying them is open work, not a shipped property; see "Known seams" below.
+frame-in/frame-out ABI, not `npu-engine`'s `Model`/`Scenario` types. `npu-runtime` constructs
+an `SrEngine` directly (scenario kind `image-sr`) rather than through `npu-engine`, so the two
+stacks share the device, the weight loader AND, since `/v1/images/upscale`, the request path
+(HTTP server, control socket, device actor) -- just not the model-pipeline abstraction.
+Unifying that last part is open work, not a shipped property; see "Known seams" below.
 
 ## Crates
 
@@ -42,7 +45,7 @@ request path. Unifying them is open work, not a shipped property; see "Known sea
 | `npu-asr` / `npu-asr-host` | GigaAM-v3 encoder on the NPU (`npu-asr`) and its pure host-CPU reference math (`npu-asr-host`). |
 | `npu-parakeet` | Parakeet-TDT FastConformer encoder (rel-pos attention, depthwise conv1d k=9, /8 conv2D subsample). |
 | `npu-whisper` | Whisper-small encoder + decoder reference and the on-NPU decode path. |
-| `npu-sr` | Super-resolution engine: frame in / frame out video upscaling (ESPCN, EDSR). Own schedule JSON, own `SrEngine` ABI, drives `npu-xrt` directly. |
+| `npu-sr` | Super-resolution engine: frame in / frame out video upscaling (ESPCN, EDSR). Own schedule JSON, own `SrEngine` ABI, drives `npu-xrt` directly; constructed by `npu-runtime` for `POST /v1/images/upscale`. |
 | `npu-sr-capi` | C ABI over `npu-sr` (`libxdna_sr.so`) for the ffmpeg `vf_xdna_sr` filter and other embedders. |
 | `npu-capi` | C ABI over `npu-engine` (cdylib + staticlib, cbindgen header) for in-process embedding from any language. |
 | `npu-cli` | `npu` multitool: serve, transcribe, embed, generate, chat, diarize, models, config, reload, bake, doctor, `top`, and the measurement readers `stats` / `replay`. |
@@ -86,9 +89,12 @@ Where the tree does not yet match the story above. Named here so a reader is not
 - **`npu-engine` is mostly not the engine.** Its generic core (`api`, `config`, `lib`,
   `pipeline`, `registry`, `tuning_profile`) is ~460 lines; the other ~4200 are the ASR, BERT
   and ESM model implementations that happen to share its manifest.
-- **The capability set is closed.** `ModelKind { Asr, Embed }` is threaded through
-  `api.rs`, `pipeline.rs`, `loader.rs`, `actor.rs` and `select.rs`, so a third modality means
-  editing all five. This is why `npu-sr` sits outside the request path.
+- **The capability set is closed.** `ModelKind { Asr, Embed, Diarize, Generate, Tts }` is
+  threaded through `api.rs`, `pipeline.rs`, `loader.rs`, `actor.rs` and `select.rs`, so a sixth
+  modality means editing all five. `image-sr` avoids that cost by not being a `ModelKind`
+  variant at all -- `npu-runtime` constructs `npu_sr::SrEngine` (which implements the open
+  `Servable` trait) directly for that scenario kind, which is why it reaches the request path
+  without `npu-engine`'s closed enum ever naming it.
 - **Kernel binaries are selected by hardcoded path.** Model crates name xclbins as string
   literals with shape, tile, column count and variant encoded in the filename (for example
   `final_512x1024x4096_64x32x128_8c_modalsilu.xclbin`). There is no machine-readable

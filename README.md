@@ -27,8 +27,9 @@ freeing the CPU - see [docs/data-movement-thesis.md](docs/data-movement-thesis.m
   encoder + a full 12-layer decoder fused into a single ELF dispatch.
 - **Embeddings** - BGE-base on the NPU, served over an OpenAI-compatible `/v1/embeddings`
   endpoint. ESM-2 (8M/35M) runs the same encoder rails.
-- **Super-resolution** - ESPCN and EDSR on the NPU, gated against a CPU oracle, reached
-  through the `xdna-sr` CLI and an ffmpeg filter rather than `npu serve`.
+- **Super-resolution** - ESPCN and EDSR on the NPU, gated against a CPU oracle. ESPCN is
+  served through `npu serve` (`npu upscale`, `POST /v1/images/upscale`); both nets are
+  also reachable directly, by schedule path, through a separate ffmpeg filter.
 - **Precision** - selectable bf16 / bfp16 / int8, per-op, gated on WER/accuracy.
 
 Weights convert and match a reference for MiniLM, E5, ModernBERT, ViT, DINOv2, ResNet-18
