@@ -12,7 +12,7 @@ def write_blob(path, data):
 
     Zero-run rather than by-name, because a cache blob is not always zero: `gen_decode.py`
     seeds a random past segment into `kc`/`vc` when P>0. Sparse rather than absent, because
-    `arena_share_probe`, `fused_elf_probe` and `prefill_golden_probe` each read every
+    `npu-dev fused-elf` and `npu-dev prefill-golden` each read every
     `meta["weights"]` blob by name.
     """
     mv = memoryview(data).cast("B")

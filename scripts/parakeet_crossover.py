@@ -2,7 +2,7 @@
 """Find the CPU↔NPU encoder crossover vs audio length. The NPU's per-dispatch overhead is fixed
 per op, so it amortizes as the sequence (post-÷8 T') grows. This builds mels at increasing lengths
 (T' ≤ 512, the static window), times the onnx-asr CPU encoder on each, and dumps the mels for the
-Rust NPU encoder (parakeet_encode_npu) to time. Compare the two tables to see where NPU overtakes CPU.
+Rust NPU encoder (npu-dev parakeet-encode) to time. Compare the two tables to see where NPU overtakes CPU.
 
 Usage:
   dump:  parakeet_crossover.py dump <mel_dir>      # build mels + print CPU encoder times
@@ -46,7 +46,7 @@ def main():
         np.save(os.path.join(out_dir, f"len{tprime}.npy"), feats[0].astype(np.float32))
         print(f"{secs:>8} {feats.shape[2]:>6} {tprime:>7} {min(ts)*1000:>11.0f}")
     print(f"\n[dumped mels to {out_dir}] now run the NPU encoder on it:")
-    print(f"  flock /tmp/xdna2-npu.flock -c './rust/target/release/parakeet_encode_npu {out_dir} /tmp/xover_enc'")
+    print(f"  flock /tmp/xdna2-npu.flock -c './rust/target/release/npu-dev parakeet-encode {out_dir} /tmp/xover_enc'")
 
 if __name__ == "__main__":
     main()

@@ -10,7 +10,7 @@
 set -u
 . "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/_npu_services.sh" || exit 1   # unit names + asserted quiesce
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$WT"
-W3="$WT/rust/target/release/whisper_e2e_timing"
+W3="$WT/rust/target/release/npu-dev"
 LDLIB=~/.local/lib/npu-asr
 CLIP="$WT/artifacts/wer_clips/en_01.wav"
 TS="$(date +%Y%m%d_%H%M%S)"; LOG="$WT/artifacts/coalesce_e2e_ab_${TS}.log"
@@ -19,7 +19,7 @@ log(){ echo -e "$*" | tee -a "$LOG"; }
 restart(){ npu_svc_start; }
 trap 'restart; echo "[done] log: $LOG"' EXIT
 
-[ -x "$W3" ] || { log "[ERR] whisper_e2e_timing missing — build: (cd rust && cargo build -p npu-probes --release --bin whisper_e2e_timing)"; exit 1; }
+[ -x "$W3" ] || { log "[ERR] npu-dev missing — build: (cd rust && cargo build -p npu-dev --release)"; exit 1; }
 ENC="$WT/mlir-aie/programming_examples/basic/matrix_multiplication/whole_array/build/final_512x800x3072_64x32x96_8c_modalsilu.xclbin"
 [ -f "$ENC" ] || { log "[ERR] encoder xclbin missing: $ENC"; exit 1; }
 for d in fused_decode12 fd12_cross fd12_self; do
@@ -43,7 +43,7 @@ log "[svc] device clear"
 run(){  # $1 label  $2 dir
   log "\n----------------- [$1]  ($2) -----------------"
   env WHISPER_TIMING=1 FUSED_PHASE_TIMING=1 NPU_DECODE_FUSED=1 NPU_DECODE_FUSED_DIR="$WT/artifacts/$2" \
-      LD_LIBRARY_PATH="$LDLIB" "$W3" "$CLIP" 2>&1 \
+      LD_LIBRARY_PATH="$LDLIB" "$W3" whisper-e2e "$CLIP" 2>&1 \
     | grep -E "WHISPER_TIMING|WHISPER_ENERGY|FUSED_PHASE\] (steps|per-token)|dispatch |lm_head |warmup text" \
     | tee -a "$LOG"
 }

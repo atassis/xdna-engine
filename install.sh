@@ -368,12 +368,12 @@ mkdir -p "$ENGINE_ROOT"
 # mha_decode are still adapter-less by design (reported NoRecipe, not built), and the
 # die-checks below (publish_kernels.sh's pin-consistency refusal, section 4c's
 # artifact/pin agreement check) remain the real safety net for anything left missing.
-DECLARED_KERNELS_BIN="$CARGO_TARGET_DIR_RESOLVED/release/build_declared_kernels"
+DECLARED_KERNELS_BIN="$CARGO_TARGET_DIR_RESOLVED/release/npu-dev"
 if [ -x "$DECLARED_KERNELS_BIN" ]; then
-  "$DECLARED_KERNELS_BIN" "$REPO" "$ENGINE_KERNELS" "$ENGINE_MLIR_AIE" \
-    || warn "build_declared_kernels reported a problem (see above) -- falling through to the plain publish/preflight below"
+  "$DECLARED_KERNELS_BIN" kernels-build "$REPO" "$ENGINE_KERNELS" "$ENGINE_MLIR_AIE" \
+    || warn "npu-dev kernels-build reported a problem (see above) -- falling through to the plain publish/preflight below"
 else
-  warn "build_declared_kernels not found at $DECLARED_KERNELS_BIN -- skipping the automatic rebuild step"
+  warn "npu-dev not found at $DECLARED_KERNELS_BIN -- skipping the automatic rebuild step"
 fi
 
 bash "$REPO/scripts/publish_kernels.sh" "$ENGINE_KERNELS" "$ENGINE_MLIR_AIE" \

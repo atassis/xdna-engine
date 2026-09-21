@@ -3,8 +3,7 @@
 
 For each clip in --clips (with refs.json mapping file -> ground-truth text), this:
   1. POSTs the WAV to the live service (multipart `file`) -> OUR hypothesis.
-     Endpoint: http://127.0.0.1:11434/v1/audio/transcriptions  (same shape as
-     scripts/test_npu_pipeline.py / scripts/asr_service.py; returns {"text": ...}).
+     Endpoint: http://127.0.0.1:11434/v1/audio/transcriptions  (returns {"text": ...}).
   2. Runs the CPU oracle (onnx-asr GigaAM-v3, same model the service decodes with)
      -> ORACLE hypothesis.
 Then computes WER for (ours vs ref), (oracle vs ref), (ours vs oracle), prints a

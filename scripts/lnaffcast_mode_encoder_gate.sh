@@ -42,7 +42,7 @@ LOG="$OUT/gate_$TS.log"
 mkdir -p "$OUT"; : > "$LOG"
 log(){ echo -e "$*" | tee -a "$LOG"; }
 
-BIN="$WT/rust/target/release/parakeet_encode_npu"
+BIN="$WT/rust/target/release/npu-dev"
 MELS="${MELS:-$WT/artifacts/wer_mels}"
 # Decoder python: PY overrides directly. Otherwise derive from ONNX_ASR_VENV (same var
 # install.sh's preflight uses), searching ./.venv then the documented conventional path if
@@ -60,7 +60,7 @@ PY="${PY:-/nonexistent/onnx-asr-python}"
 restore(){ systemctl --user start xdna-engine.service npu-vox.service >/dev/null 2>&1; log "[svc] restored"; }
 trap restore EXIT
 
-[ -x "$BIN" ] || { log "FATAL missing (prebuild with: cargo build -p npu-probes --release --bin parakeet_encode_npu): $BIN"; exit 1; }
+[ -x "$BIN" ] || { log "FATAL missing (prebuild with: cargo build -p npu-dev --release): $BIN"; exit 1; }
 [ -d "$MELS" ] || { log "FATAL: mel dir $MELS does not exist"; exit 1; }
 [ -x "$PY" ]  || { log "FATAL: decoder python $PY not executable"; exit 1; }
 NCLIP=$(ls "$MELS"/*.npy 2>/dev/null | wc -l)
@@ -89,7 +89,7 @@ encode(){  # $1 = arm name, rest = env assignments
   local dir="$OUT/$arm"
   rm -rf "$dir"; mkdir -p "$dir"
   log "\n---------- arm $arm ($*) ----------"
-  env NPU_XCLBIN_ROOT="$WT" "$@" "$BIN" "$MELS" "$dir" 2>&1 | tee -a "$LOG"
+  env NPU_XCLBIN_ROOT="$WT" "$@" "$BIN" parakeet-encode "$MELS" "$dir" 2>&1 | tee -a "$LOG"
   local r=${PIPESTATUS[0]}
   [ "$r" = 0 ] || { log "arm $arm FAILED rc=$r"; rc=$r; return $r; }
   local n; n=$(ls "$dir"/*.npy 2>/dev/null | wc -l)

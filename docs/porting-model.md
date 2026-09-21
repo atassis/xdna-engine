@@ -196,8 +196,8 @@ Four independent gates, each catching a different class of mistake:
    statistics (mean, worst-frame, worst-burst rel-L2, plus a `new-burst` delta) rather
    than a single mean, specifically because a whole-clip mean can average a short,
    localized error spike into invisibility. Its own docstring shows the usage pattern:
-   capture three encode dirs with a `npu-probes` binary
-   (`cargo run -p npu-probes --bin parakeet_encode_npu -- ...`), then gate them.
+   capture three encode dirs with the `npu-dev` binary
+   (`cargo run -p npu-dev -- parakeet-encode ...`), then gate them.
 4. **End-to-end task metric.** `scripts/wer_eval.py` for ASR: transcribes a clip set
    against the live service and a CPU oracle, reports WER for both. There is no generic
    equivalent yet for embeddings or vision in this tree -- plan to write one (a small

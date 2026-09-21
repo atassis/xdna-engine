@@ -10,7 +10,7 @@ Decode token (M=1) FFN: x -> ln_final -> fc1 -> +bias -> GELU(tanh) -> fc2 -> +b
 
 All bias adds are on-device `elementwise_add` (fc1 bias feeds the GELU nonlinearity, so it cannot be
 deferred to host). γf folds into Wfc1 (W''=diag(γf)·W); βf into bias' = βf@Wfc1 + b_fc1. fc2 has no
-preceding norm (no fold). Gate (generic fused_elf_probe): rel-L2(device out, buffers/out.bin) <= 0.08,
+preceding norm (no fold). Gate (generic npu-dev fused-elf): rel-L2(device out, buffers/out.bin) <= 0.08,
 golden = the same bf16 dataflow the device runs.
 
 Run inside IRON env (aiebu-asm on PATH). See gen_ln_qkv.py for invocation.

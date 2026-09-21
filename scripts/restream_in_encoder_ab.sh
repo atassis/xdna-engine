@@ -25,12 +25,12 @@ cd "$HERE/.." || exit 1
 REPS="${1:-12}"
 CLIPS="${2:-4}"
 OUT="${OUT:-artifacts/restream_ab}"
-BIN=rust/target/release/parakeet_encode_npu
+BIN=rust/target/release/npu-dev
 MELS=artifacts/wer_mels
 
 log(){ echo -e "[restream] $*"; }
 
-[ -x "$BIN" ] || { log "[ERR] missing $BIN -- cargo build --release -p npu-probes --bin parakeet_encode_npu"; exit 1; }
+[ -x "$BIN" ] || { log "[ERR] missing $BIN -- cargo build --release -p npu-dev"; exit 1; }
 
 # A warm-clip subset: the dispatch log resets per clip and the report describes the LAST one, so the
 # leading clips only exist to get past the cold weight-BO load.
@@ -54,7 +54,7 @@ run_arm() {   # $1 = arm name, $2 = rep index
   local fold=0
   [ "$arm" = fold ] && fold=1
   PARAKEET_FOLD_FC1=$fold NPU_DISPATCH_LOG=1 NPU_XCLBIN_ROOT="$PWD" \
-    "$BIN" "$WORK/mel" "$WORK/out_$arm" >"$rpt" 2>&1
+    "$BIN" parakeet-encode "$WORK/mel" "$WORK/out_$arm" >"$rpt" 2>&1
   rc=$?
   if [ $rc -ne 0 ]; then
     log "[ERR] arm=$arm rep=$rep exited $rc; tail:"; tail -5 "$rpt"; return 1

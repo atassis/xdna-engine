@@ -245,5 +245,4 @@ make -C $PE/ml/softmax400 NPU2=1 build/final.xclbin   # softmax-400 (pad->416)
 bash scripts/build_parakeet_modal_kernels.sh
 
 echo "All encoder + fusion xclbins built."
-echo "Verify Rust fused encoder: rust/target/release/verify_encoder"
 echo "Device-change gate:        .venv/bin/python scripts/encoder_parity.py"

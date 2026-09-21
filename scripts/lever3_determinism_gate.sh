@@ -28,7 +28,7 @@
 # =============================================================================================
 set -u
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$WT"
-W3="$WT/rust/target/release/whisper_e2e_timing"
+W3="$WT/rust/target/release/npu-dev"
 LDLIB="$HOME/.local/lib/npu-asr"
 TS="$(date +%Y%m%d_%H%M%S)"
 OUT="$WT/artifacts/lever3_determinism_${TS}"
@@ -58,7 +58,7 @@ arm(){
     onnx)  : ;;
   esac
   local raw="$OUT/$label.r$rep.$stem.raw"
-  env "${envs[@]}" "$W3" "$clip" >"$raw" 2>&1
+  env "${envs[@]}" "$W3" whisper-e2e "$clip" >"$raw" 2>&1
   # The binary prints the transcription once, from the untimed warmup pass.
   sed -n 's/^\[bench\] warmup text: //p' "$raw" > "$OUT/$label.r$rep.$stem.txt"
   sed -n 's/.*tokens=\([0-9]*\).*/\1/p' "$raw" | head -1 > "$OUT/$label.r$rep.$stem.ntok"

@@ -11,7 +11,7 @@ IRON's layer_norm is non-affine, so Whisper's affine LN folds into the projectio
 host pre-norm fold as the M=1 decode GEMV path). IRON gemv computes matrix[M,K] @ vec[K] = out[M], so the
 device matrix is W''ᵀ with M=2304 (q|k|v concat), K=768.
 
-On-device gate (generic `fused_elf_probe`): rel-L2(device qkv_nobias, buffers/qkv.bin) <= 0.08, where
+On-device gate (generic `npu-dev fused-elf`): rel-L2(device qkv_nobias, buffers/qkv.bin) <= 0.08, where
 the golden = matrix_bf16 @ bf16(LN(x)). The affine-fold correctness (golden + bias' ≈ true Whisper qkv)
 is asserted here at generation time.
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build batched fused-decode block ELFs (vector-b, plan 2026-06-16-batched-decode-elf.md). Compile-only.
 # Mirrors build_gemm_probe.sh env + applies the IRON patches (deep-C + transpose + gemm-fusion-prefix)
-# idempotently. Each block generator emits a fused_elf_probe-compatible meta.
+# idempotently. Each block generator emits an npu-dev fused-elf-compatible meta.
 #
 #   B=128 bash scripts/build_batched_decode.sh ffn         # Task 1: FFN block  -> artifacts/ffn_batched_B<B>
 # (later: ln_qkv, decode --layers N — added as those generators land)

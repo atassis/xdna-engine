@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Device gate for the six designs `export_ar_artifacts.py` emits.
 
-Writes raw little-endian f32 fixtures, then drives `s2_design_probe` (rust/npu-s2) over each
+Writes raw little-endian f32 fixtures, then drives `npu-dev s2-design` (rust/npu-s2) over each
 design directory. The probe dispatches twice and reports rel-L2 plus run-to-run bit-identity;
 per this project's convention the BLOCKING check is 1:1 determinism and rel-L2 is a note
 (error-metrics-are-notes-not-gates), so a rel-L2 regression here is a signal to investigate,
@@ -22,7 +22,7 @@ noise floor. rope-interleaved is the one design here with no prior device preced
 exact code path -- its f32<->bf16 wrapper shim is new -- which is why it is gated at both roles
 rather than sampled.
 
-Usage:  gate_ar_artifacts.py <export_dir> <s2_design_probe_path> [--fixtures DIR]
+Usage:  gate_ar_artifacts.py <export_dir> <npu-dev_path> [--fixtures DIR]
 The NPU is single-tenant: run this under scripts/npu_lock.sh, not bare.
 """
 import argparse
@@ -99,7 +99,7 @@ DESIGNS = ("rmsnorm", "qk_norm_q", "qk_norm_k",
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("export_dir", type=Path)
-    ap.add_argument("probe", type=Path, help="path to the built s2_design_probe binary")
+    ap.add_argument("probe", type=Path, help="path to the built npu-dev binary")
     ap.add_argument("--fixtures", type=Path, default=None)
     ap.add_argument("--seed", type=int, default=0)
     opts = ap.parse_args()
@@ -111,7 +111,7 @@ def main() -> int:
     for name in DESIGNS:
         res = fix / f"{name}.res.bin"
         rc = subprocess.run(
-            [str(opts.probe), str(opts.export_dir / name), str(fix / f"{name}.in.bin"),
+            [str(opts.probe), "s2-design", str(opts.export_dir / name), str(fix / f"{name}.in.bin"),
              str(res) if res.exists() else "-", str(fix / f"{name}.exp.bin")]).returncode
         print(f"  {name}: {'PASS' if rc == 0 else f'FAIL rc={rc}'}")
         if rc:

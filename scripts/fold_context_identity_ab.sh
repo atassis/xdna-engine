@@ -30,7 +30,7 @@ cd "$HERE/.." || exit 1
 REPS="${1:-12}"
 CLIPS="${2:-3}"
 OUT="${OUT:-artifacts/fold_ctx_identity}"
-BIN=rust/target/release/parakeet_encode_npu
+BIN=rust/target/release/npu-dev
 MELS=artifacts/wer_mels
 
 log(){ echo -e "[foldctx] $*"; }
@@ -66,7 +66,7 @@ run_arm() { # $1 = arm, $2 = rep
   timeout -k 10 900 "$NPU_LOCK_SH" queue -- \
     env PARAKEET_FOLD_FC1=$fold NPU_XCLBIN_CACHE_BY_CONTENT=$content \
         NPU_DISPATCH_LOG=1 NPU_XCLBIN_ROOT="$PWD" \
-        "$BIN" "$WORK/mel" "$WORK/out_$arm" >"$rpt" 2>&1
+        "$BIN" parakeet-encode "$WORK/mel" "$WORK/out_$arm" >"$rpt" 2>&1
   rc=$?
   [ $rc -eq 0 ] || { log "[ERR] arm=$arm rep=$rep exited $rc"; tail -5 "$rpt"; return 1; }
   grep -q "dispatches by PREDECESSOR" "$rpt" || { log "[ERR] arm=$arm rep=$rep no table"; return 1; }

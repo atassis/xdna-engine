@@ -23,7 +23,7 @@ WHAT THIS PROVES, device-free, before verify_mha_decode_hd128.py ever touches th
 
   3. `pack_kv_tiles()` builds the exact on-wire bf16 tile layout (K-tile | V-tile | bit-exact
      int32 runtime-S header via 2 bf16 lanes) that `verify_mha_decode_hd128.py` feeds the real
-     device kernel -- the same convention as `mha_decode_iron.py` / `mha_decode_probe.rs`.
+     device kernel -- the same convention as `mha_decode_iron.py` / `rust/npu-dev/src/cmd/mha_decode.rs`.
 
 CONFIG: S2 fast decoder hyperparameters (`scripts/s2_ar_ref.py::ARHParams` defaults --
 fast_head_count=32, fast_head_count_kv=8, fast_head_dim=128, fast_rope_freq_base=1e6). n_rep =
@@ -72,7 +72,7 @@ def _load_s2_ar_ref():
 
 def bf16_round(x: np.ndarray) -> np.ndarray:
     """f32 -> bf16 -> f32, so host reference and device kernel see identical (already-quantized)
-    inputs -- same convention as rust/npu-probes/src/bin/mha_decode_probe.rs's bf16_round."""
+    inputs -- same convention as rust/npu-dev/src/cmd/mha_decode.rs's bf16_round."""
     return x.astype(_bf16).astype(np.float32)
 
 
@@ -164,7 +164,7 @@ def int32_pair_to_bf16(val: int) -> np.ndarray:
     """Bit-exact int32 -> 2x bfloat16-shaped lanes (reinterpret, NOT a numeric conversion) -- the
     RUNTIME-S header transport mha_decode.cc reads via
     `*reinterpret_cast<const int32_t*>(kv + 2*Tkv*Hd)`. Same convention as
-    rust/npu-probes/src/bin/mha_decode_probe.rs's `s_in_tile.to_le_bytes()` packing."""
+    rust/npu-dev/src/cmd/mha_decode.rs's `s_in_tile.to_le_bytes()` packing."""
     u16 = np.array([np.int32(val)]).view(np.uint16)  # 2 elements, little-endian lanes
     return u16.view(_bf16)
 

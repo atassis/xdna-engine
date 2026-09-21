@@ -33,7 +33,7 @@ cd "$HERE/.." || exit 1
 REPS="${1:-9}"
 CLIPS="${2:-3}"
 OUT="${OUT:-artifacts/lnmode_stack}"
-BIN=rust/target/release/parakeet_encode_npu
+BIN=rust/target/release/npu-dev
 MELS=artifacts/wer_mels
 ARMS="s0 k0 k0m"
 
@@ -66,7 +66,7 @@ run_arm() { # $1 = arm, $2 = rep
   [ "$arm" = k0m ] && env_+=(PARAKEET_LN_MODE=1)
   timeout -k 10 900 "$NPU_LOCK_SH" queue -- \
     env NPU_XCLBIN_CACHE_BY_CONTENT=0 NPU_DISPATCH_LOG=1 NPU_XCLBIN_ROOT="$PWD" "${env_[@]}" \
-        "$BIN" "$WORK/mel" "$WORK/out_$arm" >"$rpt" 2>&1
+        "$BIN" parakeet-encode "$WORK/mel" "$WORK/out_$arm" >"$rpt" 2>&1
   rc=$?
   [ $rc -eq 0 ] || { log "[ERR] arm=$arm rep=$rep exited $rc"; tail -8 "$rpt"; return 1; }
   grep -q '^mean encode' "$rpt" || { log "[ERR] arm=$arm rep=$rep no timing line"; return 1; }

@@ -43,12 +43,12 @@ cd "$HERE/.." || exit 1
 REPS="${1:-11}"
 CLIPS="${2:-3}"
 OUT="${OUT:-artifacts/lnmode_fold_bracket}"
-BIN=rust/target/release/parakeet_encode_npu
+BIN=rust/target/release/npu-dev
 MELS=artifacts/wer_mels
 ARMS="f0 f0m f1 f1m"
 
 log(){ echo -e "[lnbr] $*"; }
-[ -x "$BIN" ] || { log "[ERR] missing $BIN -- cargo build --release -p npu-probes --bin parakeet_encode_npu"; exit 1; }
+[ -x "$BIN" ] || { log "[ERR] missing $BIN -- cargo build --release -p npu-dev"; exit 1; }
 
 NPU_LOCK_SH="${NPU_LOCK_SH:-}"
 if [ -z "$NPU_LOCK_SH" ] || [ ! -x "$NPU_LOCK_SH" ]; then
@@ -81,7 +81,7 @@ run_arm() { # $1 = arm, $2 = rep
   timeout -k 10 900 "$NPU_LOCK_SH" queue -- \
     env PARAKEET_FOLD_FC1=1 PARAKEET_LN_MODE=$mode NPU_XCLBIN_CACHE_BY_CONTENT=$content \
         NPU_DISPATCH_LOG=1 NPU_XCLBIN_ROOT="$PWD" \
-        "$BIN" "$WORK/mel" "$WORK/out_$arm" >"$rpt" 2>&1
+        "$BIN" parakeet-encode "$WORK/mel" "$WORK/out_$arm" >"$rpt" 2>&1
   rc=$?
   [ $rc -eq 0 ] || { log "[ERR] arm=$arm rep=$rep exited $rc"; tail -5 "$rpt"; return 1; }
   grep -q '^mean encode' "$rpt" || { log "[ERR] arm=$arm rep=$rep no timing line"; return 1; }

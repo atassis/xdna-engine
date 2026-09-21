@@ -5,7 +5,7 @@ Dispatch the SAME callable twice with no input write between the two calls and r
 buffer to read back byte-identical. No oracle, no tolerance: it separates output staleness, input
 staleness and a wrong computation in one shot, and it is the instrument that root-caused
 the bug where the FIRST dispatch after a host input write computed on the PREVIOUS input. The
-Rust-side twin lives in `rust/npu-probes/src/bin/verify_whisper_decode.rs` (`--redispatch`).
+Rust-side twin lives in `rust/npu-dev/src/cmd/verify_whisper_decode.rs` (`--redispatch`).
 
 The bug this catches is specific to the FIRST dispatch after a host write: `_sync_inputs()`
 (`iron/common/sequence.py`) trusts the coherence map, and a write through the raw `.data` handle

@@ -4,10 +4,10 @@
 
 `sweep_gemm_tiles.py` enumerates candidate tilings for a prefill shape, filters them against the
 kernel's real rules (`llm_decode_spec.gemm_tiling_rejection`), and runs this file once per survivor.
-Each run emits the `meta.json` + `buffers/` layout `rust/npu-probes/src/bin/fused_elf_probe.rs`
+Each run emits the `meta.json` + `buffers/` layout `rust/npu-dev/src/cmd/fused_elf.rs`
 already consumes, so timing an arm needs no new host code:
 
-    fused_elf_probe <arm-dir> --warmup 20 --iters 200
+    npu-dev fused-elf <arm-dir> --warmup 20 --iters 200
 
 The arm is a single `C[M,N] = A[M,K] @ B[K,N]` with A the activation tile (an input), B the weight
 (resident scratch, written once) and C the output -- the prefill projection stripped of everything

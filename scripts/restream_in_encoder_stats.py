@@ -2,7 +2,7 @@
 """Paired per-rep statistics for the IN-ENCODER restream cost.
 
 Consumes the `same-xclbin dispatches by PREDECESSOR` table that
-`NPU_DISPATCH_LOG=1 parakeet_encode_npu` prints for the last (warm) clip of each
+`NPU_DISPATCH_LOG=1 npu-dev parakeet-encode` prints for the last (warm) clip of each
 invocation, one file per rep, and reports the per-rep paired difference
 
     d = mean_ms(prev = a different stream, same xclbin) - mean_ms(prev = the same stream)

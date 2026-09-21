@@ -4,7 +4,7 @@
 # ONE xclbin (seq=448): the tile count is FIXED at n_tiles=ceil(448/64)=7 and the real
 # per-tile key count is a RUNTIME value (host writes an int32 into each tile's header), so
 # the SAME xclbin serves every cache length S<=448 with no zero-pad softmax poison. The
-# probe (rust/npu-asr/src/bin/mha_decode_probe.rs) feeds fixed-seed random q/K/V at several
+# probe (rust/npu-dev/src/cmd/mha_decode.rs, `npu-dev mha-decode`) feeds fixed-seed random q/K/V at several
 # S and compares ctx vs the host `attend_one` reference.
 #
 # Output (in the ml/mha_decode build sandbox):

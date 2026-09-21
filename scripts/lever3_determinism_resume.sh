@@ -7,7 +7,7 @@
 set -u
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$WT"
 OUT="${1:?usage: $0 <lever3_determinism dir>}"
-W3="$WT/rust/target/release/whisper_e2e_timing"; LDLIB="$HOME/.local/lib/npu-asr"
+W3="$WT/rust/target/release/npu-dev"; LDLIB="$HOME/.local/lib/npu-asr"
 LOG="$OUT/resume.log"; : > "$LOG"
 log(){ echo -e "$*" | tee -a "$LOG"; }
 restart(){ systemctl --user start xdna-engine.service >/dev/null 2>&1; }
@@ -22,7 +22,7 @@ arm(){
     cross) envs+=("NPU_DECODE_FUSED_DIR=$WT/artifacts/fused_decode12_xcross") ;;
   esac
   local raw="$OUT/$label.r$rep.$stem.raw"
-  env "${envs[@]}" "$W3" "$clip" >"$raw" 2>&1
+  env "${envs[@]}" "$W3" whisper-e2e "$clip" >"$raw" 2>&1
   sed -n 's/^\[bench\] warmup text: //p' "$raw" > "$OUT/$label.r$rep.$stem.txt"
   sed -n 's/.*tokens=\([0-9]*\).*/\1/p' "$raw" | head -1 > "$OUT/$label.r$rep.$stem.ntok"
   grep -q 'CREATE_HWCTX' "$raw" && echo "HWCTX" || echo "ok"

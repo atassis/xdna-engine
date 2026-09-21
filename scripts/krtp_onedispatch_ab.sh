@@ -33,13 +33,13 @@ cd "$HERE/.." || exit 1
 REPS="${1:-4}"
 CLIPS="${2:-17}"
 OUT="${OUT:-artifacts/krtp_onedispatch}"
-BIN=rust/target/release/parakeet_encode_npu
+BIN=rust/target/release/npu-dev
 MELS=artifacts/wer_mels
 KRTP="${KRTP:-$PWD/artifacts/krtp-probe/final_512x1024x4096_64x32x128_8c_modalsilukrtp.xclbin}"
 ARMS="k0 k1"
 
 log(){ echo -e "[krtp] $*"; }
-[ -x "$BIN" ] || { log "[ERR] missing $BIN -- cargo build --release -p npu-probes --bin parakeet_encode_npu"; exit 1; }
+[ -x "$BIN" ] || { log "[ERR] missing $BIN -- cargo build --release -p npu-dev"; exit 1; }
 [ -f "$KRTP" ] || { log "[ERR] missing krtp resident $KRTP"; exit 1; }
 
 NPU_LOCK_SH="${NPU_LOCK_SH:-}"
@@ -64,7 +64,7 @@ npu_svc_require_device_free || exit 1
 # f32 truth, once -- the parity gate's reference. Host only, no device, so it runs outside the lock.
 if [ ! -d "$OUT/ref_f32" ] || [ -z "$(ls -A "$OUT/ref_f32" 2>/dev/null)" ]; then
   log "generating f32 reference (host encoder)"
-  "$BIN" "$WORK/mel" "$OUT/ref_f32" --cpu > "$OUT/ref_f32.log" 2>&1 \
+  "$BIN" parakeet-encode "$WORK/mel" "$OUT/ref_f32" --cpu > "$OUT/ref_f32.log" 2>&1 \
     || { log "[ERR] f32 reference failed"; tail -5 "$OUT/ref_f32.log"; exit 1; }
 fi
 
@@ -76,7 +76,7 @@ run_arm() { # $1 = arm, $2 = rep
   timeout -k 10 1800 "$NPU_LOCK_SH" queue -- \
     env PARAKEET_FOLD_FC1=0 PARAKEET_FOLD_GLU=0 NPU_XCLBIN_CACHE_BY_CONTENT=0 \
         NPU_DISPATCH_LOG=1 NPU_XCLBIN_ROOT="$PWD" "${resident[@]}" \
-        "$BIN" "$WORK/mel" "$OUT/out_$arm" >"$rpt" 2>&1
+        "$BIN" parakeet-encode "$WORK/mel" "$OUT/out_$arm" >"$rpt" 2>&1
   rc=$?
   [ $rc -eq 0 ] || { log "[ERR] arm=$arm rep=$rep exited $rc"; tail -5 "$rpt"; return 1; }
   grep -q '^mean encode' "$rpt" || { log "[ERR] arm=$arm rep=$rep no timing line"; return 1; }

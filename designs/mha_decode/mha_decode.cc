@@ -8,7 +8,7 @@
 //
 // Whisper-small (shipped default, MHA_HD unset -> 64): D=768, n_heads=12, head_dim HD=64, TKV=64.
 //   Validated against the host reference `attend_one` (rust/npu-engine/src/asr/whisper_decoder.rs)
-//   via rust/npu-probes/src/bin/mha_decode_probe.rs, gate rel-L2 <= 0.08.
+//   via rust/npu-dev/src/cmd/mha_decode.rs (`npu-dev mha-decode`), gate rel-L2 <= 0.08.
 // S2 fast decoder (new, -DMHA_HD=128 -DMHA_TKV=32): head_dim HD=128, n_head=32, n_head_kv=8
 //   (n_rep=4). Validated against `scripts/s2_ar_ref.py::causal_attention` + `repeat_kv` via
 //   aie_kernels/_test/verify_mha_decode_hd128.py, gate rel-L2 <= 3e-2.

@@ -39,7 +39,7 @@ cd "$HERE/.." || exit 1
 REPS="${1:-4}"
 CLIPS="${2:-17}"
 OUT="${OUT:-artifacts/fold_krtp}"
-BIN=rust/target/release/parakeet_encode_npu
+BIN=rust/target/release/npu-dev
 MELS=artifacts/wer_mels
 ARMS="f0 f1 f2"
 # Per-arm resident epilogue variant. fc1_panel_bf16_stem() appends this to the panel stem, and
@@ -49,7 +49,7 @@ ARMS="f0 f1 f2"
 declare -A EPI_SFX=([f1]=krtp [f2]=krtpkrl)
 
 log(){ echo -e "[foldkrtp] $*"; }
-[ -x "$BIN" ] || { log "[ERR] missing $BIN -- cargo build --release -p npu-probes --bin parakeet_encode_npu"; exit 1; }
+[ -x "$BIN" ] || { log "[ERR] missing $BIN -- cargo build --release -p npu-dev"; exit 1; }
 
 WA=mlir-aie/programming_examples/basic/matrix_multiplication/whole_array/build
 for s in 512x1024x4096_32x32x128_8c_modalsilubf16outpanel1024krtp \
@@ -91,7 +91,7 @@ npu_svc_require_device_free || exit 1
 # f32 truth, once -- host only, so it runs outside the lock.
 if [ ! -d "$OUT/ref_f32" ] || [ -z "$(ls -A "$OUT/ref_f32" 2>/dev/null)" ]; then
   log "generating f32 reference (host encoder)"
-  "$BIN" "$WORK/mel" "$OUT/ref_f32" --cpu > "$OUT/ref_f32.log" 2>&1 \
+  "$BIN" parakeet-encode "$WORK/mel" "$OUT/ref_f32" --cpu > "$OUT/ref_f32.log" 2>&1 \
     || { log "[ERR] f32 reference failed"; tail -5 "$OUT/ref_f32.log"; exit 1; }
 fi
 
@@ -102,7 +102,7 @@ run_arm() { # $1 = arm, $2 = rep
   [ "$arm" != "f0" ] && fold=(PARAKEET_FOLD_FC1=1 PARAKEET_FOLD_GLU=1 PARAKEET_MODAL_EPI_SUFFIX="${EPI_SFX[$arm]}")
   timeout -k 10 1800 "$NPU_LOCK_SH" queue -- \
     env NPU_XCLBIN_CACHE_BY_CONTENT=0 NPU_DISPATCH_LOG=1 NPU_XCLBIN_ROOT="$PWD" "${fold[@]}" \
-        "$BIN" "$WORK/mel" "$OUT/out_$arm" >"$rpt" 2>&1
+        "$BIN" parakeet-encode "$WORK/mel" "$OUT/out_$arm" >"$rpt" 2>&1
   rc=$?
   [ $rc -eq 0 ] || { log "[ERR] arm=$arm rep=$rep exited $rc"; tail -15 "$rpt"; return 1; }
   grep -q '^mean encode' "$rpt" || { log "[ERR] arm=$arm rep=$rep no timing line"; return 1; }

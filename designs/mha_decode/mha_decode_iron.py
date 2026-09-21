@@ -1,7 +1,7 @@
 #
 # mha_decode — on-chip SINGLE-QUERY (M=1) multi-head attention for the Whisper
 # decoder (M1 Task 0). Standalone parity design; validated vs the host reference
-# `attend_one` by rust/npu-asr/src/bin/mha_decode_probe.rs.
+# `attend_one` by rust/npu-dev/src/cmd/mha_decode.rs (`npu-dev mha-decode`).
 #
 # whisper-small: D=768, n_heads=12, head_dim hd=64.
 #

@@ -20,7 +20,7 @@ Also demonstrated here, because both are claims the architecture doc makes and n
   * the batch is legal at M=256 under `M % (tile_m*4)`, with every N satisfying
     `N % (tile_n*num_aie_columns)`. Both are asserted here, at the point the shape is picked (K007).
 
-Emits the meta.json/buffers layout `rust/npu-probes/src/bin/fused_elf_probe.rs` consumes, so the
+Emits the meta.json/buffers layout `rust/npu-dev/src/cmd/fused_elf.rs` consumes, so the
 device run needs no new host code.
 
 Run inside the fork IRON env. AIE_DEVICE=npu2 keeps the build off the device lock.

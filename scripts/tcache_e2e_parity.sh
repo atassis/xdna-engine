@@ -23,12 +23,12 @@ WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$WT"
 BASE="${1:-$WT/artifacts/dec12_base}"
 TR="${2:-$WT/artifacts/dec12_tr}"
 STEPS="${3:-256}"
-BIN="$WT/rust/target/release/tcache_fused_parity"
+BIN="$WT/rust/target/release/npu-dev"
 LDLIB=~/.local/lib/npu-asr
 TS="$(date +%Y%m%d_%H%M%S)"; OUT="$WT/artifacts/tcache_e2e_${TS}"
 mkdir -p "$OUT"
 
-[ -x "$BIN" ] || { echo "[ERR] missing $BIN (cargo build --release -p npu-probes --bin tcache_fused_parity)"; exit 1; }
+[ -x "$BIN" ] || { echo "[ERR] missing $BIN (cargo build --release -p npu-dev)"; exit 1; }
 for d in "$BASE" "$TR"; do
   [ -f "$d/decode.elf" ] || { echo "[ERR] missing $d/decode.elf"; exit 1; }
 done
@@ -119,7 +119,7 @@ cut -d' ' -f1 /proc/loadavg > "$OUT/loadavg.pre"
 echo "[load] 1-min load average before timed runs: $(cat "$OUT/loadavg.pre") (quiet bar $LOAD_MAX)"
 
 run(){ # $1 label  $2 dir
-  LD_LIBRARY_PATH="$LDLIB" "$BIN" "$2" "$STEPS" 2>"$OUT/$1.err" > "$OUT/$1.ids"
+  LD_LIBRARY_PATH="$LDLIB" "$BIN" tcache-parity "$2" "$STEPS" 2>"$OUT/$1.err" > "$OUT/$1.ids"
   local rc=$?
   echo "[run] $1 rc=$rc steps=$(wc -l < "$OUT/$1.ids") $(grep -c . "$OUT/$1.err" >/dev/null && grep -m1 '^\[enc\]' "$OUT/$1.err")"
   return $rc

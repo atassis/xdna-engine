@@ -19,7 +19,7 @@
 #           --tier2 drives verify_llm_decode.py, which is decode-only by its own header -- so it
 #           cannot license a prefill default (K019: a gate that passes without touching its
 #           subject). Runs BOTH arms: `pertok` is the control, same binary, same references.
-#                                                        -> prefill_token_gate_probe
+#                                                        -> npu-dev prefill-token-gate
 #
 #   bash scripts/gate_llm.sh --tier1              # DEVICE: run the probes, then judge
 #   bash scripts/gate_llm.sh --tier1 --judge-only # no device: judge dumps that already exist
@@ -104,13 +104,13 @@ tier1() {
       out="$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["output"])' \
               "$art/meta.json")"
       case "$out" in
-        out|cx)  probe=fused_elf_probe ;;
-        xout)    probe=prefill_golden_probe ;;
+        out|cx)  probe=fused-elf ;;
+        xout)    probe=prefill-golden ;;
         *) echo "ERROR: $art/meta.json output=$out -- no probe known for it"; return 2 ;;
       esac
-      ( cd "$REPO/rust" && cargo build --release -p npu-probes --bin "$probe" ) || return 2
-      device_step "$probe on $name"
-      GATE_DUMP_DIR="$SCRATCH/dump_$name" "$REPO/rust/target/release/$probe" "$art" || rc=1
+      ( cd "$REPO/rust" && cargo build --release -p npu-dev ) || return 2
+      device_step "npu-dev $probe on $name"
+      GATE_DUMP_DIR="$SCRATCH/dump_$name" "$REPO/rust/target/release/npu-dev" "$probe" "$art" || rc=1
     fi
   done
   echo
@@ -173,7 +173,7 @@ EOP
   tgt="$(cd "$REPO/rust" && cargo metadata --format-version 1 --no-deps 2>/dev/null \
          | "$PY" -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])' 2>/dev/null)"
   [ -n "$tgt" ] || tgt="$REPO/rust/target"
-  local bin="$tgt/release/prefill_token_gate_probe"
+  local bin="$tgt/release/npu-dev"
   local rc=0 refs=() r arm name
   [ -d "$refdir" ] || { echo "ERROR: no prefill references in $refdir -- make them first:"; \
       echo "  bash scripts/gate_llm.sh --make-prefill-refs"; return 2; }
@@ -182,12 +182,12 @@ EOP
   [ -d "$pre" ] || { echo "ERROR: no prefill artifact at $pre"; return 2; }
   mkdir -p "$out"
   if [ "$JUDGE_ONLY" = "0" ]; then
-    ( cd "$REPO/rust" && cargo build --release -p npu-probes --bin prefill_token_gate_probe ) || return 2
-    device_step "prefill_token_gate_probe over ${#refs[@]} prompt length(s) x 2 arms"
+    ( cd "$REPO/rust" && cargo build --release -p npu-dev ) || return 2
+    device_step "npu-dev prefill-token-gate over ${#refs[@]} prompt length(s) x 2 arms"
     local refargs=()
     for r in "${refs[@]}"; do refargs+=(--ref "$r"); done
     for arm in 0 1; do
-      NPU_LLM_PREFILL_BATCHED=$arm "$bin" "$DECODE_ART" "$pre" \
+      NPU_LLM_PREFILL_BATCHED=$arm "$bin" prefill-token-gate "$DECODE_ART" "$pre" \
           --outdir "$out" "${refargs[@]}" || rc=1
     done
   fi

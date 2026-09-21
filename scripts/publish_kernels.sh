@@ -128,7 +128,7 @@ note "published $n file(s) -> $DEST  (pin $stamp)"
 # Regenerate kernel_manifest.json per published family, so kernel_registry::resolve_checked has a
 # content-hash record to verify a load against. Without this the manifest machinery exists but sees
 # nothing: measured 2026-09-12, a full publish leaves every family UNVERIFIED, not because anything
-# is wrong but because nothing had ever called this. Soft failure -- a missing gen_kernel_manifest
+# is wrong but because nothing had ever called this. Soft failure -- a missing npu-dev
 # binary (a dev-only path, or a standalone run before `cargo build --release`) should not fail an
 # otherwise-successful publish; it should be loud so the gap doesn't go quiet again.
 GEN_MANIFEST="${GEN_KERNEL_MANIFEST_BIN:-}"
@@ -136,7 +136,7 @@ if [ -z "$GEN_MANIFEST" ]; then
   target_dir="$(cd "$REPO/rust" && cargo metadata --format-version 1 --no-deps \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])' 2>/dev/null)"
   [ -n "$target_dir" ] || target_dir="$REPO/rust/target"
-  GEN_MANIFEST="$target_dir/release/gen_kernel_manifest"
+  GEN_MANIFEST="$target_dir/release/npu-dev"
 fi
 if [ -x "$GEN_MANIFEST" ]; then
   fam_dirs=()
@@ -146,11 +146,11 @@ if [ -x "$GEN_MANIFEST" ]; then
   done
   # --repo-root makes each manifest record the kernel-source digest it was built from, so a
   # later verify can see a stale-but-intact artifact instead of reporting it Present.
-  if [ "${#fam_dirs[@]}" -gt 0 ] && "$GEN_MANIFEST" --repo-root "$REPO" "${fam_dirs[@]}"; then
+  if [ "${#fam_dirs[@]}" -gt 0 ] && "$GEN_MANIFEST" kernels-manifest --repo-root "$REPO" "${fam_dirs[@]}"; then
     note "regenerated kernel_manifest.json for ${#fam_dirs[@]} published famil$([ "${#fam_dirs[@]}" -eq 1 ] && echo y || echo ies)"
   else
-    note "WARNING: gen_kernel_manifest failed on one or more published families -- resolve_checked will report them unverified"
+    note "WARNING: npu-dev kernels-manifest failed on one or more published families -- resolve_checked will report them unverified"
   fi
 else
-  note "WARNING: gen_kernel_manifest not found/executable at $GEN_MANIFEST -- published kernels stay UNVERIFIED (no content-hash record). Build the release workspace first, or set GEN_KERNEL_MANIFEST_BIN."
+  note "WARNING: npu-dev not found/executable at $GEN_MANIFEST -- published kernels stay UNVERIFIED (no content-hash record). Build the release workspace first, or set GEN_KERNEL_MANIFEST_BIN."
 fi

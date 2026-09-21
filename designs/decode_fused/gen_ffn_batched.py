@@ -14,7 +14,7 @@ needed between LN -> GEMM -> bias -> GELU. Bias is broadcast per stream by tilin
 host-side (constant weight) and adding elementwise (ElementwiseAdd is flat, no num_channels).
 
 N=B must be a multiple of tile_n*num_aie_columns = 16*8 = 128 (the full-array GEMM config). Gate
-(generic fused_elf_probe): rel-L2(device out, buffers/out.bin) <= 0.08; golden = per-stream the exact
+(generic npu-dev fused-elf): rel-L2(device out, buffers/out.bin) <= 0.08; golden = per-stream the exact
 bf16 dataflow gen_ffn.py runs, stacked to [B,D].
 
 Run inside the IRON env (newstack_compat first; aiebu-asm on PATH). See scripts/build_batched_decode.sh.

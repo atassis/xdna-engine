@@ -27,14 +27,14 @@ OUT="${TIME_OUT:-/mnt/data/xdna/scratch/prefill/timing}"
 # stale rust/target/ directory survives there, so a hardcoded path finds a directory and no binary.
 TGT="$(cd "$REPO/rust" && cargo metadata --format-version 1 --no-deps 2>/dev/null \
        | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])' 2>/dev/null)"
-BIN="${TGT:-$REPO/rust/target}/release/prefill_time_probe"
-[ -x "$BIN" ] || { echo "ERROR: build it first: cargo build --release -p npu-probes --bin prefill_time_probe"; exit 2; }
+BIN="${TGT:-$REPO/rust/target}/release/npu-dev"
+[ -x "$BIN" ] || { echo "ERROR: build it first: cargo build --release -p npu-dev"; exit 2; }
 mkdir -p "$OUT"
 echo "[time] decode=$DEC"; echo "[time] prefill=$PRE"; echo "[time] rounds=$ROUNDS reps=$REPS lens=$LENS"
 for r in $(seq 1 "$ROUNDS"); do
   for arm in 0 1; do
     echo "--- round $r arm NPU_LLM_PREFILL_BATCHED=$arm"
-    NPU_LLM_PREFILL_BATCHED=$arm "$BIN" "$DEC" "$PRE" --reps "$REPS" --lens "$LENS" \
+    NPU_LLM_PREFILL_BATCHED=$arm "$BIN" prefill-time "$DEC" "$PRE" --reps "$REPS" --lens "$LENS" \
       2>&1 | tee "$OUT/r${r}_arm${arm}.log"
   done
 done

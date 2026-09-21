@@ -7,7 +7,7 @@
 # dir; an adapter doing its own copy on top was redundant and is gone.
 # `<mlir-aie-root>` is where mlir-aie lives, so the adapter can find its own build dir
 # under it instead of assuming a fixed path relative to this repo -- the rest of this
-# system (build_declared_kernels' CLI, publish_kernels.sh) already takes that root as
+# system (npu-dev kernels-build's CLI, publish_kernels.sh) already takes that root as
 # an argument rather than hardcoding it. Only the plain bf16, M=512, tile 32x32x32,
 # 8-column matmul family is understood -- that is the one uniform loop in
 # scripts/build_kernels.sh (`for KN in 768x768 3072x768 ...; do make -C $MMW NPU2=1

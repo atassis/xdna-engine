@@ -22,11 +22,11 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 for dir in "$@"; do
   abs="$(cd "$dir" 2>/dev/null && pwd)" || { echo "WARNING: $dir does not exist -- no manifest written." >&2; continue; }
   echo "== artifact manifest: $abs =="
-  if ( cd "$REPO/rust" && cargo run -q --release -p npu-asr --bin gen_kernel_manifest -- "$abs" ); then
+  if ( cd "$REPO/rust" && cargo run -q --release -p npu-dev -- kernels-manifest "$abs" ); then
     :
   else
     rm -f "$abs/kernel_manifest.json"
-    echo "WARNING: gen_kernel_manifest failed -- removed $abs/kernel_manifest.json rather than leave a stale one." >&2
+    echo "WARNING: npu-dev kernels-manifest failed -- removed $abs/kernel_manifest.json rather than leave a stale one." >&2
     echo "         NPU_KERNEL_MANIFEST_VERIFY=1 will now fail closed here until this is re-run." >&2
   fi
 done

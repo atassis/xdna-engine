@@ -11,7 +11,7 @@ Affine LN folds into the projection (W'' = diag(γ)·Wqkv, bias' = β@Wqkv + b),
 scale folds onto the q rows [0:D] — EXACTLY as gen_decode.py does, so this block drops straight into the
 batched layer (Task 5). Bias' is added on-device (elementwise, bias tiled to [B,QKV] host-side).
 
-Gate (fused_elf_probe): rel-L2(device qkv, per-stream bf16 golden) <= 0.08. Run inside the IRON env.
+Gate (npu-dev fused-elf): rel-L2(device qkv, per-stream bf16 golden) <= 0.08. Run inside the IRON env.
 """
 import argparse
 import json

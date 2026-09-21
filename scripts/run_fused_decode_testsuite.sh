@@ -10,9 +10,9 @@
 #   0. Known KB facts (baseline numbers).
 #   1. Fused-decode CORRECTNESS — every block + whole 12-layer (rel-L2) + argmax parity (WER-safety).
 #   2. Fused-decode PER-TOKEN timing (1 decode step).
-#   3. Whisper FULL-TRANSCRIPTION e2e (whisper_e2e_timing): ONNX vs NPU-step1 vs NPU+on-chip-attn
+#   3. Whisper FULL-TRANSCRIPTION e2e (npu-dev whisper-e2e): ONNX vs NPU-step1 vs NPU+on-chip-attn
 #      — per-stage breakdown (encoder/decode/#tokens/ms-per-token) on en + ru clips.
-#   4. Whisper decode argmax PARITY vs ONNX (verify_whisper_decode host/npu/npu-attn).
+#   4. Whisper decode argmax PARITY vs ONNX (npu-dev verify-whisper-decode host/npu/npu-attn).
 #   5. Whisper WER (full transcription accuracy, 17 clips): ONNX vs NPU pooled WER vs known 0.1136.
 #   6. Other ASR / models (best-effort): Parakeet WER, embeddings, ESM latency.
 #   7. Projected fused FULL-TRANSCRIPTION latency (encoder + #tokens x measured per-token).
@@ -32,7 +32,7 @@ LDLIB=~/.local/lib/npu-asr
 WDIR=$WT/artifacts/whisper-small/whisper_decoder
 ENC=$WT/artifacts/whisper-small/refs/encoded.npy
 GEN=$WT/designs/decode_fused
-PROBE=$WT/rust/target/debug/fused_elf_probe
+PROBE=$WT/rust/target/debug/npu-dev
 CLIP_EN=$WT/artifacts/wer_clips/en_01.wav
 CLIP_RU=$WT/artifacts/wer_clips/ru_01.wav
 LOG=$WT/artifacts/fused_testsuite.log
@@ -80,10 +80,10 @@ run "sudo -n chmod -R a+r /sys/class/powercap/intel-rapl*/ 2>/dev/null && echo '
 section "BUILD (probes debug; engine bins release)"
 source "$IRON/ironenv/bin/activate" 2>/dev/null
 run "which aiebu-asm || echo MISSING_aiebu-asm"
-run "cd $WT/rust && cargo build -p npu-probes --bin fused_elf_probe 2>&1 | tail -2"
+run "cd $WT/rust && cargo build -p npu-dev 2>&1 | tail -2"
 # `--bin engine_serve` was here and is dropped: no such cargo target exists in the workspace, so
 # this build command could only ever fail. If a server binary is wanted here it is `npu` (npu-cli).
-run "cd $WT/rust && cargo build -p npu-probes --release --bin verify_whisper_decode --bin whisper_e2e_timing --bin verify_embeddings --bin verify_esm 2>&1 | tail -3"
+run "cd $WT/rust && cargo build -p npu-dev --release 2>&1 | tail -3"
 
 # ---------------------------------------------------------------------------
 section "REGENERATE FUSED ARTIFACTS (host-only IRON compile; build/ cleaned per-op)"
@@ -105,30 +105,30 @@ run "fuser -v /dev/accel/accel0 2>&1 || echo device-free"
 section "1a. Fused block CORRECTNESS (rel-L2, gate <=0.08)"
 note "decode12 expected ~0.093 (kernel-approx compounding over 12 layers; WER-safe per parity below)"
 for d in fused_spike fused_ln_qkv fused_ffn fused_self_attn fused_cross_attn fused_layer fused_decode2 fused_decode12; do
-  run "$PROBE $WT/artifacts/$d"
+  run "$PROBE fused-elf $WT/artifacts/$d"
 done
 
 section "1b. Whole-decode argmax PARITY vs f32 ideal (WER-safety; full greedy chain = a short transcription)"
 run "python $GEN/verify_fused_decode.py --weights $WDIR --encoded $ENC --layers 12 --steps 32"
 
 section "2. Fused whole-decode PER-TOKEN timing (1 decode step; trailing rel-fail is a cache-dirty artifact)"
-run "FUSED_TIME=1 $PROBE $WT/artifacts/fused_decode12"
+run "FUSED_TIME=1 $PROBE fused-elf $WT/artifacts/fused_decode12"
 
-section "3. Whisper FULL-TRANSCRIPTION e2e — whisper_e2e_timing (encoder + N tokens), 3 timed passes"
+section "3. Whisper FULL-TRANSCRIPTION e2e — npu-dev whisper-e2e (encoder + N tokens), 3 timed passes"
 note "this is the FULL transcription (not 1 token); reports e2e/encoder/decode ms, #tokens, ms/token, dispatches/token"
-W3=$WT/rust/target/release/whisper_e2e_timing
+W3=$WT/rust/target/release/npu-dev
 for clip in "$CLIP_EN" "$CLIP_RU"; do
-  run "cd $WT && WHISPER_TIMING=1 LD_LIBRARY_PATH=$LDLIB $W3 $clip                          # ONNX decode"
-  run "cd $WT && WHISPER_TIMING=1 NPU_DECODE=1 LD_LIBRARY_PATH=$LDLIB $W3 $clip             # NPU step-1 decode"
-  run "cd $WT && WHISPER_TIMING=1 NPU_DECODE=1 NPU_DECODE_ATTN=1 LD_LIBRARY_PATH=$LDLIB $W3 $clip  # NPU on-chip self-attn"
-  run "cd $WT && WHISPER_TIMING=1 NPU_DECODE_FUSED=1 LD_LIBRARY_PATH=$LDLIB $W3 $clip             # FULL-NPU fused whole-decode (1 dispatch/token)"
+  run "cd $WT && WHISPER_TIMING=1 LD_LIBRARY_PATH=$LDLIB $W3 whisper-e2e $clip                          # ONNX decode"
+  run "cd $WT && WHISPER_TIMING=1 NPU_DECODE=1 LD_LIBRARY_PATH=$LDLIB $W3 whisper-e2e $clip             # NPU step-1 decode"
+  run "cd $WT && WHISPER_TIMING=1 NPU_DECODE=1 NPU_DECODE_ATTN=1 LD_LIBRARY_PATH=$LDLIB $W3 whisper-e2e $clip  # NPU on-chip self-attn"
+  run "cd $WT && WHISPER_TIMING=1 NPU_DECODE_FUSED=1 LD_LIBRARY_PATH=$LDLIB $W3 whisper-e2e $clip             # FULL-NPU fused whole-decode (1 dispatch/token)"
 done
 note "[WHISPER_ENERGY] lines above give per-transcription RAPL package Joules + avg W per backend (NPU-vs-CPU energy)."
 
-section "4. Whisper decode argmax PARITY vs ONNX (verify_whisper_decode)"
-run "cd $WT/rust && WHISPER_ROOT=$WT LD_LIBRARY_PATH=$LDLIB cargo run -q -p npu-probes --release --bin verify_whisper_decode -- --host"
-run "cd $WT/rust && WHISPER_ROOT=$WT LD_LIBRARY_PATH=$LDLIB cargo run -q -p npu-probes --release --bin verify_whisper_decode -- --npu"
-run "cd $WT/rust && WHISPER_ROOT=$WT LD_LIBRARY_PATH=$LDLIB cargo run -q -p npu-probes --release --bin verify_whisper_decode -- --npu-attn"
+section "4. Whisper decode argmax PARITY vs ONNX (npu-dev verify-whisper-decode)"
+run "cd $WT/rust && WHISPER_ROOT=$WT LD_LIBRARY_PATH=$LDLIB cargo run -q -p npu-dev --release -- verify-whisper-decode --host"
+run "cd $WT/rust && WHISPER_ROOT=$WT LD_LIBRARY_PATH=$LDLIB cargo run -q -p npu-dev --release -- verify-whisper-decode --npu"
+run "cd $WT/rust && WHISPER_ROOT=$WT LD_LIBRARY_PATH=$LDLIB cargo run -q -p npu-dev --release -- verify-whisper-decode --npu-attn"
 
 # restart services for the harnesses that manage their own engine_serve
 npu_svc_start

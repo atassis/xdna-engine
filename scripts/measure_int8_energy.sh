@@ -7,7 +7,7 @@
 #
 #   bash scripts/measure_int8_energy.sh [clip.wav]
 #
-# For each ELF variant it runs whisper_e2e_timing (warmup + 3 timed passes, RAPL package energy) and prints
+# For each ELF variant it runs npu-dev whisper-e2e (warmup + 3 timed passes, RAPL package energy) and prints
 # pkg_J_per_transcription + e2e_ms + decode_ms. The byte cut is certain (meta layout); this measures whether
 # it converts to real J + wall-time at M=1 (decode is launch-overhead-bound, so the conversion is the unknown).
 set -u
@@ -16,11 +16,11 @@ cd "$(dirname "$0")/.."
 REPO="$(pwd)"
 CLIP="${1:-$REPO/artifacts/wer_clips/en_01.wav}"
 LIBDIR="$REPO/rust/target/release/build/npu-onnx-d479791e01d0bb48/out"
-BIN="$REPO/rust/target/release/whisper_e2e_timing"
+BIN="$REPO/rust/target/release/npu-dev"
 # baseline first, then the byte-cut variants in increasing aggressiveness.
 VARIANTS=(fused_decode12 fused_decode12_int8kv fused_decode12_int8ffn fused_decode12_int8sweet fused_decode12_int8all)
 
-[ -x "$BIN" ] || { echo "build first: (cd rust && cargo build -p npu-probes --release --bin whisper_e2e_timing)"; exit 1; }
+[ -x "$BIN" ] || { echo "build first: (cd rust && cargo build -p npu-dev --release)"; exit 1; }
 
 # ---- quiesce gate ----
 LOAD=$(cut -d' ' -f1 /proc/loadavg)
@@ -46,7 +46,7 @@ for V in "${VARIANTS[@]}"; do
   D="$REPO/artifacts/$V"
   [ -d "$D" ] || { printf '%-28s %14s\n' "$V" "(missing)"; continue; }
   OUT=$(env WHISPER_TIMING=1 NPU_DECODE_FUSED=1 NPU_DECODE_FUSED_DIR="artifacts/$V" \
-            LD_LIBRARY_PATH="$LIBDIR" "$BIN" "$CLIP" 2>&1)
+            LD_LIBRARY_PATH="$LIBDIR" "$BIN" whisper-e2e "$CLIP" 2>&1)
   J=$(printf '%s\n' "$OUT" | sed -n 's/.*pkg_J_per_transcription=\([0-9.]*\).*/\1/p' | tail -1)
   # last timed pass's e2e/decode/tokens
   LINE=$(printf '%s\n' "$OUT" | grep '\[WHISPER_TIMING\]' | tail -1)

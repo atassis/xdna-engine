@@ -23,14 +23,14 @@ LOG="$(dirname "$MANIFEST")/time.log"
 CARGO_TGT="$(cd "$WT/rust" && cargo metadata --format-version 1 --no-deps 2>/dev/null \
              | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])' 2>/dev/null)"
 [ -n "$CARGO_TGT" ] || CARGO_TGT="$WT/rust/target"
-PROBE="${PROBE:-$CARGO_TGT/release/fused_elf_probe}"
+PROBE="${PROBE:-$CARGO_TGT/release/npu-dev}"
 LDLIB="${LDLIB:-$HOME/.local/lib/npu-asr}"
 : > "$LOG"
 log(){ echo -e "$*" | tee -a "$LOG"; }
 trap 'npu_svc_start; log "[done] log: $LOG"' EXIT
 
-log "[build] fused_elf_probe (release)"
-( cd "$WT/rust" && cargo build --release -p npu-probes --bin fused_elf_probe ) >>"$LOG" 2>&1 \
+log "[build] npu-dev (release)"
+( cd "$WT/rust" && cargo build --release -p npu-dev ) >>"$LOG" 2>&1 \
   || { log "FATAL: probe build failed"; exit 1; }
 
 log "[svc] quiescing (single-tenant NPU)"

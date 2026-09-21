@@ -39,12 +39,12 @@ REPS="${1:-11}"
 CLIPS="${2:-3}"
 PARITY_CLIPS="${PARITY_CLIPS:-17}"
 OUT="${OUT:-artifacts/lnmode_krtpkrl_bracket}"
-BIN=rust/target/release/parakeet_encode_npu
+BIN=rust/target/release/npu-dev
 MELS=artifacts/wer_mels
 ARMS="k0 k0m"
 
 log(){ echo -e "[lnkr] $*"; }
-[ -x "$BIN" ] || { log "[ERR] missing $BIN -- cargo build --release -p npu-probes --bin parakeet_encode_npu"; exit 1; }
+[ -x "$BIN" ] || { log "[ERR] missing $BIN -- cargo build --release -p npu-dev"; exit 1; }
 
 WA=mlir-aie/programming_examples/basic/matrix_multiplication/whole_array/build
 PANEL=512x1024x4096_32x32x128_8c_modalsilubf16outpanel1024krtpkrl
@@ -96,7 +96,7 @@ run_arm() { # $1 = arm, $2 = rep
   local rpt="$OUT/${arm}_rep${rep}.txt"
   timeout -k 10 900 "$NPU_LOCK_SH" queue -- \
     env $(comp_env "$arm") NPU_XCLBIN_CACHE_BY_CONTENT=0 NPU_DISPATCH_LOG=1 NPU_XCLBIN_ROOT="$PWD" \
-        "$BIN" "$WORK/mel" "$WORK/out_$arm" >"$rpt" 2>&1
+        "$BIN" parakeet-encode "$WORK/mel" "$WORK/out_$arm" >"$rpt" 2>&1
   rc=$?
   [ $rc -eq 0 ] || { log "[ERR] arm=$arm rep=$rep exited $rc"; tail -8 "$rpt"; return 1; }
   grep -q '^mean encode' "$rpt" || { log "[ERR] arm=$arm rep=$rep no timing line"; return 1; }
@@ -121,7 +121,7 @@ if [ "$(ls "$REF"/*.npy 2>/dev/null | wc -l)" -ne "$j" ]; then
   REF="$OUT/ref_f32"
   if [ "$(ls "$REF"/*.npy 2>/dev/null | wc -l)" -ne "$j" ]; then
     log "generating f32 reference (host encoder, $j clips)"
-    "$BIN" "$WORK/pmel" "$REF" --cpu >"$OUT/ref_f32.log" 2>&1 \
+    "$BIN" parakeet-encode "$WORK/pmel" "$REF" --cpu >"$OUT/ref_f32.log" 2>&1 \
       || { log "[ERR] f32 reference failed"; tail -5 "$OUT/ref_f32.log"; exit 1; }
   fi
 fi
@@ -129,7 +129,7 @@ log "--- parity pass ($PARITY_CLIPS clips): k0 baseline, k0m candidate, truth $R
 for arm in k0 k0m; do
   timeout -k 10 1800 "$NPU_LOCK_SH" queue -- \
     env $(comp_env "$arm") NPU_XCLBIN_CACHE_BY_CONTENT=0 NPU_XCLBIN_ROOT="$PWD" \
-        "$BIN" "$WORK/pmel" "$OUT/parity_out_$arm" >"$OUT/parity_run_$arm.txt" 2>&1 \
+        "$BIN" parakeet-encode "$WORK/pmel" "$OUT/parity_out_$arm" >"$OUT/parity_run_$arm.txt" 2>&1 \
     || { log "[ERR] parity run $arm failed"; tail -8 "$OUT/parity_run_$arm.txt"; exit 1; }
 done
 python3 scripts/encoder_parity.py "$REF" "$OUT/parity_out_k0" "$OUT/parity_out_k0m" \

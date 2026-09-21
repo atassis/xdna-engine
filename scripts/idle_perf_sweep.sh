@@ -26,7 +26,7 @@ set -u
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$WT"
 LDLIB=~/.local/lib/npu-asr
-W3="$WT/rust/target/release/whisper_e2e_timing"
+W3="$WT/rust/target/release/npu-dev"
 SERVE="$WT/rust/target/release/engine_serve"
 SCEN="$WT/scenarios/asr-whisper-small.toml"
 CLIP="$WT/artifacts/wer_clips/en_01.wav"
@@ -66,13 +66,13 @@ fi
 # ---- binaries (PREBUILT) ----
 # Prebuild before running so the idle measurement does NOT spend CPU compiling (a parallel cargo build
 # spikes every core and warms the package — not part of an idle run). Build manually first with:
-#   ( cd rust && cargo build -p npu-engine --release --bin whisper_e2e_timing --bin engine_serve )
+#   ( cd rust && cargo build -p npu-dev --release && cargo build -p npu-engine --release --bin engine_serve )
 # This script only compiles if a binary is missing (safety net for a fresh checkout).
 if [ -x "$W3" ] && [ -x "$SERVE" ]; then
   log "\n[build] binaries present — skipping compile (idle run uses prebuilt)"
 else
   log "\n[build] a binary is missing — compiling (prebuild next time to keep the run idle) ..."
-  if ( cd "$WT/rust" && cargo build -p npu-engine --release --bin whisper_e2e_timing --bin engine_serve ) >>"$LOG" 2>&1; then
+  if ( cd "$WT/rust" && cargo build -p npu-dev --release && cargo build -p npu-engine --release --bin engine_serve ) >>"$LOG" 2>&1; then
     log "[build] ok"
   else
     log "[build] FAILED — see log above. Aborting."; exit 1
@@ -92,7 +92,7 @@ log "\n################  E2E LATENCY + PER-PHASE + RAPL ENERGY (en_01, warmup+3 
 run_e2e(){  # $1 = label ; $2.. = extra env KV pairs
   local label="$1"; shift
   log "\n----------------- [$label] -----------------"
-  env WHISPER_TIMING=1 FUSED_PHASE_TIMING=1 "$@" LD_LIBRARY_PATH="$LDLIB" "$W3" "$CLIP" 2>&1 \
+  env WHISPER_TIMING=1 FUSED_PHASE_TIMING=1 "$@" LD_LIBRARY_PATH="$LDLIB" "$W3" whisper-e2e "$CLIP" 2>&1 \
     | grep -E "FUSED_PHASE\] (steps|per-token)|  [a-z_]+ +[0-9]|WHISPER_TIMING|WHISPER_ENERGY|warmup text|cross-K/V" \
     | tee -a "$LOG"
 }

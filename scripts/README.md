@@ -148,7 +148,6 @@ Drive one kernel or one path on the device and check it. These take the NPU.
 | `run_lpddr_bw_microbench.sh`, `lpddr_bw_microbench_harness.py` | LPDDR bandwidth sweep. |
 | `run_parakeet_occupancy.sh`, `parakeet_occupancy_harness.py` | Per-op occupancy A/B. |
 | `run_parakeet_dma_occupancy.sh`, `parakeet_dma_occupancy_harness.py` | Split DMA-wait from dispatch/BD/lock/stall. |
-| `run_glue_contention.sh` | Host-glue bandwidth-contention probe. |
 | `run_fused_decode_testsuite.sh` | Comprehensive fused-decode + full-ASR e2e suite. |
 | `prototype_ln_cast_resident.py` | Device-side BO hand-off across TWO xclbins (resident-rails feasibility). |
 | `proto_ffn_chain.py` | Keep the FFN intermediate H on-device between two matmul dispatches. |
@@ -190,7 +189,7 @@ Numerical correctness. CPU-only unless the name says `verify_*` against a device
 | `whisper_decode_wer.py` | WER via the live service. |
 | `whisper_dump_mels.py` | Dump log-mel features for the WER clips. |
 | `_whisper_decode_wer_run.sh`, `_whisper_decode_attn_wer_run.sh` | Single-tenant head-to-heads. **[NPU]** |
-| `wer_batched_decode.sh`, `_score_batched_wer.py`, `_score_m1_wer.py` | Batched-decode WER gate and scorers. |
+| `_score_m1_wer.py` | Score `wer_m1_decode` output against refs.json. |
 | `int8_wer_eval.py` | int8-quantization WER for the GigaAM-v3 encoder (CPU only). |
 | `burst_sensitivity.py`, `burst_to_transcript.py` | How big must an encoder error burst be to change the transcript? |
 | `edsr_before_after.py` | EDSR ship-net before/after on a real image. |
@@ -202,10 +201,8 @@ Timed runs. Read `docs/benchmark-methodology.md` first - these want a quiesced b
 | Script | Measurement |
 | --- | --- |
 | `idle_perf_sweep.sh` | Idle full-NPU ASR perf sweep on a quiesced box. |
-| `measure_phase2_sweep.sh` | Phase-2 sweep; stops `npu-asr`/vox first. |
 | `measure_int8_energy.sh` | Batched energy + timing A/B of int8 variants vs baseline. |
-| `measure_arrayfill.sh` | Per-token dispatch at B=16 vs B=128. |
-| `bench_batched_decode.sh` | Batched (B=16) vs M=1 decode J/token + tok/s. |
+| `bench_batched_decode.sh` | M=1 decode J/token + tok/s, canonical full e2e. |
 | `bench_npu_block.py` | Latency reality-check for the host-orchestrated GigaAM-v3 encoder. |
 | `gemm_probe_sweep.sh` | Batched-GEMM dispatch-amortisation sweep. |
 | `lever3_coalesce_ab.sh`, `lever3_isolate.sh`, `coalesce_e2e_ab.sh` | Coalesced-dispatch A/B and correctness isolation. |
@@ -218,7 +215,6 @@ Timed runs. Read `docs/benchmark-methodology.md` first - these want a quiesced b
 | --- | --- |
 | `test_install.sh` | Verify the installed service end-to-end: health, model list, a real transcription. |
 | `uninstall.sh` | Stop + remove the service unit and binary. Keeps the onnxruntime dir. |
-| `test_npu_pipeline.py` | End-to-end test of the NPU encode path. |
 | `ci_gate.sh` | **The Rust gate.** Run before pushing anything that touches `rust/`. |
 | `check_no_private_refs.sh` | Audit the PUBLIC tree for anything that should not be here. |
 | `test_repro_vendoring.sh` | End-to-end reproducibility test for the pinned-submodule + tethered-patch vendoring. |

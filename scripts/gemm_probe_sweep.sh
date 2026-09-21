@@ -10,7 +10,7 @@
 # in N (per-token cost falls) => batching amortises the weight read+launch => GO for the full batched
 # decode. If dispatch_ms ~ linear in N (per-token cost flat) => no amortisation on this HW => KILL.
 #
-# Builds the probe ELFs (device-free) if missing, then dispatches each on the NPU via fused_elf_probe
+# Builds the probe ELFs (device-free) if missing, then dispatches each on the NPU via npu-dev fused-elf
 # FUSED_TIME (reports "dispatch alone" ms) and the rel-L2 <= 0.08 correctness gate. Fully unattended:
 # quiesces the NPU services, ALWAYS restarts them on exit, fuser-checks the device, beeps when done.
 # RAPL note: energy not measured here (dispatch-only microbench); ms/tok is the signal.
@@ -24,7 +24,7 @@ NS="${1:-16 32 64 128}"
 NUM_COLS="${NUM_COLS:-1}"
 SUF=""; [ "$NUM_COLS" != "1" ] && SUF="_c${NUM_COLS}"
 LDLIB=~/.local/lib/npu-asr
-PROBE="$WT/rust/target/release/fused_elf_probe"
+PROBE="$WT/rust/target/release/npu-dev"
 TS="$(date +%Y%m%d_%H%M%S)"
 LOG="$WT/artifacts/gemm_probe_sweep_${TS}.log"
 mkdir -p "$WT/artifacts"; : > "$LOG"
@@ -42,8 +42,8 @@ for N in $NS; do
 done
 
 # 2) build the probe host bin
-log "[build] fused_elf_probe (release)"
-( cd "$WT/rust" && cargo build --release -p npu-probes --bin fused_elf_probe ) >>"$LOG" 2>&1 || { log "FATAL: probe build failed"; exit 1; }
+log "[build] npu-dev (release)"
+( cd "$WT/rust" && cargo build --release -p npu-dev ) >>"$LOG" 2>&1 || { log "FATAL: probe build failed"; exit 1; }
 
 # 3) claim the single-tenant NPU
 log "[svc] quiescing (single-tenant)"
@@ -62,7 +62,7 @@ log "  N | weightMB | dispatch_ms | per-tok ms (=disp/N) | rel-L2 | gate"
 log "  --+----------+-------------+----------------------+--------+-----"
 for N in $NS; do
   OUT="$WT/artifacts/gemm_probe${SUF}_N${N}"
-  res="$(cd "$WT" && FUSED_TIME=1 LD_LIBRARY_PATH=$LDLIB "$PROBE" "$OUT" 2>&1)"
+  res="$(cd "$WT" && FUSED_TIME=1 LD_LIBRARY_PATH=$LDLIB "$PROBE" fused-elf "$OUT" 2>&1)"
   echo "$res" >>"$LOG"
   disp="$(echo "$res" | sed -n 's/.*dispatch alone (1 NPU dispatch): *\([0-9.]*\) ms.*/\1/p' | head -1)"
   rel="$(echo "$res"  | sed -n 's/.*rel-L2 = \([0-9.]*\).*/\1/p' | head -1)"

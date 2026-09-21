@@ -279,7 +279,7 @@ def run_build(args, shapes, registry_path):
 # device timing -- the ONLY mode here that opens /dev/accel
 # ---------------------------------------------------------------------------------------------
 def run_time_manifest(args, registry_path):
-    """Dispatch every built arm through fused_elf_probe and write timings.jsonl.
+    """Dispatch every built arm through npu-dev fused-elf and write timings.jsonl.
 
     Two pieces of measurement discipline, both paid for elsewhere on this rail. The power mode is
     GATED before the first dispatch -- a sequential sweep on an unpinned NPU aliases the swept
@@ -300,8 +300,8 @@ def run_time_manifest(args, registry_path):
     timings = out_dir / "timings.jsonl"
     probe = Path(args.probe)
     if not probe.is_file():
-        raise SystemExit(f"ERROR: no fused_elf_probe at {probe} "
-                         f"(cargo build --release -p npu-probes --bin fused_elf_probe)")
+        raise SystemExit(f"ERROR: no npu-dev at {probe} "
+                         f"(cargo build --release -p npu-dev)")
     env = dict(os.environ)
     if args.ld_library_path:
         env["LD_LIBRARY_PATH"] = args.ld_library_path
@@ -319,7 +319,7 @@ def run_time_manifest(args, registry_path):
     rows = []
     with timings.open("w") as fh:
         for n, a in enumerate(order, 1):
-            proc = subprocess.run([str(probe), a["dir"], "--warmup", str(args.warmup),
+            proc = subprocess.run([str(probe), "fused-elf", a["dir"], "--warmup", str(args.warmup),
                                    "--iters", str(args.iters)],
                                   capture_output=True, text=True, env=env)
             text = proc.stdout + proc.stderr
@@ -349,7 +349,7 @@ def run_time_manifest(args, registry_path):
 
 
 def parse_probe(text):
-    """Pull the numbers out of one fused_elf_probe run. Missing means the arm did not get there."""
+    """Pull the numbers out of one npu-dev fused-elf run. Missing means the arm did not get there."""
     import re
 
     def grab(pat):
@@ -421,7 +421,7 @@ def run_ingest(args, registry_path):
                        "iters": win.get("iters"), "warmup": win.get("warmup"),
                        "date": win.get("date") or time.strftime("%Y-%m-%d"),
                        "power_mode": win.get("power_mode"),
-                       "probe": "fused_elf_probe",
+                       "probe": "npu-dev fused-elf",
                        "selection": args.prefer,
                        "runner_up_us": sorted(r["warm_min_us"] for r in group
                                               if r.get("pass") and r.get("warm_min_us"))[1:2] or None,
@@ -518,7 +518,7 @@ def main():
                     help="ON DEVICE: dispatch every built arm of this manifest and ingest the "
                          "result. The only mode here that opens /dev/accel; it gates on a pinned "
                          "power mode first (scripts/npu_power_mode.py).")
-    ap.add_argument("--probe", default="rust/target/release/fused_elf_probe")
+    ap.add_argument("--probe", default="rust/target/release/npu-dev")
     ap.add_argument("--warmup", type=int, default=20)
     ap.add_argument("--iters", type=int, default=200)
     ap.add_argument("--ld-library-path", default=None)

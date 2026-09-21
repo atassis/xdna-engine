@@ -10,7 +10,7 @@
 #
 # NOT mha_decode_iron.py parameterized: this driver's KV host buffer is sized at N_HEAD_KV=8,
 # a different SHAPE than Whisper's [NHEADS,...], not a different parameter value. Also,
-# rust/npu-asr/src/kernel_registry.rs:339-356 and rust/npu-probes/src/bin/mha_decode_probe.rs:102
+# rust/npu-asr/src/kernel_registry.rs:339-356 and rust/npu-dev/src/cmd/mha_decode.rs
 # hardcode the exact stem "mha_decode_448" / filename final_mha_decode_${S}.xclbin, so
 # Makefile.mha's tag format is an external contract, not free to repurpose for a second shape.
 #

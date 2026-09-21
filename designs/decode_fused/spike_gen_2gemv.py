@@ -7,7 +7,7 @@ the new xrt::elf path end to end. It produces a fused ELF that chains
     y0 = W0 @ x        (GEMV, M=K=128)
     y1 = W1 @ y0       (GEMV, M=K=128)
 into ONE program with the 3-arena (input/output/scratch) ABI, plus pre-assembled arena blobs and a
-numpy golden, so the Rust `fused_elf_probe` can load the ELF through our NEW `shim_run_elf` path
+numpy golden, so `npu-dev fused-elf` can load the ELF through our NEW `shim_run_elf` path
 (xrt::elf -> hw_context(device,elf) -> ext::kernel("main:sequence")) and prove it dispatches
 correctly on device — WITHOUT any device access here (compile + golden are host-only).
 

@@ -11,7 +11,7 @@ exactly that single GEMM (no LN/bias/GELU — we want the cleanest weight-read-a
 using the fattest decode weight (Whisper fc1: M=FF=3072, K=D=768, the 4.72 MB/layer buffer) so the
 DDR-bandwidth term dominates and the amortisation (or its absence) is unambiguous.
 
-Decisive measurement (run on device via fused_elf_probe FUSED_TIME): dispatch_ms at each N.
+Decisive measurement (run on device via npu-dev fused-elf FUSED_TIME): dispatch_ms at each N.
   per-token cost = dispatch_ms / N.
   GO   if per-token cost FALLS as N grows (dispatch_ms sub-linear in N => weight read amortised).
   KILL if per-token cost is ~flat (dispatch_ms ~ linear in N => no amortisation on this HW).
@@ -19,7 +19,7 @@ Decisive measurement (run on device via fused_elf_probe FUSED_TIME): dispatch_ms
 IRON GEMM arg order (get_arg_spec): A[M,K] (the matrix, here the resident weight W), B[K,N] (the
 activation X), C[M,N] (out). So the runlist tuple is (gemm, "W", "X", "out"); W is a resident weight,
 X is the per-token input. Output golden is the same bf16 dataflow the device runs (gate <= 0.08 in
-fused_elf_probe). GEMM tiling constraint: N % (tile_n * num_aie_columns) == 0, AND the bf16 vectorized mm.cc kernel
+npu-dev fused-elf). GEMM tiling constraint: N % (tile_n * num_aie_columns) == 0, AND the bf16 vectorized mm.cc kernel
 requires tile_n % 16 == 0 (static_assert n % (2*t), t=8). With the defaults here (tile_n=16,
 num_aie_columns=1) N must be a multiple of 16, so the skinny-N sweep {16,32,64,128} is valid on one
 fixed array config. (N<16 per column would need a scalar/custom kernel — itself a finding.)

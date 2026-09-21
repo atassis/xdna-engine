@@ -70,9 +70,9 @@ than rel-L2-gated for its own numerical reasons).
 
 This is the layer that actually dispatches a real forward pass to the NPU and compares
 it against a CPU/ONNX/PyTorch oracle, at the rel-L2 bar from section 3. It lives in
-`rust/npu-probes` (`verify_encoder.rs`, `verify_embeddings.rs`, `verify_esm.rs`,
-`verify_parakeet.rs`, `verify_whisper.rs`, `verify_patch_embed.rs --npu`, and others) and
-in `rust/npu-sr/tests/npu_gate.rs` / `edsr_npu_gate.rs` for the super-resolution nets.
+`rust/npu-dev` (`npu-dev verify-parakeet`, `npu-dev verify-whisper`,
+`npu-dev verify-whisper-decode`) and in `rust/npu-sr/tests/npu_gate.rs` /
+`edsr_npu_gate.rs` for the super-resolution nets.
 `scripts/verify_bge_parity.py` is the equivalent for BGE embeddings, checked against a
 mean-pooled, L2-normalized HF f32 reference.
 
