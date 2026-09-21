@@ -3231,6 +3231,25 @@
       "measured": null,
       "candidates_considered": 86
     },
+    "m64_k32768_n512_bf162bf16_bfp1_acc0": {
+      "M": 64,
+      "K": 32768,
+      "N": 512,
+      "dtype": "bf16>bf16",
+      "emulate": true,
+      "prio_accuracy": false,
+      "tile_m": 16,
+      "tile_k": 64,
+      "tile_n": 64,
+      "cols": 8,
+      "b_col_maj": false,
+      "source": "assumed",
+      "labels": [
+        "gemma4-12b:ctx"
+      ],
+      "measured": null,
+      "candidates_considered": null
+    },
     "m64_k3840_n15360_bf162bf16_bfp1_acc0": {
       "M": 64,
       "K": 3840,
@@ -3402,6 +3421,25 @@
       ],
       "measured": null,
       "candidates_considered": 96
+    },
+    "m64_k512_n32768_bf162bf16_bfp1_acc0": {
+      "M": 64,
+      "K": 512,
+      "N": 32768,
+      "dtype": "bf16>bf16",
+      "emulate": true,
+      "prio_accuracy": false,
+      "tile_m": 16,
+      "tile_k": 64,
+      "tile_n": 64,
+      "cols": 8,
+      "b_col_maj": true,
+      "source": "assumed",
+      "labels": [
+        "gemma4-12b:scores"
+      ],
+      "measured": null,
+      "candidates_considered": null
     },
     "m64_k512_n6912_bf162bf16_bfp1_acc0": {
       "M": 64,
