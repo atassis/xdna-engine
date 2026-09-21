@@ -2485,8 +2485,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             (op_lin_zab, p + "Wlzab", p + "hn", p + "zab"),
             (op_conv, p + "cw", p + "cvw", p + "cw"),
             (op_mix_act, xrow, xrow),
-            *[(op_l2, q, "l2q", q) for q in qs],
-            *[(op_l2, k, "l2k", k) for k in ks],
+            *[(op_l2, q, p + "l2q", q) for q in qs],
+            *[(op_l2, k, p + "l2k", k) for k in ks],
             (op_gdr, p + "zab", p + "gdp", p + "cw", p + "S", p + "S", p + "lo"),
             *[(op_gnorm, o, p + "gnw", o) for o in os_],
             (op_z_act, z, z),
@@ -2566,9 +2566,6 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     op_head = gemv(VOCAB, D, ctx, **head_quant_kw)
 
     weights, bufsz, cache_names, rl = {}, {}, [], []
-    if lin_layers:
-        weights["l2q"] = np.full(LDK, 1.0 / LDK, BF16)       # also carries q's dk^-0.5 scale
-        weights["l2k"] = np.full(LDK, LDK ** -0.5, BF16)
     if sp.v_norm:
         # The gainless v-norm's gain, one per head_dim and shared by EVERY layer -- a true constant,
         # unlike the per-layer learned gains beside it, so it is registered once here rather than in
@@ -2667,6 +2664,10 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             gp[sp.lin_v_heads:2 * sp.lin_v_heads] = npy(pl + "dt_bias")
             weights[p + "gdp"] = gp.view(np.uint16).view(BF16)
             weights[p + "gnw"] = bf16(npy(pl + "norm.weight"))   # plain w: not a norm_gain norm
+            # Per layer, not shared: a segmented stack loads each segment's weights once and a
+            # constant read by two segments would be claimed twice.
+            weights[p + "l2q"] = np.full(LDK, 1.0 / LDK, BF16)   # also carries q's dk^-0.5 scale
+            weights[p + "l2k"] = np.full(LDK, LDK ** -0.5, BF16)
             weights[p + "cw"] = np.zeros(LTAPS * LCH, BF16)
             # f32 state as raw bytes: int8 is how the writer recognises "already in wire format".
             weights[p + "S"] = np.zeros(sp.lin_v_heads * LDK * LDK, np.float32).view(np.int8)
