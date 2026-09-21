@@ -290,6 +290,9 @@ def main():
     ap.add_argument("--check-hf", type=int, default=0, metavar="N")
     ap.add_argument("--check-incremental", type=int, default=0, metavar="N")
     ap.add_argument("--steps", type=int, default=0, help="greedy continuation tokens")
+    ap.add_argument("--int4-group", type=int, default=0,
+                    help="run the projections through the int4 packer at this group size")
+    ap.add_argument("--clip-search", action="store_true")
     ap.add_argument("--out", default=None)
     ap.add_argument("--dump-logits", default=None,
                     help="npz of the logits at every fed position (prompt, then the greedy tokens) "
@@ -300,7 +303,7 @@ def main():
     torch.set_grad_enabled(False)
     torch.set_num_threads(max(1, (os.cpu_count() or 2) // 2))
 
-    ck = Ckpt(a.ckpt)
+    ck = Ckpt(a.ckpt, a.int4_group, a.clip_search)
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(a.ckpt)
     ids = tok.encode(a.prompt, add_special_tokens=False)
