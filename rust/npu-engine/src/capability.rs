@@ -88,6 +88,8 @@ pub enum Request {
     /// the C ABI / ffmpeg filter already calls -- `npu-sr-capi/src/lib.rs:90`, not the lower-level
     /// `upscale_plane`/`upscale_planar_rgb` used only by the parity gates).
     Image { rgb: Vec<u8>, w: usize, h: usize },
+    /// Typed decision questions over one state, answered off a generate model's logits.
+    Decide(crate::decide::DecideRequest),
 }
 
 impl Request {
@@ -98,6 +100,7 @@ impl Request {
             Request::Text(_) => "text",
             Request::Audio { .. } => "audio",
             Request::Image { .. } => "image",
+            Request::Decide(_) => "decide",
         }
     }
 }
@@ -129,6 +132,8 @@ pub enum Response {
     /// `Diarizer::diarize`'s shape: who spoke when. A distinct shape from `Text` because a
     /// transcript and a speaker timeline are not interchangeable payloads.
     Segments(Vec<Segment>),
+    /// One answer per question, in request order.
+    Decisions(Vec<crate::decide::DecideAnswer>),
 }
 
 impl Response {
@@ -140,6 +145,7 @@ impl Response {
             Response::Audio { .. } => "audio",
             Response::Image { .. } => "image",
             Response::Segments(_) => "segments",
+            Response::Decisions(_) => "decisions",
         }
     }
 }

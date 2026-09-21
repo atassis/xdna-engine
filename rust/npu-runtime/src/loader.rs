@@ -98,6 +98,7 @@ impl Servable for EngineModel {
             // error -- but still a Result, because the actor must not be panicked by one.
             Request::Image { .. } => Err(EngineError::WrongKind {
                 wanted: Capability::IMAGE_SR, got: self.model.kind().capability() }),
+            Request::Decide(r) => self.model.decide(&r).map(Response::Decisions),
         }
     }
 }

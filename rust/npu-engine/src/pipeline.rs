@@ -412,6 +412,13 @@ pub trait TextGenerator {
     /// See `AsrModel::bo_bytes`.
     fn bo_bytes(&self) -> u64 { 0 }
 
+    /// Typed decisions off the next-token logits (see `crate::decide`). Not every generator has
+    /// logits to read.
+    fn decide(&mut self, _req: &crate::decide::DecideRequest)
+        -> Result<Vec<crate::decide::DecideAnswer>, EngineError> {
+        Err(EngineError::Unsupported("this generator cannot answer typed decisions".to_string()))
+    }
+
     /// Collect a whole generation into a String. Provided, not required: this is the buffered
     /// surface expressed in terms of the streaming one, which is the point of the single method.
     fn generate_to_string(

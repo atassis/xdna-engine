@@ -440,6 +440,43 @@ impl<D: DecodeStep> LlmGenerator<D> {
         LlmGenerator { cfg, decode, scenario_defaults: Default::default(), resident: Vec::new() }
     }
 
+    /// Prime `ids` and return the logits at their last position: `generate`'s prompt phase without
+    /// its streaming, cancellation and report, under the same ledger rules (dropped before any
+    /// write, rebuilt only on success) and the same batched-resume alignment.
+    fn prime_to_last_logits(&mut self, ids: &[u32]) -> Result<Vec<f32>, EngineError> {
+        if ids.is_empty() {
+            return Err(EngineError::Unsupported("prompt tokenized to zero tokens".to_string()));
+        }
+        if let Some(max_ctx) = self.decode.max_context().filter(|&m| ids.len() > m) {
+            return Err(EngineError::Unsupported(format!(
+                "prompt is {} tokens but this model's context window is {max_ctx}", ids.len())));
+        }
+        if self.decode.reset()? == CacheState::Cleared {
+            self.resident.clear();
+        }
+        let batchable = ids.len() - 1;
+        let reused = common_prefix_len(&self.resident, ids).min(batchable);
+        let batched_from = match reuse_on_batched_prefill() {
+            true => batched_resume_point(reused, self.decode.prefill_batch()),
+            false => 0,
+        };
+        self.resident.clear();
+        let mut primed = reused;
+        let break_even = self.decode.prefill_break_even_tokens().unwrap_or_else(prefill_min_tokens);
+        if self.decode.prefill_batch().is_some() && batchable - batched_from >= break_even {
+            let at = self.decode.prefill(&ids[..batchable], batched_from)?;
+            if at > batched_from {
+                primed = at;
+            }
+        }
+        let mut logits = Vec::new();
+        for (i, &tok) in ids.iter().enumerate().skip(primed) {
+            logits = self.decode.step(tok, i)?;
+        }
+        self.resident = ids.to_vec();
+        Ok(logits)
+    }
+
     /// Set the scenario's generation defaults. A request that names a field still wins; these
     /// apply only under the fields it leaves out, and above the checkpoint's own settings.
     pub fn with_scenario_defaults(mut self, d: crate::pipeline::GenerationDefaults) -> Self {
@@ -526,6 +563,28 @@ fn default_seed() -> u64 {
 }
 
 impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
+    /// One full prompt per question, primed from wherever the ledger allows: a model whose caches
+    /// are all positional resumes the shared system/evidence prefix, one with recurrent state is
+    /// primed from 0 every time (its `reset` reports `Cleared`).
+    fn decide(&mut self, req: &crate::decide::DecideRequest)
+        -> Result<Vec<crate::decide::DecideAnswer>, EngineError> {
+        use crate::decide::{answer, messages, LETTERS};
+        let need = req.questions.iter().map(|q| q.options.len()).max().unwrap_or(0).min(LETTERS.len());
+        let slots = LETTERS.chars().take(need)
+            .map(|c| self.cfg.tokenizer.token_to_id(&c.to_string()).ok_or_else(|| EngineError::Unsupported(
+                format!("answer slot {c:?} is not a single token of this model's vocabulary"))))
+            .collect::<Result<Vec<u32>, _>>()?;
+        let mut out = Vec::with_capacity(req.questions.len());
+        for q in &req.questions {
+            q.validate().map_err(EngineError::Unsupported)?;
+            let ids = tokenize_prompt(&self.cfg, &Prompt::Chat(messages(&req.evidence, q)), Some(false), &[])?;
+            let logits = self.prime_to_last_logits(&ids)?;
+            let picked: Vec<f32> = slots[..q.options.len()].iter().map(|&t| logits[t as usize]).collect();
+            out.push(answer(q, &picked));
+        }
+        Ok(out)
+    }
+
     fn bo_bytes(&self) -> u64 {
         self.decode.bo_bytes()
     }

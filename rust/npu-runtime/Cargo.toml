@@ -10,7 +10,9 @@ testkit = []
 [dependencies]
 npu-engine = { path = "../npu-engine" }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# preserve_order: a TypeSafe `choice`'s criteria object is ORDERED -- its key order assigns the
+# answer letters, and a sorted map would put a different prompt in front of the model.
+serde_json = { version = "1", features = ["preserve_order"] }
 toml = "0.8"
 toml_edit = "0.22"
 
