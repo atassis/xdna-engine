@@ -587,6 +587,15 @@ impl LlmArtifact {
                 )));
             }
         }
+        // Ordinary partial rotary (Qwen3.5): the angle row is this wide and its frequencies are over
+        // this width, which rope_row already does for a row of that width. Not the same convention
+        // as rope_partial_rotary, so an artifact naming both is contradictory.
+        let rope_rotary_dim = opt_f64("rope_rotary_dim")?.map(|v| v as usize);
+        if rope_rotary_dim.is_some() && rope_partial_rotary.is_some() {
+            return Err(ctx("host_protocol sets both rope_partial_rotary and rope_rotary_dim -- two \
+                            partial-rotary conventions for one angle row"
+                .to_string()));
+        }
         let logit_softcap = opt_f64("logit_softcap")?;
         if let Some(c) = logit_softcap {
             if !(c > 0.0) {
@@ -876,12 +885,16 @@ impl LlmArtifact {
             ["rope_global", "rope_local"].iter().filter_map(|n| layout.get(*n).map(|l| l.len / 2)).collect();
         rope_widths.sort_unstable();
         rope_widths.dedup();
+        let mut angle_widths: Vec<usize> = declared.iter().map(|&hd| rope_rotary_dim.unwrap_or(hd)).collect();
+        angle_widths.sort_unstable();
+        angle_widths.dedup();
         if role == ArtifactRole::Decode && !rope_widths.is_empty() {
-            if declared != rope_widths {
+            if angle_widths != rope_widths {
                 return Err(ctx(format!(
-                    "attention geometry disagrees: scratchpad.kv_params declares head_dim(s) {declared:?}, \
-                     but the RoPE angle buffers are {rope_widths:?} bf16 elements wide -- each distinct \
-                     geometry needs exactly one angle row of its own width"
+                    "attention geometry disagrees: scratchpad.kv_params declares head_dim(s) {declared:?} \
+                     (angle rows {angle_widths:?} wide at rope_rotary_dim {rope_rotary_dim:?}), but the \
+                     RoPE angle buffers are {rope_widths:?} bf16 elements wide -- each distinct geometry \
+                     needs exactly one angle row of its own width"
                 )));
             }
             if !declared.contains(&head_dim) {
@@ -1772,6 +1785,29 @@ mod tests {
         write_meta(dir.path(), &meta);
         let err = LlmArtifact::load(dir.path()).unwrap_err().to_string();
         assert!(err.contains("attention geometry disagrees"), "{err}");
+    }
+
+    /// Ordinary partial rotary: the angle row is rope_rotary_dim wide, not head_dim, and that is
+    /// the declared width the check compares against -- in both directions.
+    #[test]
+    fn a_rotary_dim_angle_row_loads_and_a_wrong_one_fails_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        // head_dim 4, a 2-wide (4-byte) angle row declared by rope_rotary_dim = 2.
+        let mut meta = base_meta(8, 4, serde_json::json!({"rope_global": {"type": "input", "offset": 8, "len": 4}}));
+        meta["host_protocol"]["rope_rotary_dim"] = serde_json::json!(2);
+        write_meta(dir.path(), &meta);
+        LlmArtifact::load(dir.path()).expect("a row as wide as rope_rotary_dim loads");
+
+        meta["host_protocol"]["rope_rotary_dim"] = serde_json::json!(4);
+        write_meta(dir.path(), &meta);
+        let err = LlmArtifact::load(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("attention geometry disagrees"), "{err}");
+
+        meta["host_protocol"]["rope_rotary_dim"] = serde_json::json!(2);
+        meta["host_protocol"]["rope_partial_rotary"] = serde_json::json!(0.5);
+        write_meta(dir.path(), &meta);
+        let err = LlmArtifact::load(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("two partial-rotary conventions"), "{err}");
     }
 
     /// Load a REAL built artifact and assert the geometry contract on it. Device-free -- this only
