@@ -361,7 +361,8 @@ def main():
         with xin.overwrite() as _buf:
             _buf[:] = np.asarray(embed[tok0] * scale, BF16).reshape(-1)
         with rope_buf.overwrite() as _buf:
-            _buf[:] = rope_row(0, HD, sp.rope_theta_global).reshape(-1)
+            _buf[:] = rope_row(0, _buf.size, sp.rope_theta_global,
+                               sp.rope_partial_rotary).reshape(-1)
         params.write("kv_off", 0)
         params.write("sm_mask", 1)
         if window_granule is not None:

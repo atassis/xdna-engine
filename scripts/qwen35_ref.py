@@ -291,6 +291,11 @@ def main():
     ap.add_argument("--check-incremental", type=int, default=0, metavar="N")
     ap.add_argument("--steps", type=int, default=0, help="greedy continuation tokens")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--dump-logits", default=None,
+                    help="npz of the logits at every fed position (prompt, then the greedy tokens) "
+                         "in verify_llm_decode.py --dump-logits' own layout")
+    ap.add_argument("--ref-json", default=None,
+                    help="write {prompt_ids, gen_ids, margins} for designs/decode_fused/verify_llm_decode.py")
     a = ap.parse_args()
     torch.set_grad_enabled(False)
     torch.set_num_threads(max(1, (os.cpu_count() or 2) // 2))
@@ -311,15 +316,26 @@ def main():
 
     m = Model(ck, a.layers)
     x, per_layer = m.forward(ids, keep_layers=True)
-    lg = m.logits(m.final(x[-1:]))[0]
+    all_lg = [m.logits(m.final(x))] if a.dump_logits else []
+    lg = (all_lg[0][-1] if all_lg else m.logits(m.final(x[-1:]))[0])
     gen, margins = [], []
     for _ in range(a.steps):
         top = torch.topk(lg, 2)
         gen.append(int(top.indices[0]))
         margins.append(float(top.values[0] - top.values[1]))
         lg = m.logits(m.final(m.forward([gen[-1]])))[0]
+        if a.dump_logits:
+            all_lg.append(lg[None])
     print(f"[ref] top5 next={torch.topk(lg if not gen else lg, 5).indices.tolist()} gen={gen} "
           f"text={tok.decode(gen)!r} margins={[round(x, 3) for x in margins]}")
+    if a.dump_logits:
+        np.savez(a.dump_logits, logits=torch.cat(all_lg).numpy(), tokens_fed=np.array(ids + gen))
+        print(f"[ref] wrote {a.dump_logits}")
+    if a.ref_json:
+        json.dump({"prompt": a.prompt, "prompt_ids": ids, "gen_ids": gen, "margins": margins,
+                   "layers": m.L, "source": "scripts/qwen35_ref.py f32 recurrent reference"},
+                  open(a.ref_json, "w"))
+        print(f"[ref] wrote {a.ref_json}")
     if a.out:
         np.savez(a.out, ids=np.array(ids), gen=np.array(gen), margins=np.array(margins),
                  hidden=torch.stack(per_layer).numpy(), final=m.final(x).numpy())
