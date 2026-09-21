@@ -104,6 +104,11 @@ pub const FLAGS: &[Flag] = &[
               point is rounded down to a multiple of the prefill batch and prime() refuses a \
               misaligned one, because blocked KV is contiguous only inside a block. Flip the \
               default once a decode+prefill pair rebuilt from current main gates it." },
+    Flag { name: "NPU_DECIDE_SHARED_STATE", owner: "npu-engine", site: "npu-engine/src/llm/generator.rs",
+        semantics: NotZero, default: "true",
+        doc: "let a decide request's questions share one primed prefix on a model with recurrent \
+              state (Qwen3.5's DeltaNet): prime it once, snapshot the state, restore it per \
+              question. =0 primes every question from scratch -- the bit-exact control arm." },
     Flag { name: "NPU_LLM_PREFILL_MIN_TOKENS", owner: "npu-engine", site: "npu-engine/src/llm/generator.rs",
         semantics: Value, default: "12 (the measured break-even)",
         doc: "the fewest BATCHABLE prompt tokens (prompt length minus one) that make the batched \

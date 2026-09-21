@@ -30,6 +30,9 @@ pub enum CacheState {
     Cleared,
 }
 
+/// Recurrent state on the host: one byte vector per recurrent buffer, in the backend's own order.
+pub struct RecurrentSnapshot(pub Vec<Vec<u8>>);
+
 pub trait DecodeStep {
     fn step(&mut self, token: u32, pos: usize) -> Result<Vec<f32>, EngineError>;
 
@@ -51,6 +54,24 @@ pub trait DecodeStep {
     /// The default body does nothing, so it truthfully reports `Retained`.
     fn reset(&mut self) -> Result<CacheState, EngineError> {
         Ok(CacheState::Retained)
+    }
+
+    /// Whether this backend carries state that absorbs every token and has no position to mask
+    /// (Gated DeltaNet's `S` and conv window). Only such a backend can share a primed prefix
+    /// between decide questions by snapshot; a positional KV cache shares through the ledger.
+    fn has_recurrent_state(&self) -> bool {
+        false
+    }
+
+    /// A host copy of the recurrent state as it stands now.
+    fn snapshot_recurrent(&mut self) -> Result<RecurrentSnapshot, EngineError> {
+        Err(EngineError::Unsupported("this backend has no recurrent state to snapshot".into()))
+    }
+
+    /// Put back a [`snapshot_recurrent`](Self::snapshot_recurrent) copy. Positional caches are
+    /// left as they are.
+    fn restore_recurrent(&mut self, _s: &RecurrentSnapshot) -> Result<(), EngineError> {
+        Err(EngineError::Unsupported("this backend has no recurrent state to restore".into()))
     }
 
     /// The largest number of token positions this backend's KV cache can hold, or `None` when the
@@ -209,6 +230,31 @@ fn reuse_on_batched_prefill() -> bool {
 /// How many leading ids two sequences share.
 fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
+/// Where a decide request's questions can share one primed prefix: their common token prefix,
+/// capped so each keeps its last token for `step`, floored to the prefill batch `m` (a batched
+/// resume must start on a chunk boundary). 0: nothing to share.
+fn shared_prefix_len(ids: &[Vec<u32>], m: usize) -> usize {
+    if ids.len() < 2 || m == 0 {
+        return 0;
+    }
+    let common = ids[1..].iter().fold(ids[0].len(), |n, q| common_prefix_len(&ids[0][..n], q));
+    let b = ids.iter().map(|q| q.len().saturating_sub(1)).fold(common, usize::min);
+    b - b % m
+}
+
+/// `NPU_DECIDE_SHARED_STATE=0` primes every question from scratch.
+fn shared_state_enabled() -> bool {
+    std::env::var("NPU_DECIDE_SHARED_STATE").ok().as_deref() != Some("0")
+}
+
+/// What priming a prompt did, for `QuestionStats`.
+struct Primed {
+    logits: Vec<f32>,
+    reused: usize,
+    batched: usize,
+    stepwise: usize,
 }
 
 /// Dispatch groups between cancellation checks on the BATCHED prefill path. One group is
@@ -449,7 +495,7 @@ impl<D: DecodeStep> LlmGenerator<D> {
     /// Prime `ids` and return the logits at their last position: `generate`'s prompt phase without
     /// its streaming, cancellation and report, under the same ledger rules (dropped before any
     /// write, rebuilt only on success) and the same batched-resume alignment.
-    fn prime_to_last_logits(&mut self, ids: &[u32]) -> Result<Vec<f32>, EngineError> {
+    fn prime_to_last_logits(&mut self, ids: &[u32]) -> Result<Primed, EngineError> {
         if ids.is_empty() {
             return Err(EngineError::Unsupported("prompt tokenized to zero tokens".to_string()));
         }
@@ -468,11 +514,15 @@ impl<D: DecodeStep> LlmGenerator<D> {
         };
         self.resident.clear();
         let mut primed = reused;
+        let mut reused_from = reused;
+        let mut batched = 0;
         let break_even = self.decode.prefill_break_even_tokens().unwrap_or_else(prefill_min_tokens);
         if self.decode.prefill_batch().is_some() && batchable - batched_from >= break_even {
             let at = self.decode.prefill(&ids[..batchable], batched_from)?;
             if at > batched_from {
                 primed = at;
+                reused_from = batched_from;
+                batched = at - batched_from;
             }
         }
         let mut logits = Vec::new();
@@ -480,7 +530,95 @@ impl<D: DecodeStep> LlmGenerator<D> {
             logits = self.decode.step(tok, i)?;
         }
         self.resident = ids.to_vec();
-        Ok(logits)
+        Ok(Primed { logits, reused: reused_from, batched, stepwise: ids.len() - primed })
+    }
+
+    /// Prime `ids[b..]` over a restored `b`-token prefix. Batched whatever the suffix length: the
+    /// fresh path batched the whole prompt, and a stepwise suffix would be a different datapath.
+    fn prime_suffix(&mut self, ids: &[u32], b: usize) -> Result<Primed, EngineError> {
+        let batchable = ids.len() - 1;
+        let primed = match batchable > b {
+            true => self.decode.prefill(&ids[..batchable], b)?.max(b),
+            false => b,
+        };
+        let mut logits = Vec::new();
+        for (i, &tok) in ids.iter().enumerate().skip(primed) {
+            logits = self.decode.step(tok, i)?;
+        }
+        self.resident = ids.to_vec();
+        Ok(Primed { logits, reused: b, batched: primed - b, stepwise: ids.len() - primed })
+    }
+
+    /// Prime the questions' shared prefix once and snapshot the recurrent state after it, or
+    /// `None` when sharing does not apply: no recurrent state, less than a batch in common, a
+    /// question the fresh path would not have batched (sharing must run the same kernels to give
+    /// the same answer), or a backend that declined the prefix.
+    fn prime_shared_prefix(&mut self, ids: &[Vec<u32>], stats: &mut crate::decide::DecideStats)
+        -> Result<Option<RecurrentSnapshot>, EngineError> {
+        let Some(m) = self.decode.prefill_batch() else { return Ok(None) };
+        let b = shared_prefix_len(ids, m);
+        let break_even = self.decode.prefill_break_even_tokens().unwrap_or_else(prefill_min_tokens);
+        let fits = |q: &Vec<u32>| self.decode.max_context().is_none_or(|max| q.len() <= max);
+        if !self.decode.has_recurrent_state() || b == 0
+            || ids.iter().any(|q| q.len() - 1 < break_even || !fits(q)) {
+            return Ok(None);
+        }
+        let t = Instant::now();
+        self.decode.reset()?;
+        self.resident.clear();
+        if self.decode.prefill(&ids[0][..b], 0)? < b {
+            return Ok(None);
+        }
+        self.resident = ids[0][..b].to_vec();
+        stats.prefix_us = t.elapsed().as_micros() as u64;
+        let t = Instant::now();
+        let snap = self.decode.snapshot_recurrent()?;
+        stats.snapshot_us = t.elapsed().as_micros() as u64;
+        stats.shared_prefix_tokens = b;
+        Ok(Some(snap))
+    }
+
+    /// `decide` after tokenization; `share` is `NPU_DECIDE_SHARED_STATE` read once by the caller.
+    fn decide_ids_with(&mut self, share: bool, qs: &[crate::decide::DecideQuestion], ids: &[Vec<u32>], slots: &[u32])
+        -> Result<crate::decide::Decisions, EngineError> {
+        use crate::decide::{answer, DecideStats, Decisions, QuestionStats};
+        let mut stats = DecideStats::default();
+        let snap = match share {
+            true => self.prime_shared_prefix(ids, &mut stats)?,
+            false => None,
+        };
+        let mut answers = Vec::with_capacity(qs.len());
+        for (q, ids) in qs.iter().zip(ids) {
+            let mut s = QuestionStats { id: q.id.clone(), prompt_tokens: ids.len(), ..Default::default() };
+            let p = match &snap {
+                Some(snap) => {
+                    let t = Instant::now();
+                    self.decode.restore_recurrent(snap)?;
+                    s.restore_us = t.elapsed().as_micros() as u64;
+                    let t = Instant::now();
+                    let p = self.prime_suffix(ids, stats.shared_prefix_tokens)?;
+                    s.prefill_us = t.elapsed().as_micros() as u64;
+                    p
+                }
+                None => {
+                    let t = Instant::now();
+                    let p = self.prime_to_last_logits(ids)?;
+                    s.prefill_us = t.elapsed().as_micros() as u64;
+                    p
+                }
+            };
+            (s.reused_tokens, s.batched_tokens, s.stepwise_tokens) = (p.reused, p.batched, p.stepwise);
+            let t = Instant::now();
+            let want = &slots[..q.options.len()];
+            let picked = match self.decode.option_logits(want)? {
+                Some(v) => v,
+                None => want.iter().map(|&t| p.logits[t as usize]).collect(),
+            };
+            answers.push(answer(q, &picked));
+            s.readout_us = t.elapsed().as_micros() as u64;
+            stats.questions.push(s);
+        }
+        Ok(Decisions { answers, stats })
     }
 
     /// Set the scenario's generation defaults. A request that names a field still wins; these
@@ -569,32 +707,24 @@ fn default_seed() -> u64 {
 }
 
 impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
-    /// One full prompt per question, primed from wherever the ledger allows: a model whose caches
-    /// are all positional resumes the shared system/evidence prefix, one with recurrent state is
-    /// primed from 0 every time (its `reset` reports `Cleared`).
+    /// One full prompt per question. Questions share one primed prefix when the backend has
+    /// recurrent state (see `prime_shared_prefix`); otherwise each is primed from wherever the
+    /// ledger allows.
     fn decide(&mut self, req: &crate::decide::DecideRequest)
         -> Result<crate::decide::Decisions, EngineError> {
-        use crate::decide::{answer, messages, DecideStats, Decisions, QuestionStats, LETTERS};
+        use crate::decide::{messages, LETTERS};
         let need = req.questions.iter().map(|q| q.options.len()).max().unwrap_or(0).min(LETTERS.len());
         let slots = LETTERS.chars().take(need)
             .map(|c| self.cfg.tokenizer.token_to_id(&c.to_string()).ok_or_else(|| EngineError::Unsupported(
                 format!("answer slot {c:?} is not a single token of this model's vocabulary"))))
             .collect::<Result<Vec<u32>, _>>()?;
-        let mut out = Vec::with_capacity(req.questions.len());
-        let mut stats = DecideStats { questions: Vec::with_capacity(req.questions.len()), ..Default::default() };
         for q in &req.questions {
             q.validate().map_err(EngineError::Unsupported)?;
-            let ids = tokenize_prompt(&self.cfg, &Prompt::Chat(messages(&req.evidence, q)), Some(false), &[])?;
-            stats.questions.push(QuestionStats { id: q.id.clone(), prompt_tokens: ids.len(), ..Default::default() });
-            let logits = self.prime_to_last_logits(&ids)?;
-            let want = &slots[..q.options.len()];
-            let picked = match self.decode.option_logits(want)? {
-                Some(v) => v,
-                None => want.iter().map(|&t| logits[t as usize]).collect(),
-            };
-            out.push(answer(q, &picked));
         }
-        Ok(Decisions { answers: out, stats })
+        let ids: Vec<Vec<u32>> = req.questions.iter()
+            .map(|q| tokenize_prompt(&self.cfg, &Prompt::Chat(messages(&req.evidence, q)), Some(false), &[]))
+            .collect::<Result<_, _>>()?;
+        self.decide_ids_with(shared_state_enabled(), &req.questions, &ids, &slots)
     }
 
     fn bo_bytes(&self) -> u64 {
@@ -2145,5 +2275,174 @@ mod ledger_tests {
                 assert!(reused - at < m, "discarded more reuse than one batch");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod decide_tests {
+    use super::tests::build_cfg;
+    use super::*;
+    use crate::decide::{DecideAnswer, DecideQuestion};
+
+    /// Absorbs every token like DeltaNet's S: the logits are a function of the whole history, so a
+    /// restore that misses anything changes the answer. `ignore_restore` is the known-bad input
+    /// that proves the isolation test can fail.
+    struct Recurrent {
+        state: u64,
+        batch: usize,
+        break_even: Option<usize>,
+        decline_prefill: bool,
+        ignore_restore: bool,
+        recurrent: bool,
+        prefills: Vec<(usize, usize)>,
+    }
+
+    impl Recurrent {
+        fn new(batch: usize) -> Self {
+            Recurrent { state: 0, batch, break_even: None, decline_prefill: false,
+                        ignore_restore: false, recurrent: true, prefills: Vec::new() }
+        }
+        fn absorb(&mut self, tok: u32, pos: usize) {
+            self.state = self.state.wrapping_mul(0x0100_0000_01b3) ^ ((tok as u64) << 20 | pos as u64);
+        }
+    }
+
+    impl DecodeStep for Recurrent {
+        fn step(&mut self, tok: u32, pos: usize) -> Result<Vec<f32>, EngineError> {
+            self.absorb(tok, pos);
+            Ok((0..16).map(|i| ((self.state >> (i * 4)) & 0xf) as f32).collect())
+        }
+        fn reset(&mut self) -> Result<CacheState, EngineError> {
+            self.state = 0;
+            Ok(CacheState::Cleared)
+        }
+        fn prefill_batch(&self) -> Option<usize> { Some(self.batch) }
+        fn prefill_break_even_tokens(&self) -> Option<usize> { self.break_even }
+        fn prefill(&mut self, tokens: &[u32], from: usize) -> Result<usize, EngineError> {
+            self.prefills.push((from, tokens.len()));
+            if self.decline_prefill { return Ok(from); }
+            for (i, &t) in tokens.iter().enumerate().skip(from) { self.absorb(t, i); }
+            Ok(tokens.len())
+        }
+        fn has_recurrent_state(&self) -> bool { self.recurrent }
+        fn snapshot_recurrent(&mut self) -> Result<RecurrentSnapshot, EngineError> {
+            Ok(RecurrentSnapshot(vec![self.state.to_le_bytes().to_vec()]))
+        }
+        fn restore_recurrent(&mut self, s: &RecurrentSnapshot) -> Result<(), EngineError> {
+            if !self.ignore_restore {
+                self.state = u64::from_le_bytes(s.0[0][..8].try_into().unwrap());
+            }
+            Ok(())
+        }
+    }
+
+    /// `shared` common tokens, then `tails[i]` distinct ones per question.
+    fn prompts(shared: usize, tails: &[usize]) -> Vec<Vec<u32>> {
+        tails.iter().enumerate()
+            .map(|(q, &t)| (0..shared as u32).chain((0..t as u32).map(|i| 10_000 + 1_000 * q as u32 + i)).collect())
+            .collect()
+    }
+
+    fn questions(n: usize) -> Vec<DecideQuestion> {
+        let kinds = [
+            DecideQuestion::noul("n", "?", None, None),
+            DecideQuestion::choice("c", "?", vec![("a".into(), "".into()), ("b".into(), "".into()), ("c".into(), "".into())]),
+            DecideQuestion::score("s", "?", vec!["lo".into(), "mid".into(), "hi".into(), "top".into()]),
+        ];
+        (0..n).map(|i| { let mut q = kinds[i % 3].clone(); q.id = format!("q{i}"); q }).collect()
+    }
+
+    const SLOTS: [u32; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+
+    fn run(d: Recurrent, share: bool, qs: &[DecideQuestion], ids: &[Vec<u32>])
+        -> (Vec<DecideAnswer>, crate::decide::DecideStats, Vec<(usize, usize)>) {
+        let mut g = LlmGenerator::new(build_cfg(None), d);
+        let r = g.decide_ids_with(share, qs, ids, &SLOTS).unwrap();
+        (r.answers, r.stats, g.decode.prefills.clone())
+    }
+
+    #[test]
+    fn shared_prefix_len_floors_to_the_batch_and_keeps_every_last_token() {
+        let v = |n: usize| -> Vec<u32> { (0..n as u32).collect() };
+        let mut b = v(300); b[290] = 9_999;
+        assert_eq!(shared_prefix_len(&[v(600), b.clone()], 256), 256, "common 290 floors to 256");
+        assert_eq!(shared_prefix_len(&[v(600), v(600)], 256), 512, "600 identical: cap 599 floors to 512");
+        assert_eq!(shared_prefix_len(&[v(512), v(700)], 256), 256, "a 512-token question keeps its last token: cap 511");
+        assert_eq!(shared_prefix_len(&[v(513), v(700)], 256), 512);
+        assert_eq!(shared_prefix_len(&[v(255), v(900)], 256), 0, "less than one batch shares nothing");
+        assert_eq!(shared_prefix_len(&[v(900)], 256), 0, "one question shares nothing");
+    }
+
+    #[test]
+    fn a_shared_prefix_answers_exactly_what_fresh_prefills_answer() {
+        for shared in [255, 256, 257, 511, 512, 700] {
+            let ids = prompts(shared, &[130, 40, 1]);
+            let qs = questions(3);
+            let (fresh, fs, _) = run(Recurrent::new(256), false, &qs, &ids);
+            let (reused, rs, prefills) = run(Recurrent::new(256), true, &qs, &ids);
+            assert_eq!(reused, fresh, "shared {shared}");
+            assert_eq!(fs.shared_prefix_tokens, 0);
+            let b = shared_prefix_len(&ids, 256);
+            assert_eq!(rs.shared_prefix_tokens, b, "shared {shared}");
+            if b > 0 {
+                assert_eq!(prefills[0], (0, b), "the prefix is primed once, from 0");
+                // A question whose batchable part IS the prefix has no suffix chunk to prefill.
+                let want: Vec<(usize, usize)> = ids.iter().filter(|q| q.len() - 1 > b)
+                    .map(|q| (b, q.len() - 1)).collect();
+                assert_eq!(prefills[1..], want[..], "each question resumes at the prefix");
+                for q in &rs.questions {
+                    assert_eq!(q.reused_tokens, b);
+                    assert_eq!(q.stepwise_tokens, 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_long_question_does_not_leak_into_the_next() {
+        let ids = prompts(600, &[900, 20]);
+        let qs = questions(2);
+        let (both, stats, _) = run(Recurrent::new(256), true, &qs, &ids);
+        assert!(stats.shared_prefix_tokens > 0);
+        let (alone, _, _) = run(Recurrent::new(256), true, &qs[1..], &ids[1..]);
+        assert_eq!(both[1], alone[0]);
+        let mut leaky = Recurrent::new(256);
+        leaky.ignore_restore = true;
+        let (leaked, _, _) = run(leaky, true, &qs, &ids);
+        assert_ne!(leaked[1], alone[0], "a restore that does nothing must be caught");
+    }
+
+    #[test]
+    fn sharing_stands_down_when_a_question_would_not_batch() {
+        let ids = prompts(600, &[100, 100]);
+        let mut d = Recurrent::new(256);
+        d.break_even = Some(701);
+        let (_, stats, prefills) = run(d, true, &questions(2), &ids);
+        assert_eq!(stats.shared_prefix_tokens, 0);
+        assert!(prefills.is_empty(), "under break-even the fresh path steps every token");
+    }
+
+    #[test]
+    fn a_declined_prefix_falls_back_to_fresh_prefills() {
+        let ids = prompts(600, &[100, 100]);
+        let qs = questions(2);
+        let mut d = Recurrent::new(256);
+        d.decline_prefill = true;
+        let (answers, stats, _) = run(d, true, &qs, &ids);
+        let mut d = Recurrent::new(256);
+        d.decline_prefill = true;
+        let (fresh, _, _) = run(d, false, &qs, &ids);
+        assert_eq!(stats.shared_prefix_tokens, 0);
+        assert_eq!(answers, fresh);
+    }
+
+    #[test]
+    fn a_positional_backend_keeps_its_own_path() {
+        let ids = prompts(600, &[100, 100]);
+        let mut d = Recurrent::new(256);
+        d.recurrent = false;
+        let (_, stats, prefills) = run(d, true, &questions(2), &ids);
+        assert_eq!(stats.shared_prefix_tokens, 0);
+        assert!(prefills.iter().all(|&(from, _)| from == 0), "{prefills:?}");
     }
 }
