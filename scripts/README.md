@@ -13,8 +13,8 @@ this sentence -- the count above read 194 for long enough that a task filed agai
 announce it, stop `npu-serve` / `npu-asr`, and check `fuser -v /dev/accel/accel0` first.
 Everything else is CPU-only and safe to run any time.
 
-**The Rust-side siblings of these live in `rust/npu-probes`** (53 device probes, parity checks
-and benchmarks). Several scripts here drive them: `cargo run -p npu-probes --bin <name>`.
+**The Rust-side equivalent is `rust/npu-dev`**, a single binary with subcommands for device tests, parity checks,
+and debug tools. Run `npu-dev` with no arguments to list all subcommands.
 
 ---
 

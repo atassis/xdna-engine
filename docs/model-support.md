@@ -82,8 +82,8 @@ encoder does not implement.
 | Qwen3.5-4B | Supported (typed decisions) | `scenarios/generate-qwen3.5-4b.toml`; 24 Gated DeltaNet + 8 gated-attention layers, int4 g32 weights, batched prefill M=256 over decode's arena; serves `/v1/systemone` and `npu decide` |
 | opt-125m | Host-only | see below |
 
-**opt-125m** (`rust/npu-probes/src/bin/opt125m_decode.rs`) is a greedy-decode host
-reference validated token-for-token against the HF golden (`scripts/opt125m_reference.py`),
+**opt-125m** is a greedy-decode host reference validated token-for-token against the HF golden
+(`scripts/opt125m_reference.py`),
 with host-simulated int8/int4 weight quantization for a bandwidth study. It never opens
 an NPU device -- the file's own comment puts the decode on host f32 first and leaves the NPU LLM-decode
 path as a follow-on reusing the K=768 ctx_decode primitives.
@@ -100,9 +100,9 @@ research/scaffolding toward that goal, not an instance of it yet (see above).
 
 | Model | Status | Evidence |
 | --- | --- | --- |
-| ViT-base (google/vit-base-patch16-224) | Host-only | `rust/npu-probes/src/bin/vit_embed.rs`, own comment: "(host f32)" |
+| ViT-base (google/vit-base-patch16-224) | Host-only | host f32 forward pass validated by cosine and argmax agreement against the HF golden on a fixed random image |
 | DINOv2 (facebook/dinov2-base) | Host-only | weight-conversion parity only |
-| ResNet-18 (microsoft/resnet-18) | Host-only | `rust/npu-probes/src/bin/verify_resnet.rs` |
+| ResNet-18 (microsoft/resnet-18) | Host-only | host f32 forward pass via im2col + GEMM, validated against an ONNX Runtime oracle |
 | CLIP | Host-only | weight-conversion parity only |
 
 None of these reach the NPU as a full model. What each one actually has:

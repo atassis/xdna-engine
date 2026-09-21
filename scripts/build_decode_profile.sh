@@ -9,8 +9,8 @@
 #   COALESCE_GEMV=1 bash scripts/build_decode_profile.sh wer   # opt-in BD-iteration
 #
 # Profiles (single source of truth for decode build configs):
-#   wer    : the config scripts/wer_batched_decode.sh + rust verify_batched_decode
-#            REQUIRE — B=16 NL=12 S=448 T_enc=1500 P=5, scratchpad + engine-only.
+#   wer    : B=16 NL=12 S=448 T_enc=1500 P=5, scratchpad + engine-only.
+#            No in-tree consumer; retained for reference and offline benchmarking.
 #            (verify asserts T_enc==1500; S=448 is the production self-context.)
 #   l1gate : the byte-gate proxy — B=128 NL=1 S=448 T=1500, scratchpad engine-only,
 #            SKIP_EXPAND_PDIS + DISABLE_REPEATER (frozen-MLIR aiecc-only gate = 370686d).

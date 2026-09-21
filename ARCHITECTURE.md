@@ -30,8 +30,8 @@ Unifying that last part is open work, not a shipped property; see "Known seams" 
 
 ## Crates
 
-16 workspace members (`rust/Cargo.toml`). `cargo build` at the workspace root builds the 15
-`default-members`; `npu-probes` is excluded and built on request.
+15 workspace members (`rust/Cargo.toml`). `cargo build` at the workspace root builds all of them,
+including `npu-dev` which contains device tests and debug tools.
 
 | Crate | Responsibility |
 | --- | --- |
@@ -42,14 +42,13 @@ Unifying that last part is open work, not a shipped property; see "Known seams" 
 | `npu-runtime` | Control plane over `npu-engine`: desired-state config, reconcile, and a single device actor that serializes NPU work. |
 | `npu-weights` | Rust-native weight loader: bakes HF safetensors / ONNX into an mmap-able bf16 checkpoint with a content fingerprint and parity gate. |
 | `npu-onnx` | Runs ONNX graphs from Rust via a thin C shim over the system onnxruntime (oracles + fallback). |
-| `npu-asr` / `npu-asr-host` | GigaAM-v3 encoder on the NPU (`npu-asr`) and its pure host-CPU reference math (`npu-asr-host`). |
 | `npu-parakeet` | Parakeet-TDT FastConformer encoder (rel-pos attention, depthwise conv1d k=9, /8 conv2D subsample). |
 | `npu-whisper` | Whisper-small encoder + decoder reference and the on-NPU decode path. |
 | `npu-sr` | Super-resolution engine: frame in / frame out video upscaling (ESPCN, EDSR). Own schedule JSON, own `SrEngine` ABI, drives `npu-xrt` directly; constructed by `npu-runtime` for `POST /v1/images/upscale`. |
 | `npu-sr-capi` | C ABI over `npu-sr` (`libxdna_sr.so`) for the ffmpeg `vf_xdna_sr` filter and other embedders. |
 | `npu-capi` | C ABI over `npu-engine` (cdylib + staticlib, cbindgen header) for in-process embedding from any language. |
 | `npu-cli` | `npu` multitool: serve, transcribe, embed, generate, chat, diarize, models, config, reload, bake, doctor, `top`, and the measurement readers `stats` / `replay`. |
-| `npu-probes` | 53 device probes, parity checks and benchmarks. Dev tooling, not shipped: NOT in `default-members`, so it costs nothing on a product build. `cargo build -p npu-probes`. |
+| `npu-dev` | Device tests, parity checks, and debug tools. Subcommands: kernels-build/manifest/verify, s2-chain/design, verify-parakeet/whisper/whisper-decode, parakeet-encode, whisper-e2e, fused-elf, prefill-token-gate/time/golden, mha-decode, conveyor-parity, tcache-parity. Run with no arguments to list all. `cargo build --release -p npu-dev`. |
 | `npu-dispatch` | Byte-marshaling helpers and dispatch profiling with zero model-specific semantics; the one definition of `PAD_M`/`WA_SUBDIR`/`u16_bytes` that `npu-asr`, `npu-parakeet` and `npu-whisper` each used to copy. |
 | `npu-s2` | S2 TTS codec: opens one exported streamed design (`final.xclbin` + `insts.bin` + `meta.json`) once and dispatches it many times. |
 

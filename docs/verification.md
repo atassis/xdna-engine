@@ -153,8 +153,8 @@ when the two runs did not compute the same thing or ran under different power mo
   `cargo test -p npu-weights --test parity_<arch>` (falls back to `SKIP` and prints the
   export command if the oracle fixture is missing -- read the printed line, not just the
   exit code).
-- Device parity for a model that has one: build `npu-probes`
-  (`cargo build -p npu-probes --release`) and run its `verify_*` binary against real
+- Device parity for a model that has one: build `npu-dev`
+  (`cargo build --release -p npu-dev`) and run its `verify-*` subcommands against real
   artifacts, or `cargo test -p npu-sr` for the super-resolution gates. The NPU is
   single-tenant -- stop `xdna-engine.service` and confirm `/dev/accel/accel0` is free
   (`fuser /dev/accel/accel0`) first, the way `scripts/lever3_determinism_gate.sh` does.

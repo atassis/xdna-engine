@@ -86,7 +86,7 @@ does not need it.
 
 ## Layout
 
-- `rust/` - the engine (14 product crates + `npu-probes`; see [ARCHITECTURE.md](ARCHITECTURE.md))
+- `rust/` - the engine (15 crates, including `npu-dev` for device tests and debug tools; see [ARCHITECTURE.md](ARCHITECTURE.md))
 - `aie_kernels/` - the kernel library: 48 hand-written AIE kernels (GEMM, GEMV, cascade FFN,
   MHA, conv, LayerNorm, ...), each with its numpy golden where one exists ([index](aie_kernels/INDEX.md))
 - `designs/` - the IRON multi-core dataflow graphs the engine actually dispatches, built from

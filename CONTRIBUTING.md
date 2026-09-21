@@ -8,7 +8,7 @@ team and no SLA on review turnaround; I'll get to a PR when I get to it.
 ```
 cd rust
 cargo build              # the product workspace (default-members in rust/Cargo.toml)
-cargo build -p npu-probes             # dev-only: device probes/parity checks, not built by default
+cargo build -p npu-dev                # dev-only: device tests and debug tools, not built by default
 cargo build -p npu-vod-chain-skeleton # dev-only: a wiring proof-of-concept, not built by default
 ```
 
