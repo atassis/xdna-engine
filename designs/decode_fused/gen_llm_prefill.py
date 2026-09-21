@@ -2039,6 +2039,10 @@ def check_shared_weights(dec_meta_path, weights_dir, sp, dims):
 
     Skipped when the caller has no weights (`--no-golden`); it costs one layer's tensors otherwise.
     """
+    if sp.mixer_for(0) != "full_attention":
+        print(f"[check] shared-weight contract NOT verified: layer 0 is {sp.mixer_for(0)} and this "
+              "check reads only an attention layer's buffers")
+        return
     bdir = os.path.join(os.path.dirname(os.path.abspath(dec_meta_path)), "buffers")
     npy = lambda t: np.load(os.path.join(weights_dir, f"{sp.weight_prefix}layers.0.{t}.weight.npy"))
     raw = lambda n: np.fromfile(os.path.join(bdir, f"L0_{n}.bin"), dtype=BF16)
