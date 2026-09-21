@@ -536,6 +536,7 @@ impl<D: DecodeStep> LlmGenerator<D> {
     /// Prime `ids[b..]` over a restored `b`-token prefix. Batched whatever the suffix length: the
     /// fresh path batched the whole prompt, and a stepwise suffix would be a different datapath.
     fn prime_suffix(&mut self, ids: &[u32], b: usize) -> Result<Primed, EngineError> {
+        self.resident.clear();
         let batchable = ids.len() - 1;
         let primed = match batchable > b {
             true => self.decode.prefill(&ids[..batchable], b)?.max(b),
@@ -560,7 +561,7 @@ impl<D: DecodeStep> LlmGenerator<D> {
         let break_even = self.decode.prefill_break_even_tokens().unwrap_or_else(prefill_min_tokens);
         let fits = |q: &Vec<u32>| self.decode.max_context().is_none_or(|max| q.len() <= max);
         if !self.decode.has_recurrent_state() || b == 0
-            || ids.iter().any(|q| q.len() - 1 < break_even || !fits(q)) {
+            || ids.iter().any(|q| q.len().saturating_sub(1) < break_even || !fits(q)) {
             return Ok(None);
         }
         let t = Instant::now();
@@ -2294,13 +2295,16 @@ mod decide_tests {
         decline_prefill: bool,
         ignore_restore: bool,
         recurrent: bool,
+        /// Like the real `NpuPrefill::prime`, which can stop at a batch-aligned absolute window:
+        /// `prefill` absorbs only positions before `min(tokens.len(), window floored to batch)`.
+        window: Option<usize>,
         prefills: Vec<(usize, usize)>,
     }
 
     impl Recurrent {
         fn new(batch: usize) -> Self {
             Recurrent { state: 0, batch, break_even: None, decline_prefill: false,
-                        ignore_restore: false, recurrent: true, prefills: Vec::new() }
+                        ignore_restore: false, recurrent: true, window: None, prefills: Vec::new() }
         }
         fn absorb(&mut self, tok: u32, pos: usize) {
             self.state = self.state.wrapping_mul(0x0100_0000_01b3) ^ ((tok as u64) << 20 | pos as u64);
@@ -2321,8 +2325,12 @@ mod decide_tests {
         fn prefill(&mut self, tokens: &[u32], from: usize) -> Result<usize, EngineError> {
             self.prefills.push((from, tokens.len()));
             if self.decline_prefill { return Ok(from); }
-            for (i, &t) in tokens.iter().enumerate().skip(from) { self.absorb(t, i); }
-            Ok(tokens.len())
+            let end = match self.window {
+                Some(w) => tokens.len().min(w - w % self.batch),
+                None => tokens.len(),
+            };
+            for (i, &t) in tokens.iter().enumerate().take(end).skip(from) { self.absorb(t, i); }
+            Ok(end.max(from))
         }
         fn has_recurrent_state(&self) -> bool { self.recurrent }
         fn snapshot_recurrent(&mut self) -> Result<RecurrentSnapshot, EngineError> {
@@ -2396,6 +2404,22 @@ mod decide_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_window_limited_prefill_still_matches_the_fresh_path() {
+        // Batch 256, window 768: q0 (len 1000) has a suffix chunk from 512 that the window
+        // truncates at 768, so its tail steps token-by-token; q1's suffix (to 699) fits inside it.
+        let ids = prompts(600, &[400, 100]);
+        let qs = questions(2);
+        let windowed = || { let mut d = Recurrent::new(256); d.window = Some(768); d };
+        let (shared, stats, _) = run(windowed(), true, &qs, &ids);
+        let (fresh, fs, _) = run(windowed(), false, &qs, &ids);
+        assert!(stats.shared_prefix_tokens > 0, "this case must actually share");
+        assert_eq!(fs.shared_prefix_tokens, 0);
+        assert_eq!(shared, fresh, "a window-truncated suffix must still answer what fresh priming does");
+        assert_eq!(stats.questions[0].stepwise_tokens, ids[0].len() - 768, "q0's suffix crosses the window");
+        assert_eq!(stats.questions[1].stepwise_tokens, 1, "q1's suffix ends before the window");
     }
 
     #[test]

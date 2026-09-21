@@ -82,6 +82,8 @@ pub struct QuestionStats {
     pub batched_tokens: usize,
     pub stepwise_tokens: usize,
     pub restore_us: u64,
+    /// On the shared path this is the SUFFIX only -- the shared prefix itself is
+    /// `DecideStats::prefix_us`, paid once per request, not once per question.
     pub prefill_us: u64,
     pub readout_us: u64,
 }
