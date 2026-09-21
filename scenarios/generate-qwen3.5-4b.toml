@@ -12,16 +12,17 @@ kind = "generate"
 # path never reads `weights` at runtime, only the memory-ceiling estimate does. So it names the
 # arena bytes the device actually receives, 3.3 GB, not the dump.
 #
-# Batched prefill, M=128 over decode's own arena, int4 rows read through DequantRows:
-#   PREFILL_BFP16=0 PREFILL_ACC=1 ACT_POLY=1 SPEC=qwen3.5-4b \
-#     DECODE_META=artifacts/qwen3.5-4b/decode/meta.json scripts/build_prefill.sh 32 128 2048
+# Batched prefill, M=256 over decode's own arena, int4 rows read through DequantRows, the delta rule
+# on limbs and SiLU/sigmoid from act_poly's Fast pair:
+#   PREFILL_BFP16=0 PREFILL_ACC=1 ACT_POLY=1 PREFILL_ACT_FAST=1 SPEC=qwen3.5-4b \
+#     DECODE_META=artifacts/qwen3.5-4b/decode/meta.json scripts/build_prefill.sh 32 256 2048
 name = "qwen3.5-4b"
 
 [artifacts]
 decode = "artifacts/qwen3.5-4b/decode"
 weights = "artifacts/qwen3.5-4b/decode/buffers"
 tokenizer_dir = "artifacts/qwen3.5-4b/tokenizer"
-prefill = "artifacts/qwen3.5-4b/prefill"
+prefill = "artifacts/qwen3.5-4b/prefill_m256f"
 
 [generation]
 max_tokens = 1024
