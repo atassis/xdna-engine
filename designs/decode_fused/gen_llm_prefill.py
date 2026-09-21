@@ -1721,6 +1721,9 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     # added.
     prefill_local = sorted(n for n in bufsz if n not in dec_sizes)
     dims = dict(NL=NL, M=M, S=S, inputs=inputs, cache_names=cache_names,
+                recurrent_counts=(dict(buffer=GDR_COUNT, tokens_per_call=GDR_T, calls=M // GDR_T,
+                                       slot_bytes=LDK * 2, hist_param="hist_off",
+                                       hist_row_elems=LCH) if lin_layers else None),
                 tn_sc=tn_sc, tn_cx=tn_cx, tiles=tiles, cols=cols, causal=causal,
                 kv_block=kvl.T, wqkv_head_major=hm, geom_slots=geom_slots,
                 sm_widths=(SM_WIDTHS if causal == "rows" else None), sm_rows=Hq * M,
@@ -2403,6 +2406,8 @@ def main():
         "cache_buffers": dims["cache_names"],
         # Not position-indexed: zeroed before a request's first chunk, never resumed mid-prefix.
         "recurrent_buffers": [n for n in dims["cache_names"] if n.endswith(("_cw", "_S"))],
+        # Per chunk, what keeps pad rows out of that state; see host_protocol's gdr_count/hist_off.
+        "recurrent_counts": dims["recurrent_counts"],
         "arena_shared": bool(dec_meta_path),
         "decode_artifact": dec_ref,
         "causal": dims["causal"] == "rows",
