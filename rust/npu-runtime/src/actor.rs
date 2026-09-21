@@ -6,11 +6,12 @@ use std::time::Duration;
 use std::thread::JoinHandle;
 use std::time::Instant;
 
-use crate::config::Config;
+use crate::config::{Config, EvictPolicy};
 use crate::control_socket::LiveStatus;
 use crate::loader::ModelLoader;
 use crate::reconcile::{reconcile, ReconcileReport};
-use crate::registry::{deep_release_due, release_free_memory, Capability, ModelStatus, Registry, UnloadReason};
+use crate::registry::{deep_release_due, is_hwctx_exhaustion, release_free_memory, Capability,
+                      ModelStatus, Registry, UnloadReason};
 use crate::select::resolve;
 use crate::stream::StreamItem;
 use npu_engine::capability::{Request, Response, Segment};
@@ -284,11 +285,11 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
                             // Published BEFORE the work and cleared after it, panic included -- see
                             // the identical pattern around `run_generate` below. Harmless for the
                             // capabilities that finish in one dispatch: nothing ever reads it before
-                            // `clear()` removes it again.
-                            inflight.set(&name, cancel.clone());
+                            // `clear()` removes it again. `run_named_evicting` re-publishes it on
+                            // every retry attempt.
                             let t_serve = Instant::now();
-                            let out = guard(|| run_named(&mut reg, &name, req, cancel))
-                                .unwrap_or_else(|msg| Err(EngineError::Device(msg)));
+                            let (name, out) = run_named_evicting(&cfg, &mut reg, loader.as_ref(), cap,
+                                model.as_deref(), name, req, cancel, &inflight);
                             inflight.clear();
                             // Charged whether it succeeded or failed: a request that held the
                             // device and then errored still held it, and occupancy that only
@@ -569,6 +570,48 @@ fn run_named(reg: &mut Registry, name: &str, req: Request, cancel: npu_engine::C
     m.run_cancellable(req, cancel)
 }
 
+/// `run_named`, retrying once per hardware-context exhaustion by evicting the LRU OTHER resident
+/// model and reloading `name`.
+///
+/// Covers the case `Registry::ensure_resident`'s own hwctx retry cannot see: a model like parakeet
+/// LOADS successfully and opens some kernels lazily on its first REQUEST, so the exhaustion only
+/// shows up here, inside `run`. Stops -- returning the failing attempt -- at the first
+/// non-exhaustion error, at `EvictPolicy::None`, or once no evictable victim remains; the caller
+/// condemns `name` on that final error exactly as it always has.
+fn run_named_evicting(cfg: &Config, reg: &mut Registry, loader: &dyn ModelLoader, cap: Capability,
+                      want: Option<&str>, mut name: String, req: Request, cancel: npu_engine::Cancel,
+                      inflight: &InFlight) -> (String, Result<Response, EngineError>) {
+    let victim = |reg: &Registry, name: &str| -> Option<String> {
+        if cfg.server.evict_policy == EvictPolicy::None { return None; }
+        reg.lru_victim_except(name)
+    };
+    // A clone is made only when a retry could plausibly follow, so the common (no exhaustion) path
+    // allocates nothing extra.
+    let mut spare = victim(reg, &name).is_some().then(|| req.clone());
+    let mut req = Some(req);
+    loop {
+        let this_req = req.take().expect("a request is queued for every loop iteration");
+        inflight.set(&name, cancel.clone());
+        let out = guard(|| run_named(reg, &name, this_req, cancel.clone()))
+            .unwrap_or_else(|msg| Err(EngineError::Device(msg)));
+        let Err(e) = &out else { return (name, out) };
+        if !(condemns_model(e) && is_hwctx_exhaustion(&e.to_string())) { return (name, out); }
+        let (Some(v), Some(next_req)) = (victim(reg, &name), spare.take()) else { return (name, out); };
+        reg.mark_failed(&name, &e.to_string());
+        eprintln!("[npu-runtime] {name} FAILED serving {cap}: {e}");
+        reg.release(&v, &format!("evicted for {name}: hardware contexts"), UnloadReason::Evicted);
+        match guard(|| serve_ready(cfg, reg, loader, cap, want))
+            .unwrap_or_else(|msg| Err(EngineError::Device(msg))) {
+            Err(e2) => return (name, Err(e2)),
+            Ok(new_name) => {
+                name = new_name;
+                spare = victim(reg, &name).is_some().then(|| next_req.clone());
+                req = Some(next_req);
+            }
+        }
+    }
+}
+
 fn run_generate(reg: &mut Registry, name: &str, prompt: &Prompt, params: &GenerateParams,
                 sink: &mut dyn FnMut(Chunk<'_>) -> bool) -> Result<(), EngineError> {
     let m = reg.get_loaded_mut(name).ok_or_else(|| EngineError::Load(format!("{name} not loaded")))?;
@@ -772,8 +815,10 @@ mod tests {
     use super::*;
     use crate::config::{Defaults, ModelCfg, ServerCfg};
     use crate::loader::mock::MockLoader;
+    use crate::loader::{Servable, StreamServable};
     use crate::registry::LoadState;
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
     const MB: u64 = 1024 * 1024;
@@ -1035,6 +1080,177 @@ mod tests {
         let s = h.status().into_iter().find(|s| s.name == "asr").expect("entry");
         assert_eq!(s.state, LoadState::Failed, "the model must not look healthy");
         assert!(s.detail.contains("boom"), "the panic message is the cause: {}", s.detail);
+        h.shutdown(); j.join().unwrap();
+    }
+
+    const CREATE_HWCTX_EINVAL: &str =
+        "DRM_IOCTL_AMDXDNA_CREATE_HWCTX IOCTL failed (err=-22): Invalid argument";
+
+    /// Parakeet's shape: the LOAD always succeeds, but the first `fails` calls to `run` fail with
+    /// the driver's context-exhaustion text, standing in for kernels opened lazily on first
+    /// dispatch. The budget lives on the LOADER (shared via `Arc`, decremented on every `run`
+    /// regardless of which model instance), not on a model instance -- `mark_failed` drops the
+    /// instance and a retry loads a fresh one, so instance-local state would silently reset.
+    struct HwctxOnRunModel { inner: Box<dyn StreamServable>, fails: Arc<AtomicU32> }
+    impl Servable for HwctxOnRunModel {
+        fn capabilities(&self) -> Capability { self.inner.capabilities() }
+        fn footprint(&self) -> u64 { self.inner.footprint() }
+        fn run(&mut self, req: Request) -> Result<Response, EngineError> {
+            let left = self.fails.load(Ordering::SeqCst);
+            if left > 0 {
+                self.fails.store(left - 1, Ordering::SeqCst);
+                return Err(EngineError::Device(CREATE_HWCTX_EINVAL.to_string()));
+            }
+            self.inner.run(req)
+        }
+    }
+    impl StreamServable for HwctxOnRunModel {}
+    struct HwctxOnRunLoader { inner: MockLoader, target: String, fails: Arc<AtomicU32> }
+    impl ModelLoader for HwctxOnRunLoader {
+        fn load(&self, cfg: &ModelCfg) -> Result<Box<dyn StreamServable>, EngineError> {
+            let m = self.inner.load(cfg)?;
+            if cfg.name == self.target {
+                Ok(Box::new(HwctxOnRunModel { inner: m, fails: self.fails.clone() }))
+            } else {
+                Ok(m)
+            }
+        }
+        fn declared_capability(&self, cfg: &ModelCfg) -> Option<Capability> { self.inner.declared_capability(cfg) }
+        fn declared_footprint(&self, cfg: &ModelCfg) -> Option<u64> { self.inner.declared_footprint(cfg) }
+    }
+
+    #[test]
+    fn a_one_shot_request_exhausting_hwctx_evicts_the_lru_other_model_and_retries() {
+        let mut t = BTreeMap::new();
+        t.insert("target".to_string(), Ok((Capability::ASR, MB)));
+        t.insert("o1".to_string(), Ok((Capability::EMBED, MB)));
+        t.insert("o2".to_string(), Ok((Capability::EMBED, MB)));
+        let l = HwctxOnRunLoader { inner: MockLoader { table: t }, target: "target".into(),
+                                   fails: Arc::new(AtomicU32::new(1)) };
+        let cfg = Config {
+            server: ServerCfg { memory_ceiling_mb: 100, idle_unload_s: 0, ..Default::default() },
+            defaults: Defaults::from_pairs([(Capability::ASR, "target".to_string())]),
+            models: vec![
+                ModelCfg { name: "target".into(), scenario: "x".into(), resident: false },
+                ModelCfg { name: "o1".into(), scenario: "x".into(), resident: false },
+                ModelCfg { name: "o2".into(), scenario: "x".into(), resident: false },
+            ],
+        };
+        let (h, j) = start_lazy(cfg, Box::new(l)).unwrap();
+        // o1 before o2, so o1 is the colder of the two -- the one eviction must pick.
+        h.load("o1").unwrap();
+        h.load("o2").unwrap();
+        let tr = h.transcribe(None, vec![0i16; 4], 16_000).unwrap();
+        assert_eq!((tr.model.as_str(), tr.value.as_str()), ("target", "mock-text"),
+            "the retried request must still land on the model that asked for it");
+        assert_eq!(state_of(&h, "target"), LoadState::Loaded, "the reload after eviction must have succeeded");
+        let o1 = h.status().into_iter().find(|s| s.name == "o1").unwrap();
+        assert_eq!(o1.state, LoadState::Unloaded, "o1 is the LRU and must be the one evicted");
+        assert!(o1.detail.contains("evicted for target: hardware contexts"), "{}", o1.detail);
+        assert_eq!(state_of(&h, "o2"), LoadState::Loaded, "o2 is more recently used and must survive");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn hwctx_exhaustion_with_only_a_pinned_other_resident_fails_without_touching_the_pin() {
+        let mut t = BTreeMap::new();
+        t.insert("target".to_string(), Ok((Capability::ASR, MB)));
+        t.insert("p".to_string(), Ok((Capability::EMBED, MB)));
+        let l = HwctxOnRunLoader { inner: MockLoader { table: t }, target: "target".into(),
+                                   fails: Arc::new(AtomicU32::new(1)) };
+        let cfg = Config {
+            server: ServerCfg { memory_ceiling_mb: 100, idle_unload_s: 0, ..Default::default() },
+            defaults: Defaults::from_pairs([(Capability::ASR, "target".to_string())]),
+            models: vec![
+                ModelCfg { name: "target".into(), scenario: "x".into(), resident: false },
+                ModelCfg { name: "p".into(), scenario: "x".into(), resident: true },
+            ],
+        };
+        let (h, j) = start_lazy(cfg, Box::new(l)).unwrap();
+        h.load("p").unwrap(); // pinned, so the load itself honours the pin
+        let e = match h.transcribe(None, vec![0i16; 4], 16_000) {
+            Err(e) => e.to_string(),
+            Ok(s) => panic!("served {}", s.model),
+        };
+        assert!(e.contains("CREATE_HWCTX"), "{e}");
+        assert_eq!(state_of(&h, "p"), LoadState::Loaded, "an honoured pin must never be the victim");
+        assert_eq!(state_of(&h, "target"), LoadState::Failed, "with no victim, the failure condemns as before");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// A model whose `run` always fails with an ordinary device error -- not the driver's
+    /// context-exhaustion text -- so the retry path must never engage.
+    struct AlwaysDeviceErrorModel;
+    impl Servable for AlwaysDeviceErrorModel {
+        fn capabilities(&self) -> Capability { Capability::ASR }
+        fn run(&mut self, _req: Request) -> Result<Response, EngineError> {
+            Err(EngineError::Device("some other device failure".into()))
+        }
+    }
+    impl StreamServable for AlwaysDeviceErrorModel {}
+    struct AlwaysDeviceErrorLoader { target: String, inner: MockLoader }
+    impl ModelLoader for AlwaysDeviceErrorLoader {
+        fn load(&self, cfg: &ModelCfg) -> Result<Box<dyn StreamServable>, EngineError> {
+            if cfg.name == self.target { Ok(Box::new(AlwaysDeviceErrorModel)) } else { self.inner.load(cfg) }
+        }
+        fn declared_capability(&self, cfg: &ModelCfg) -> Option<Capability> { self.inner.declared_capability(cfg) }
+        fn declared_footprint(&self, cfg: &ModelCfg) -> Option<u64> { self.inner.declared_footprint(cfg) }
+    }
+
+    #[test]
+    fn a_non_hwctx_device_error_does_not_evict_anything() {
+        let mut t = BTreeMap::new();
+        t.insert("o1".to_string(), Ok((Capability::EMBED, MB)));
+        t.insert("o2".to_string(), Ok((Capability::EMBED, MB)));
+        let l = AlwaysDeviceErrorLoader { target: "target".into(), inner: MockLoader { table: t } };
+        let cfg = Config {
+            server: ServerCfg { memory_ceiling_mb: 100, idle_unload_s: 0, ..Default::default() },
+            defaults: Defaults::from_pairs([(Capability::ASR, "target".to_string())]),
+            models: vec![
+                ModelCfg { name: "target".into(), scenario: "x".into(), resident: false },
+                ModelCfg { name: "o1".into(), scenario: "x".into(), resident: false },
+                ModelCfg { name: "o2".into(), scenario: "x".into(), resident: false },
+            ],
+        };
+        let (h, j) = start_lazy(cfg, Box::new(l)).unwrap();
+        h.load("o1").unwrap();
+        h.load("o2").unwrap();
+        let e = match h.transcribe(None, vec![0i16; 4], 16_000) {
+            Err(e) => e.to_string(),
+            Ok(s) => panic!("served {}", s.model),
+        };
+        assert!(e.contains("some other device failure"), "{e}");
+        assert_eq!(state_of(&h, "o1"), LoadState::Loaded, "a non-exhaustion failure must not evict anything");
+        assert_eq!(state_of(&h, "o2"), LoadState::Loaded);
+        assert_eq!(state_of(&h, "target"), LoadState::Failed);
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn evict_policy_none_leaves_hwctx_exhaustion_unretried() {
+        let mut t = BTreeMap::new();
+        t.insert("target".to_string(), Ok((Capability::ASR, MB)));
+        t.insert("o1".to_string(), Ok((Capability::EMBED, MB)));
+        let l = HwctxOnRunLoader { inner: MockLoader { table: t }, target: "target".into(),
+                                   fails: Arc::new(AtomicU32::new(1)) };
+        let cfg = Config {
+            server: ServerCfg { memory_ceiling_mb: 100, idle_unload_s: 0,
+                                evict_policy: EvictPolicy::None, ..Default::default() },
+            defaults: Defaults::from_pairs([(Capability::ASR, "target".to_string())]),
+            models: vec![
+                ModelCfg { name: "target".into(), scenario: "x".into(), resident: false },
+                ModelCfg { name: "o1".into(), scenario: "x".into(), resident: false },
+            ],
+        };
+        let (h, j) = start_lazy(cfg, Box::new(l)).unwrap();
+        h.load("o1").unwrap();
+        let e = match h.transcribe(None, vec![0i16; 4], 16_000) {
+            Err(e) => e.to_string(),
+            Ok(s) => panic!("served {}", s.model),
+        };
+        assert!(e.contains("CREATE_HWCTX"), "{e}");
+        assert_eq!(state_of(&h, "o1"), LoadState::Loaded, "evict_policy = none must not evict o1 either");
+        assert_eq!(state_of(&h, "target"), LoadState::Failed);
         h.shutdown(); j.join().unwrap();
     }
 }

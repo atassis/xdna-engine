@@ -76,7 +76,7 @@ impl Capability {
 /// `EmbedPipeline` and `SrEngine`; `Audio` from wiring the shipped ASR models onto this trait --
 /// `Text` cannot carry PCM. Note `Text` serves three capabilities (embed, generate, tts): the enum
 /// discriminates SHAPES, not capabilities, so a new capability that reuses a shape costs nothing.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Request {
     /// `EmbedPipeline`/`EsmEmbedPipeline`'s shape: one string in.
     Text(String),

@@ -416,8 +416,18 @@ impl Registry {
     /// invariant is currently protecting is not a pin if LRU can still evict it. An over-budget pin
     /// -- `pinned` true, `pin_honored` false -- IS a candidate: the invariant already refused to
     /// protect it, so ordinary LRU pressure is free to reclaim it like any unpinned model.
-    pub fn lru_victim(&self) -> Option<String> {
-        self.entries.iter().filter(|e| e.model.is_some() && !e.pin_honored)
+    pub fn lru_victim(&self) -> Option<String> { self.lru_victim_filtered(None) }
+
+    /// `lru_victim`, excluding `name` itself. For the one-shot serve path: a model whose LOAD
+    /// succeeded but whose first REQUEST exhausted hardware contexts (parakeet's lazily-opened
+    /// kernels) must evict some OTHER resident model, never itself.
+    pub fn lru_victim_except(&self, name: &str) -> Option<String> {
+        self.lru_victim_filtered(Some(name))
+    }
+
+    fn lru_victim_filtered(&self, exclude: Option<&str>) -> Option<String> {
+        self.entries.iter()
+            .filter(|e| e.model.is_some() && !e.pin_honored && exclude != Some(e.cfg.name.as_str()))
             .min_by_key(|e| e.last_used).map(|e| e.cfg.name.clone())
     }
 
@@ -840,6 +850,29 @@ mod tests {
         let mut r = Registry::default();
         r.try_load(&pinned("a"), &l, &srv, Instant::now());
         assert_eq!(r.lru_victim(), None, "a pin-only registry offers no victim");
+    }
+    #[test]
+    fn lru_victim_except_excludes_the_named_model_even_when_it_is_the_lru() {
+        let l = loader(&["a", "b", "c"]);
+        let srv = ceiling_mb(10);
+        let mut r = Registry::default();
+        let t0 = Instant::now();
+        r.try_load(&cfg("a"), &l, &srv, t0);
+        r.try_load(&cfg("b"), &l, &srv, t0 + Duration::from_secs(1));
+        r.try_load(&cfg("c"), &l, &srv, t0 + Duration::from_secs(2));
+        // "a" is the LRU overall, but it must never be its own victim.
+        assert_eq!(r.lru_victim(), Some("a".to_string()));
+        assert_eq!(r.lru_victim_except("a"), Some("b".to_string()));
+    }
+    #[test]
+    fn lru_victim_except_is_none_when_the_only_other_resident_is_pinned() {
+        let l = loader(&["a", "p"]);
+        let srv = ceiling_mb(10);
+        let mut r = Registry::default();
+        let t0 = Instant::now();
+        r.try_load(&pinned("p"), &l, &srv, t0);
+        r.try_load(&cfg("a"), &l, &srv, t0 + Duration::from_secs(1));
+        assert_eq!(r.lru_victim_except("a"), None, "the only other resident model is an honoured pin");
     }
     #[test]
     fn ensure_resident_evicts_the_lru_not_just_anyone() {
