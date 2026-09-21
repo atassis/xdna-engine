@@ -246,10 +246,8 @@ fn op_k(op: &Op) -> usize {
 // real (Kf=Cin*k*k <= 576, Cout <= 256) up to the kernel dims, so we build ONE xclbin, not four. Per
 // conv: host im2col -> C[M,Cout] = A[M,Kf] @ B[Kf,Cout] (+bias, +relu). M (=H*W) is tiled to PAD_M=512.
 //
-// Requires the whole_array xclbin + insts at:
-//   mlir-aie/programming_examples/basic/matrix_multiplication/whole_array/build/
-//     final_512x576x256_32x32x32_8c.xclbin  +  insts_512x576x256_32x32x32_8c.txt
-// built via `make M=512 K=576 N=256 n_aie_cols=8` under the fork toolchain (insts .bin copied to .txt).
+// Requires final_512x576x256_32x32x32_8c.xclbin + its insts in the whole_array dir; the kernel is
+// declared in declared_kernels.json, so `npu-dev kernels-build` (run by install.sh) builds it.
 mod npu_backend {
     use super::{ConvW, Feat};
     use crate::SrError;
@@ -287,12 +285,7 @@ mod npu_backend {
             let kernel = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 NativeKernel::load(&dev, wa, KERNEL_K, KERNEL_N, TILE)
             }))
-            .map_err(|_| {
-                SrError::Device(format!(
-                    "load whole_array xclbin from {} (need final_{PAD_M}x{KERNEL_K}x{KERNEL_N}_{TILE}_8c.xclbin + insts .txt)",
-                    wa.display()
-                ))
-            })?;
+            .map_err(|p| super::kernel_load_error(wa, p.as_ref()))?;
             let mut built = Vec::new();
             for cw in convs {
                 let kf = cw.cin * cw.k * cw.k;
@@ -389,9 +382,27 @@ mod npu_backend {
     }
 }
 
+/// A caught `NativeKernel::load` panic as an error that keeps the driver's text: the service
+/// evicts and retries only when it can read `CREATE_HWCTX` in a load failure.
+fn kernel_load_error(dir: &std::path::Path, payload: &(dyn std::any::Any + Send)) -> SrError {
+    let why = payload.downcast_ref::<String>().map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("panicked with no message");
+    SrError::Device(format!("load whole_array kernel from {}: {why}", dir.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_kernel_load_panic_keeps_the_drivers_text() {
+        let why = "load_kernel(k.xclbin): DRM_IOCTL_AMDXDNA_CREATE_HWCTX IOCTL failed (err=-22): Invalid argument";
+        let e = kernel_load_error(std::path::Path::new("/wa"), &why.to_string());
+        assert!(e.to_string().contains(why), "{e}");
+        let e = kernel_load_error(std::path::Path::new("/wa"), &"static text");
+        assert!(e.to_string().contains("static text"), "{e}");
+    }
 
     #[test]
     fn pixel_shuffle_crd_order() {
