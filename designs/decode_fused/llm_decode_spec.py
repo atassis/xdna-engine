@@ -456,6 +456,25 @@ class LlmSpec:
     # device the right logits and the host the wrong embeddings. See head_weight_name().
     tied_embeddings: bool = True
 
+    # ---- Qwen3.5 axes (hybrid linear attention), read off transformers/models/qwen3_5 ----
+    # The token mixer per layer: "full_attention" or "linear_attention" (Gated DeltaNet). None means
+    # every layer is full attention. A different OP SEQUENCE per layer, not a different geometry --
+    # which is why it is its own axis and not another head_dim_for().
+    mixer_types: tuple[str, ...] | None = None
+    # Gated DeltaNet geometry: key heads, value heads (each key head serves lin_v_heads/lin_k_heads
+    # of them), one head dim for keys and values, and the short causal conv's taps.
+    lin_k_heads: int = 0
+    lin_v_heads: int = 0
+    lin_head_dim: int = 0
+    lin_conv_taps: int = 0
+    # q_proj emits [q | gate] per head and the attention output is multiplied by sigmoid(gate)
+    # before o_proj.
+    attn_output_gate: bool = False
+    # ORDINARY partial rotary: RoPE on the first rope_rotary_dim dims of each head, split at their
+    # own half-point, the rest passed through. Not rope_partial_rotary, which is Gemma-4's
+    # proportional convention (full width, exponent over head_dim) and would be silently wrong here.
+    rope_rotary_dim: int | None = None
+
     # ---- derived ----
     def head_weight_name(self) -> str:
         """The dump key the LM head's weights come from.
@@ -494,6 +513,9 @@ class LlmSpec:
     def geometry_is_uniform(self) -> bool:
         """True when every layer shares one head_dim and one n_kv_heads."""
         return self.global_head_dim is None and self.global_n_kv_heads is None
+
+    def mixer_for(self, layer_idx: int) -> str:
+        return "full_attention" if self.mixer_types is None else self.mixer_types[layer_idx]
 
     def head_dim_for(self, layer_idx: int) -> int:
         if self.global_head_dim is not None and self.is_global(layer_idx):
@@ -552,6 +574,15 @@ class LlmSpec:
         #     exponent by head_dim rather than by the rotated width (which is what distinguishes it
         #     from ordinary partial rotary). Gated against transformers' own rotary embedding.
         #   logit softcap -- host-side: tanh(logits/c)*c after readback, no dispatch.
+        if self.mixer_types is not None and "linear_attention" in self.mixer_types:
+            gaps.append("linear_attention (Gated DeltaNet): the generator emits only softmax-attention "
+                        "layers, so these layers would build as attention over weights that do not exist")
+        if self.attn_output_gate:
+            gaps.append("attn_output_gate: q_proj's per-head gate half would be read as query heads and "
+                        "the sigmoid(gate) multiply never applied")
+        if self.rope_rotary_dim is not None:
+            gaps.append("rope_rotary_dim: the host writes full-width or proportional RoPE rows, so the "
+                        "rotated slice and its frequencies would both be wrong")
         return gaps
 
     def softmax_cols(self, cap: int) -> int:
@@ -936,7 +967,24 @@ S1_MINI_FAST_AR = LlmSpec(
     tied_embeddings=False,
 )
 
-SPECS = {s.name: s for s in (GEMMA3_270M, QWEN3_0_6B, GEMMA4_12B, S2_PRO_SLOW_AR,
+# Qwen3.5-4B (Qwen/Qwen3.5-4B @851bf6e8, the text path of Qwen3_5ForConditionalGeneration). Every
+# axis read off its config.json and transformers 5.17's modeling_qwen3_5.py, and the forward checked
+# by scripts/qwen35_ref.py against HF at rel-L2 7.4e-07. Norms are zero-centred (1 + w) everywhere
+# but the DeltaNet output norm, which is plain w and is loaded by name, not through norm_gain. mrope
+# collapses to 1-D RoPE for text.
+QWEN35_4B = LlmSpec(
+    name="qwen3.5-4b", d_model=2560, n_layers=32, n_q_heads=16, n_kv_heads=4, head_dim=256,
+    ffn=9216, vocab=248320, eps=1e-6, act="silu", norm_gain="one_plus_w",
+    sandwich_norms=False, qk_norm=True, embed_scale="none",
+    rope_theta_global=10_000_000.0, rope_theta_local=None,
+    sliding_window=None, sw_pattern=None, query_pre_attn_scalar=None,
+    weight_prefix="model.language_model.",
+    mixer_types=(("linear_attention",) * 3 + ("full_attention",)) * 8,
+    lin_k_heads=16, lin_v_heads=32, lin_head_dim=128, lin_conv_taps=4,
+    attn_output_gate=True, rope_rotary_dim=64,
+)
+
+SPECS = {s.name: s for s in (GEMMA3_270M, QWEN3_0_6B, GEMMA4_12B, QWEN35_4B, S2_PRO_SLOW_AR,
                              S1_MINI_SLOW_AR, S1_MINI_FAST_AR)}
 
 
