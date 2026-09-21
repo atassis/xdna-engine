@@ -64,3 +64,14 @@ def test_global_flash_matches_full_attention(base):
     out = flash_attention(q, k, v, vis, scale, b_kv=B_KV)
     assert np.isfinite(out).all()
     assert rel_l2(out, full_attention(q, k, v, vis, scale)) < TOL
+
+
+@pytest.mark.parametrize("base", [0, 512, 1536, 2048])
+def test_sliding_flash_matches_full_attention(base):
+    hd, grp = 256, 2
+    q, k, v = qkv(100 + base, grp * M, RING + M, hd)
+    vis = sliding_visible(base, grp)
+    scale = 1.0 / np.sqrt(hd)
+    out = flash_attention(q, k, v, vis, scale, b_kv=B_KV)
+    assert np.isfinite(out).all()
+    assert rel_l2(out, full_attention(q, k, v, vis, scale)) < TOL
