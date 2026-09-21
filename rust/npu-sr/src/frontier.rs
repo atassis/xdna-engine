@@ -328,33 +328,38 @@ mod npu_backend {
             relu: bool,
         ) -> Result<Feat, SrError> {
             let (cin, h, w) = (x.c, x.h, x.w);
-            let kf = cin * k * k;
-            let m = h * w;
-            let at = |c: usize, yy: isize, xx: isize| -> f32 {
-                if yy < 0 || xx < 0 || yy as usize >= h || xx as usize >= w {
-                    0.0
-                } else {
-                    x.data[c * h * w + yy as usize * w + xx as usize]
-                }
-            };
+            let (kf, kk, hw) = (cin * k * k, k * k, h * w);
             let chunks = &self.convs[idx];
-            let mut out = vec![0f32; cw.cout * h * w];
+            let mut out = vec![0f32; cw.cout * hw];
             // Tile M into chunks of PAD_M (frames > 512 px); N-tile Cout into the weight chunks.
             let mut p0 = 0usize;
-            while p0 < m {
-                let rows = (m - p0).min(PAD_M);
+            while p0 < hw {
+                let rows = (hw - p0).min(PAD_M);
+                // im2col: row r holds pixel p0+r's k x k window per input channel, zero outside the
+                // frame; interior windows are slice copies.
                 let mut a = Array2::<f32>::zeros((rows, kf));
-                for r in 0..rows {
-                    let p = p0 + r;
-                    let (oy, ox) = (p / w, p % w);
+                let a_s = a.as_slice_mut().expect("a fresh Array2 is contiguous");
+                for (r, dst) in a_s.chunks_mut(kf).enumerate() {
+                    let (oy, ox) = ((p0 + r) / w, (p0 + r) % w);
+                    let x0 = ox as isize - pad as isize;
                     for ic in 0..cin {
+                        let plane = &x.data[ic * hw..(ic + 1) * hw];
                         for ky in 0..k {
-                            for kx in 0..k {
-                                a[[r, ic * (k * k) + ky * k + kx]] = at(
-                                    ic,
-                                    oy as isize + ky as isize - pad as isize,
-                                    ox as isize + kx as isize - pad as isize,
-                                );
+                            let yy = oy as isize + ky as isize - pad as isize;
+                            if yy < 0 || yy as usize >= h {
+                                continue;
+                            }
+                            let src = &plane[yy as usize * w..(yy as usize + 1) * w];
+                            let d = &mut dst[ic * kk + ky * k..ic * kk + ky * k + k];
+                            if x0 >= 0 && x0 as usize + k <= w {
+                                d.copy_from_slice(&src[x0 as usize..x0 as usize + k]);
+                            } else {
+                                for (kx, dv) in d.iter_mut().enumerate() {
+                                    let xx = x0 + kx as isize;
+                                    if xx >= 0 && (xx as usize) < w {
+                                        *dv = src[xx as usize];
+                                    }
+                                }
                             }
                         }
                     }
@@ -362,11 +367,12 @@ mod npu_backend {
                 for ch in chunks {
                     let bias = &cw.b[ch.off..ch.off + ch.cols];
                     let c = self.kernel.matmul(&ch.weight, &a, ch.cols, Some(bias)); // [rows, cols]
-                    for r in 0..rows {
-                        let p = p0 + r;
-                        for j in 0..ch.cols {
+                    // Column-outer: each output channel's plane is written contiguously.
+                    for j in 0..ch.cols {
+                        let plane = &mut out[(ch.off + j) * hw + p0..(ch.off + j) * hw + p0 + rows];
+                        for (r, o) in plane.iter_mut().enumerate() {
                             let v = c[[r, j]];
-                            out[(ch.off + j) * h * w + p] = if relu { v.max(0.0) } else { v };
+                            *o = if relu { v.max(0.0) } else { v };
                         }
                     }
                 }
