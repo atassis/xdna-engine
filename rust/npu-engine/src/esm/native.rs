@@ -119,17 +119,24 @@ impl NativeKernel {
         self.bo_a.sync_to_device().unwrap();
         self.kern.run_matmul8(3, &self.instr, self.n_instr, &self.bo_a, &w.bo_b, &self.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
         self.bo_c.sync_from_device().unwrap();
-        let mut cf = vec![0f32; PAD_M * self.n];
-        let dst = unsafe { std::slice::from_raw_parts_mut(cf.as_mut_ptr() as *mut u8, PAD_M * self.n * 4) };
-        self.bo_c.read_bytes(dst).unwrap();
-        let mut out = Array2::<f32>::zeros((mp, n_out));
-        for r in 0..mp {
-            for c in 0..n_out {
-                let v = cf[r * self.n + c];
-                out[[r, c]] = if let Some(b) = bias { v + b[c] } else { v };
+        // Only the `mp` x `n_out` corner: reads from this BO's mapping ran at ~0.3 GB/s (ESPCN,
+        // 2026-09-22), so the padded rows and columns cost more than the GEMM. Whole rows are one
+        // read; a narrower corner is one read per row.
+        let mut cf = vec![0f32; mp * n_out];
+        let bytes = |v: &mut [f32]| unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, v.len() * 4) };
+        if n_out == self.n {
+            self.bo_c.read_bytes(bytes(&mut cf)).unwrap();
+        } else {
+            for (r, row) in cf.chunks_mut(n_out).enumerate() {
+                self.bo_c.read_bytes_at(r * self.n * 4, bytes(row)).unwrap();
             }
         }
-        out
+        if let Some(b) = bias {
+            for row in cf.chunks_mut(n_out) {
+                row.iter_mut().zip(b).for_each(|(v, b)| *v += b);
+            }
+        }
+        Array2::from_shape_vec((mp, n_out), cf).unwrap()
     }
 }
 

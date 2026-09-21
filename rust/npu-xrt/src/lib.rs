@@ -1610,7 +1610,12 @@ impl Bo {
     }
 
     pub fn read_bytes(&self, out: &mut [u8]) -> Result<()> {
-        let r = unsafe { shim_bo_read(self.ptr, out.as_mut_ptr() as *mut c_void, out.len(), 0) };
+        self.read_bytes_at(0, out)
+    }
+
+    /// Read `out.len()` bytes starting `offset` bytes into the BO.
+    pub fn read_bytes_at(&self, offset: usize, out: &mut [u8]) -> Result<()> {
+        let r = unsafe { shim_bo_read(self.ptr, out.as_mut_ptr() as *mut c_void, out.len(), offset) };
         if r != 0 {
             Err(format!("bo_read: {}", last_error()))
         } else {
