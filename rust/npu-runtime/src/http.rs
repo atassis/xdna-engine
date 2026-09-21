@@ -253,6 +253,7 @@ pub fn route(req: &Request, handle: &Handle, cfg_path: &Path) -> Response {
         ("POST", "/v1/chat/completions") => chat_completions(req, handle),
         ("POST", "/v1/completions") => completions(req, handle),
         ("POST", "/v1/embeddings") => embeddings(req, handle),
+        ("POST", "/v1/systemone") => systemone(req, handle),
         // The Ollama surface. Same models, same engine -- a second wire, because OpenAI's has no
         // field for a capability or a context length and every client therefore asks the user.
         ("GET", "/api/version") => (200, crate::ollama::version_json().into()),
@@ -569,6 +570,80 @@ fn audio_speech(req: &Request, handle: &Handle) -> Response {
 /// `reject_unsupported_speech_fields` lets `response_format` resolve to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpeechFormat { Wav, Pcm }
+
+/// TypeSafe's `/v1/systemone`: typed questions over one `state`, answered off a generate model's
+/// next-token logits (npu_engine::decide). Questions keep their request order, which is why the
+/// body is parsed with serde_json's preserve_order rather than the field extractors above.
+fn systemone(req: &Request, handle: &Handle) -> Response {
+    let bad = |m: String| -> Response { (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&m)).into()) };
+    let body: serde_json::Value = match serde_json::from_slice(&req.body) {
+        Ok(v) => v,
+        Err(e) => return bad(format!("body is not JSON: {e}")),
+    };
+    let decide = match parse_systemone(&body) {
+        Ok(d) => d,
+        Err(m) => return bad(m),
+    };
+    let model = body.get("model").and_then(|v| v.as_str());
+    let served = match handle.serve(Capability::GENERATE, model, EngineReq::Decide(decide)) {
+        Ok(s) => s,
+        Err(e) => return engine_err(&e),
+    };
+    let answers = match served.value {
+        EngineResp::Decisions(a) => a,
+        other => return engine_err(&npu_engine::EngineError::Device(format!(
+            "decide returned a {} response", other.shape()))),
+    };
+    let mut out = serde_json::Map::new();
+    for a in answers {
+        let (id, v) = match a {
+            npu_engine::DecideAnswer::Noul { id, p_true } => (id, serde_json::json!({"noul": p_true})),
+            npu_engine::DecideAnswer::Choice { id, choice, probabilities, confidence } => {
+                let p: serde_json::Map<String, serde_json::Value> =
+                    probabilities.into_iter().map(|(k, p)| (k, p.into())).collect();
+                (id, serde_json::json!({"choice": choice, "probabilities": p, "confidence": confidence}))
+            }
+            npu_engine::DecideAnswer::Score { id, score, probabilities, confidence } =>
+                (id, serde_json::json!({"score": score, "probabilities": probabilities, "confidence": confidence})),
+        };
+        out.insert(id, v);
+    }
+    (200, serde_json::json!({"model": served.model, "answers": out}).to_string().into())
+}
+
+fn parse_systemone(body: &serde_json::Value) -> Result<npu_engine::DecideRequest, String> {
+    use npu_engine::DecideQuestion;
+    let evidence = body.get("state").cloned().ok_or("missing `state`")?;
+    let qs = body.get("questions").and_then(|v| v.as_object()).ok_or("`questions` must be an object")?;
+    if qs.is_empty() {
+        return Err("`questions` is empty".into());
+    }
+    let text = |v: &serde_json::Value| v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string());
+    let mut questions = Vec::with_capacity(qs.len());
+    for (id, q) in qs {
+        let kind = q.get("type").and_then(|v| v.as_str()).ok_or(format!("question `{id}` has no `type`"))?;
+        let instr = q.get("instructions").map(text).ok_or(format!("question `{id}` has no `instructions`"))?;
+        let crit = q.get("criteria");
+        let question = match kind {
+            "noul" | "boolean" => {
+                let side = |k: &str| crit.and_then(|c| c.get(k)).map(text);
+                DecideQuestion::noul(id, &instr, side("true").as_deref(), side("false").as_deref())
+            }
+            "choice" => {
+                let c = crit.and_then(|c| c.as_object()).ok_or(format!("choice `{id}` needs a criteria object"))?;
+                DecideQuestion::choice(id, &instr, c.iter().map(|(k, v)| (k.clone(), text(v))).collect())
+            }
+            "score" => {
+                let c = crit.and_then(|c| c.as_array()).ok_or(format!("score `{id}` needs a criteria array"))?;
+                DecideQuestion::score(id, &instr, c.iter().map(text).collect())
+            }
+            other => return Err(format!("question `{id}` has unknown type `{other}`")),
+        };
+        question.validate()?;
+        questions.push(question);
+    }
+    Ok(npu_engine::DecideRequest { evidence, questions })
+}
 
 fn embeddings(req: &Request, handle: &Handle) -> Response {
     let body = String::from_utf8_lossy(&req.body).to_string();
@@ -2429,6 +2504,25 @@ pub(crate) mod generate_tests {
     use crate::config::{Config, ModelCfg, ServerCfg};
     use crate::loader::{ModelLoader, Servable, StreamServable};
     use npu_engine::capability::{Capability, Request as EngineReq, Response as EngineResp};
+
+    /// A choice's criteria are ORDERED -- their order assigns the answer letters -- so parsing must
+    /// keep the request's order, not sort it; and a request with no `state` is a 400, not a guess.
+    #[test]
+    fn systemone_keeps_choice_order_and_refuses_a_missing_state() {
+        let body = serde_json::json!({"state": "s", "questions": {
+            "q1": {"type": "choice", "instructions": "i", "criteria": {"zeta": "z", "alpha": "a", "mid": "m"}},
+            "q0": {"type": "noul", "instructions": "i"},
+            "q2": {"type": "score", "instructions": "i", "criteria": ["lo", "hi"]}}});
+        let r = parse_systemone(&body).expect("parses");
+        let keys: Vec<&str> = r.questions[0].options.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["zeta", "alpha", "mid"]);
+        assert_eq!(r.questions.iter().map(|q| q.id.as_str()).collect::<Vec<_>>(), ["q1", "q0", "q2"]);
+        assert_eq!(r.questions[1].options[0].1, "The proposition is true.");
+        assert!(parse_systemone(&serde_json::json!({"questions": {"q": {"type": "noul", "instructions": "i"}}})).is_err());
+        assert!(parse_systemone(&serde_json::json!({"state": "s", "questions": {"q": {"type": "choice",
+            "instructions": "i", "criteria": {"only": "one"}}}})).is_err(), "one option is not a choice");
+    }
+
     use npu_engine::{Chunk, FinishReason, GenerateParams, GenerateUsage, GenerationReport, Prompt,
                      StepRecord, TextGenerator};
     use npu_engine::EngineError;

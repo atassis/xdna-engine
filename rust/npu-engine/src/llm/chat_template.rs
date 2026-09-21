@@ -178,7 +178,7 @@ fn env<'a>() -> Environment<'a> {
 /// Written out rather than configured: `serde_json`'s `Formatter` cannot express this separator pair
 /// without a custom impl either way, and non-ASCII already passes through as UTF-8, which is exactly
 /// what `ensure_ascii=False` means.
-fn json_dumps_py(v: &serde_json::Value) -> String {
+pub(crate) fn json_dumps_py(v: &serde_json::Value) -> String {
     let mut s = String::new();
     write_dumps(v, &mut s);
     s
