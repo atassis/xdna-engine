@@ -945,18 +945,18 @@ impl LlmArtifact {
                     )));
                 }
             }
-            // A RoPE table's row is its OWN geometry's head_dim, not `dims.head_dim`: Gemma-4-12B
+            // A RoPE table's row is its OWN geometry's angle width, not `dims.head_dim`: Gemma-4-12B
             // rotates its global layers over 512 and its sliding ones over 256, so the two tables
-            // are different widths in one artifact. Checked against the geometries `kv_params`
-            // declares rather than against the scalar, which is only the base one.
-            let geoms: Vec<usize> = kv_offs.iter().map(|&(_, hd)| hd).collect();
+            // are different widths in one artifact, and an ordinary partial rotary (Qwen3.5) is
+            // rope_rotary_dim wide. Checked against the geometries `kv_params` declares.
             for (name, _) in &rope_inputs {
                 let Some(loc) = layout.get(name.as_str()) else { continue };
                 let row = loc.len / (batch * 2);
-                if loc.len % (batch * 2) != 0 || !geoms.contains(&row) {
+                if loc.len % (batch * 2) != 0 || !angle_widths.contains(&row) {
                     return Err(ctx(format!(
-                        "layout[{name}].len = {} is not dims.M({batch}) rows of any geometry \
-                         scratchpad.kv_params declares ({geoms:?}), in bf16",
+                        "layout[{name}].len = {} is not dims.M({batch}) rows of any geometry's angle \
+                         width ({angle_widths:?}, from scratchpad.kv_params at rope_rotary_dim \
+                         {rope_rotary_dim:?}), in bf16",
                         loc.len
                     )));
                 }
@@ -1879,6 +1879,22 @@ mod tests {
         write_meta(dir.path(), &meta);
         let err = LlmArtifact::load(dir.path()).unwrap_err().to_string();
         assert!(err.contains("recurrent buffer `S1`"), "{err}");
+    }
+
+    /// A prefill's angle table is M rows of the rotary width, which the prefill-role row check
+    /// must accept as it does for decode.
+    #[test]
+    fn a_prefill_rope_table_at_the_rotary_width_loads() {
+        let m = 2;
+        let mut meta = generator_shaped_prefill_meta(m, serde_json::json!("sm_mask"));
+        meta["layout"]["rope"]["len"] = serde_json::json!(m * 2 * 2);
+        let dir = tempfile::tempdir().unwrap();
+        write_meta(dir.path(), &meta);
+        let err = LlmArtifact::load_prefill(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("angle width"), "{err}");
+        meta["host_protocol"]["rope_rotary_dim"] = serde_json::json!(2);
+        write_meta(dir.path(), &meta);
+        LlmArtifact::load_prefill(dir.path()).expect("M rows of rope_rotary_dim load");
     }
 
     /// Ordinary partial rotary: the angle row is rope_rotary_dim wide, not head_dim, and that is
