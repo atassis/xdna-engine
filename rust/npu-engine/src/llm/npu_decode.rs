@@ -344,6 +344,16 @@ impl EmbedTable {
         Ok(Cow::Owned(pack_bf16_bytes(&v)))
     }
 
+    /// The head's own bf16 row for `token`, unscaled: the table IS the tied head (or the head's bf16
+    /// sidecar), and `row`'s embed scale belongs to the input side only.
+    pub(crate) fn head_row(&self, token: u32) -> Result<Vec<f32>, EngineError> {
+        let tok = token as usize;
+        if tok >= self.vocab {
+            return Err(EngineError::Unsupported(format!("token {tok} >= vocab {}", self.vocab)));
+        }
+        Ok(unpack_bf16_bytes(&self.map[tok * self.d_model * 2..(tok + 1) * self.d_model * 2]))
+    }
+
     /// A real (mmapped, not faked) table over `rows`, for tests that need [`EmbedTable::row`]'s
     /// actual bf16 round-trip without a full [`LlmArtifact`](crate::llm::artifact::LlmArtifact) --
     /// see `multimodal::tests` for the one that exercises the media-vs-text hook end to end.
@@ -631,6 +641,25 @@ impl NpuDecodeStep {
 }
 
 impl DecodeStep for NpuDecodeStep {
+    /// f32 logits of `ids` from the last step's final-normed hidden (`xf`) and the head's bf16 rows.
+    /// The logits buffer is bf16, which at magnitude ~25 spaces values 0.125 apart -- coarse for a
+    /// decision that reads the gap between two of them. None on an artifact that does not publish
+    /// `xf`.
+    fn option_logits(&mut self, ids: &[u32]) -> Result<Option<Vec<f32>>, EngineError> {
+        let Some(loc) = self.artifact.layout.get("xf").copied() else { return Ok(None) };
+        let mut bytes = vec![0u8; loc.len];
+        self.arena
+            .read_at(loc.arena, loc.off, &mut bytes)
+            .map_err(|e| EngineError::Device(format!("read xf: {e}")))?;
+        let xf = unpack_bf16_bytes(&bytes);
+        let mut out = ids.iter()
+            .map(|&t| self.embed.head_row(t)
+                .map(|r| r.iter().zip(&xf).map(|(a, b)| *a as f64 * *b as f64).sum::<f64>() as f32))
+            .collect::<Result<Vec<f32>, _>>()?;
+        apply_logit_softcap(&mut out, self.artifact.logit_softcap);
+        Ok(Some(out))
+    }
+
     /// The artifact's own `dims.S`. This is what makes the generator's bound real: without it the
     /// trait default is `None` and the decode loop walks `pos` past the end of the KV cache.
     fn max_context(&self) -> Option<usize> {
