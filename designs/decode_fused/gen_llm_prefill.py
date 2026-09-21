@@ -141,7 +141,11 @@ from iron.operators.dequant_rows.op import DequantRows  # noqa: E402
 # Decode's ACT_POLY, mirrored: SiLU and sigmoid in f32 polynomial math instead of the SFU tanh LUT.
 # The two halves must agree, or prefill and decode compute different activations over one cache.
 ACT_POLY = os.environ.get("ACT_POLY", "0") == "1"
-if ACT_POLY:
+# The same functions in native bf16 MACs over two-limb operands (act_poly's *Fast), prefill only.
+ACT_FAST = ACT_POLY and os.environ.get("PREFILL_ACT_FAST", "0") == "1"
+if ACT_FAST:
+    from iron.operators.act_poly.op import SiLUFast as SiLUAct, SigmoidFast as SigmoidAct  # noqa: E402
+elif ACT_POLY:
     from iron.operators.act_poly.op import SiLUPoly as SiLUAct, SigmoidPoly as SigmoidAct  # noqa: E402
 else:
     SiLUAct = SiLU
@@ -1358,9 +1362,13 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
                              f"width ({LVD}) must equal q_dim ({QD})")
         if M % GDR_T:
             raise ValueError(f"M={M} is not a whole number of GDR_T={GDR_T} delta-rule steps")
-        # The widest conv tile whose double-buffered window, output and weight tiles fit L1.
-        conv_tc = max(t for t in (32, 64, 128, 256) if (LCH // cols) % t == 0
-                      and 2 * (2 * (LTAPS - 1 + M) + LTAPS) * t * 2 <= 56 * 1024)
+        # The widest conv tile whose window, output and weight fifos fit L1, double-buffered if
+        # any tile allows it, else single (a long window: 259 rows at M=256).
+        conv_fits = [(d, t) for d in (2, 1) for t in (256, 128, 64, 32) if (LCH // cols) % t == 0
+                     and d * (2 * (LTAPS - 1 + M) + LTAPS) * t * 2 <= 56 * 1024]
+        if not conv_fits:
+            raise ValueError(f"no conv tile of a [{LTAPS - 1 + M}, t] window fits L1")
+        conv_depth, conv_tc = conv_fits[0]
         op_lqkv = gemm_for("lin_qkv", D, LCH)
         op_lz = gemm_for("lin_z", D, LVD)
         op_lab = gemm_for("lin_ab", D, LAB)
@@ -1374,6 +1382,7 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
                                   transfer_size=pick_transfer(HIST), num_aie_channels=1,
                                   input_offset_parameter="hist_off", context=ctx)
         op_conv = Conv1dStep(channels=LCH, taps=LTAPS, tokens=M, tile_channels=conv_tc,
+                             depth=conv_depth if conv_depth != 2 else None,
                              num_aie_columns=cols, context=ctx)
         op_mix_act = SiLUAct(size=M * LCH, num_aie_columns=cols, tile_size=LCH // cols,
                              context=ctx, allocation_scheme=alloc_all)
@@ -1677,7 +1686,7 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     if _dq_cache:
         name += "_dq"
     if ACT_POLY:
-        name += "_actp"
+        name += "_actf" if ACT_FAST else "_actp"
     # Both lscale arms change the RUNLIST (156 -> 93 entries/layer at M=64) while leaving every
     # other name component identical, which is the collision this block's header warns about --
     # and it bit: an A/B on 2026-09-19 compiled two arms to one md5 and measured nothing.
