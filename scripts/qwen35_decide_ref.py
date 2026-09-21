@@ -90,7 +90,7 @@ def main():
         logits = (m.final(x[-1:]) @ head.T)[0]
         probs = torch.softmax(logits, -1)
         got = answer_label(task["question"]["type"], keys, probs)
-        ok = got == task.get("expected")
+        ok = str(got) == str(task.get("expected"))
         right += ok
         rec = {"id": task["id"], "type": task["question"]["type"], "n_tokens": len(ids),
                "option_ids": keys, "option_logits": logits.tolist(), "probabilities": probs.tolist(),
