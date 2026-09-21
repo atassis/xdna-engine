@@ -7,3 +7,11 @@ name = "espcn"
 
 [artifacts]
 weights = "artifacts/espcn/espcn.json"
+# The schedule JSON's own `checkpoint` field is a path relative to the DEV CHECKOUT (where
+# `xdna-sr`/the gate tests ran from); an installed service has no checkout, so this field
+# overrides it, resolved against the ENGINE ROOT instead (EngineLoader::load, image-sr arm).
+# Bake it (host-only, no NPU): `install.sh` stages `artifacts/` into the engine root, so bake
+# under the repo's own `artifacts/` and reinstall.
+#   npu checkpoint bake --source path:artifacts/espcn/espcn_x3_dyn.onnx --arch espcn \
+#     --checkpoint artifacts/espcn/espcn.safetensors
+checkpoint = "artifacts/espcn/espcn.safetensors"

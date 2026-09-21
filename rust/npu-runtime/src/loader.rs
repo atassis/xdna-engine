@@ -154,8 +154,26 @@ impl ModelLoader for EngineLoader {
             .map_err(|e| EngineError::Load(format!("scenario {}: {e}", path.display())))?;
         if sc.scenario.kind == IMAGE_SR_KIND {
             let sched = self.root.join(&sc.artifacts.weights);
+            // The schedule JSON's own `checkpoint` field is a repo-root-relative dev path (the
+            // checkout convention `SrEngine::load` has always used); an installed service has no
+            // such checkout, so a scenario that names one explicitly gets it resolved against the
+            // ENGINE root here instead, and checked before touching a device -- a missing bake is
+            // then a named, actionable load error, not the schedule's own bare ENOENT further in.
+            let checkpoint = if sc.artifacts.checkpoint.is_empty() {
+                None
+            } else {
+                let ckpt = self.root.join(&sc.artifacts.checkpoint);
+                if !ckpt.exists() {
+                    return Err(EngineError::Load(format!(
+                        "image-sr checkpoint missing: {} -- bake it first (see the `[artifacts] \
+                         checkpoint` comment in {} for the exact `npu checkpoint bake` command)",
+                        ckpt.display(), path.display())));
+                }
+                Some(ckpt)
+            };
             let wa = npu_asr::kernel_registry::resolve_kernel_dir(&self.root, npu_dispatch::WA_SUBDIR);
-            let eng = npu_sr::SrEngine::load_with(&sched, true, Some(&wa))
+            let overrides = npu_sr::LoadOverrides { wa_dir: Some(&wa), checkpoint: checkpoint.as_deref() };
+            let eng = npu_sr::SrEngine::load_with(&sched, true, overrides)
                 .map_err(|e| EngineError::Load(e.to_string()))?;
             return Ok(Box::new(eng));
         }
@@ -191,7 +209,14 @@ impl ModelLoader for EngineLoader {
             }
             return Some(total);
         }
-        dir_or_file_size(&self.root.join(&sc.artifacts.weights))
+        // `checkpoint` is an ADDITIONAL artifact next to `weights`, not an alternative to it (see
+        // image-sr's scenario, whose `weights` is a tiny schedule JSON and whose `checkpoint` is
+        // the actual baked net) -- so this sums both when a scenario sets one, rather than picking.
+        let mut total = dir_or_file_size(&self.root.join(&sc.artifacts.weights))?;
+        if !sc.artifacts.checkpoint.is_empty() {
+            total += dir_or_file_size(&self.root.join(&sc.artifacts.checkpoint))?;
+        }
+        Some(total)
     }
 
     /// Mirrors the CLI's own `bake()`: load the scenario, resolve its declarative spec if it has
@@ -355,6 +380,18 @@ mod tests {
         assert_eq!(l.declared_footprint(&cfg()), Some(42));
     }
 
+    /// image-sr's shape: `weights` is a tiny schedule JSON, `checkpoint` is the real baked net --
+    /// an explicit `checkpoint` is summed IN ADDITION to `weights`, not instead of it.
+    #[test]
+    fn declared_footprint_sums_checkpoint_in_addition_to_weights_when_both_are_set() {
+        let dir = tempfile::tempdir().unwrap();
+        write_image_sr_scenario_with_checkpoint(dir.path(), "w.json", Some("c.safetensors"));
+        std::fs::write(dir.path().join("w.json"), vec![0u8; 7]).unwrap();
+        std::fs::write(dir.path().join("c.safetensors"), vec![0u8; 100]).unwrap();
+        let l = EngineLoader { root: dir.path().to_path_buf() };
+        assert_eq!(l.declared_footprint(&cfg()), Some(107));
+    }
+
     #[test]
     fn declared_footprint_is_none_when_the_scenario_or_weights_do_not_exist() {
         let dir = tempfile::tempdir().unwrap();
@@ -433,9 +470,23 @@ mod tests {
     }
 
     fn write_image_sr_scenario(root: &std::path::Path, weights: &str) {
+        write_image_sr_scenario_with_checkpoint(root, weights, None)
+    }
+
+    fn write_image_sr_scenario_with_checkpoint(root: &std::path::Path, weights: &str, checkpoint: Option<&str>) {
+        let ckpt_line = checkpoint.map(|c| format!("checkpoint = \"{c}\"\n")).unwrap_or_default();
         std::fs::write(root.join("scenario.toml"), format!(
-            "[scenario]\nkind = \"image-sr\"\nname = \"espcn\"\n[artifacts]\nweights = \"{weights}\"\n"
+            "[scenario]\nkind = \"image-sr\"\nname = \"espcn\"\n[artifacts]\nweights = \"{weights}\"\n{ckpt_line}"
         )).unwrap();
+    }
+
+    /// A real, minimal schedule JSON (no conv ops) at `root/rel`, so the scenario's `weights` path
+    /// resolves and `SrEngine::load_with` gets far enough to read the CHECKPOINT -- which is what
+    /// these tests are about -- before anything checks for a device.
+    fn write_espcn_schedule(root: &std::path::Path, rel: &str, checkpoint: &str) {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, format!(r#"{{"name":"espcn","scale":1,"checkpoint":"{checkpoint}","ops":[]}}"#)).unwrap();
     }
 
     #[test]
@@ -460,5 +511,57 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("no-such-schedule.json"), "{msg}");
         assert!(!msg.contains("unknown scenario kind"), "{msg}");
+    }
+
+    /// A scenario's `[artifacts] checkpoint` is resolved against the ENGINE ROOT (never the
+    /// schedule JSON's own repo-root-relative field, which has no meaning for an installed
+    /// service) and checked BEFORE `SrEngine::load_with` runs -- a missing bake is a named,
+    /// actionable error, not the schedule's own bare ENOENT several layers down.
+    #[test]
+    fn image_sr_checkpoint_override_is_resolved_against_root_and_checked_first() {
+        let dir = tempfile::tempdir().unwrap();
+        write_espcn_schedule(dir.path(), "artifacts/espcn/espcn.json", "unused.safetensors");
+        write_image_sr_scenario_with_checkpoint(
+            dir.path(), "artifacts/espcn/espcn.json", Some("artifacts/espcn/espcn.safetensors"));
+        let l = EngineLoader { root: dir.path().to_path_buf() };
+        let err = l.load(&cfg()).err().expect("a missing checkpoint must fail to load");
+        let msg = err.to_string();
+        let want = dir.path().join("artifacts/espcn/espcn.safetensors");
+        assert!(msg.contains(&want.display().to_string()), "{msg}");
+        assert!(msg.contains("bake"), "{msg}");
+        assert!(msg.contains("scenario.toml"), "names the scenario to look at: {msg}");
+    }
+
+    /// When the override file exists, it is what actually gets read -- not the schedule's own
+    /// `checkpoint` field, which this test gives an obviously-distinct sentinel value. The override
+    /// file is deliberately not a real checkpoint (no device, no real bake needed here): the parse
+    /// failure that follows still proves resolution reached the OVERRIDE path, since the sentinel
+    /// never appears in the error.
+    #[test]
+    fn image_sr_checkpoint_override_is_the_one_actually_read() {
+        let dir = tempfile::tempdir().unwrap();
+        write_espcn_schedule(dir.path(), "artifacts/espcn/espcn.json", "should-not-be-read.safetensors");
+        write_image_sr_scenario_with_checkpoint(
+            dir.path(), "artifacts/espcn/espcn.json", Some("artifacts/espcn/espcn.safetensors"));
+        let ckpt_dir = dir.path().join("artifacts/espcn");
+        std::fs::create_dir_all(&ckpt_dir).unwrap();
+        std::fs::write(ckpt_dir.join("espcn.safetensors"), b"not a real checkpoint").unwrap();
+        let l = EngineLoader { root: dir.path().to_path_buf() };
+        let err = l.load(&cfg()).err().expect("a garbage checkpoint must fail to load");
+        let msg = err.to_string();
+        assert!(!msg.contains("should-not-be-read.safetensors"), "{msg}");
+        assert!(msg.contains("espcn.safetensors"), "{msg}");
+    }
+
+    /// A scenario with no `checkpoint` field keeps today's behavior: the schedule's own field,
+    /// unresolved against root (the CWD-relative dev convention `SrEngine::load` has always used).
+    #[test]
+    fn image_sr_scenario_without_a_checkpoint_field_keeps_the_schedules_own_path() {
+        let dir = tempfile::tempdir().unwrap();
+        write_espcn_schedule(dir.path(), "artifacts/espcn/espcn.json", "schedule-owns-this.safetensors");
+        write_image_sr_scenario(dir.path(), "artifacts/espcn/espcn.json");
+        let l = EngineLoader { root: dir.path().to_path_buf() };
+        let err = l.load(&cfg()).err().expect("a missing checkpoint must fail to load");
+        assert!(err.to_string().contains("schedule-owns-this.safetensors"), "{err}");
     }
 }

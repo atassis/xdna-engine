@@ -143,6 +143,15 @@ size-optimized for these shapes," so reported per-frame latency is a correctness
 baseline, not a real-time figure -- real-time playback is "measured as headroom, not
 shipped in v1."
 
+The ESPCN checkpoint is not staged by default: `artifacts/` is untracked except the
+schedule JSONs, and the schedule's own `checkpoint` field is a dev-checkout-relative path
+that has no meaning for an installed service (`scenarios/upscale-espcn.toml`'s
+`[artifacts] checkpoint` overrides it, resolved against the engine root instead -- a
+missing bake is a named `EngineLoader::load` error, not a bare ENOENT). Bake it, host-only
+(`npu-weights` has no NPU dependency), then reinstall so `artifacts/` gets staged:
+`npu checkpoint bake --source path:artifacts/espcn/espcn_x3_dyn.onnx --arch espcn
+--checkpoint artifacts/espcn/espcn.safetensors`.
+
 ## Diarization
 
 | Model | Status | Evidence |

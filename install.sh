@@ -722,8 +722,25 @@ while IFS= read -r scen; do
   [ -n "$kind" ] || die "scenario has no [scenario].kind: $scen_abs"
   if [ -n "$wdir" ]; then
     case "$wdir" in /*) wabs="$wdir" ;; *) wabs="$ENGINE_ROOT/$wdir" ;; esac
-    [ -d "$wabs" ] && [ -n "$(ls -A "$wabs" 2>/dev/null)" ] \
-      || die "scenario '$scen_abs' points at missing/empty weights: $wabs"
+    # `weights` is a non-empty DIRECTORY for every scenario kind but one: image-sr points it at a
+    # single schedule JSON FILE (rust/npu-sr's `Schedule`, not a weight directory at all), so a
+    # bare `-d` here would die on that legitimate case -- an existing file is enough for it.
+    if [ -f "$wabs" ]; then
+      :
+    elif [ -d "$wabs" ] && [ -n "$(ls -A "$wabs" 2>/dev/null)" ]; then
+      :
+    else
+      die "scenario '$scen_abs' points at missing/empty weights: $wabs"
+    fi
+  fi
+  # image-sr's checkpoint override (npu_sr::LoadOverrides -- see loader.rs): when a scenario
+  # names one explicitly, it must be staged before the service can load, or the failure is a
+  # crash-loop at first request instead of an install-time refusal.
+  ckpt=$(grep -oP '^\s*checkpoint\s*=\s*"\K[^"]+' "$scen_abs" | head -1 || true)
+  if [ -n "$ckpt" ]; then
+    case "$ckpt" in /*) ckabs="$ckpt" ;; *) ckabs="$ENGINE_ROOT/$ckpt" ;; esac
+    [ -f "$ckabs" ] || die "scenario '$scen_abs' points at a missing checkpoint: $ckabs
+  bake it (see the scenario's own comment for the exact \`npu checkpoint bake\` command), then re-run install.sh."
   fi
 
   # A batched-prefill artifact shares one FusedArena with its decode ELF (prefill emits no

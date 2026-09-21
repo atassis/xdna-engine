@@ -1128,6 +1128,7 @@ dependencies = [
  "npu-xrt",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
 ]
 

@@ -37,19 +37,36 @@ pub struct SrEngine {
     frontier: frontier::Frontier,
 }
 
+/// Paths [`SrEngine::load_with`] resolves itself, replacing the schedule's own CWD-relative
+/// defaults (which assume the dev checkout layout -- `artifacts/`, `mlir-aie/` beside the process's
+/// cwd -- and have no meaning for an installed service). Both default to `load`'s existing
+/// behavior when left `None`: the whole_array dir from `frontier`'s hardcoded dev path, the
+/// checkpoint from the schedule JSON's own `checkpoint` field.
+#[derive(Default, Clone, Copy)]
+pub struct LoadOverrides<'a> {
+    /// The whole_array kernel build dir the NPU frontier loads its xclbin from.
+    pub wa_dir: Option<&'a Path>,
+    /// Overrides the schedule's own `checkpoint` field. The schedule's field is a path relative to
+    /// the repo root the schedule was authored against, not the engine root a service runs with --
+    /// the caller resolves the real path (e.g. against the engine root) and hands it here.
+    pub checkpoint: Option<&'a Path>,
+}
+
 impl SrEngine {
     /// Load a schedule (espcn.json) + its baked weights checkpoint. `use_npu`=false forces the CPU frontier.
     pub fn load(schedule_path: impl AsRef<Path>, use_npu: bool) -> Result<SrEngine, SrError> {
-        Self::load_with(schedule_path, use_npu, None)
+        Self::load_with(schedule_path, use_npu, LoadOverrides::default())
     }
 
-    /// Like `load`, with an explicit whole_array kernel dir for the NPU frontier (the service
-    /// resolves this from the engine root, `kernel_registry::resolve_kernel_dir`-style, the same
-    /// way every other on-device model does); `None` keeps `load`'s CWD-relative dev default.
-    pub fn load_with(schedule_path: impl AsRef<Path>, use_npu: bool, wa_dir: Option<&Path>)
+    /// Like `load`, with explicit overrides a caller resolved itself instead of the schedule's own
+    /// (CWD-relative, dev-checkout-only) paths. See [`LoadOverrides`].
+    pub fn load_with(schedule_path: impl AsRef<Path>, use_npu: bool, overrides: LoadOverrides)
         -> Result<SrEngine, SrError> {
-        let sched = schedule::Schedule::load(schedule_path.as_ref())?;
-        let frontier = frontier::Frontier::build(&sched, use_npu, wa_dir)?;
+        let mut sched = schedule::Schedule::load(schedule_path.as_ref())?;
+        if let Some(ckpt) = overrides.checkpoint {
+            sched.checkpoint = ckpt.to_string_lossy().into_owned();
+        }
+        let frontier = frontier::Frontier::build(&sched, use_npu, overrides.wa_dir)?;
         Ok(SrEngine { sched, frontier })
     }
 
@@ -159,5 +176,52 @@ impl npu_engine::capability::Servable for SrEngine {
             other => Err(EngineError::Unsupported(
                 format!("SrEngine: expected an image request, got {}", other.shape()))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A schedule with no conv ops: `Frontier::build` still reads the checkpoint unconditionally
+    /// (before touching any op or any device), so this fails on the checkpoint alone -- no device,
+    /// no real checkpoint, no `set_current_dir` needed.
+    fn write_schedule(dir: &std::path::Path, checkpoint: &str) -> std::path::PathBuf {
+        let p = dir.join("sched.json");
+        std::fs::write(&p, format!(r#"{{"name":"t","scale":1,"checkpoint":"{checkpoint}","ops":[]}}"#)).unwrap();
+        p
+    }
+
+    /// `load_with`'s `checkpoint` override REPLACES the schedule's own field rather than
+    /// supplementing it -- proven with two different missing paths so the error names the one
+    /// actually attempted.
+    #[test]
+    fn load_with_checkpoint_override_replaces_the_schedules_own_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let sched = write_schedule(dir.path(), "schedule-owns-this.safetensors");
+
+        // `unwrap_err` needs `T: Debug`; `SrEngine` has none (it holds device-frontier state), so
+        // `.err()` instead.
+        let err = SrEngine::load(&sched, false).err().expect("a missing checkpoint must fail to load");
+        assert!(err.to_string().contains("schedule-owns-this.safetensors"), "{err}");
+
+        let override_path = dir.path().join("caller-resolved.safetensors");
+        let overrides = LoadOverrides { checkpoint: Some(override_path.as_path()), ..Default::default() };
+        let err = SrEngine::load_with(&sched, false, overrides)
+            .err().expect("a missing checkpoint must fail to load");
+        let msg = err.to_string();
+        assert!(msg.contains("caller-resolved.safetensors"), "{msg}");
+        assert!(!msg.contains("schedule-owns-this.safetensors"), "{msg}");
+    }
+
+    /// No override (`load`'s own path, and `load_with` given the default overrides) keeps the
+    /// schedule's own `checkpoint` field untouched.
+    #[test]
+    fn no_checkpoint_override_keeps_the_schedules_own_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let sched = write_schedule(dir.path(), "schedule-owns-this.safetensors");
+        let err = SrEngine::load_with(&sched, false, LoadOverrides::default())
+            .err().expect("a missing checkpoint must fail to load");
+        assert!(err.to_string().contains("schedule-owns-this.safetensors"), "{err}");
     }
 }
