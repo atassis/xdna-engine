@@ -133,6 +133,16 @@ pub fn chunk_plan(start: usize, n: usize, batch: usize) -> Vec<PrefillChunk> {
 /// second case (one angle row per position), so a test written against `reference.py` would compute
 /// a wrong expected answer. Each row is `rope_row`'s output verbatim -- the same function the M=1
 /// path calls -- so the two paths cannot drift in the interleaved `[cos, sin, ...]` packing either.
+/// Each delta-rule call's real-token count, an int32 at the start of its `slot_bytes` slot.
+pub fn recurrent_count_block(real: usize, rc: &crate::llm::artifact::RecurrentCounts) -> Vec<u8> {
+    let mut out = vec![0u8; rc.calls * rc.slot_bytes];
+    for c in 0..rc.calls {
+        let n = real.saturating_sub(c * rc.tokens_per_call).min(rc.tokens_per_call) as i32;
+        out[c * rc.slot_bytes..c * rc.slot_bytes + 4].copy_from_slice(&n.to_le_bytes());
+    }
+    out
+}
+
 pub fn rope_block(
     start: usize, batch: usize, head_dim: usize, theta: f64, partial: Option<f64>,
 ) -> Vec<u8> {
@@ -544,6 +554,19 @@ impl NpuPrefill {
                 })?;
             }
 
+            // A padded chunk's trailing rows must not reach the recurrent state: each delta-rule
+            // call steps only its real tokens, and the conv history is read after the last one.
+            if let Some(rc) = &self.artifact.recurrent_counts {
+                let loc = *self.artifact.loc(&rc.buffer);
+                arena.write_at(loc.arena, loc.off, &recurrent_count_block(chunk.real, rc))
+                    .map_err(|e| EngineError::Device(format!("write prefill {}: {e}", rc.buffer)))?;
+                let off = (chunk.real * rc.hist_row_elems) as u32;
+                for seg in &self.segments {
+                    seg.write_scratchpad(rc.hist_off.byte_offset, &off.to_le_bytes())
+                        .map_err(|e| EngineError::Device(format!("write prefill hist_off: {e}")))?;
+                }
+            }
+
             // `kv_param` is "addr"-kind (element-unit BD offset, no shift). Both values are the
             // decode ones with `M` substituted for 1, so a prefill ELF built at M=1 would be
             // driven byte-identically to the decode ELF.
@@ -828,6 +851,21 @@ mod tests {
     // ---------------------------------------------------------------------------------------
 
     const THETA: f64 = 1_000_000.0;
+
+    #[test]
+    fn recurrent_counts_step_only_the_real_rows() {
+        let rc = crate::llm::artifact::RecurrentCounts {
+            buffer: "gdr_count".into(), tokens_per_call: 16, calls: 8, slot_bytes: 256,
+            hist_off: crate::llm::artifact::ScratchpadParam { byte_offset: 0, core: false },
+            hist_row_elems: 8192,
+        };
+        let at = |b: &[u8], c: usize| i32::from_le_bytes(b[c * 256..c * 256 + 4].try_into().unwrap());
+        let full = recurrent_count_block(128, &rc);
+        assert!((0..8).all(|c| at(&full, c) == 16));
+        let part = recurrent_count_block(37, &rc);
+        assert_eq!((0..8).map(|c| at(&part, c)).collect::<Vec<_>>(), [16, 16, 5, 0, 0, 0, 0, 0]);
+        assert!(part.iter().enumerate().all(|(i, &b)| i % 256 < 4 || b == 0), "slot tails stay zero");
+    }
 
     #[test]
     fn a_rope_block_is_the_m1_rows_for_the_chunks_absolute_positions() {

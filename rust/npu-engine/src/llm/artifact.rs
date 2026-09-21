@@ -74,6 +74,21 @@ pub struct MaskRing {
     pub geoms: Vec<(usize, usize)>,
 }
 
+/// What keeps a padded chunk's trailing rows out of the recurrent state (Qwen3.5's Gated DeltaNet),
+/// from `meta.json`'s `recurrent_counts`. Prefill only: per chunk the host writes each delta-rule
+/// call's real-token count into `buffer`, and the real-token count times `hist_row_elems` into
+/// `hist_off`, which picks the conv history handed back to decode.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecurrentCounts {
+    pub buffer: String,
+    pub tokens_per_call: usize,
+    pub calls: usize,
+    /// Bytes between two calls' counts; each count is an int32 at the start of its slot.
+    pub slot_bytes: usize,
+    pub hist_off: ScratchpadParam,
+    pub hist_row_elems: usize,
+}
+
 /// How the host scales `embed[token]` before writing it to the device -- `host_protocol.embed_scale`
 /// in `meta.json`, a real per-model choice (Whisper embeds unscaled; some LLM families multiply by
 /// `sqrt(d_model)`) and therefore a branch on *what*, not *how*: an unrecognised value fails loud
@@ -228,6 +243,8 @@ pub struct LlmArtifact {
     /// built before this existed, or one with no geometry narrow enough to need it. See
     /// [`MaskRing`].
     pub mask_ring: Option<MaskRing>,
+    /// See [`RecurrentCounts`]. `None` on every model without recurrent mixers.
+    pub recurrent_counts: Option<RecurrentCounts>,
     /// The declared input buffers holding RoPE angle tables, and which base each wants. Derived
     /// from `inputs` rather than a literal `["rope_global", "rope_local"]`, which is what lets a
     /// single-table prefill artifact name its buffer `rope` without a second code path.
@@ -1076,6 +1093,36 @@ impl LlmArtifact {
             _ => None,
         };
 
+        let recurrent_counts = match (role, meta.get("recurrent_counts")) {
+            (ArtifactRole::Prefill, Some(rc)) if !rc.is_null() => {
+                let num = |k: &str| -> Result<usize, EngineError> {
+                    rc.get(k).and_then(|v| v.as_u64()).map(|v| v as usize)
+                        .ok_or_else(|| ctx(format!("recurrent_counts.{k} missing/non-numeric")))
+                };
+                let buffer = rc.get("buffer").and_then(|v| v.as_str())
+                    .ok_or_else(|| ctx("recurrent_counts.buffer missing/non-string".to_string()))?
+                    .to_string();
+                let (tokens_per_call, calls, slot_bytes) =
+                    (num("tokens_per_call")?, num("calls")?, num("slot_bytes")?);
+                if !inputs.iter().any(|n| n == &buffer) {
+                    return Err(ctx(format!("recurrent_counts.buffer `{buffer}` is not a declared input")));
+                }
+                let loc = layout.get(&buffer)
+                    .ok_or_else(|| ctx(format!("recurrent_counts.buffer `{buffer}` has no `layout` entry")))?;
+                if tokens_per_call * calls != batch || loc.len != calls * slot_bytes || slot_bytes < 4 {
+                    return Err(ctx(format!(
+                        "recurrent_counts: {calls} calls x {tokens_per_call} tokens against dims.M                          {batch}, {calls} x {slot_bytes} B slots against layout[{buffer}].len {}",
+                        loc.len)));
+                }
+                let hist_name = rc.get("hist_param").and_then(|v| v.as_str())
+                    .ok_or_else(|| ctx("recurrent_counts.hist_param missing/non-string".to_string()))?;
+                Some(RecurrentCounts { buffer, tokens_per_call, calls, slot_bytes,
+                                       hist_off: read_param(hist_name)?,
+                                       hist_row_elems: num("hist_row_elems")? })
+            }
+            _ => None,
+        };
+
         // Toolchain freshness: fail loud on an ACTIVE mismatch (the pin moved, nobody rebuilt this
         // artifact -- a stale ELF answers with a plausible WRONG token, silently). Anything short of a
         // confirmed mismatch is reported, never fatal -- a shipped consumer must not require
@@ -1123,6 +1170,7 @@ impl LlmArtifact {
             window_rungs,
             mask_widths,
             mask_ring,
+            recurrent_counts,
             rope_inputs,
             head_dim,
             d_model,
