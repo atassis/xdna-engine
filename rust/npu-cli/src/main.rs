@@ -2439,11 +2439,13 @@ mod tests {
     }
 
     /// Same oracle as `embed_over_the_socket_matches_the_http_route_byte_for_byte`, once per
-    /// question kind: `decide_body`'s output sent both ways must produce identical 200s, and the
-    /// echoed answer must name what `decide_body` actually sent (the choice test's FIRST option
-    /// key), proving the server parsed the CLI's body rather than the harness rubber-stamping it.
+    /// question kind: `decide_body`'s output sent both ways must produce the same `answers` and
+    /// `model`, and the echoed answer must name what `decide_body` actually sent (the choice
+    /// test's FIRST option key), proving the server parsed the CLI's body rather than the harness
+    /// rubber-stamping it. Not byte-for-byte any more: `x_npu` times each call separately, so the
+    /// two calls' `x_npu` objects legitimately differ -- only their presence is asserted.
     #[test]
-    fn decide_over_the_socket_matches_the_http_route_byte_for_byte() {
+    fn decide_over_the_socket_matches_the_http_route_in_answers_and_model() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         const PORT: u16 = 19198;
         let (handle, join, dir) = decide_socket_harness(PORT);
@@ -2465,7 +2467,12 @@ mod tests {
             let (code, resp) = npu_runtime::http::route(&req, &handle, &cfg_path);
             assert_eq!(code, 200, "{}", resp.text());
             let via_http: serde_json::Value = serde_json::from_str(resp.text()).unwrap();
-            assert_eq!(via_socket, via_http, "{kind:?}: the CLI-over-socket and HTTP route must agree exactly");
+            assert_eq!(via_socket["answers"], via_http["answers"],
+                "{kind:?}: the CLI-over-socket and HTTP route must agree on answers");
+            assert_eq!(via_socket["model"], via_http["model"],
+                "{kind:?}: the CLI-over-socket and HTTP route must agree on model");
+            assert!(via_socket["x_npu"].is_object(), "{kind:?}: socket response missing x_npu: {via_socket}");
+            assert!(via_http["x_npu"].is_object(), "{kind:?}: http response missing x_npu: {via_http}");
 
             if kind == DecideType::Choice {
                 assert_eq!(via_socket["answers"]["q"]["choice"], "alpha",

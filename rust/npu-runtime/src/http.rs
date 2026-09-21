@@ -573,7 +573,8 @@ pub enum SpeechFormat { Wav, Pcm }
 
 /// TypeSafe's `/v1/systemone`: typed questions over one `state`, answered off a generate model's
 /// next-token logits (npu_engine::decide). Questions keep their request order, which is why the
-/// body is parsed with serde_json's preserve_order rather than the field extractors above.
+/// body is parsed with serde_json's preserve_order rather than the field extractors above. The
+/// response always carries `x_npu`, the way a non-streaming chat completion does (docs/measurement.md).
 fn systemone(req: &Request, handle: &Handle) -> Response {
     let bad = |m: String| -> Response { (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&m)).into()) };
     let body: serde_json::Value = match serde_json::from_slice(&req.body) {
@@ -585,17 +586,32 @@ fn systemone(req: &Request, handle: &Handle) -> Response {
         Err(m) => return bad(m),
     };
     let model = body.get("model").and_then(|v| v.as_str());
+    let t0 = std::time::Instant::now();
     let served = match handle.serve(Capability::GENERATE, model, EngineReq::Decide(decide)) {
         Ok(s) => s,
         Err(e) => return engine_err(&e),
     };
+    let total_us = t0.elapsed().as_micros() as u64;
     let d = match served.value {
         EngineResp::Decisions(d) => d,
         other => return engine_err(&npu_engine::EngineError::Device(format!(
             "decide returned a {} response", other.shape()))),
     };
+    let ms = |us: u64| us as f64 / 1e3;
+    let stats = &d.stats;
+    let questions: serde_json::Map<String, serde_json::Value> = stats.questions.iter().map(|q| (q.id.clone(), serde_json::json!({
+        "prompt_tokens": q.prompt_tokens, "reused_tokens": q.reused_tokens,
+        "batched_tokens": q.batched_tokens, "stepwise_tokens": q.stepwise_tokens,
+        "restore_ms": ms(q.restore_us), "prefill_ms": ms(q.prefill_us), "readout_ms": ms(q.readout_us),
+    }))).collect();
+    let x_npu = serde_json::json!({
+        "queue_ms": ms(served.queue_us), "load_ms": ms(served.load_us), "total_ms": ms(total_us),
+        "shared_prefix_tokens": stats.shared_prefix_tokens,
+        "prefix_ms": ms(stats.prefix_us), "snapshot_ms": ms(stats.snapshot_us),
+        "questions": questions,
+    });
     let out: serde_json::Map<String, serde_json::Value> = d.answers.into_iter().map(answer_json).collect();
-    (200, serde_json::json!({"model": served.model, "answers": out}).to_string().into())
+    (200, serde_json::json!({"model": served.model, "answers": out, "x_npu": x_npu}).to_string().into())
 }
 
 /// One answer in Jev's shape: `type` names the question kind; score probabilities are keyed by level.
@@ -2545,6 +2561,30 @@ pub(crate) mod generate_tests {
             "instructions": "i", "criteria": {"only": "one"}}}})).is_err(), "one option is not a choice");
     }
 
+    /// The route always answers `x_npu`, keyed by question id in request order -- `queue`/`load`
+    /// from the actor's own `Served`, the rest from `Decisions.stats` (`decide_handle`, below).
+    #[test]
+    fn systemone_reports_where_the_time_went() {
+        let (h, j, _d, p) = decide_handle();
+        let body = serde_json::json!({"state": "s", "questions": {
+            "first": {"type": "noul", "instructions": "i"},
+            "second": {"type": "noul", "instructions": "i"},
+        }});
+        let (code, resp) = route(&post("/v1/systemone", &body.to_string()), &h, &p);
+        assert_eq!(code, 200, "{resp}");
+        let v: serde_json::Value = serde_json::from_str(resp.text()).unwrap();
+        let x = &v["x_npu"];
+        for k in ["queue_ms", "load_ms", "total_ms", "prefix_ms", "snapshot_ms"] {
+            assert!(x[k].is_number(), "{k} missing: {x}");
+        }
+        assert!(x["shared_prefix_tokens"].is_u64());
+        let q = x["questions"].as_object().unwrap();
+        assert_eq!(q.keys().collect::<Vec<_>>(), ["first", "second"], "request order, keyed by id");
+        assert!(q["first"]["prefill_ms"].as_f64().unwrap() > 0.0);
+        assert!(x["total_ms"].as_f64().unwrap() >= x["load_ms"].as_f64().unwrap());
+        h.shutdown(); let _ = j.join();
+    }
+
     use npu_engine::{Chunk, FinishReason, GenerateParams, GenerateUsage, GenerationReport, Prompt,
                      StepRecord, TextGenerator};
     use npu_engine::EngineError;
@@ -2654,6 +2694,49 @@ pub(crate) mod generate_tests {
         cfg.save(&p).unwrap();
         let (h, j) = start(cfg, Box::new(loader)).unwrap();
         (h, j, dir, p, sent, seen)
+    }
+
+    /// Answers each question with a fixed `Noul`, and stats scaled by the question's position so a
+    /// caller can tell them apart -- non-zero throughout, since a zeroed mock proves nothing about
+    /// `x_npu`'s wiring.
+    struct DecideModel;
+    impl Servable for DecideModel {
+        fn capabilities(&self) -> Capability { Capability::GENERATE }
+        fn run(&mut self, req: EngineReq) -> Result<EngineResp, EngineError> {
+            let d = match req {
+                EngineReq::Decide(d) => d,
+                other => return Err(EngineError::Unsupported(format!("DecideModel cannot serve {}", other.shape()))),
+            };
+            let answers = d.questions.iter().map(|q| npu_engine::DecideAnswer::Noul { id: q.id.clone(), p_true: 0.6 }).collect();
+            let questions = d.questions.iter().enumerate().map(|(i, q)| npu_engine::QuestionStats {
+                id: q.id.clone(), prompt_tokens: 20, reused_tokens: 5 * i, batched_tokens: 3, stepwise_tokens: 2,
+                restore_us: 100, prefill_us: 1_500 + 100 * i as u64, readout_us: 50,
+            }).collect();
+            Ok(EngineResp::Decisions(npu_engine::Decisions {
+                answers,
+                stats: npu_engine::DecideStats { shared_prefix_tokens: 7, prefix_us: 200, snapshot_us: 80, questions },
+            }))
+        }
+    }
+    impl StreamServable for DecideModel {}
+
+    struct DecideLoader;
+    impl ModelLoader for DecideLoader {
+        fn load(&self, _cfg: &ModelCfg) -> Result<Box<dyn StreamServable>, EngineError> { Ok(Box::new(DecideModel)) }
+        fn declared_capability(&self, _cfg: &ModelCfg) -> Option<Capability> { Some(Capability::GENERATE) }
+    }
+
+    pub(crate) fn decide_handle() -> (Handle, std::thread::JoinHandle<()>, tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("engine.toml");
+        let cfg = Config {
+            server: ServerCfg { idle_unload_s: 0, ..Default::default() },
+            models: vec![ModelCfg { name: "llm".into(), scenario: "x".into(), resident: false }],
+            ..Default::default()
+        };
+        cfg.save(&p).unwrap();
+        let (h, j) = start(cfg, Box::new(DecideLoader)).unwrap();
+        (h, j, dir, p)
     }
 
     /// A buffered response carries its own measurements, always. This is the surface a human hits
