@@ -55,6 +55,17 @@ pub fn deep_release_due(
 /// `footprint()` returns real bytes.
 pub const UNWEIGHED: &str = "memory_ceiling not applied: footprint unmeasured";
 
+/// True when a load failure's detail text is the driver refusing a hardware context rather than
+/// any other failure -- XDNA2 allows at most 16 concurrent `DRM_IOCTL_AMDXDNA_CREATE_HWCTX`
+/// contexts per device, a limit the byte accountant cannot see. EINVAL (-22) is the refusal; EBUSY
+/// (-16) is the device caught mid-transition. An unrelated errno on the same ioctl -- ENOMEM, say
+/// -- is a different failure and must not be read as exhaustion.
+pub fn is_hwctx_exhaustion(detail: &str) -> bool {
+    detail.contains("CREATE_HWCTX")
+        && (detail.contains("err=-22") || detail.contains("Invalid argument")
+            || detail.contains("err=-16") || detail.contains("Device or resource busy"))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadState { Loaded, Failed, Unloaded }
 
@@ -310,6 +321,22 @@ impl Registry {
             }
         }
         self.try_load(cfg, loader, srv, now);
+        // Byte headroom can be fine while the driver still refuses: XDNA2's 16-context limit is
+        // invisible to `estimated_bytes`. Retry against that failure the same way the loop above
+        // retries against bytes -- evict the LRU resident, try again -- until it loads or nothing
+        // is left to evict. `lru_victim` only ever returns a RESIDENT entry, and `cfg.name` is not
+        // one here (the `try_load` above just failed it), so it can never be its own victim.
+        while self.get_loaded(&cfg.name).is_none() && srv.evict_policy != EvictPolicy::None {
+            let exhausted = self.entries.iter().find(|e| e.cfg.name == cfg.name)
+                .is_some_and(|e| is_hwctx_exhaustion(&e.status.detail));
+            if !exhausted { break; }
+            match self.lru_victim() {
+                Some(v) => self.release(&v, &format!("evicted for {}: hardware contexts", cfg.name),
+                                        UnloadReason::Evicted),
+                None => break,
+            }
+            self.try_load(cfg, loader, srv, now);
+        }
         if self.get_loaded(&cfg.name).is_some() { return Ok(()); }
         let why = self.entries.iter().find(|e| e.cfg.name == cfg.name)
             .map(|e| e.status.detail.clone()).unwrap_or_else(|| "load failed".into());
@@ -946,5 +973,93 @@ mod tests {
         let mut r = Registry::default();
         let e = r.ensure_resident(&cfg("bad"), &l, &srv, Instant::now()).unwrap_err();
         assert!(e.to_string().contains("no such xclbin"), "{e}");
+    }
+
+    const CREATE_HWCTX_EINVAL: &str =
+        "DRM_IOCTL_AMDXDNA_CREATE_HWCTX IOCTL failed (err=-22): Invalid argument";
+
+    #[test]
+    fn is_hwctx_exhaustion_matches_the_driver_refusal() {
+        assert!(is_hwctx_exhaustion(CREATE_HWCTX_EINVAL));
+        assert!(!is_hwctx_exhaustion("open_elf_resident (decode): No such file or directory (os error 2)"),
+            "a plain missing-file load error is not context exhaustion");
+        assert!(!is_hwctx_exhaustion("DRM_IOCTL_AMDXDNA_CREATE_HWCTX IOCTL failed (err=-12): Cannot allocate memory"),
+            "err=-12 is out of memory, not context exhaustion");
+    }
+
+    /// Fails loading `target` with the CREATE_HWCTX/EINVAL text for its first `fails` calls, then
+    /// defers to `inner`. `ensure_resident`'s hwctx-retry loop calls `try_load` once per eviction,
+    /// so counting calls stands in for counting resident contexts freed.
+    struct HwctxThenLoads { inner: MockLoader, target: String, fails: std::cell::Cell<u32> }
+    impl ModelLoader for HwctxThenLoads {
+        fn load(&self, cfg: &ModelCfg) -> Result<Box<dyn StreamServable>, EngineError> {
+            if cfg.name == self.target && self.fails.get() > 0 {
+                self.fails.set(self.fails.get() - 1);
+                return Err(EngineError::Load(CREATE_HWCTX_EINVAL.to_string()));
+            }
+            self.inner.load(cfg)
+        }
+        fn declared_capability(&self, cfg: &ModelCfg) -> Option<Capability> { self.inner.declared_capability(cfg) }
+        fn declared_footprint(&self, cfg: &ModelCfg) -> Option<u64> { self.inner.declared_footprint(cfg) }
+    }
+
+    #[test]
+    fn ensure_resident_evicts_lru_on_hwctx_exhaustion_until_it_loads() {
+        let l = HwctxThenLoads { inner: loader(&["a", "b", "c", "d"]), target: "d".into(),
+                                 fails: std::cell::Cell::new(2) };
+        let srv = ceiling_mb(10); // byte headroom is not the constraint here
+        let mut r = Registry::default();
+        let t0 = Instant::now();
+        r.try_load(&cfg("a"), &l, &srv, t0);
+        r.try_load(&cfg("b"), &l, &srv, t0 + Duration::from_secs(1));
+        r.try_load(&cfg("c"), &l, &srv, t0 + Duration::from_secs(2));
+        r.ensure_resident(&cfg("d"), &l, &srv, t0 + Duration::from_secs(3)).unwrap();
+        assert!(r.get_loaded("d").is_some());
+        assert!(r.get_loaded("a").is_none(), "a is the LRU resident, evicted first");
+        assert!(r.get_loaded("b").is_none(), "b is evicted second");
+        assert!(r.get_loaded("c").is_some(), "c is the most recently used and survives");
+        let a = r.status().into_iter().find(|x| x.name == "a").unwrap();
+        assert!(a.detail.contains("hardware contexts"), "{}", a.detail);
+    }
+
+    #[test]
+    fn ensure_resident_on_hwctx_exhaustion_never_evicts_a_pinned_model() {
+        let l = HwctxThenLoads { inner: loader(&["p", "d"]), target: "d".into(),
+                                 fails: std::cell::Cell::new(1) };
+        let srv = ceiling_mb(10);
+        let mut r = Registry::default();
+        let t0 = Instant::now();
+        r.try_load(&pinned("p"), &l, &srv, t0);
+        let e = r.ensure_resident(&cfg("d"), &l, &srv, t0 + Duration::from_secs(1)).unwrap_err();
+        assert!(e.to_string().contains("CREATE_HWCTX"), "{e}");
+        assert!(r.get_loaded("p").is_some(), "an honoured pin must not be released for hwctx pressure either");
+    }
+
+    #[test]
+    fn ensure_resident_does_not_evict_on_a_non_hwctx_load_failure() {
+        let mut t = BTreeMap::new();
+        t.insert("a".to_string(), Ok((Capability::EMBED, MB)));
+        t.insert("d".to_string(), Err("open_elf_resident (decode): No such file or directory (os error 2)".to_string()));
+        let l = MockLoader { table: t };
+        let srv = ceiling_mb(10);
+        let mut r = Registry::default();
+        let t0 = Instant::now();
+        r.try_load(&cfg("a"), &l, &srv, t0);
+        let e = r.ensure_resident(&cfg("d"), &l, &srv, t0 + Duration::from_secs(1)).unwrap_err();
+        assert!(e.to_string().contains("No such file"), "{e}");
+        assert!(r.get_loaded("a").is_some(), "a non-hwctx failure must not evict anything");
+    }
+
+    #[test]
+    fn ensure_resident_on_hwctx_exhaustion_respects_evict_policy_none() {
+        let l = HwctxThenLoads { inner: loader(&["a", "d"]), target: "d".into(),
+                                 fails: std::cell::Cell::new(1) };
+        let srv = ServerCfg { memory_ceiling_mb: 10, evict_policy: EvictPolicy::None, ..Default::default() };
+        let mut r = Registry::default();
+        let t0 = Instant::now();
+        r.try_load(&cfg("a"), &l, &srv, t0);
+        let e = r.ensure_resident(&cfg("d"), &l, &srv, t0 + Duration::from_secs(1)).unwrap_err();
+        assert!(e.to_string().contains("CREATE_HWCTX"), "{e}");
+        assert!(r.get_loaded("a").is_some(), "evict_policy = none must refuse rather than evict");
     }
 }
