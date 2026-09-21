@@ -44,6 +44,9 @@ export IRON_DIR="${IRON_DIR:-$XDNA_WS/wt-iron-integ}"
 # input_with_addresses.mlir differs only in the work-dir path it embeds, which two runs
 # at the SAME -j differ in too.
 export AIECC_JOBS="${AIECC_JOBS:-0}"
+# Same property for the runtime-sequence partitions (36/36 instruction streams identical on the
+# 48-layer gemma4 prefill, toolchain.lock's mlir-aie note); IRON passes the flag when this is 1.
+export AIECC_PARTITION_RUNTIME_SEQUENCES="${AIECC_PARTITION_RUNTIME_SEQUENCES:-1}"
 
 # Route kernel .cc compiles through ccache. Measured on 8 kernels: 6.72 s of misses
 # against 0.09 s of hits, objects identical. It composes with the intrinsics PCH,
