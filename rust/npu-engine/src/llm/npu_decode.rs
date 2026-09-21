@@ -606,10 +606,18 @@ impl NpuDecodeStep {
         // `idle_unload_s` drops the whole model and frees its 2 GB arena, cache included.
         //
         // NPU_LLM_REUSE_KV=0 restores the per-request pass, for bisecting a suspected KV bug.
-        if std::env::var("NPU_LLM_REUSE_KV").ok().as_deref() != Some("0") {
-            return Ok(CacheState::Retained);
-        }
-        for name in &self.artifact.cache_buffers {
+        //
+        // That argument is about POSITION-indexed caches. Recurrent state (Gated DeltaNet's S and
+        // conv window) has absorbed every token of the last request and has no mask to hide it, so
+        // it is zeroed every time and the ledger is invalidated: a prefix cannot be resumed
+        // mid-way through a recurrence.
+        let recurrent = !self.artifact.recurrent_buffers.is_empty();
+        let names = match std::env::var("NPU_LLM_REUSE_KV").ok().as_deref() != Some("0") {
+            true if !recurrent => return Ok(CacheState::Retained),
+            true => &self.artifact.recurrent_buffers,
+            false => &self.artifact.cache_buffers,
+        };
+        for name in names {
             let loc = self.artifact.loc(name);
             self.arena
                 .write_at(loc.arena, loc.off, &vec![0u8; loc.len])
