@@ -318,6 +318,11 @@ FUSE_QKV_GEMV = os.environ.get("FUSE_QKV_GEMV", "1") == "1"
 # per-row kernel, so also expected bit-identical.
 FUSE_ROPE_QK = os.environ.get("FUSE_ROPE_QK", "1") == "1"
 
+# SiLU and sigmoid in f32 polynomial math (iron/operators/act_poly) instead of the tanh-LUT kernels,
+# for the activations of Qwen3.5's layers and the MLP. An A/B knob, off by default: the LUT is
+# 5e-3..5e-2 relative (kb/aie-tanh-is-the-same-coarse-sfu-lut-as-exp2).
+ACT_POLY = os.environ.get("ACT_POLY", "0") == "1"
+
 # Fold `attn_scale` into the q-norm gain instead of running an ElementwiseMul over the whole
 # [Hq, S] score matrix. RMSNorm's gain multiply and RoPE's rotation are both linear in q, and the
 # scores GEMV is linear in q, so scaling n_qn by attn_scale scales `sc` by exactly the same factor
@@ -682,6 +687,8 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tm
         parts.append("noqkvgemv")
     if FUSE_QKV_GEMV and not FUSE_ROPE_QK:
         parts.append("noropeqk")
+    if ACT_POLY:
+        parts.append("actp")
     if sp.qk_norm and not SCALE_IN_QNORM:
         parts.append("noscaleqn")
     # One fragment per quantized site. scale_kind rides the name only when it is not the class
@@ -2327,6 +2334,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     op_up = gemv(FF, D, ctx, **mlp_quant_kw)
     op_act = None
     op_mlp_dp = None
+    if ACT_POLY:
+        from iron.operators.act_poly.op import SigmoidPoly, SiLUPoly
+    SiLUAct = SiLUPoly if ACT_POLY else SiLU
     if mlp_dp_why is None:
         from iron.operators.swiglu_mlp_dp.op import SwiGLUMLPDataParallel
         # act/post_norm carry the two clauses mlp_dp_reason() used to refuse on. Both default to
@@ -2404,7 +2414,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     ffw = FF // ff_chunks
     if not fuse_act:
         if sp.act == "silu":
-            op_act = SiLU(size=ffw, num_aie_columns=COLS, tile_size=ffw // COLS, context=ctx)
+            op_act = SiLUAct(size=ffw, num_aie_columns=COLS, tile_size=ffw // COLS, context=ctx)
         else:
             op_act = GELU(size=ffw, num_aie_columns=COLS, num_channels=1, tile_size=ffw // COLS, context=ctx)
     op_mul_ffn = ElementwiseMul(size=ffw, tile_size=ffw // COLS, num_aie_columns=COLS, context=ctx)
@@ -2437,7 +2447,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         op_lin_qkv = gemv(LCH, D, ctx, **_quant_kw("qkv"))
         op_lin_zab = gemv(LZAB, D, ctx, **_quant_kw("qkv"))
         op_conv = Conv1dStep(channels=LCH, taps=LTAPS, num_aie_columns=COLS, context=ctx)
-        op_mix_act = SiLU(size=LCH, num_aie_columns=COLS, tile_size=LCH // COLS, context=ctx)
+        op_mix_act = SiLUAct(size=LCH, num_aie_columns=COLS, tile_size=LCH // COLS, context=ctx)
         # l2norm(x) = rmsnorm at eps/dk, divided by sqrt(dk): the division rides the gain (l2q/l2k).
         op_l2 = RMSNorm(size=LDK, num_aie_columns=1, num_channels=1, tile_size=LDK,
                         weighted=True, epsilon=sp.eps / LDK, context=ctx)
@@ -2447,13 +2457,15 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                                 context=ctx)
         op_gnorm = RMSNorm(size=LDK, num_aie_columns=1, num_channels=1, tile_size=LDK,
                            weighted=True, epsilon=sp.eps, context=ctx)
-        op_z_act = SiLU(size=LVD, num_aie_columns=COLS, tile_size=LVD // COLS, context=ctx)
+        op_z_act = SiLUAct(size=LVD, num_aie_columns=COLS, tile_size=LVD // COLS, context=ctx)
         op_o_mul = ElementwiseMul(size=LVD, tile_size=LVD // COLS, num_aie_columns=COLS, context=ctx)
     if sp.attn_output_gate:
         from iron.operators.sigmoid.op import Sigmoid
         op_gate_proj = gemv(QD, D, ctx, **_quant_kw("qkv"))
-        op_gate_act = Sigmoid(size=QD, num_aie_columns=COLS, num_channels=1,
-                              tile_size=QD // COLS, context=ctx)
+        op_gate_act = (SigmoidPoly(size=QD, num_aie_columns=COLS, tile_size=QD // COLS, context=ctx)
+                       if ACT_POLY else
+                       Sigmoid(size=QD, num_aie_columns=COLS, num_channels=1,
+                               tile_size=QD // COLS, context=ctx))
         op_gate_mul = ElementwiseMul(size=QD, tile_size=QD // COLS, num_aie_columns=COLS, context=ctx)
     op_rope_part = (RoPE(rows=1, cols=sp.rope_rotary_dim, angle_rows=1, context=ctx)
                     if sp.rope_rotary_dim is not None else None)
