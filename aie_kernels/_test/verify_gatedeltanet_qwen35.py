@@ -82,15 +82,15 @@ def dispatch(bricklib, T, k, v, q, gates, s_in):
     return r, o_dev, s_dev.astype(np.float32), o_ref, s_ref
 
 
-def run(T):
+def run(T, n_disp=2):
     import bricklib
     g = _golden()
     rng = np.random.default_rng(T)
-    k, v, q, gates = model_inputs(rng, 2 * T)
-    h = slice(0, T), slice(T, 2 * T)
+    k, v, q, gates = model_inputs(rng, n_disp * T)
     ok = True
     s_in = np.zeros((DK, DV), np.float32)
-    for n, sl in enumerate(h, 1):
+    for n in range(1, n_disp + 1):
+        sl = slice((n - 1) * T, n * T)
         r, o_dev, s_dev, o_ref, s_ref = dispatch(bricklib, T, k[sl], v[sl], q[sl], gates[sl], s_in)
         ro, rs = g.rel_l2(o_dev, o_ref), g.rel_l2(s_dev, s_ref)
         good = r["ok"] and ro <= OUT_GATE and rs <= STATE_GATE and np.isfinite(s_dev).all()
@@ -103,8 +103,9 @@ def run(T):
 
 
 def main():
-    Ts = [int(a) for a in sys.argv[1:]] or [4, 16]
-    return 0 if all([run(T) for T in Ts]) else 1
+    """`T:N` runs N chained dispatches of T steps; the default ends on 256 steps, 15 hand-offs."""
+    specs = sys.argv[1:] or ["4:2", "16:2", "16:16"]
+    return 0 if all([run(*map(int, s.split(":"))) for s in specs]) else 1
 
 
 if __name__ == "__main__":
