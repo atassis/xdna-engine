@@ -33,6 +33,12 @@ pub enum CacheState {
 pub trait DecodeStep {
     fn step(&mut self, token: u32, pos: usize) -> Result<Vec<f32>, EngineError>;
 
+    /// After a `step`: the logits of just `ids`, computed more exactly than `step`'s own return
+    /// (see `NpuDecodeStep::option_logits`). None means "read them off `step`'s logits".
+    fn option_logits(&mut self, _ids: &[u32]) -> Result<Option<Vec<f32>>, EngineError> {
+        Ok(None)
+    }
+
     /// Drop any per-generation state before a new one starts, and SAY whether the KV cache was
     /// emptied doing it.
     ///
@@ -579,7 +585,11 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
             q.validate().map_err(EngineError::Unsupported)?;
             let ids = tokenize_prompt(&self.cfg, &Prompt::Chat(messages(&req.evidence, q)), Some(false), &[])?;
             let logits = self.prime_to_last_logits(&ids)?;
-            let picked: Vec<f32> = slots[..q.options.len()].iter().map(|&t| logits[t as usize]).collect();
+            let want = &slots[..q.options.len()];
+            let picked = match self.decode.option_logits(want)? {
+                Some(v) => v,
+                None => want.iter().map(|&t| logits[t as usize]).collect(),
+            };
             out.push(answer(q, &picked));
         }
         Ok(out)

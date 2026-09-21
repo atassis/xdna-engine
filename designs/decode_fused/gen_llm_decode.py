@@ -3335,6 +3335,10 @@ def main():
     # IRON already computed the answer: `subbuffer_layout` covers every input, output and scratch
     # arg, and `calculate_buffer_layout` raises if a declared arg is missing from the runlist.
     lay = {n: fused.get_layout_for_buffer(n) for n in [*inputs, "logits", *wnames]}
+    # The final-normed hidden the head reads, so a host can take a few head rows in f32 instead of
+    # the whole-vocab logits the ELF writes as bf16 (npu_decode.rs option_logits).
+    if "xf" in bufsz:
+        lay["xf"] = fused.get_layout_for_buffer("xf")
 
     import glob
     import shutil
