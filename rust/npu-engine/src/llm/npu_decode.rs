@@ -23,12 +23,12 @@ use std::borrow::Cow;
 use std::path::Path;
 use std::rc::Rc;
 
-use npu_xrt::{Device, ElfResident, FusedArena};
+use npu_xrt::{Arena, Device, ElfResident, FusedArena};
 use sha2::{Digest, Sha256};
 
 use crate::api::EngineError;
 use crate::llm::artifact::{BufLoc, EmbedScale, LlmArtifact, RopeWrite, ScratchpadParam};
-use crate::llm::generator::{CacheState, DecodeStep};
+use crate::llm::generator::{CacheState, DecodeStep, RecurrentSnapshot};
 use crate::llm::multimodal::{self, MediaEmbeds};
 use crate::llm::npu_prefill::NpuPrefill;
 use crate::telemetry::ArmProvenance;
@@ -679,6 +679,57 @@ impl DecodeStep for NpuDecodeStep {
             npu_xrt::dispatch_log::reset();
         }
         NpuDecodeStep::reset(self)
+    }
+
+    fn has_recurrent_state(&self) -> bool {
+        !self.artifact.recurrent_buffers.is_empty()
+    }
+
+    /// Reads `recurrent_buffers` back after a device sync of the arenas that hold them. The scratch
+    /// sync covers the whole scratch BO (there is no ranged sync); `snapshot_us` measures it.
+    fn snapshot_recurrent(&mut self) -> Result<RecurrentSnapshot, EngineError> {
+        let locs: Vec<_> = self.artifact.recurrent_buffers.iter().map(|n| self.artifact.loc(n)).collect();
+        if locs.iter().any(|l| l.arena == Arena::Scratch) {
+            self.arena
+                .sync_scratch_from_device()
+                .map_err(|e| EngineError::Device(format!("sync recurrent state: {e}")))?;
+        }
+        if locs.iter().any(|l| l.arena == Arena::Output) {
+            self.arena
+                .sync_from_device()
+                .map_err(|e| EngineError::Device(format!("sync recurrent state: {e}")))?;
+        }
+        locs.iter()
+            .zip(&self.artifact.recurrent_buffers)
+            .map(|(l, name)| {
+                let mut b = vec![0u8; l.len];
+                self.arena
+                    .read_at(l.arena, l.off, &mut b)
+                    .map_err(|e| EngineError::Device(format!("read recurrent buffer {name}: {e}")))?;
+                Ok(b)
+            })
+            .collect::<Result<_, _>>()
+            .map(RecurrentSnapshot)
+    }
+
+    /// The inverse, written and synced the way `reset` writes its zeros.
+    fn restore_recurrent(&mut self, s: &RecurrentSnapshot) -> Result<(), EngineError> {
+        if s.0.len() != self.artifact.recurrent_buffers.len() {
+            return Err(EngineError::Device(format!(
+                "snapshot has {} buffers, the artifact {}",
+                s.0.len(),
+                self.artifact.recurrent_buffers.len()
+            )));
+        }
+        for (name, bytes) in self.artifact.recurrent_buffers.iter().zip(&s.0) {
+            let loc = self.artifact.loc(name);
+            self.arena
+                .write_at(loc.arena, loc.off, bytes)
+                .map_err(|e| EngineError::Device(format!("restore recurrent buffer {name}: {e}")))?;
+        }
+        self.arena
+            .sync_to_device()
+            .map_err(|e| EngineError::Device(format!("sync restored state: {e}")))
     }
 
     /// Everything this rail has on the device: the fused arena's three buffers hold the weights,
