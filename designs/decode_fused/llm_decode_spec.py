@@ -517,6 +517,26 @@ class LlmSpec:
     def mixer_for(self, layer_idx: int) -> str:
         return "full_attention" if self.mixer_types is None else self.mixer_types[layer_idx]
 
+    def q_proj_rows_for(self, layer_idx: int) -> int:
+        """q_proj's output rows: the query heads, plus one gate row per query row under
+        attn_output_gate (HF views it per head as [q | gate])."""
+        return self.q_dim_for(layer_idx) * (2 if self.attn_output_gate else 1)
+
+    def linear_attn_leaves(self, layer_idx: int) -> dict:
+        """A Gated DeltaNet layer's tensors (leaf under the layer prefix -> shape), empty on attention
+        layers. The output norm is plain w, not norm_gain, so it is listed here, not as a norm."""
+        if self.mixer_for(layer_idx) != "linear_attention":
+            return {}
+        kd, vd = self.lin_k_heads * self.lin_head_dim, self.lin_v_heads * self.lin_head_dim
+        D, H = self.d_model, self.lin_v_heads
+        return {"linear_attn.in_proj_qkv.weight": (2 * kd + vd, D),
+                "linear_attn.in_proj_z.weight": (vd, D),
+                "linear_attn.in_proj_a.weight": (H, D), "linear_attn.in_proj_b.weight": (H, D),
+                "linear_attn.conv1d.weight": (2 * kd + vd, 1, self.lin_conv_taps),
+                "linear_attn.A_log": (H,), "linear_attn.dt_bias": (H,),
+                "linear_attn.norm.weight": (self.lin_head_dim,),
+                "linear_attn.out_proj.weight": (D, vd)}
+
     def head_dim_for(self, layer_idx: int) -> int:
         if self.global_head_dim is not None and self.is_global(layer_idx):
             return self.global_head_dim
@@ -652,7 +672,7 @@ class LlmSpec:
             "n_pf": p + ("pre_feedforward_layernorm" if self.sandwich_norms
                          else "post_attention_layernorm") + ".weight",
         }
-        if self.qk_norm:
+        if self.qk_norm and self.mixer_for(layer) == "full_attention":
             names["n_qn"] = p + "self_attn.q_norm.weight"
             names["n_kn"] = p + "self_attn.k_norm.weight"
         if self.sandwich_norms:
