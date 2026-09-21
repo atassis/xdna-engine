@@ -134,6 +134,7 @@ const FREE_FORM_ARGS: &[(&str, &str)] = &[
     ("diarize", "diarization model name, same reason as `model`"),
     ("track", "0-based audio track index -- arbitrary integer"),
     ("wav", "input WAV file path"),
+    ("net", "SR net/schedule name -- from the operator's [[model]] list, not a fixed set"),
     ("text", "prose to embed -- arbitrary string"),
     ("prompt", "generation prompt -- arbitrary string"),
     ("temperature", "sampling float -- arbitrary number"),

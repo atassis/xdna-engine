@@ -12,6 +12,7 @@ mod exit;
 mod media;
 mod socket_client;
 mod stats;
+mod upscale;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser};
@@ -121,6 +122,7 @@ fn run(cli: &Cli, path: &Path) -> Result<()> {
         Cmd::Stats { log, diff } => stats_cmd(log, diff.as_deref()),
         Cmd::Replay { log, realtime, frames } => replay_cmd(log, *realtime, *frames),
         Cmd::Diarize { wav, model, json } => diarize(wav, model.as_deref(), *json || as_json),
+        Cmd::Upscale { input, out, net, model } => upscale::run_cli(input, out, net, model.as_deref()),
         Cmd::TranscribeMedia { input, out, format, asr, diarize: diar, track, no_diarize } =>
             transcribe_media(input, out.as_deref(), *format, asr.as_deref(),
                              diar.as_deref(), *track, *no_diarize),

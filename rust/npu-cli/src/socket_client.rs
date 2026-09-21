@@ -111,28 +111,49 @@ pub fn call_bytes(path: &str, body: &serde_json::Value) -> Result<Vec<u8>> {
     Ok(resp)
 }
 
+const MULTIPART_BOUNDARY: &str = "npu-cli-boundary";
+
+/// Build a `multipart/form-data` body: `fields` in order, then one file part named `file_field`.
+fn build_multipart(fields: &[(&str, &str)], file_field: &str, filename: &str, file: &[u8]) -> Vec<u8> {
+    let b = MULTIPART_BOUNDARY;
+    let mut body = Vec::new();
+    for (k, v) in fields {
+        body.extend_from_slice(
+            format!("--{b}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n").as_bytes());
+    }
+    body.extend_from_slice(format!(
+        "--{b}\r\nContent-Disposition: form-data; name=\"{file_field}\"; filename=\"{filename}\"\r\n\
+         Content-Type: application/octet-stream\r\n\r\n").as_bytes());
+    body.extend_from_slice(file);
+    body.extend_from_slice(format!("\r\n--{b}--\r\n").as_bytes());
+    body
+}
+
 /// A `multipart/form-data` POST, for the two file-upload endpoints (transcribe, diarize). Mirrors
 /// exactly what `transcriptions()`/`diarizations()` already parse: a `model` field (if present)
 /// then a `file` part -- so a request built here and one built by a real OpenAI client differ only
 /// in which library assembled the bytes.
 pub fn call_multipart(path: &str, model: Option<&str>, filename: &str, file: &[u8])
     -> Result<serde_json::Value> {
-    const BOUNDARY: &str = "npu-cli-boundary";
-    let mut body = Vec::new();
-    if let Some(m) = model {
-        body.extend_from_slice(
-            format!("--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{m}\r\n")
-                .as_bytes());
-    }
-    body.extend_from_slice(format!(
-        "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n\
-         Content-Type: application/octet-stream\r\n\r\n").as_bytes());
-    body.extend_from_slice(file);
-    body.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
-    let content_type = format!("multipart/form-data; boundary={BOUNDARY}");
+    let fields: Vec<(&str, &str)> = model.map(|m| ("model", m)).into_iter().collect();
+    let body = build_multipart(&fields, "file", filename, file);
+    let content_type = format!("multipart/form-data; boundary={MULTIPART_BOUNDARY}");
     let (code, resp) = call("POST", path, Some(&content_type), &body)?;
     if !(200..300).contains(&code) { return Err(response_error(code, &resp)); }
     serde_json::from_slice(&resp).context("control socket: response was not JSON")
+}
+
+/// Like `call_multipart`, for a route whose success body is not JSON -- `/v1/images/upscale`,
+/// which answers a dims header (4 bytes LE width, 4 bytes LE height) followed by raw pixels (see
+/// `docs/api.md`). `fields` is the form's non-file fields in order; `file_field` names the upload
+/// part (`image`, not `file`).
+pub fn call_multipart_bytes(path: &str, fields: &[(&str, &str)], file_field: &str, filename: &str,
+    file: &[u8]) -> Result<Vec<u8>> {
+    let body = build_multipart(fields, file_field, filename, file);
+    let content_type = format!("multipart/form-data; boundary={MULTIPART_BOUNDARY}");
+    let (code, resp) = call("POST", path, Some(&content_type), &body)?;
+    if !(200..300).contains(&code) { return Err(response_error(code, &resp)); }
+    Ok(resp)
 }
 
 /// A streamed `POST`: the connection to a live SSE body, read one `data:` frame at a time. Generic

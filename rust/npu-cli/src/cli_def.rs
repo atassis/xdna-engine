@@ -104,6 +104,18 @@ pub enum Cmd {
         /// Emit the same JSON body the HTTP route returns, instead of readable lines.
         #[arg(long)] json: bool,
     },
+    /// Upscale a video file frame by frame over `npu serve`'s `/v1/images/upscale` (this binary
+    /// never opens the NPU itself).
+    ///
+    /// Decode and encode run through ffmpeg, same as `transcribe-media`; one request per frame.
+    Upscale {
+        #[arg(value_hint = ValueHint::FilePath)] input: PathBuf,
+        #[arg(value_hint = ValueHint::FilePath)] out: PathBuf,
+        /// SR net/schedule name; also the model name used when `--model` is not given.
+        #[arg(long, default_value = "espcn")] net: String,
+        /// Model name to request; defaults to `--net`.
+        #[arg(long)] model: Option<String>,
+    },
     /// One-shot speech synthesis of a text string, written to a file.
     ///
     /// The server always renders WAV; `--format pcm` strips its 44-byte header locally, writing
