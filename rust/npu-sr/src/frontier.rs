@@ -30,10 +30,15 @@ pub struct Frontier {
 }
 
 impl Frontier {
-    pub fn build(sched: &Schedule, use_npu: bool) -> Result<Frontier, SrError> {
+    /// `wa_dir`: the whole_array kernel build dir the NPU backend loads
+    /// `final_512x576x256_32x32x32_8c.xclbin` from. `None` falls back to the CWD-relative dev path
+    /// (`mlir-aie/.../whole_array/build`) `npu_backend` has always used; the service resolves a real
+    /// directory from the engine root and passes it explicitly (`resolve_kernel_dir`, same as every
+    /// other model). Unused when `use_npu` is false.
+    pub fn build(sched: &Schedule, use_npu: bool, wa_dir: Option<&std::path::Path>) -> Result<Frontier, SrError> {
         let weights = load_conv_weights(sched)?;
         let npu = if use_npu {
-            Some(npu_backend::NpuGemm::build(&weights)?)
+            Some(npu_backend::NpuGemm::build(&weights, wa_dir)?)
         } else {
             None
         };
@@ -273,17 +278,19 @@ mod npu_backend {
     }
 
     impl NpuGemm {
-        pub fn build(convs: &[ConvW]) -> Result<NpuGemm, SrError> {
+        pub fn build(convs: &[ConvW], wa_dir: Option<&Path>) -> Result<NpuGemm, SrError> {
             if !crate::npu_available() {
                 return Err(SrError::NotAvailable);
             }
             let dev = Rc::new(Device::open(0).map_err(|e| SrError::Device(format!("open: {e}")))?);
+            let wa = wa_dir.unwrap_or_else(|| Path::new(WA));
             let kernel = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                NativeKernel::load(&dev, Path::new(WA), KERNEL_K, KERNEL_N, TILE)
+                NativeKernel::load(&dev, wa, KERNEL_K, KERNEL_N, TILE)
             }))
             .map_err(|_| {
                 SrError::Device(format!(
-                    "load whole_array xclbin from {WA} (need final_{PAD_M}x{KERNEL_K}x{KERNEL_N}_{TILE}_8c.xclbin + insts .txt)"
+                    "load whole_array xclbin from {} (need final_{PAD_M}x{KERNEL_K}x{KERNEL_N}_{TILE}_8c.xclbin + insts .txt)",
+                    wa.display()
                 ))
             })?;
             let mut built = Vec::new();

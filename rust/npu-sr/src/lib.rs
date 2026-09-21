@@ -40,8 +40,16 @@ pub struct SrEngine {
 impl SrEngine {
     /// Load a schedule (espcn.json) + its baked weights checkpoint. `use_npu`=false forces the CPU frontier.
     pub fn load(schedule_path: impl AsRef<Path>, use_npu: bool) -> Result<SrEngine, SrError> {
+        Self::load_with(schedule_path, use_npu, None)
+    }
+
+    /// Like `load`, with an explicit whole_array kernel dir for the NPU frontier (the service
+    /// resolves this from the engine root, `kernel_registry::resolve_kernel_dir`-style, the same
+    /// way every other on-device model does); `None` keeps `load`'s CWD-relative dev default.
+    pub fn load_with(schedule_path: impl AsRef<Path>, use_npu: bool, wa_dir: Option<&Path>)
+        -> Result<SrEngine, SrError> {
         let sched = schedule::Schedule::load(schedule_path.as_ref())?;
-        let frontier = frontier::Frontier::build(&sched, use_npu)?;
+        let frontier = frontier::Frontier::build(&sched, use_npu, wa_dir)?;
         Ok(SrEngine { sched, frontier })
     }
 
@@ -128,11 +136,10 @@ pub fn npu_available() -> bool {
     std::path::Path::new("/dev/accel/accel0").exists()
 }
 
-// engine-open-capability-contract probe instance #2: image in, image out, genuinely &mut self --
-// this is the island the task exists to open: `SrEngine` has never implemented `AsrModel`,
-// `Embedder`, or npu-runtime's `Inference`; nothing here routes it through `ModelKind`/`Scenario`/
-// `Cmd`. `npu_sr` already depends on `npu_engine` (for `esm::native`'s conv-as-GEMM rail,
-// `frontier.rs:252`), so this adapter costs no new Cargo dependency.
+// image in, image out, genuinely &mut self. Routed through npu-runtime's `EngineLoader` for
+// scenario kind `image-sr`, not npu_engine's own `ModelKind`/`Scenario` (npu_engine cannot depend
+// on npu_sr). `npu_sr` already depends on `npu_engine` (for `esm::native`'s conv-as-GEMM rail,
+// `frontier.rs`), so this adapter costs no new Cargo dependency.
 impl npu_engine::capability::Servable for SrEngine {
     fn capabilities(&self) -> npu_engine::capability::Capability {
         npu_engine::capability::Capability::IMAGE_SR
