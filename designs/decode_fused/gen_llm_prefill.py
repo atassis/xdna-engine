@@ -117,6 +117,7 @@ import ml_dtypes
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from llm_decode_spec import SPECS  # noqa: E402
 from gemm_tile_registry import registry  # noqa: E402
+import pack_cache  # noqa: E402
 from prefill_ref import (f32, gate_block, layer_stack, npy_weights,  # noqa: E402
                          rope_block as _rope_block, softmax_rows as _softmax_rows)
 
@@ -329,6 +330,53 @@ def quant_source_files(src_dir, prefix, tensor):
         files.append(f"{prefix}{tensor}.kchunk{n}.npy")
         n += 1
     return files
+
+
+def pack_quant_weights(quant_pack, bdir, quant_plan):
+    """Write `bdir/<buf>.bin` for every `quant_pack` entry (Task 5): unlike x/rope/sm_widths,
+    these are STATIC model weights, packed ONCE, here, at build time. Each is a permutation of the
+    same per-tensor dump decode's own GEVM reads (`iron.common.quant.repack_gemm_weight`; nothing
+    is requantized), cut to the exact tile config the op that owns it was built with, so a
+    mismatch between the two would be a coding error in this file, not a device numerics gap.
+
+    Content-addressed cache (pack_cache.py): repack_gemm_weight is a pure function of the dump
+    bytes + these params + the two files that decide them, so the same checkpoint + packing layout
+    hits instead of re-permuting ~6.5 GB/build. PREFILL_PACK_CACHE=0 falls back to always-pack,
+    byte-identical either way.
+    """
+    from iron.common import quant as quant_mod
+
+    use_cache = pack_cache.cache_enabled()
+    hits = misses = 0
+    if use_cache:
+        store = pack_cache.ContentStore(pack_cache.default_cache_dir())
+        packer_digest = pack_cache.sha256_file(quant_mod.__file__)
+        generator_digest = pack_cache.sha256_file(os.path.abspath(__file__))
+        src_digests = {}
+    for e in quant_pack:
+        dest = os.path.join(bdir, f"{e['buf']}.bin")
+        if use_cache:
+            src_path = os.path.join(e["src_dir"], e["src_file"])
+            if src_path not in src_digests:
+                src_digests[src_path] = pack_cache.sha256_file(src_path)
+            key = pack_cache.content_key(e, src_digests[src_path], packer_digest,
+                                         generator_digest)
+            if store.materialize(key, dest):
+                hits += 1
+                continue
+            misses += 1
+        row_packed = np.load(os.path.join(e["src_dir"], e["src_file"]))
+        _, mmul_s, mmul_t = e["mmul"]
+        packed = quant_mod.repack_gemm_weight(row_packed, e["N"], e["K"], e["tile_k"],
+                                              e["tile_n"], e["group_size"], e["weight_dtype"],
+                                              mmul_s, mmul_t, e["cols"],
+                                              scale_dtype=e["scale_dtype"])
+        packed.tofile(dest)
+        if use_cache:
+            store.put(key, dest)
+    cache_note = f" (cache: {hits} hit, {misses} miss)" if use_cache else ""
+    print(f"[gen] packed {len(quant_pack)} quantized weight buffer(s) into {bdir} "
+          f"(sites: {sorted({s for s in quant_plan})}){cache_note}")
 
 
 def decode_arena_plan(meta_path):
@@ -2078,23 +2126,8 @@ def main():
             raise SystemExit(f"ERROR: {SM_RING} is {rows.nbytes}B here and {want}B in the layout")
         open(os.path.join(bdir, f"{SM_RING}.bin"), "wb").write(rows.tobytes())
 
-    # Quantized weight buffers (Task 5): unlike x/rope/sm_widths above, these are STATIC model
-    # weights, packed ONCE, here, at build time -- not per-request. Each is a permutation of the
-    # same per-tensor dump decode's own GEVM reads (`iron.common.quant.repack_gemm_weight`;
-    # nothing is requantized), cut to the exact tile config the op that owns it was built with, so
-    # a mismatch between the two would be a coding error in this file, not a device numerics gap.
     if dims["quant_pack"]:
-        from iron.common.quant import repack_gemm_weight
-
-        for e in dims["quant_pack"]:
-            row_packed = np.load(os.path.join(e["src_dir"], e["src_file"]))
-            _, mmul_s, mmul_t = e["mmul"]
-            packed = repack_gemm_weight(row_packed, e["N"], e["K"], e["tile_k"], e["tile_n"],
-                                        e["group_size"], e["weight_dtype"], mmul_s, mmul_t,
-                                        e["cols"], scale_dtype=e["scale_dtype"])
-            packed.tofile(os.path.join(bdir, f"{e['buf']}.bin"))
-        print(f"[gen] packed {len(dims['quant_pack'])} quantized weight buffer(s) into {bdir} "
-              f"(sites: {sorted({s for s in quant_plan})})")
+        pack_quant_weights(dims["quant_pack"], bdir, quant_plan)
 
     golden_files, gate = {}, None
     if not a.no_golden:
