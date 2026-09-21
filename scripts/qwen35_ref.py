@@ -24,13 +24,42 @@ from safetensors import safe_open
 PFX = "model.language_model."
 
 
+# The matrices the decode rail packs; the 32-row in_proj_a/b gates, norms and conv stay bf16.
+QUANT_LEAVES = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj",
+                "in_proj_qkv", "in_proj_z", "out_proj")
+
+
+def _iron_quant():
+    """IRON's packer, loaded by path: the `iron` package imports the device toolchain, this file only
+    numpy. IRON_DIR resolves as scripts/amd_paths.sh does."""
+    import importlib.util
+    ws = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    path = os.path.join(os.environ.get("IRON_DIR") or os.path.join(ws, "wt-iron-integ"),
+                        "iron", "common", "quant.py")
+    spec = importlib.util.spec_from_file_location("iron_quant", path)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def int4_roundtrip(w, group):
+    """Quantize-dequantize through the device packer, scale narrowed to bf16 as mv_quant.cc does."""
+    q = _iron_quant()
+    W = w.numpy()
+    packed = q.quantize_weight(W, group, "int4")
+    return torch.from_numpy(q.dequantize_weight(packed, *W.shape, group, "int4",
+                                                emulate_kernel_scale_cast=True))
+
+
 class Ckpt:
-    def __init__(self, root):
+    def __init__(self, root, int4_group=0):
         self.root = root
+        self.int4_group = int4_group
         self.cfg = json.load(open(os.path.join(root, "config.json")))["text_config"]
         wm = json.load(open(os.path.join(root, "model.safetensors.index.json")))["weight_map"]
         self.shard = wm
         self._open = {}
+        self._memo = {}
 
     def _f(self, name):
         path = os.path.join(self.root, self.shard[name])
@@ -39,7 +68,18 @@ class Ckpt:
         return self._open[path]
 
     def w(self, name):
-        return self._f(PFX + name).get_tensor(PFX + name).float()
+        """Memoised over one layer's worth of tensors, so a layer-major pass packs each matrix once."""
+        if name not in self._memo:
+            if len(self._memo) >= 16:
+                self._memo.pop(next(iter(self._memo)))
+            self._memo[name] = self._load(name)
+        return self._memo[name]
+
+    def _load(self, name):
+        t = self._f(PFX + name).get_tensor(PFX + name).float()
+        if self.int4_group and name.endswith(".weight") and name.split(".")[-2] in QUANT_LEAVES:
+            t = int4_roundtrip(t, self.int4_group)
+        return t
 
     def rows(self, name, lo, hi):
         return self._f(PFX + name).get_slice(PFX + name)[lo:hi].float()
@@ -183,6 +223,20 @@ class Model:
                 per_layer.append(x.clone())
         self.pos += len(ids)
         return (x, per_layer) if keep_layers else x
+
+    def forward_many(self, seqs):
+        """Layer-major pass over independent sequences from position 0: each layer is loaded once."""
+        ck, eps = self.ck, self.ck.cfg["rms_norm_eps"]
+        xs = [self.embed(ids) for ids in seqs]
+        for i, t in enumerate(self.types):
+            for n, x in enumerate(xs):
+                h = rms(x, ck.w(f"layers.{i}.input_layernorm.weight"), eps)
+                if t == "linear_attention":
+                    x = x + deltanet(ck, i, h, DeltaNetState(ck.cfg))
+                else:
+                    x = x + attention(ck, i, h, KVState(), 0)
+                xs[n] = x + mlp(ck, i, rms(x, ck.w(f"layers.{i}.post_attention_layernorm.weight"), eps))
+        return xs
 
     def final(self, x):
         return rms(x, self.ck.w("norm.weight"), self.ck.cfg["rms_norm_eps"])
