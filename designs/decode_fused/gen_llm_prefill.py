@@ -1303,6 +1303,8 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         LAB = LZAB - LVD
         HIST = (LTAPS - 1) * LCH
         GDR_T = int(os.environ.get("PREFILL_GDR_TOKENS", "16"))
+        # The state as bf16 limbs, native MACs: 7x the emulated-f32 step, 16 mantissa bits not 24.
+        GDR_LIMBS = os.environ.get("PREFILL_GDR_LIMBS", "1") == "1"
         if LVD != QD:
             raise ValueError(f"{sp.name}: the DeltaNet output takes o_proj's slot, so its value "
                              f"width ({LVD}) must equal q_dim ({QD})")
@@ -1330,7 +1332,7 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         op_gdr = GatedDeltaRule(v_heads=sp.lin_v_heads, k_heads=sp.lin_k_heads, dk=LDK, dv=LDK,
                                 ab_len=LAB, ab_off=0, mixed_len=LCH, q_off=0, k_off=LKD,
                                 v_off=2 * LKD, tokens=GDR_T, l2_qk=True, counted=True,
-                                num_aie_columns=cols, context=ctx)
+                                limbs=GDR_LIMBS or None, num_aie_columns=cols, context=ctx)
         op_gnorm = RMSNorm(size=M * LVD, num_aie_columns=cols, num_channels=1, tile_size=LDK,
                            weighted=True, epsilon=sp.eps, context=ctx, allocation_scheme=alloc_all)
         op_z_act = SiLUAct(size=M * LVD, num_aie_columns=cols, tile_size=LVD // cols, context=ctx,
@@ -1623,7 +1625,7 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     if A_RESIDENT:
         name += "_ares"
     if lin_layers:
-        name += f"_gdr{GDR_T}"
+        name += f"_gdr{GDR_T}" + ("l" if GDR_LIMBS else "")
     if _dq_cache:
         name += "_dq"
     if ACT_POLY:
