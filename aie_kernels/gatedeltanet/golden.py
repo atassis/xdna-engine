@@ -10,7 +10,7 @@ gatedeltanet.cc for the derivation and citation):
   sigmoid/softplus itself; that is its own elementwise op-type).
 
     pred_t   = S_{t-1}^T k_t
-    err_t    = v_t - pred_t
+    err_t    = v_t - alpha_t * pred_t
     S_t[i,:] = alpha_t * S_{t-1}[i,:] + beta_t * k_t[i] * err_t
     o_t      = S_t^T q_t
 
@@ -55,21 +55,21 @@ def make_inputs(rng, T, DK, DV, decay_lo=0.90, decay_hi=0.999):
     return k, v, q, gates
 
 
-def host_reference(k, v, q, gates, DK, DV):
-    """Full fp32 recurrence -- the golden."""
+def host_reference(k, v, q, gates, DK, DV, S0=None):
+    """Full fp32 recurrence -- the golden. S0 is the carried-in state (zeros: a fresh sequence)."""
     T = k.shape[0]
-    S = np.zeros((DK, DV), dtype=np.float32)
+    S = np.zeros((DK, DV), dtype=np.float32) if S0 is None else np.array(S0, dtype=np.float32)
     out = np.zeros((T, DV), dtype=np.float32)
     for t in range(T):
         alpha, beta = gates[t]
         pred = S.T @ k[t]                      # [DV]
-        err = v[t] - pred
+        err = v[t] - alpha * pred
         S = alpha * S + beta * np.outer(k[t], err)
         out[t] = S.T @ q[t]
     return out, S
 
 
-def kernel_model(k_f32, v_f32, q_f32, gates, DK, DV):
+def kernel_model(k_f32, v_f32, q_f32, gates, DK, DV, S0=None):
     """Bit-faithful model of gatedeltanet.cc: bf16 k/v/q (rounded once on
     entry), f32 gates/state (accfloat, un-rounded across steps), f32
     intermediate math, single bf16 round on the per-step output only."""
@@ -77,12 +77,12 @@ def kernel_model(k_f32, v_f32, q_f32, gates, DK, DV):
     kb = bf16(k_f32)
     vb = bf16(v_f32)
     qb = bf16(q_f32)
-    S = np.zeros((DK, DV), dtype=np.float32)  # s_in seed (all-zero for a fresh sequence)
+    S = np.zeros((DK, DV), dtype=np.float32) if S0 is None else np.array(S0, dtype=np.float32)
     out = np.zeros((T, DV), dtype=np.float32)
     for t in range(T):
         alpha, beta = gates[t]
         pred = S.T @ kb[t]
-        err = vb[t] - pred
+        err = vb[t] - alpha * pred
         S = alpha * S + beta * np.outer(kb[t], err)
         ov = S.T @ qb[t]
         out[t] = bf16(ov)  # one bf16 round on store (matches aie::store_v<bfloat16,DV>)

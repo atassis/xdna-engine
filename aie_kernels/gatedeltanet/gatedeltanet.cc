@@ -29,7 +29,7 @@
 //   separate producer):
 //
 //     pred_t   = S_{t-1}^T k_t                      (R^{D_V}; a K-reduction)
-//     err_t    = v_t - pred_t                        (the delta / correction)
+//     err_t    = v_t - alpha_t * pred_t              (the delta, read from the DECAYED state)
 //     S_t[i,:] = alpha_t * S_{t-1}[i,:] + beta_t * k_t[i] * err_t   (i=0..D_K-1)
 //     o_t      = S_t^T q_t                            (R^{D_V}; same reduction)
 //
@@ -196,8 +196,10 @@ static inline void gatedeltanet_core(const bfloat16 *__restrict k,
     const float beta = gates[t * 2 + 1];
 #endif
 
-    // 1) predict what the (pre-update) state already stores for this key.
+    // 1) predict what the decayed state stores for this key: alpha * S^T k.
     aie::vector<float, DV> pred = gdn_state_read<DK, DV>(s_out, kf);
+    pred = aie::mul(pred, aie::broadcast<float, DV>(gates[t * 2 + 0]))
+               .template to_vector<float>();
     // 2) delta / correction term.
     aie::vector<float, DV> err = aie::sub(vf, pred);
     // 3) decay + delta-rule write (in place on s_out).
