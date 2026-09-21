@@ -69,13 +69,15 @@ def main():
     ap.add_argument("--out", default=None)
     ap.add_argument("--int4-group", type=int, default=0,
                     help="run the projections through the int4 packer at this group size")
+    ap.add_argument("--clip-search", action="store_true", help="packer's per-group MSE clip search")
+    ap.add_argument("--full-range", action="store_true", help="all 16 int4 levels, not 15")
     a = ap.parse_args()
     torch.set_grad_enabled(False)
     torch.set_num_threads(max(1, (os.cpu_count() or 2) // 2))
 
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(a.ckpt)
-    ck = Ckpt(a.ckpt, a.int4_group)
+    ck = Ckpt(a.ckpt, a.int4_group, a.clip_search, a.full_range)
     tasks = [json.loads(l) for l in open(a.tasks) if l.strip()]
     tasks = tasks[:a.limit] if a.limit else tasks
     out = open(a.out, "w") if a.out else None
@@ -95,7 +97,7 @@ def main():
         rec = {"id": task["id"], "type": task["question"]["type"], "n_tokens": len(ids),
                "option_ids": keys, "option_logits": logits.tolist(), "probabilities": probs.tolist(),
                "answer": got, "expected": task.get("expected"), "correct": bool(ok),
-               "int4_group": a.int4_group, "seconds": round(per_task, 1)}
+               "int4_group": a.int4_group, "clip_search": a.clip_search, "full_range": a.full_range, "seconds": round(per_task, 1)}
         print(json.dumps(rec), flush=True)
         if out:
             out.write(json.dumps(rec) + "\n")

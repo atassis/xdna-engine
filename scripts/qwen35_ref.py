@@ -42,19 +42,20 @@ def _iron_quant():
     return m
 
 
-def int4_roundtrip(w, group):
+def int4_roundtrip(w, group, clip_search=False, full_range=False):
     """Quantize-dequantize through the device packer, scale narrowed to bf16 as mv_quant.cc does."""
     q = _iron_quant()
     W = w.numpy()
-    packed = q.quantize_weight(W, group, "int4")
+    packed = q.quantize_weight(W, group, "int4", clip_search=clip_search, full_range=full_range)
     return torch.from_numpy(q.dequantize_weight(packed, *W.shape, group, "int4",
                                                 emulate_kernel_scale_cast=True))
 
 
 class Ckpt:
-    def __init__(self, root, int4_group=0):
+    def __init__(self, root, int4_group=0, clip_search=False, full_range=False):
         self.root = root
         self.int4_group = int4_group
+        self.int4_kw = {"clip_search": clip_search, "full_range": full_range}
         self.cfg = json.load(open(os.path.join(root, "config.json")))["text_config"]
         wm = json.load(open(os.path.join(root, "model.safetensors.index.json")))["weight_map"]
         self.shard = wm
@@ -78,7 +79,7 @@ class Ckpt:
     def _load(self, name):
         t = self._f(PFX + name).get_tensor(PFX + name).float()
         if self.int4_group and name.endswith(".weight") and name.split(".")[-2] in QUANT_LEAVES:
-            t = int4_roundtrip(t, self.int4_group)
+            t = int4_roundtrip(t, self.int4_group, **self.int4_kw)
         return t
 
     def rows(self, name, lo, hi):
