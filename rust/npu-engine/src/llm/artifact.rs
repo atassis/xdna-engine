@@ -158,6 +158,10 @@ pub struct LlmArtifact {
     /// re-zero (`NpuDecodeStep::reset`). Absent (empty) is legal: a model with no on-device cache
     /// buffer still validates.
     pub cache_buffers: Vec<String>,
+    /// The subset of `cache_buffers` that is RECURRENT state (Gated DeltaNet's S and conv window):
+    /// not indexed by position, so the attention mask cannot hide a previous request's contents and
+    /// a shared prefix cannot be resumed mid-way. `NpuDecodeStep::reset` zeroes these every request.
+    pub recurrent_buffers: Vec<String>,
     /// `meta.json`'s `embed_blob`; see [`Self::embed_blob`]. `None` in pre-2026-09-08 artifacts.
     pub embed_blob: Option<String>,
     pub kv_off: ScratchpadParam,
@@ -389,6 +393,11 @@ impl LlmArtifact {
         let inputs = str_list("inputs")?;
         let weights = str_list("weights")?;
         let cache_buffers = meta.get("cache_buffers").map(|_| str_list("cache_buffers")).transpose()?.unwrap_or_default();
+        let recurrent_buffers =
+            meta.get("recurrent_buffers").map(|_| str_list("recurrent_buffers")).transpose()?.unwrap_or_default();
+        if let Some(n) = recurrent_buffers.iter().find(|n| !cache_buffers.contains(n)) {
+            return Err(ctx(format!("recurrent buffer `{n}` is not one of `cache_buffers`")));
+        }
         let embed_blob = meta.get("embed_blob").and_then(|v| v.as_str()).map(str::to_owned);
         let toolchain_hash = meta
             .get("toolchain")
@@ -1103,6 +1112,7 @@ impl LlmArtifact {
             weights,
             output,
             cache_buffers,
+            recurrent_buffers,
             embed_blob,
             kv_off,
             kv_offs,
@@ -1785,6 +1795,25 @@ mod tests {
         write_meta(dir.path(), &meta);
         let err = LlmArtifact::load(dir.path()).unwrap_err().to_string();
         assert!(err.contains("attention geometry disagrees"), "{err}");
+    }
+
+    /// Recurrent state must be a cache buffer: `reset` zeroes it through the same arena locations,
+    /// and a name the cache list does not carry would be zeroed nowhere.
+    #[test]
+    fn recurrent_buffers_load_as_a_subset_of_the_cache_and_a_stray_one_fails_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = base_meta(8, 4, serde_json::json!({"S0": {"type": "scratch", "offset": 16, "len": 8}}));
+        meta["scratch_size"] = serde_json::json!(24);
+        meta["cache_buffers"] = serde_json::json!(["S0"]);
+        meta["recurrent_buffers"] = serde_json::json!(["S0"]);
+        write_meta(dir.path(), &meta);
+        let art = LlmArtifact::load(dir.path()).expect("a recurrent cache buffer loads");
+        assert_eq!(art.recurrent_buffers, vec!["S0".to_string()]);
+
+        meta["recurrent_buffers"] = serde_json::json!(["S1"]);
+        write_meta(dir.path(), &meta);
+        let err = LlmArtifact::load(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("recurrent buffer `S1`"), "{err}");
     }
 
     /// Ordinary partial rotary: the angle row is rope_rotary_dim wide, not head_dim, and that is

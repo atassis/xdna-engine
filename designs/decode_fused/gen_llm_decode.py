@@ -2566,6 +2566,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     op_head = gemv(VOCAB, D, ctx, **head_quant_kw)
 
     weights, bufsz, cache_names, rl = {}, {}, [], []
+    recurrent_names = []   # the cache buffers a position mask cannot hide; see npu_decode.rs reset()
     if sp.v_norm:
         # The gainless v-norm's gain, one per head_dim and shared by EVERY layer -- a true constant,
         # unlike the per-layer learned gains beside it, so it is registered once here rather than in
@@ -2672,6 +2673,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             # f32 state as raw bytes: int8 is how the writer recognises "already in wire format".
             weights[p + "S"] = np.zeros(sp.lin_v_heads * LDK * LDK, np.float32).view(np.int8)
             cache_names += [p + "cw", p + "S"]
+            recurrent_names += [p + "cw", p + "S"]
             # cw is sliced in the runlist, so its size must be explicit even though it is a weight.
             bufsz.update({p + "zab": LZAB * 2, p + "lo": LVD * 2, p + "cw": LTAPS * LCH * 2})
         mlp_keys = {"Wg", "Wu", "Wd"}
@@ -3268,6 +3270,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                                 context=ctx, extra_flags=placer_flags, share_designs=share)
         head.compile()
     return sp, fused, weights, dict(NL=NL, S=S, T=T, inputs=inputs, cache_names=cache_names,
+                                        recurrent_names=recurrent_names,
                                         decode_layer_active=op_decode_layer is not None,
                                         # getattr, not attribute access: a spec whose fused
                                         # layer did not build has no such attribute.
@@ -3466,6 +3469,7 @@ def main():
                           "logit_softcap": sp.logit_softcap},
         "layer_types": ["global" if sp.is_global(l) else "sliding" for l in range(NL)],
         "cache_buffers": cache_names,
+        "recurrent_buffers": md["recurrent_names"],
         # `plan` is the whole per-site truth and `projected_mb_per_token` is what it was priced
         # at; the flat keys beside them are the shape npu_decode.rs::provenance_extras reads.
         # scale_kind rides here rather than in the design name whenever it is the class default:
