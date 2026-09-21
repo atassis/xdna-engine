@@ -323,6 +323,10 @@ FUSE_ROPE_QK = os.environ.get("FUSE_ROPE_QK", "1") == "1"
 # 5e-3..5e-2 relative (kb/aie-tanh-is-the-same-coarse-sfu-lut-as-exp2).
 ACT_POLY = os.environ.get("ACT_POLY", "0") == "1"
 
+# The gated delta rule's state as two bf16 limbs (16 mantissa bits, native MACs) instead of emulated
+# f32. Changes decode numerics, so off until a decision gate picks it.
+GDR_LIMBS = os.environ.get("DECODE_GDR_LIMBS", "0") == "1"
+
 # Fold `attn_scale` into the q-norm gain instead of running an ElementwiseMul over the whole
 # [Hq, S] score matrix. RMSNorm's gain multiply and RoPE's rotation are both linear in q, and the
 # scores GEMV is linear in q, so scaling n_qn by attn_scale scales `sc` by exactly the same factor
@@ -689,6 +693,8 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tm
         parts.append("noropeqk")
     if ACT_POLY:
         parts.append("actp")
+    if GDR_LIMBS and any(sp.mixer_for(l) == "linear_attention" for l in range(NL)):
+        parts.append("gdrl")
     if sp.qk_norm and not SCALE_IN_QNORM:
         parts.append("noscaleqn")
     # One fragment per quantized site. scale_kind rides the name only when it is not the class
@@ -2454,7 +2460,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         op_gdr = GatedDeltaRule(v_heads=sp.lin_v_heads, k_heads=sp.lin_k_heads, dk=LDK, dv=LDK,
                                 ab_len=LZAB, ab_off=LVD, mixed_len=LTAPS * LCH, q_off=LWIN,
                                 k_off=LWIN + LKD, v_off=LWIN + 2 * LKD, num_aie_columns=COLS,
-                                context=ctx)
+                                limbs=GDR_LIMBS or None, context=ctx)
         op_gnorm = RMSNorm(size=LDK, num_aie_columns=1, num_channels=1, tile_size=LDK,
                            weighted=True, epsilon=sp.eps, context=ctx)
         op_z_act = SiLUAct(size=LVD, num_aie_columns=COLS, tile_size=LVD // COLS, context=ctx)
