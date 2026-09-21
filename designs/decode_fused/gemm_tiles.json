@@ -1274,6 +1274,25 @@
       "measured": null,
       "candidates_considered": null
     },
+    "m256_k2048_n256_bf162bf16_bfp0_acc1": {
+      "M": 256,
+      "K": 2048,
+      "N": 256,
+      "dtype": "bf16>bf16",
+      "emulate": false,
+      "prio_accuracy": true,
+      "tile_m": 16,
+      "tile_k": 32,
+      "tile_n": 64,
+      "cols": 4,
+      "b_col_maj": false,
+      "source": "assumed",
+      "labels": [
+        "ctx"
+      ],
+      "measured": null,
+      "candidates_considered": null
+    },
     "m256_k2048_n256_bf162bf16_bfp1_acc0": {
       "M": 256,
       "K": 2048,
@@ -1424,6 +1443,25 @@
       "measured": null,
       "candidates_considered": null
     },
+    "m256_k2560_n128_bf162bf16_bfp0_acc1": {
+      "M": 256,
+      "K": 2560,
+      "N": 128,
+      "dtype": "bf16>bf16",
+      "emulate": false,
+      "prio_accuracy": true,
+      "tile_m": 16,
+      "tile_k": 128,
+      "tile_n": 16,
+      "cols": 8,
+      "b_col_maj": true,
+      "source": "assumed",
+      "labels": [
+        "lin_ab"
+      ],
+      "measured": null,
+      "candidates_considered": null
+    },
     "m256_k2560_n4096_bf162bf16_bfp0_acc0": {
       "M": 256,
       "K": 2560,
@@ -1496,6 +1534,44 @@
       "source": "assumed",
       "labels": [
         "s2-pro-slow-ar:q"
+      ],
+      "measured": null,
+      "candidates_considered": null
+    },
+    "m256_k2560_n8192_bf162bf16_bfp0_acc1": {
+      "M": 256,
+      "K": 2560,
+      "N": 8192,
+      "dtype": "bf16>bf16",
+      "emulate": false,
+      "prio_accuracy": true,
+      "tile_m": 16,
+      "tile_k": 128,
+      "tile_n": 32,
+      "cols": 8,
+      "b_col_maj": true,
+      "source": "assumed",
+      "labels": [
+        "lin_qkv"
+      ],
+      "measured": null,
+      "candidates_considered": null
+    },
+    "m256_k2560_n9216_bf162bf16_bfp0_acc1": {
+      "M": 256,
+      "K": 2560,
+      "N": 9216,
+      "dtype": "bf16>bf16",
+      "emulate": false,
+      "prio_accuracy": true,
+      "tile_m": 16,
+      "tile_k": 128,
+      "tile_n": 32,
+      "cols": 8,
+      "b_col_maj": true,
+      "source": "assumed",
+      "labels": [
+        "gate_up"
       ],
       "measured": null,
       "candidates_considered": null
@@ -1595,6 +1671,25 @@
       "source": "assumed",
       "labels": [
         "scores_hd256_w1024"
+      ],
+      "measured": null,
+      "candidates_considered": null
+    },
+    "m256_k256_n2048_bf162bf16_bfp0_acc1": {
+      "M": 256,
+      "K": 256,
+      "N": 2048,
+      "dtype": "bf16>bf16",
+      "emulate": false,
+      "prio_accuracy": true,
+      "tile_m": 16,
+      "tile_k": 64,
+      "tile_n": 64,
+      "cols": 4,
+      "b_col_maj": true,
+      "source": "assumed",
+      "labels": [
+        "scores"
       ],
       "measured": null,
       "candidates_considered": null
@@ -2307,6 +2402,25 @@
       ],
       "measured": null,
       "candidates_considered": 231
+    },
+    "m256_k9216_n2560_bf162bf16_bfp0_acc1": {
+      "M": 256,
+      "K": 9216,
+      "N": 2560,
+      "dtype": "bf16>bf16",
+      "emulate": false,
+      "prio_accuracy": true,
+      "tile_m": 16,
+      "tile_k": 64,
+      "tile_n": 16,
+      "cols": 4,
+      "b_col_maj": true,
+      "source": "assumed",
+      "labels": [
+        "down"
+      ],
+      "measured": null,
+      "candidates_considered": null
     },
     "m256_k9728_n2560_bf162bf16_bfp0_acc0": {
       "M": 256,
