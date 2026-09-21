@@ -28,7 +28,8 @@ fn report_pairing() {
     eprintln!("prefill L={} S={} kv_block={} M={} kv_windows={:?}",
               pa.n_layers, pa.max_seq, pa.kv_block, pa.batch, wins(&pa));
     for (what, r) in [("check_prefill_pairing", da.check_prefill_pairing(&pa)),
-                      ("check_shared_layout_agrees", da.check_shared_layout_agrees(&pa))] {
+                      ("check_shared_layout_agrees", da.check_shared_layout_agrees(&pa)),
+                      ("prefill check_per_token_writes", pa.check_per_token_writes(&pa.per_dispatch_writes()))] {
         match r {
             Ok(()) => eprintln!("{what}: PASS"),
             Err(e) => eprintln!("{what}: FAIL -- {e}"),

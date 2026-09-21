@@ -1384,6 +1384,7 @@ impl LlmArtifact {
             .chain(self.rope_inputs.iter().map(|(n, _)| n.as_str()))
             .chain(self.mask_widths.iter().map(|m| m.buffer.as_str()))
             .chain(self.mask_ring.iter().map(|m| m.buffer.as_str()))
+            .chain(self.recurrent_counts.iter().map(|r| r.buffer.as_str()))
             .collect()
     }
 
