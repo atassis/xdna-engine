@@ -135,6 +135,17 @@ from iron.operators.gelu.op import GELU  # noqa: E402
 from iron.operators.elementwise_mul.op import ElementwiseMul  # noqa: E402
 from iron.operators.elementwise_add.op import ElementwiseAdd  # noqa: E402
 from iron.operators.strided_copy.op import StridedCopy  # noqa: E402
+from iron.common.quant import row_stride_bytes  # noqa: E402
+from iron.operators.dequant_rows.op import DequantRows  # noqa: E402
+
+# Decode's ACT_POLY, mirrored: SiLU and sigmoid in f32 polynomial math instead of the SFU tanh LUT.
+# The two halves must agree, or prefill and decode compute different activations over one cache.
+ACT_POLY = os.environ.get("ACT_POLY", "0") == "1"
+if ACT_POLY:
+    from iron.operators.act_poly.op import SiLUPoly as SiLUAct, SigmoidPoly as SigmoidAct  # noqa: E402
+else:
+    SiLUAct = SiLU
+    from iron.operators.sigmoid.op import Sigmoid as SigmoidAct  # noqa: E402
 
 BF16 = ml_dtypes.bfloat16
 
@@ -738,10 +749,13 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         # bit-identical to an unweighted one, and reusing the object -- not building a `weighted=
         # False` twin -- makes the v-norm and k-norm runs one contiguous same-design block.
         op_vn = op_kn if sp.v_norm else None
-        op_rq = RoPE(rows=M * Hq, cols=hd, angle_rows=M, num_aie_columns=cols, context=ctx,
-                    allocation_scheme=alloc_all)
-        op_rk = RoPE(rows=M * hkv, cols=hd, angle_rows=M, num_aie_columns=cols, context=ctx,
-                    allocation_scheme=alloc_all)
+        # An ordinary partial rotary (Qwen3.5) turns the first `rot` of each head row, in place.
+        rot = sp.rope_rotary_dim or hd
+        rkw = dict(row_stride=hd) if rot != hd else {}
+        op_rq = RoPE(rows=M * Hq, cols=rot, angle_rows=M, num_aie_columns=cols, context=ctx,
+                    allocation_scheme=alloc_all, **rkw)
+        op_rk = RoPE(rows=M * hkv, cols=rot, angle_rows=M, num_aie_columns=cols, context=ctx,
+                    allocation_scheme=alloc_all, **rkw)
         # One kv head's run of rows, and where each role's block sits inside it. A layer with no
         # v_proj (attention_k_eq_v) concatenates grp+1 blocks, not grp+2 -- verified against the
         # decode dump: L*_Wqkv is 62,914,560 B at sliding (grp+2=4 blocks) and 66,846,720 B at
@@ -926,8 +940,8 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     # contiguous slice of the same buffer. That is also what makes the causal mask a plain vector:
     # row Hq*M is (head, token) flattened, and the width depends only on the token half.
     if sp.act == "silu":
-        op_act = SiLU(size=M * FF, num_aie_columns=cols, tile_size=FF // cols, context=ctx,
-                      allocation_scheme=alloc_all)
+        op_act = SiLUAct(size=M * FF, num_aie_columns=cols, tile_size=FF // cols, context=ctx,
+                         allocation_scheme=alloc_all)
     else:
         op_act = GELU(size=M * FF, num_aie_columns=cols, num_channels=1,
                       tile_size=FF // cols, context=ctx, allocation_scheme=alloc_all)
@@ -1030,6 +1044,18 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
             base, span = geom.blocking[role][1] * D, op.b_elems
         return f"{p}Wqkv[{base * 2}:{(base + span) * 2}]"
 
+    def qkv_rl(p, role, geom, layer, out):
+        """Runlist entries for one of q/k/v: the GEMM over its operand, preceded by the
+        DequantRows that makes the operand when decode holds `Wqkv` as int4 rows."""
+        op = {"q": geom.op_gq, "k": geom.op_gkv, "v": geom.op_gkv}[role]
+        if "qkv" in quant_plan or hm or not dec_meta_path:
+            return [(op, "h", qkv_operand(p, role, geom, layer), out)]
+        row0, n = {"q": (0, geom.qd), "k": (geom.qd, geom.kvd),
+                   "v": (geom.qd + geom.kvd, geom.kvd)}[role]
+        total = geom.qd + (2 if geom.has_v else 1) * geom.kvd
+        pre, w = weight_rows(f"{p}Wqkv", total, row0, n, D)
+        return pre + [(op, "h", w, out)]
+
     def qkv_operand(p, role, geom, layer):
         """Q/K/V's weight operand: `qkv_slab` (decode's head-major `Wqkv` slice) when bf16, or a
         buffer this build packs itself from the "qkv" site's own dump when quantized.
@@ -1084,6 +1110,41 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
             return (f"{b}[0:{D * 2}]", f"{b}[{D * 2}:{(D + hd) * 2}]",
                     f"{b}[{(D + hd) * 2}:{(D + 2 * hd) * 2}]")
         return (p + "n_in", p + "n_qn", p + "n_kn")
+
+    # Decode's weights as int4 rows (its GEMV format) are read through DequantRows into ONE shared
+    # bf16 matrix `wdq`, right before the GEMM that consumes it: a second packed copy in GEMM's
+    # layout does not fit the 4 GiB arena beside a 4B model's decode weights. Which buffers are int4
+    # is read off decode's own byte lengths, never assumed.
+    _dq_cache = {}
+    wdq_elems = [0]
+
+    def dq_group(buf, rows, K):
+        n = dec_sizes.get(buf)
+        if n is None:
+            raise ValueError(f"{buf}: not in the decode arena")
+        if n == rows * K * 2:
+            return None
+        hits = [g for g in (32, 64, 128) if n == rows * row_stride_bytes(K, g, "int4")]
+        if len(hits) != 1:
+            raise ValueError(f"{buf}: {n} B is neither bf16 nor one int4 group size for "
+                             f"[{rows}, {K}] (matches: {hits})")
+        return hits[0]
+
+    def weight_rows(buf, total_rows, row0, nrows, K, out_stride=None, out_col=0):
+        """(runlist entries, operand) for rows [row0, row0+nrows) of decode's [total_rows, K]
+        weight `buf`: its bf16 slice as is, or a DequantRows of the int4 rows into `wdq`."""
+        g = dq_group(buf, total_rows, K)
+        if g is None:
+            return [], f"{buf}[{row0 * K * 2}:{(row0 + nrows) * K * 2}]"
+        key = (nrows, K, g, out_stride, out_col)
+        if key not in _dq_cache:
+            _dq_cache[key] = DequantRows(rows=nrows, K=K, group_size=g, num_aie_columns=cols,
+                                         out_stride=out_stride, out_col=out_col, context=ctx)
+        op = _dq_cache[key]
+        width = out_stride or K
+        wdq_elems[0] = max(wdq_elems[0], nrows * width)
+        out = f"wdq[0:{nrows * width * 2}]"
+        return [(op, f"{buf}[{row0 * op.row_stride}:{(row0 + nrows) * op.row_stride}]", out)], out
 
     # A K-split weight's chunk GEMM + its accumulate-add, memoized by (chunk_K, Nout): every layer
     # needing a chunked down-projection shares one pair of designs, exactly like `attn_ops` shares
@@ -1172,8 +1233,11 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
                                        weight_dtype=dtype, cols=chunk_op.num_aie_columns,
                                        scale_dtype=scale_dtype, mmul=chunk_op._mmul_rst))
                 return f"{name}[0:{nbytes}]"
-        elif not dec_meta_path or plain in dec_sizes:
+        elif not dec_meta_path:
             return [(plain_op, a_buf, f"{plain}[0:{K * Nout * 2}]", out_buf)]
+        elif plain in dec_sizes:
+            pre, w = weight_rows(plain, Nout, 0, Nout, K)
+            return pre + [(plain_op, a_buf, w, out_buf)]
         else:
             n = 0
             while f"{plain}k{n}" in dec_sizes:
@@ -1184,6 +1248,13 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
             if K % n:
                 raise ValueError(f"{plain}: K={K} not divisible by its own {n} decode-arena chunks")
             chunk_k = K // n
+            if dq_group(f"{plain}k0", Nout, chunk_k) is not None:
+                # int4 chunks land side by side in one [Nout, K] matrix: one full-K GEMM, no fold.
+                pre = []
+                for i in range(n):
+                    pre += weight_rows(f"{plain}k{i}", Nout, 0, Nout, chunk_k, out_stride=K,
+                                       out_col=i * chunk_k)[0]
+                return pre + [(plain_op, a_buf, f"wdq[0:{Nout * K * 2}]", out_buf)]
             if n > 1:
                 # kacc/kpart/kpart2 are pre-sized D-wide, above, for the only two roles the shared
                 # arena chunks today (Wd, Wo). A future K-split at a different Nout (Wg/Wu -> FF)
@@ -1248,6 +1319,88 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     def ang_buf(l):
         return ("rope_global" if sp.is_global(l) else "rope_local") if dual_rope else "rope"
 
+    # Gated DeltaNet (Qwen3.5's linear attention), M tokens a chunk: the in_proj rows land in a
+    # [taps-1+M, LCH] conv window `cwp` behind the history rows copied in from decode's `cw`, the
+    # conv runs in place and hands the history back, and the delta rule steps GDR_T tokens a call
+    # with its state in L1. The output lands in `cxt`, where o_proj reads it, as in decode.
+    lin_layers = [l for l in range(NL) if sp.mixer_for(l) == "linear_attention"]
+    if lin_layers:
+        from iron.operators.conv1d_step.op import Conv1dStep
+        from iron.operators.gated_delta_rule.op import GatedDeltaRule
+        if not dec_meta_path:
+            raise ValueError(f"{sp.name}: the DeltaNet state lives in decode's arena; build with "
+                             f"--decode-meta")
+        LDK, LTAPS = sp.lin_head_dim, sp.lin_conv_taps
+        LKD, LVD = sp.lin_k_heads * LDK, sp.lin_v_heads * LDK
+        LCH = 2 * LKD + LVD
+        LZAB = LVD + max(2 * sp.lin_v_heads, LDK)   # decode's z | a | b row, a|b padded to dk
+        LAB = LZAB - LVD
+        HIST = (LTAPS - 1) * LCH
+        GDR_T = int(os.environ.get("PREFILL_GDR_TOKENS", "16"))
+        if LVD != QD:
+            raise ValueError(f"{sp.name}: the DeltaNet output takes o_proj's slot, so its value "
+                             f"width ({LVD}) must equal q_dim ({QD})")
+        if M % GDR_T:
+            raise ValueError(f"M={M} is not a whole number of GDR_T={GDR_T} delta-rule steps")
+        # The widest conv tile whose double-buffered window, output and weight tiles fit L1.
+        conv_tc = max(t for t in (32, 64, 128, 256) if (LCH // cols) % t == 0
+                      and 2 * (2 * (LTAPS - 1 + M) + LTAPS) * t * 2 <= 56 * 1024)
+        op_lqkv = gemm_for("lin_qkv", D, LCH)
+        op_lz = gemm_for("lin_z", D, LVD)
+        op_lab = gemm_for("lin_ab", D, LAB)
+        op_hist = StridedCopy(input_sizes=(HIST,), input_strides=(1,), input_offset=0,
+                              output_sizes=(HIST,), output_strides=(1,), output_offset=0,
+                              input_buffer_size=HIST, output_buffer_size=HIST,
+                              transfer_size=pick_transfer(HIST), num_aie_channels=1, context=ctx)
+        op_conv = Conv1dStep(channels=LCH, taps=LTAPS, tokens=M, tile_channels=conv_tc,
+                             num_aie_columns=cols, context=ctx)
+        op_mix_act = SiLUAct(size=M * LCH, num_aie_columns=cols, tile_size=LCH // cols,
+                             context=ctx, allocation_scheme=alloc_all)
+        op_gdr = GatedDeltaRule(v_heads=sp.lin_v_heads, k_heads=sp.lin_k_heads, dk=LDK, dv=LDK,
+                                ab_len=LAB, ab_off=0, mixed_len=LCH, q_off=0, k_off=LKD,
+                                v_off=2 * LKD, tokens=GDR_T, l2_qk=True, num_aie_columns=cols,
+                                context=ctx)
+        op_gnorm = RMSNorm(size=M * LVD, num_aie_columns=cols, num_channels=1, tile_size=LDK,
+                           weighted=True, epsilon=sp.eps, context=ctx, allocation_scheme=alloc_all)
+        op_z_act = SiLUAct(size=M * LVD, num_aie_columns=cols, tile_size=LVD // cols, context=ctx,
+                           allocation_scheme=alloc_all)
+        op_o_mul = ElementwiseMul(size=M * LVD, num_aie_columns=cols, tile_size=LVD // cols,
+                                  context=ctx, allocation_scheme=alloc_all)
+        bufsz.update({"cwp": (LTAPS - 1 + M) * LCH * 2, "lz": M * LVD * 2, "lab": M * LAB * 2,
+                      "lo": M * LVD * 2})
+
+    def deltanet_rl(p, out):
+        el = lambda buf, lo, n: f"{buf}[{lo * 2}:{(lo + n) * 2}]"
+        rows = el("cwp", HIST, M * LCH)
+        rl_ = [(op_hist, el(p + "cw", 0, HIST), el("cwp", 0, HIST))]
+        pre, w = weight_rows(p + "Wlqkv", LCH, 0, LCH, D)
+        rl_ += pre + [(op_lqkv, "h", w, rows),
+                      (op_conv, "cwp", p + "cvw", "cwp"),
+                      (op_hist, el("cwp", 0, HIST), el(p + "cw", 0, HIST)),
+                      (op_mix_act, rows, rows)]
+        pre, w = weight_rows(p + "Wlzab", LZAB, 0, LVD, D)
+        rl_ += pre + [(op_lz, "h", w, "lz")]
+        pre, w = weight_rows(p + "Wlzab", LZAB, LVD, LAB, D)
+        rl_ += pre + [(op_lab, "h", w, "lab")]
+        for c in range(M // GDR_T):
+            rl_.append((op_gdr, el("lab", c * GDR_T * LAB, GDR_T * LAB), p + "gdp",
+                        el("cwp", HIST + c * GDR_T * LCH, GDR_T * LCH), p + "S", p + "S",
+                        el("lo", c * GDR_T * LVD, GDR_T * LVD)))
+        return rl_ + [(op_gnorm, "lo", p + "gnw", "lo"), (op_z_act, "lz", "lz"),
+                      (op_o_mul, "lo", "lz", out)]
+
+    if sp.attn_output_gate:
+        if not seam:
+            raise ValueError("the attention output gate multiplies the token-major context; "
+                             "build with PREFILL_HEAD_SEAM=1")
+        op_gate_act = SigmoidAct(size=M * QD, num_aie_columns=cols, num_channels=1,
+                                 tile_size=QD // cols, context=ctx, allocation_scheme=alloc_all) \
+            if not ACT_POLY else SigmoidAct(size=M * QD, num_aie_columns=cols, tile_size=QD // cols,
+                                             context=ctx, allocation_scheme=alloc_all)
+        op_gate_mul = ElementwiseMul(size=M * QD, num_aie_columns=cols, tile_size=QD // cols,
+                                     context=ctx, allocation_scheme=alloc_all)
+        bufsz["gt"] = M * QD * 2
+
     rl, cache_names, layer_starts, ring_layers = [], [], [], []
     for l in range(NL):
         layer_starts.append(len(rl))
@@ -1260,117 +1413,122 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         # cannot serve two geometries.
         qb, kb, vb, cxtb = f"q{g.sfx}", f"k{g.sfx}", f"v{g.sfx}", f"cxt{g.sfx}"
         qhb, cxb = f"qh{g.sfx}", f"cx{g.sfx}"
-        wq, wk = qkv_operand(p, "q", g, l), qkv_operand(p, "k", g, l)
         w_nin, w_nqn, w_nkn = attn_norms(p, hd)
-        rl += [
-            (op_norm, src, w_nin, "h"),
-            (g.op_gq, "h", wq, qb),
-            (g.op_gkv, "h", wk, kb),
-        ] + ([(g.op_gkv, "h", qkv_operand(p, "v", g, l), vb)] if g.has_v else [])
-        if sp.v_norm and not g.has_v:
-            # attention_k_eq_v: no v_proj at all. v_norm reads the RAW k projection -- before
-            # qk-norm and RoPE, which mutate `k` in place below -- and writes `v`; that IS the
-            # copy, so no separate copy operator (mirrors gen_llm_decode.py:1907-1922 exactly).
-            rl.append((g.op_vn, kb, f"ones_h{hd}", vb))
-        elif sp.v_norm:
-            rl.append((g.op_vn, vb, f"ones_h{hd}", vb))
-        qn_runs = ([(g.op_kn, f"{qb}[{i * M * g.kvd * 2}:{(i + 1) * M * g.kvd * 2}]", w_nqn,
-                     f"{qb}[{i * M * g.kvd * 2}:{(i + 1) * M * g.kvd * 2}]") for i in range(grp)]
-                   if merge_qknorm else [(g.op_qn, qb, w_nqn, qb)])
-        rl += qn_runs + [
-            (g.op_kn, kb, w_nkn, kb),
-            (g.op_rq, qb, ang_buf(l), qb),
-            (g.op_rk, kb, ang_buf(l), kb),
-        ]
-        if not g.ring:
-            # K after qk-norm AND after RoPE; V raw, projection only. Different points in the
-            # pipeline, and the M=1 path a decode step resumes from depends on both. Moved past
-            # the context read on a ring layer -- see the `g.ring` branch below.
-            rl += [(g.op_kvapp, kb, p + "kc"), (g.op_kvapp, vb, p + "vc")]
-        rl += [] if seam else [(g.op_q2h, qb, qhb)]
-        # The widths buffer is an INPUT of the softmax step, not a side channel: op.get_arg_spec()
-        # puts it between in and out, so it is the middle name here.
-        scb, swb = f"sc{g.sfx}", f"sw{g.sfx}"
-
-        if g.ring:
-            # Read-first ring runlist (sec 2.1): concat [ring g.w | this chunk's own M rows], one
-            # (hole_lo, hole_hi, width) mask per row, commit to the ring AFTER the context is read
-            # (K007 already refused this geometry unless seam=True). Grouped by row type (all Hq
-            # sc_ring, then all Hq sc_batch, ...) so each type is one configure (D009).
-            row_w = g.w + M
-
-            def qslice_ring(h):
-                return f"{qb}[{h * hd * 2}:{(h * hd + g.op_sc_ring.a_elems) * 2}]"
-
-            for h in range(Hq):
-                rl.append((g.op_sc_ring, qslice_ring(h), kv_slab(p + "kc", h // grp, g),
-                           f"{scb}[{h * M * row_w * 2}:"
-                           f"{h * M * row_w * 2 + g.op_sc_ring.c_elems * 2}]"))
-            for h in range(Hq):
-                kg = h // grp
-                rl.append((g.op_sc_batch, qslice_ring(h),
-                           f"{kb}[{kg * hd * 2}:{kg * hd * 2 + g.op_sc_batch.b_elems * 2}]",
-                           f"{scb}[{h * M * row_w * 2 + g.w * 2}:"
-                           f"{h * M * row_w * 2 + g.w * 2 + g.op_sc_batch.c_elems * 2}]"))
-            rl.append((g.op_sm_ring, scb, SM_RING, swb))
-            for h in range(Hq):
-                cx_out = f"{cxtb}[{h * hd * 2}:{(h * hd + g.op_cx_ring.c_elems) * 2}]"
-                rl.append((g.op_cx_ring,
-                           f"{swb}[{h * M * row_w * 2}:"
-                           f"{h * M * row_w * 2 + g.op_cx_ring.a_elems * 2}]",
-                           kv_slab(p + "vc", h // grp, g), cx_out))
-            cxt2b = f"cxt2{g.sfx}"
-            for h in range(Hq):
-                kg = h // grp
-                cx2_out = f"{cxt2b}[{h * hd * 2}:{(h * hd + g.op_cx_batch.c_elems) * 2}]"
-                rl.append((g.op_cx_batch,
-                           f"{swb}[{h * M * row_w * 2 + g.w * 2}:"
-                           f"{h * M * row_w * 2 + g.w * 2 + g.op_cx_batch.a_elems * 2}]",
-                           f"{vb}[{kg * hd * 2}:{kg * hd * 2 + g.op_cx_batch.b_elems * 2}]",
-                           cx2_out))
-            rl.append((g.op_add_cx, cxtb, cxt2b, cxtb))
-            # KV commit LAST: past the wrap, appending before the context read above would
-            # overwrite ring slots this chunk's own later rows still need (sec 1.2/1.4).
-            # `check_kv_append_order` below is the build-time assert that catches this reordered.
-            rl += [(g.op_kvapp, kb, p + "kc"), (g.op_kvapp, vb, p + "vc")]
+        lin = sp.mixer_for(l) == "linear_attention"
+        if lin:
+            rl += [(op_norm, src, w_nin, "h")] + deltanet_rl(p, cxtb)
         else:
-            def qslice(h):
-                """Head h's queries: a strided slice of token-major `q`, or the head-major copy."""
-                if not seam:
-                    return f"{qhb}[{h * M * hd * 2}:{(h + 1) * M * hd * 2}]"
-                return f"{qb}[{h * hd * 2}:{(h * hd + g.op_sc.a_elems) * 2}]"
+            rl += ([(op_norm, src, w_nin, "h")] + qkv_rl(p, "q", g, l, qb)
+                   + qkv_rl(p, "k", g, l, kb) + (qkv_rl(p, "v", g, l, vb) if g.has_v else []))
+            if sp.attn_output_gate:
+                pre, w = weight_rows(p + "Wgate", g.qd, 0, g.qd, D)
+                rl += pre + [(g.op_gq, "h", w, "gt"), (op_gate_act, "gt", "gt")]
+            if sp.v_norm and not g.has_v:
+                # attention_k_eq_v: no v_proj at all. v_norm reads the RAW k projection -- before
+                # qk-norm and RoPE, which mutate `k` in place below -- and writes `v`; that IS the
+                # copy, so no separate copy operator (mirrors gen_llm_decode.py:1907-1922 exactly).
+                rl.append((g.op_vn, kb, f"ones_h{hd}", vb))
+            elif sp.v_norm:
+                rl.append((g.op_vn, vb, f"ones_h{hd}", vb))
+            qn_runs = ([(g.op_kn, f"{qb}[{i * M * g.kvd * 2}:{(i + 1) * M * g.kvd * 2}]", w_nqn,
+                         f"{qb}[{i * M * g.kvd * 2}:{(i + 1) * M * g.kvd * 2}]") for i in range(grp)]
+                       if merge_qknorm else [(g.op_qn, qb, w_nqn, qb)])
+            rl += qn_runs + [
+                (g.op_kn, kb, w_nkn, kb),
+                (g.op_rq, qb, ang_buf(l), qb),
+                (g.op_rk, kb, ang_buf(l), kb),
+            ]
+            if not g.ring:
+                # K after qk-norm AND after RoPE; V raw, projection only. Different points in the
+                # pipeline, and the M=1 path a decode step resumes from depends on both. Moved past
+                # the context read on a ring layer -- see the `g.ring` branch below.
+                rl += [(g.op_kvapp, kb, p + "kc"), (g.op_kvapp, vb, p + "vc")]
+            rl += [] if seam else [(g.op_q2h, qb, qhb)]
+            # The widths buffer is an INPUT of the softmax step, not a side channel: op.get_arg_spec()
+            # puts it between in and out, so it is the middle name here.
+            scb, swb = f"sc{g.sfx}", f"sw{g.sfx}"
 
-            def score(h):
-                return (g.op_sc, qslice(h), kv_slab(p + "kc", h // grp, g),
-                        f"{scb}[{h * M * g.w * 2}:{(h + 1) * M * g.w * 2}]")
+            if g.ring:
+                # Read-first ring runlist (sec 2.1): concat [ring g.w | this chunk's own M rows], one
+                # (hole_lo, hole_hi, width) mask per row, commit to the ring AFTER the context is read
+                # (K007 already refused this geometry unless seam=True). Grouped by row type (all Hq
+                # sc_ring, then all Hq sc_batch, ...) so each type is one configure (D009).
+                row_w = g.w + M
 
-            def soft(h):
-                sl = f"{scb}[{h * M * g.w * 2}:{(h + 1) * M * g.w * 2}]"
-                out = f"{swb}[{h * M * g.w * 2}:{(h + 1) * M * g.w * 2}]"
-                wid = f"{SM_WIDTHS}[{h * M * 4}:{(h + 1) * M * 4}]"
-                return (g.op_sm_head, sl, wid, out) if causal == "rows" else (g.op_sm_head, sl, out)
+                def qslice_ring(h):
+                    return f"{qb}[{h * hd * 2}:{(h * hd + g.op_sc_ring.a_elems) * 2}]"
 
-            if attn_order == "interleaved":
-                # Only the first `n_il` heads alternate; the rest stay grouped. The knob exists
-                # because a configure costs ~80 KB of instruction stream, so interleaving all 16
-                # heads built a 157 MB ELF that the driver refuses to allocate a BO for (CREATE_BO
-                # EAGAIN, reproducible). +2 configures per interleaved head per layer.
-                for h in range(n_il):
-                    rl += [score(h), soft(h)]
-                rl += [score(h) for h in range(n_il, Hq)]
-                rl += [soft(h) for h in range(n_il, Hq)]
-            elif attn_order == "grouped":
-                rl += [score(h) for h in range(Hq)] + [soft(h) for h in range(Hq)]
+                for h in range(Hq):
+                    rl.append((g.op_sc_ring, qslice_ring(h), kv_slab(p + "kc", h // grp, g),
+                               f"{scb}[{h * M * row_w * 2}:"
+                               f"{h * M * row_w * 2 + g.op_sc_ring.c_elems * 2}]"))
+                for h in range(Hq):
+                    kg = h // grp
+                    rl.append((g.op_sc_batch, qslice_ring(h),
+                               f"{kb}[{kg * hd * 2}:{kg * hd * 2 + g.op_sc_batch.b_elems * 2}]",
+                               f"{scb}[{h * M * row_w * 2 + g.w * 2}:"
+                               f"{h * M * row_w * 2 + g.w * 2 + g.op_sc_batch.c_elems * 2}]"))
+                rl.append((g.op_sm_ring, scb, SM_RING, swb))
+                for h in range(Hq):
+                    cx_out = f"{cxtb}[{h * hd * 2}:{(h * hd + g.op_cx_ring.c_elems) * 2}]"
+                    rl.append((g.op_cx_ring,
+                               f"{swb}[{h * M * row_w * 2}:"
+                               f"{h * M * row_w * 2 + g.op_cx_ring.a_elems * 2}]",
+                               kv_slab(p + "vc", h // grp, g), cx_out))
+                cxt2b = f"cxt2{g.sfx}"
+                for h in range(Hq):
+                    kg = h // grp
+                    cx2_out = f"{cxt2b}[{h * hd * 2}:{(h * hd + g.op_cx_batch.c_elems) * 2}]"
+                    rl.append((g.op_cx_batch,
+                               f"{swb}[{h * M * row_w * 2 + g.w * 2}:"
+                               f"{h * M * row_w * 2 + g.w * 2 + g.op_cx_batch.a_elems * 2}]",
+                               f"{vb}[{kg * hd * 2}:{kg * hd * 2 + g.op_cx_batch.b_elems * 2}]",
+                               cx2_out))
+                rl.append((g.op_add_cx, cxtb, cxt2b, cxtb))
+                # KV commit LAST: past the wrap, appending before the context read above would
+                # overwrite ring slots this chunk's own later rows still need (sec 1.2/1.4).
+                # `check_kv_append_order` below is the build-time assert that catches this reordered.
+                rl += [(g.op_kvapp, kb, p + "kc"), (g.op_kvapp, vb, p + "vc")]
             else:
-                rl += [score(h) for h in range(Hq)]
-                rl.append((g.op_sm, scb, SM_WIDTHS, swb) if causal == "rows"
-                          else (g.op_sm, scb, swb))
-            for h in range(Hq):
-                cx_out = (f"{cxtb}[{h * hd * 2}:{(h * hd + g.op_cx.c_elems) * 2}]" if seam
-                          else f"{cxb}[{h * M * hd * 2}:{(h + 1) * M * hd * 2}]")
-                rl.append((g.op_cx, f"{swb}[{h * M * g.w * 2}:{(h + 1) * M * g.w * 2}]",
-                           kv_slab(p + "vc", h // grp, g), cx_out))
-        rl += ([] if seam else [(g.op_h2t, cxb, cxtb)]) + \
+                def qslice(h):
+                    """Head h's queries: a strided slice of token-major `q`, or the head-major copy."""
+                    if not seam:
+                        return f"{qhb}[{h * M * hd * 2}:{(h + 1) * M * hd * 2}]"
+                    return f"{qb}[{h * hd * 2}:{(h * hd + g.op_sc.a_elems) * 2}]"
+
+                def score(h):
+                    return (g.op_sc, qslice(h), kv_slab(p + "kc", h // grp, g),
+                            f"{scb}[{h * M * g.w * 2}:{(h + 1) * M * g.w * 2}]")
+
+                def soft(h):
+                    sl = f"{scb}[{h * M * g.w * 2}:{(h + 1) * M * g.w * 2}]"
+                    out = f"{swb}[{h * M * g.w * 2}:{(h + 1) * M * g.w * 2}]"
+                    wid = f"{SM_WIDTHS}[{h * M * 4}:{(h + 1) * M * 4}]"
+                    return (g.op_sm_head, sl, wid, out) if causal == "rows" else (g.op_sm_head, sl, out)
+
+                if attn_order == "interleaved":
+                    # Only the first `n_il` heads alternate; the rest stay grouped. The knob exists
+                    # because a configure costs ~80 KB of instruction stream, so interleaving all 16
+                    # heads built a 157 MB ELF that the driver refuses to allocate a BO for (CREATE_BO
+                    # EAGAIN, reproducible). +2 configures per interleaved head per layer.
+                    for h in range(n_il):
+                        rl += [score(h), soft(h)]
+                    rl += [score(h) for h in range(n_il, Hq)]
+                    rl += [soft(h) for h in range(n_il, Hq)]
+                elif attn_order == "grouped":
+                    rl += [score(h) for h in range(Hq)] + [soft(h) for h in range(Hq)]
+                else:
+                    rl += [score(h) for h in range(Hq)]
+                    rl.append((g.op_sm, scb, SM_WIDTHS, swb) if causal == "rows"
+                              else (g.op_sm, scb, swb))
+                for h in range(Hq):
+                    cx_out = (f"{cxtb}[{h * hd * 2}:{(h * hd + g.op_cx.c_elems) * 2}]" if seam
+                              else f"{cxb}[{h * M * hd * 2}:{(h + 1) * M * hd * 2}]")
+                    rl.append((g.op_cx, f"{swb}[{h * M * g.w * 2}:{(h + 1) * M * g.w * 2}]",
+                               kv_slab(p + "vc", h // grp, g), cx_out))
+            if sp.attn_output_gate:
+                rl.append((op_gate_mul, cxtb, "gt", cxtb))
+        rl += ([] if seam or lin else [(g.op_h2t, cxb, cxtb)]) + \
             weight_gemm(p, "Wo", g.op_o, g.qd, D, cxtb, "a", f"o_hd{hd}", site="o", layer=l) + \
             ([(op_norm, "a", p + "n_pa", "a")] if sp.sandwich_norms else []) + [
             (op_add, src, "a", "xs"),
@@ -1401,9 +1559,11 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
                 # against decode's shared `p+"ls"` (same arena slot, same D-wide value every row).
                 rl += [(op_lscale, f"{dst}[{r * D * 2}:{(r + 1) * D * 2}]", p + "ls",
                         f"{dst}[{r * D * 2}:{(r + 1) * D * 2}]") for r in range(M)]
-        cache_names += [p + "kc", p + "vc"]
-        ring_layers.append(g.ring)
+        cache_names += [p + "cw", p + "S"] if lin else [p + "kc", p + "vc"]
+        ring_layers.append(False if lin else g.ring)
 
+    if wdq_elems[0]:
+        bufsz["wdq"] = wdq_elems[0] * 2
     uses_ring = any(ring_layers)
     # (head_dim, capacity) per ring-enabled geometry -- what `check_prefill_pairing` (artifact.rs)
     # matches a circular decode geometry against before accepting a prefill past its window.
@@ -1489,6 +1649,12 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         name += f"_seg{len(cuts)}"
     if A_RESIDENT:
         name += "_ares"
+    if lin_layers:
+        name += f"_gdr{GDR_T}"
+    if _dq_cache:
+        name += "_dq"
+    if ACT_POLY:
+        name += "_actp"
     # Both lscale arms change the RUNLIST (156 -> 93 entries/layer at M=64) while leaving every
     # other name component identical, which is the collision this block's header warns about --
     # and it bit: an A/B on 2026-09-19 compiled two arms to one md5 and measured nothing.
@@ -2085,7 +2251,9 @@ def main():
     # golden would silently compare the device against a dataflow it does not run.
     golden_gaps = [n for n, on in (("sandwich_norms", sp.sandwich_norms), ("dual-theta RoPE",
                    dual_rope), ("v_norm", sp.v_norm), ("layer_scalar", sp.layer_scalar),
-                   ("non-uniform geometry", not sp.geometry_is_uniform())) if on]
+                   ("non-uniform geometry", not sp.geometry_is_uniform()),
+                   ("linear-attention mixers", sp.mixer_types is not None),
+                   ("attention output gate", sp.attn_output_gate)) if on]
     if golden_gaps and not a.no_golden:
         raise SystemExit(f"ERROR: {sp.name} sets {golden_gaps}, which prefill_ref.layer_stack "
                          f"does not model yet -- pass --no-golden (the device graph itself has no "
@@ -2097,7 +2265,8 @@ def main():
     # rotates only 0.25 of the global layers' frequency pairs (rope_type "proportional"), over that
     # geometry's OWN head_dim, which may differ from the base `HD` (512 vs 256 on Gemma-4).
     global_hd = sp.global_head_dim if sp.global_head_dim is not None else HD
-    table = rope_table(a.base, M, global_hd, sp.rope_theta_global, partial=sp.rope_partial_rotary)
+    table = rope_table(a.base, M, sp.rope_rotary_dim or global_hd, sp.rope_theta_global,
+                       partial=sp.rope_partial_rotary)
 
     os.makedirs(os.path.join(a.out, "buffers"), exist_ok=True)
     bdir = os.path.join(a.out, "buffers")
@@ -2205,6 +2374,8 @@ def main():
         "weights_from": (os.path.join(os.path.dirname(os.path.abspath(dec_meta_path)), "buffers")
                          if dec_meta_path else None),
         "cache_buffers": dims["cache_names"],
+        # Not position-indexed: zeroed before a request's first chunk, never resumed mid-prefix.
+        "recurrent_buffers": [n for n in dims["cache_names"] if n.endswith(("_cw", "_S"))],
         "arena_shared": bool(dec_meta_path),
         "decode_artifact": dec_ref,
         "causal": dims["causal"] == "rows",
@@ -2284,8 +2455,10 @@ def main():
                 "rope_global": f"[{M}, {global_hd}] bf16, same layout, theta={sp.rope_theta_global}"
                               f"{f', partial={sp.rope_partial_rotary}' if sp.rope_partial_rotary else ''}"}
               if dual_rope else
-              {"rope": f"[{M}, {HD}] bf16, one row per absolute position base..base+{M}-1, "
-                       f"INTERLEAVED [cos, sin, cos, sin, ...], theta={sp.rope_theta_global}"}),
+              {"rope": f"[{M}, {sp.rope_rotary_dim or HD}] bf16, one row per absolute position "
+                       f"base..base+{M}-1, INTERLEAVED [cos, sin, cos, sin, ...], "
+                       f"theta={sp.rope_theta_global}"}),
+            **({"rope_rotary_dim": sp.rope_rotary_dim} if sp.rope_rotary_dim else {}),
             "kv_off": "base * head_dim, element units, addr kind, written raw",
             SM_WIDTHS: (f"[{dims['sm_rows']}] int32 = q_heads({Hq}) * M({M}), row r = h*M + i "
                         f"holding clamp(base + i + 1, 1, {S}); a plain input-arena write, not a "
