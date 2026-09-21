@@ -1,0 +1,24 @@
+[scenario]
+kind = "generate"
+# Qwen3.5-4B: 24 Gated DeltaNet + 8 gated-attention layers. The servable arm is int4 g32 clip-search
+# weights (which keep 69 of 72 JevBench decisions against bf16's 70 on the CPU reference) with a bf16
+# head, and ACT_POLY=1 activations (the tanh-LUT ones put logits at 6x the bf16 floor):
+#
+#   decode     PRECISION='{"mlp": "int4/g32/clip", "attn_o": "int4/g32/clip", "qkv": "int4/g32/clip"}' \
+#              ACT_POLY=1 scripts/build_llm_decode.sh qwen3.5-4b
+#   tokenizer  the HF snapshot of Qwen/Qwen3.5-4B (tokenizer.json, tokenizer_config.json)
+#
+# The build reads the f32 dump (scripts/dump_llm_weights.py --spec qwen3.5-4b), 16 GB; the decode
+# path never reads `weights` at runtime, only the memory-ceiling estimate does. So it names the
+# arena bytes the device actually receives, 3.3 GB, not the dump.
+#
+# No batched prefill artifact exists for this model: prompts prime one token per dispatch.
+name = "qwen3.5-4b"
+
+[artifacts]
+decode = "artifacts/qwen3.5-4b/decode"
+weights = "artifacts/qwen3.5-4b/decode/buffers"
+tokenizer_dir = "artifacts/qwen3.5-4b/tokenizer"
+
+[generation]
+max_tokens = 1024
