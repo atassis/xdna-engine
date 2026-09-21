@@ -67,24 +67,40 @@ def main():
     ap.add_argument("--no-clip", action="store_true")
     ap.add_argument("--valid", type=int, default=None,
                     help="real tokens in the chunk (default M); the rest are pad rows")
+    ap.add_argument("--oracle-cache", default=None,
+                    help=".npz for the oracle's outputs: read if present, written if not")
+    ap.add_argument("--oracle-only", action="store_true",
+                    help="compute (and cache) the oracle, then stop before the device")
     a = ap.parse_args()
     NL, M, S = a.layers, a.batch, a.seq
 
-    from qwen35_decide_ref import prompt_ids
-    from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained(a.hf)
-    ids = []
-    for line in open(a.tasks):
-        if len(ids) >= M:
-            break
-        ids += prompt_ids(tok, json.loads(line))
-    ids = ids[:M]
     nv = a.valid or M
-    emb = np.load(a.embed, mmap_mode="r")
-    x0 = np.asarray(np.asarray(emb[ids], np.float32), BF16)
-
-    ref_x, ref_st = oracle(a.hf, ids[:nv], NL, x0[:nv].astype(np.float32), a.int4_group,
-                           not a.no_clip)
+    if a.oracle_cache and os.path.isfile(a.oracle_cache):
+        z = np.load(a.oracle_cache)
+        x0, ref_x = z["x0"].view(BF16), z["x"]
+        ref_st = {int(k.split("_")[1]): (str(z[k][()]), z[f"a_{k.split('_')[1]}"],
+                                         z[f"b_{k.split('_')[1]}"]) for k in z.files if k.startswith("kind_")}
+    else:
+        from qwen35_decide_ref import prompt_ids
+        from transformers import AutoTokenizer
+        tok = AutoTokenizer.from_pretrained(a.hf)
+        ids = []
+        for line in open(a.tasks):
+            if len(ids) >= M:
+                break
+            ids += prompt_ids(tok, json.loads(line))[0]
+        ids = ids[:M]
+        emb = np.load(a.embed, mmap_mode="r")
+        x0 = np.asarray(np.asarray(emb[ids], np.float32), BF16)
+        ref_x, ref_st = oracle(a.hf, ids[:nv], NL, x0[:nv].astype(np.float32), a.int4_group,
+                               not a.no_clip)
+        if a.oracle_cache:
+            np.savez(a.oracle_cache, x0=x0.view(np.uint16), x=ref_x,
+                     **{f"kind_{i}": np.array(st[0]) for i, st in ref_st.items()},
+                     **{f"a_{i}": st[1] for i, st in ref_st.items()},
+                     **{f"b_{i}": st[2] for i, st in ref_st.items()})
+    if a.oracle_only:
+        return
 
     from gen_llm_prefill import build_graph, causal_widths, rope_table, SM_WIDTHS, GDR_COUNT
     from llm_decode_spec import SPECS
@@ -126,7 +142,11 @@ def main():
     for slot, *_ in dims["geom_slots"]:
         sc.params.write(slot, 0)
     sc.params.sync()
+    import time
+    t0 = time.perf_counter()
     sc()
+    print(f"[device] one prefill dispatch ({NL} layers, M={M}): {time.perf_counter() - t0:.3f} s "
+          f"host wall, input sync included")
     sc.scratch_buffer.device = "npu"
     sc.scratch_buffer.to("cpu")
 
