@@ -594,21 +594,26 @@ fn systemone(req: &Request, handle: &Handle) -> Response {
         other => return engine_err(&npu_engine::EngineError::Device(format!(
             "decide returned a {} response", other.shape()))),
     };
-    let mut out = serde_json::Map::new();
-    for a in answers {
-        let (id, v) = match a {
-            npu_engine::DecideAnswer::Noul { id, p_true } => (id, serde_json::json!({"noul": p_true})),
-            npu_engine::DecideAnswer::Choice { id, choice, probabilities, confidence } => {
-                let p: serde_json::Map<String, serde_json::Value> =
-                    probabilities.into_iter().map(|(k, p)| (k, p.into())).collect();
-                (id, serde_json::json!({"choice": choice, "probabilities": p, "confidence": confidence}))
-            }
-            npu_engine::DecideAnswer::Score { id, score, probabilities, confidence } =>
-                (id, serde_json::json!({"score": score, "probabilities": probabilities, "confidence": confidence})),
-        };
-        out.insert(id, v);
-    }
+    let out: serde_json::Map<String, serde_json::Value> = answers.into_iter().map(answer_json).collect();
     (200, serde_json::json!({"model": served.model, "answers": out}).to_string().into())
+}
+
+/// One answer in Jev's shape: `type` names the question kind; score probabilities are keyed by level.
+fn answer_json(a: npu_engine::DecideAnswer) -> (String, serde_json::Value) {
+    match a {
+        npu_engine::DecideAnswer::Noul { id, p_true } =>
+            (id, serde_json::json!({"type": "noul", "noul": p_true})),
+        npu_engine::DecideAnswer::Choice { id, choice, probabilities, confidence } => {
+            let p: serde_json::Map<String, serde_json::Value> =
+                probabilities.into_iter().map(|(k, p)| (k, p.into())).collect();
+            (id, serde_json::json!({"type": "choice", "choice": choice, "probabilities": p, "confidence": confidence}))
+        }
+        npu_engine::DecideAnswer::Score { id, score, probabilities, confidence } => {
+            let p: serde_json::Map<String, serde_json::Value> =
+                probabilities.into_iter().enumerate().map(|(i, p)| (i.to_string(), p.into())).collect();
+            (id, serde_json::json!({"type": "score", "score": score, "probabilities": p, "confidence": confidence}))
+        }
+    }
 }
 
 fn parse_systemone(body: &serde_json::Value) -> Result<npu_engine::DecideRequest, String> {
@@ -2507,6 +2512,23 @@ pub(crate) mod generate_tests {
 
     /// A choice's criteria are ORDERED -- their order assigns the answer letters -- so parsing must
     /// keep the request's order, not sort it; and a request with no `state` is a 400, not a guess.
+    /// JevBench's `typesafe` adapter rejects an answer without `type`, and a score whose
+    /// probabilities are not an object keyed by level (its djev fixture is Jev's shape).
+    #[test]
+    fn systemone_answers_carry_their_type_and_key_scores_by_level() {
+        let (_, n) = answer_json(npu_engine::DecideAnswer::Noul { id: "n".into(), p_true: 0.8 });
+        assert_eq!(n, serde_json::json!({"type": "noul", "noul": 0.8}));
+        let (_, c) = answer_json(npu_engine::DecideAnswer::Choice { id: "c".into(), choice: "b".into(),
+            probabilities: vec![("a".into(), 0.25), ("b".into(), 0.75)], confidence: 0.5 });
+        assert_eq!(c, serde_json::json!({"type": "choice", "choice": "b",
+            "probabilities": {"a": 0.25, "b": 0.75}, "confidence": 0.5}));
+        let (id, s) = answer_json(npu_engine::DecideAnswer::Score { id: "s".into(), score: 0.75,
+            probabilities: vec![0.25, 0.75], confidence: 0.5 });
+        assert_eq!(id, "s");
+        assert_eq!(s, serde_json::json!({"type": "score", "score": 0.75,
+            "probabilities": {"0": 0.25, "1": 0.75}, "confidence": 0.5}));
+    }
+
     #[test]
     fn systemone_keeps_choice_order_and_refuses_a_missing_state() {
         let body = serde_json::json!({"state": "s", "questions": {
