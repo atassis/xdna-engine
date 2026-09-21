@@ -3271,6 +3271,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         head.compile()
     return sp, fused, weights, dict(NL=NL, S=S, T=T, inputs=inputs, cache_names=cache_names,
                                         recurrent_names=recurrent_names,
+                                        final_hidden="xf" if "xf" in bufsz else None,
                                         decode_layer_active=op_decode_layer is not None,
                                         # getattr, not attribute access: a spec whose fused
                                         # layer did not build has no such attribute.
@@ -3337,8 +3338,8 @@ def main():
     lay = {n: fused.get_layout_for_buffer(n) for n in [*inputs, "logits", *wnames]}
     # The final-normed hidden the head reads, so a host can take a few head rows in f32 instead of
     # the whole-vocab logits the ELF writes as bf16 (npu_decode.rs option_logits).
-    if "xf" in bufsz:
-        lay["xf"] = fused.get_layout_for_buffer("xf")
+    if md.get("final_hidden"):
+        lay[md["final_hidden"]] = fused.get_layout_for_buffer(md["final_hidden"])
 
     import glob
     import shutil
