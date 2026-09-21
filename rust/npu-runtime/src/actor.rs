@@ -23,7 +23,14 @@ use npu_engine::{Chunk, EngineError, GenerateParams, Prompt};
 const GENERATE_CHANNEL_CAP: usize = 8;
 
 /// Result carrying which model served (the echo).
-pub struct Served<T> { pub model: String, pub value: T }
+pub struct Served<T> {
+    pub model: String,
+    pub value: T,
+    /// `queue_us`/`load_us`: how long the request waited for the actor and for its model to become
+    /// resident; 0 on `Handle::generate`, whose report carries its own.
+    pub queue_us: u64,
+    pub load_us: u64,
+}
 
 /// What an explicit load did, so the caller can report it without a second round trip.
 #[derive(Debug, Clone, PartialEq)]
@@ -88,6 +95,9 @@ enum Cmd {
         /// `npu model stop` while the actor thread is blocked inside it.
         cancel: npu_engine::Cancel,
         reply: Sender<Result<Served<Response>, EngineError>>,
+        /// Stamped by the caller, read by the actor: the gap is the request's queue wait. See
+        /// `Cmd::Generate`'s `enqueued`.
+        enqueued: Instant,
     },
     /// Text generation, split from `Serve` because it does not answer with one `Response`: the
     /// result is a STREAM of chunks, produced on this thread and drained on the caller's. `ack`
@@ -265,16 +275,19 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
         live.set(reg.status_at(Instant::now()));
         loop {
             match rx.recv_timeout(next_sweep.saturating_duration_since(Instant::now())) {
-                Ok(Cmd::Serve { cap, model, req, cancel, reply }) => {
+                Ok(Cmd::Serve { cap, model, req, cancel, reply, enqueued }) => {
                     last_request = Instant::now(); released = false;
+                    let queue_us = enqueued.elapsed().as_micros() as u64;
                     // Two guarded steps rather than one, so the model NAME is known when the second
                     // fails. The shipped failure is a PANIC inside the dispatch (a missing insts
                     // file panics in npu-asr), which unwinds past any Result handling inside the
                     // call -- so condemning the model has to happen out here, after catch_unwind.
                     live.set_doing(reg.status_at(Instant::now()),
                         Some(format!("loading for {cap}{}", named(model.as_deref()))));
+                    let t_load = Instant::now();
                     let ready = guard(|| serve_ready(&cfg, &mut reg, loader.as_ref(), cap, model.as_deref()))
                         .unwrap_or_else(|msg| Err(EngineError::Device(msg)));
+                    let load_us = t_load.elapsed().as_micros() as u64;
                     let r = match ready {
                         Err(e) => Err(e),
                         Ok(name) => {
@@ -296,7 +309,7 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
                             // counted successes would understate exactly the runs worth noticing.
                             reg.charge(&name, t_serve.elapsed().as_micros() as u64);
                             match out {
-                                Ok(value) => Ok(Served { model: name, value }),
+                                Ok(value) => Ok(Served { model: name, value, queue_us, load_us }),
                                 Err(e) => {
                                     if condemns_model(&e) {
                                         reg.mark_failed(&name, &e.to_string());
@@ -728,7 +741,7 @@ impl Handle {
         -> Result<Served<Response>, EngineError> {
         let (r, rx) = channel();
         self.tx.send(Cmd::Serve { cap, model: model.map(String::from), req,
-                                  cancel: npu_engine::Cancel::new(), reply: r })
+                                  cancel: npu_engine::Cancel::new(), reply: r, enqueued: Instant::now() })
             .map_err(|_| EngineError::Device("actor stopped".into()))?;
         self.await_reply(rx)?
     }
@@ -744,19 +757,19 @@ impl Handle {
                                      ack: ack_tx, enqueued: Instant::now() })
             .map_err(|_| EngineError::Device("actor stopped".into()))?;
         let name = self.await_reply(ack_rx)??;
-        Ok(Served { model: name, value: rx })
+        Ok(Served { model: name, value: rx, queue_us: 0, load_us: 0 })
     }
     pub fn transcribe(&self, model: Option<&str>, pcm: Vec<i16>, sr: u32) -> Result<Served<String>, EngineError> {
         let s = self.serve(Capability::ASR, model, Request::Audio { pcm, sample_rate: sr })?;
         match s.value {
-            Response::Text(t) => Ok(Served { model: s.model, value: t }),
+            Response::Text(t) => Ok(Served { model: s.model, value: t, queue_us: s.queue_us, load_us: s.load_us }),
             other => Err(wrong_shape(Capability::ASR, &s.model, &other)),
         }
     }
     pub fn embed(&self, model: Option<&str>, text: &str) -> Result<Served<Vec<f32>>, EngineError> {
         let s = self.serve(Capability::EMBED, model, Request::Text(text.to_string()))?;
         match s.value {
-            Response::Vector(v) => Ok(Served { model: s.model, value: v }),
+            Response::Vector(v) => Ok(Served { model: s.model, value: v, queue_us: s.queue_us, load_us: s.load_us }),
             other => Err(wrong_shape(Capability::EMBED, &s.model, &other)),
         }
     }
@@ -764,7 +777,7 @@ impl Handle {
         -> Result<Served<Vec<Segment>>, EngineError> {
         let s = self.serve(Capability::DIARIZE, model, Request::Audio { pcm, sample_rate: sr })?;
         match s.value {
-            Response::Segments(v) => Ok(Served { model: s.model, value: v }),
+            Response::Segments(v) => Ok(Served { model: s.model, value: v, queue_us: s.queue_us, load_us: s.load_us }),
             other => Err(wrong_shape(Capability::DIARIZE, &s.model, &other)),
         }
     }
@@ -1251,6 +1264,36 @@ mod tests {
         assert!(e.contains("CREATE_HWCTX"), "{e}");
         assert_eq!(state_of(&h, "o1"), LoadState::Loaded, "evict_policy = none must not evict o1 either");
         assert_eq!(state_of(&h, "target"), LoadState::Failed);
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// Wraps a `MockLoader`, sleeping 30 ms inside `load()` -- stands in for a real model's load
+    /// time so a one-shot request's `load_us` has something non-trivial to report.
+    struct SleepyLoader { inner: MockLoader }
+    impl ModelLoader for SleepyLoader {
+        fn load(&self, cfg: &ModelCfg) -> Result<Box<dyn StreamServable>, EngineError> {
+            std::thread::sleep(Duration::from_millis(30));
+            self.inner.load(cfg)
+        }
+        fn declared_capability(&self, cfg: &ModelCfg) -> Option<Capability> { self.inner.declared_capability(cfg) }
+        fn declared_footprint(&self, cfg: &ModelCfg) -> Option<u64> { self.inner.declared_footprint(cfg) }
+    }
+
+    #[test]
+    fn a_one_shot_reports_its_load_and_queue() {
+        let mut t = BTreeMap::new();
+        t.insert("bge".to_string(), Ok((Capability::EMBED, MB)));
+        let cfg = Config {
+            server: ServerCfg { memory_ceiling_mb: 1, idle_unload_s: 0, ..Default::default() },
+            defaults: Defaults::from_pairs([(Capability::EMBED, "bge".to_string())]),
+            models: vec![ModelCfg { name: "bge".into(), scenario: "x".into(), resident: false }],
+        };
+        let (h, j) = start_lazy(cfg, Box::new(SleepyLoader { inner: MockLoader { table: t } })).unwrap();
+        let s = h.serve(Capability::EMBED, None, Request::Text("x".into())).unwrap();
+        assert!(s.load_us >= 30_000, "load_us {} missed the 30 ms load", s.load_us);
+        let s = h.serve(Capability::EMBED, None, Request::Text("x".into())).unwrap();
+        assert!(s.load_us < 30_000, "a resident model must not report the load again: {}", s.load_us);
+        assert!(s.queue_us < 1_000_000);
         h.shutdown(); j.join().unwrap();
     }
 }
