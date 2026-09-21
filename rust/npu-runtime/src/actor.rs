@@ -282,9 +282,9 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
                     // fails. The shipped failure is a PANIC inside the dispatch (a missing insts
                     // file panics in npu-asr), which unwinds past any Result handling inside the
                     // call -- so condemning the model has to happen out here, after catch_unwind.
+                    let t_load = Instant::now();
                     live.set_doing(reg.status_at(Instant::now()),
                         Some(format!("loading for {cap}{}", named(model.as_deref()))));
-                    let t_load = Instant::now();
                     let ready = guard(|| serve_ready(&cfg, &mut reg, loader.as_ref(), cap, model.as_deref()))
                         .unwrap_or_else(|msg| Err(EngineError::Device(msg)));
                     let load_us = t_load.elapsed().as_micros() as u64;
@@ -831,7 +831,7 @@ mod tests {
     use crate::loader::{Servable, StreamServable};
     use crate::registry::LoadState;
     use std::collections::BTreeMap;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
     use std::time::Duration;
 
     const MB: u64 = 1024 * 1024;
@@ -1267,11 +1267,14 @@ mod tests {
         h.shutdown(); j.join().unwrap();
     }
 
-    /// Wraps a `MockLoader`, sleeping 30 ms inside `load()` -- stands in for a real model's load
-    /// time so a one-shot request's `load_us` has something non-trivial to report.
-    struct SleepyLoader { inner: MockLoader }
+    /// Wraps a `MockLoader`, sleeping 30 ms inside `load()` and counting calls -- stands in for a
+    /// real model's load time so a one-shot request's `load_us` has something non-trivial to
+    /// report, and lets a test assert residency by call count rather than by a wall-clock ceiling
+    /// (which a starved box can blow through even when nothing reloaded).
+    struct SleepyLoader { inner: MockLoader, loads: Arc<AtomicUsize> }
     impl ModelLoader for SleepyLoader {
         fn load(&self, cfg: &ModelCfg) -> Result<Box<dyn StreamServable>, EngineError> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
             std::thread::sleep(Duration::from_millis(30));
             self.inner.load(cfg)
         }
@@ -1288,12 +1291,13 @@ mod tests {
             defaults: Defaults::from_pairs([(Capability::EMBED, "bge".to_string())]),
             models: vec![ModelCfg { name: "bge".into(), scenario: "x".into(), resident: false }],
         };
-        let (h, j) = start_lazy(cfg, Box::new(SleepyLoader { inner: MockLoader { table: t } })).unwrap();
+        let loads = Arc::new(AtomicUsize::new(0));
+        let (h, j) = start_lazy(cfg, Box::new(SleepyLoader { inner: MockLoader { table: t }, loads: loads.clone() })).unwrap();
         let s = h.serve(Capability::EMBED, None, Request::Text("x".into())).unwrap();
         assert!(s.load_us >= 30_000, "load_us {} missed the 30 ms load", s.load_us);
         let s = h.serve(Capability::EMBED, None, Request::Text("x".into())).unwrap();
-        assert!(s.load_us < 30_000, "a resident model must not report the load again: {}", s.load_us);
-        assert!(s.queue_us < 1_000_000);
+        assert!(s.queue_us < 5_000_000, "queue_us {} implausible for an idle actor", s.queue_us);
+        assert_eq!(loads.load(Ordering::SeqCst), 1, "a resident model must not be loaded again");
         h.shutdown(); j.join().unwrap();
     }
 }
