@@ -1468,6 +1468,23 @@ impl LlmArtifact {
                 prefill.max_seq, self.max_seq
             )));
         }
+        // Which layers are recurrent is the mixer pattern, which no dims scalar carries: a
+        // prefill that primes attention where decode runs DeltaNet (or the reverse) would leave a
+        // layer's state zero, and every token after the prompt would read it.
+        let (mut dr, mut pr) = (self.recurrent_buffers.clone(), prefill.recurrent_buffers.clone());
+        dr.sort();
+        pr.sort();
+        if dr != pr {
+            return Err(EngineError::Load(format!(
+                "decode's recurrent buffers {dr:?} are not prefill's {pr:?}: the two halves disagree \
+                 on which layers carry DeltaNet state"
+            )));
+        }
+        if !pr.is_empty() && prefill.recurrent_counts.is_none() {
+            return Err(EngineError::Load(
+                "prefill primes recurrent state but declares no `recurrent_counts`, so a padded \
+                 last chunk would step its pad rows into it".to_string()));
+        }
         // 0 means "not declared, and provably never read" -- see the loader. Only compare two
         // artifacts that both state it.
         if self.kv_heads != 0 && prefill.kv_heads != 0 {
@@ -2640,6 +2657,17 @@ mod tests {
         let (_d, _p, da, pa) = load_pair(&dec, &pre);
         let err = da.check_prefill_pairing(&pa).unwrap_err().to_string();
         assert!(err.contains("RoPE tables"), "{err}");
+    }
+
+    #[test]
+    fn halves_that_disagree_on_recurrent_state_fail_loud() {
+        // L0_kc stands in for a DeltaNet state buffer: what matters is that decode calls it
+        // recurrent and prefill does not, so prefill would leave it for decode to read as zero.
+        let (mut dec, pre) = pair_metas(2);
+        dec["recurrent_buffers"] = serde_json::json!(["L0_kc"]);
+        let (_d, _p, da, pa) = load_pair(&dec, &pre);
+        let err = da.check_prefill_pairing(&pa).unwrap_err().to_string();
+        assert!(err.contains("recurrent buffers"), "{err}");
     }
 
     #[test]
