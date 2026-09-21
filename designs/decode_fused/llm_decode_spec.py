@@ -594,15 +594,6 @@ class LlmSpec:
         #     exponent by head_dim rather than by the rotated width (which is what distinguishes it
         #     from ordinary partial rotary). Gated against transformers' own rotary embedding.
         #   logit softcap -- host-side: tanh(logits/c)*c after readback, no dispatch.
-        if self.mixer_types is not None and "linear_attention" in self.mixer_types:
-            gaps.append("linear_attention (Gated DeltaNet): the generator emits only softmax-attention "
-                        "layers, so these layers would build as attention over weights that do not exist")
-        if self.attn_output_gate:
-            gaps.append("attn_output_gate: q_proj's per-head gate half would be read as query heads and "
-                        "the sigmoid(gate) multiply never applied")
-        if self.rope_rotary_dim is not None:
-            gaps.append("rope_rotary_dim: the host writes full-width or proportional RoPE rows, so the "
-                        "rotated slice and its frequencies would both be wrong")
         return gaps
 
     def softmax_cols(self, cap: int) -> int:
@@ -637,6 +628,8 @@ class LlmSpec:
         """
         if not self.qk_norm:
             return "the op applies a per-head qk-norm and this spec has none"
+        if self.attn_output_gate or self.rope_rotary_dim is not None:
+            return "the op rotates the full head_dim and has no q_proj gate half"
         hd = self.head_dim if head_dim is None else head_dim
         if self.d_model % hd:
             return (f"d_model={self.d_model} is not a whole number of head_dim={hd} "

@@ -2418,6 +2418,68 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     else:
         op_down = gemv(D, FF, ctx, **mlp_quant_kw)
     op_add = ElementwiseAdd(size=D, tile_size=D // COLS, num_aie_columns=COLS, context=ctx)
+    # Gated DeltaNet (linear attention) op vocabulary, shared by every such layer. A layer of this
+    # kind produces `cx` like attention does, and out_proj takes Wo's slot, so everything from o_proj
+    # on is the attention path's own. Imported lazily: only IRON trees carrying the two ops need them.
+    lin_layers = [l for l in range(NL) if sp.mixer_for(l) == "linear_attention"]
+    if lin_layers:
+        from iron.operators.conv1d_step.op import Conv1dStep
+        from iron.operators.gated_delta_rule.op import GatedDeltaRule
+        LDK, LTAPS = sp.lin_head_dim, sp.lin_conv_taps
+        LKD, LVD = sp.lin_k_heads * LDK, sp.lin_v_heads * LDK
+        LCH = 2 * LKD + LVD
+        if LVD != QD:
+            raise SystemExit(f"{sp.name}: out_proj takes o_proj's slot, so the linear-attention "
+                             f"value width ({LVD}) must equal q_dim ({QD})")
+        # z | a | b, padded so GatedDeltaRule's dk-wide [a | b] read at offset LVD stays in bounds.
+        LZAB = LVD + max(2 * sp.lin_v_heads, LDK)
+        LWIN = (LTAPS - 1) * LCH   # element offset of the conv window's input/output row
+        op_lin_qkv = gemv(LCH, D, ctx, **_quant_kw("qkv"))
+        op_lin_zab = gemv(LZAB, D, ctx, **_quant_kw("qkv"))
+        op_conv = Conv1dStep(channels=LCH, taps=LTAPS, num_aie_columns=COLS, context=ctx)
+        op_mix_act = SiLU(size=LCH, num_aie_columns=COLS, tile_size=LCH // COLS, context=ctx)
+        # l2norm(x) = rmsnorm at eps/dk, divided by sqrt(dk): the division rides the gain (l2q/l2k).
+        op_l2 = RMSNorm(size=LDK, num_aie_columns=1, num_channels=1, tile_size=LDK,
+                        weighted=True, epsilon=sp.eps / LDK, context=ctx)
+        op_gdr = GatedDeltaRule(v_heads=sp.lin_v_heads, k_heads=sp.lin_k_heads, dk=LDK, dv=LDK,
+                                ab_len=LZAB, ab_off=LVD, mixed_len=LTAPS * LCH, q_off=LWIN,
+                                k_off=LWIN + LKD, v_off=LWIN + 2 * LKD, num_aie_columns=COLS,
+                                context=ctx)
+        op_gnorm = RMSNorm(size=LDK, num_aie_columns=1, num_channels=1, tile_size=LDK,
+                           weighted=True, epsilon=sp.eps, context=ctx)
+        op_z_act = SiLU(size=LVD, num_aie_columns=COLS, tile_size=LVD // COLS, context=ctx)
+        op_o_mul = ElementwiseMul(size=LVD, tile_size=LVD // COLS, num_aie_columns=COLS, context=ctx)
+    if sp.attn_output_gate:
+        from iron.operators.sigmoid.op import Sigmoid
+        op_gate_proj = gemv(QD, D, ctx, **_quant_kw("qkv"))
+        op_gate_act = Sigmoid(size=QD, num_aie_columns=COLS, num_channels=1,
+                              tile_size=QD // COLS, context=ctx)
+        op_gate_mul = ElementwiseMul(size=QD, tile_size=QD // COLS, num_aie_columns=COLS, context=ctx)
+    op_rope_part = (RoPE(rows=1, cols=sp.rope_rotary_dim, angle_rows=1, context=ctx)
+                    if sp.rope_rotary_dim is not None else None)
+
+    def deltanet_rl(p, cur):
+        """One Gated DeltaNet token mixer, ending in `cx`. The conv window's last row is where the
+        q|k|v projection lands and where Conv1dStep leaves its output."""
+        el = lambda buf, lo, n: f"{buf}[{lo * 2}:{(lo + n) * 2}]"
+        xrow = el(p + "cw", LWIN, LCH)
+        qs = [el(p + "cw", LWIN + j * LDK, LDK) for j in range(sp.lin_k_heads)]
+        ks = [el(p + "cw", LWIN + LKD + j * LDK, LDK) for j in range(sp.lin_k_heads)]
+        os_ = [el(p + "lo", h * LDK, LDK) for h in range(sp.lin_v_heads)]
+        z = el(p + "zab", 0, LVD)
+        return [
+            (op_norm, cur, p + "n_in", p + "hn"),
+            (op_lin_qkv, p + "Wlqkv", p + "hn", xrow),
+            (op_lin_zab, p + "Wlzab", p + "hn", p + "zab"),
+            (op_conv, p + "cw", p + "cvw", p + "cw"),
+            (op_mix_act, xrow, xrow),
+            *[(op_l2, q, "l2q", q) for q in qs],
+            *[(op_l2, k, "l2k", k) for k in ks],
+            (op_gdr, p + "zab", p + "gdp", p + "cw", p + "S", p + "S", p + "lo"),
+            *[(op_gnorm, o, p + "gnw", o) for o in os_],
+            (op_z_act, z, z),
+            (op_o_mul, p + "lo", z, p + "cx"),
+        ]
     # Gemma-4's trained per-layer scalar, applied to the block output after BOTH residual adds.
     # It cannot fold anywhere: it scales the residual stream itself, so the next layer's norm sees
     # it and every later layer compounds it. One D-wide multiply per layer is the honest form.
@@ -2492,6 +2554,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     op_head = gemv(VOCAB, D, ctx, **head_quant_kw)
 
     weights, bufsz, cache_names, rl = {}, {}, [], []
+    if lin_layers:
+        weights["l2q"] = np.full(LDK, 1.0 / LDK, BF16)       # also carries q's dk^-0.5 scale
+        weights["l2k"] = np.full(LDK, LDK ** -0.5, BF16)
     if sp.v_norm:
         # The gainless v-norm's gain, one per head_dim and shared by EVERY layer -- a true constant,
         # unlike the per-layer learned gains beside it, so it is registered once here rather than in
@@ -2572,11 +2637,37 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 # a whole [Hq, S] elementwise pass. Scaled in f32 before the bf16 round.
                 w = bf16(np.asarray(w, np.float32) * sp.attn_scale)
             weights[p + key] = w
+        lin = sp.mixer_for(l) == "linear_attention"
+        if lin:
+            pl = f"{sp.weight_prefix}layers.{l}.linear_attn."
+            if any(pl + t in PACKED for t in ("in_proj_qkv.weight", "in_proj_z.weight")):
+                raise SystemExit(f"{pl}: a packed linear-attention dump is not wired yet -- the "
+                                 f"[z|a|b] stack is concatenated in the float domain")
+            weights[p + "Wlqkv"] = _pack(npy(pl + "in_proj_qkv.weight"), "qkv")
+            zab = np.concatenate([npy(pl + "in_proj_z.weight"), npy(pl + "in_proj_a.weight"),
+                                  npy(pl + "in_proj_b.weight")])
+            weights[p + "Wlzab"] = _pack(np.pad(zab, ((0, LZAB - zab.shape[0]), (0, 0))), "qkv")
+            weights[p + "cvw"] = bf16(np.ascontiguousarray(
+                npy(pl + "conv1d.weight")[:, 0, :].T)).reshape(-1)          # tap-major [taps, C]
+            # f32 [neg_a | dt_bias], carried in one dk-wide bf16 element's bytes.
+            gp = np.zeros(LDK // 2, np.float32)
+            gp[:sp.lin_v_heads] = -np.exp(npy(pl + "A_log").astype(np.float64))
+            gp[sp.lin_v_heads:2 * sp.lin_v_heads] = npy(pl + "dt_bias")
+            weights[p + "gdp"] = gp.view(np.uint16).view(BF16)
+            weights[p + "gnw"] = bf16(npy(pl + "norm.weight"))   # plain w: not a norm_gain norm
+            weights[p + "cw"] = np.zeros(LTAPS * LCH, BF16)
+            # f32 state as raw bytes: int8 is how the writer recognises "already in wire format".
+            weights[p + "S"] = np.zeros(sp.lin_v_heads * LDK * LDK, np.float32).view(np.int8)
+            cache_names += [p + "cw", p + "S"]
+            # cw is sliced in the runlist, so its size must be explicit even though it is a weight.
+            bufsz.update({p + "zab": LZAB * 2, p + "lo": LVD * 2, p + "cw": LTAPS * LCH * 2})
         mlp_keys = {"Wg", "Wu", "Wd"}
         qkv_keys = ("Wq", "Wk", "Wv")
         qkv_parts = []   # filled in Wq, Wk, Wv order below -- the row order op_qkv assumes
-        for key, tensor in (("Wq", "self_attn.q_proj"), ("Wk", "self_attn.k_proj"),
-                            ("Wv", "self_attn.v_proj"), ("Wo", "self_attn.o_proj"),
+        mixer_tensors = ((("Wo", "linear_attn.out_proj"),) if lin else
+                         (("Wq", "self_attn.q_proj"), ("Wk", "self_attn.k_proj"),
+                          ("Wv", "self_attn.v_proj"), ("Wo", "self_attn.o_proj")))
+        for key, tensor in (*mixer_tensors,
                             ("Wg", "mlp.gate_proj"), ("Wu", "mlp.up_proj"), ("Wd", "mlp.down_proj")):
             if key == "Wv" and not g.has_v:
                 continue     # attention_k_eq_v: no v_proj tensor exists for this layer
@@ -2608,6 +2699,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                         weights[f"{p}{key}k{i}"] = (
                             _pack(part, _site_of(key)))
                 continue
+            if hf in PACKED and key == "Wq" and sp.attn_output_gate:
+                raise SystemExit(f"{hf}: splitting q_proj's per-head gate half out of a packed dump "
+                                 f"is not wired yet")
             if hf in PACKED:
                 # Already on the wire; npy_raw, never npy -- widening these bytes to f32 renumbers
                 # the payload instead of copying it, and does so silently.
@@ -2633,6 +2727,11 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             w = (_dequant_wd_from_kchunks(hf)
                  if key == "Wd" and mlp_dp_why is None and f"{hf}.kchunk0" in PACKED
                  else npy(hf))  # [M, K], f32
+            if key == "Wq" and sp.attn_output_gate:
+                # HF views q_proj per head as [q | gate]; the gate half is its own GEMV.
+                wq = w.reshape(Hq, 2, g.hd, D)
+                weights[p + "Wgate"] = _pack(np.ascontiguousarray(wq[:, 1].reshape(-1, D)), "qkv")
+                w = np.ascontiguousarray(wq[:, 0].reshape(-1, D))
             if key in mlp_keys:
                 weights[p + key] = _pack(w, "mlp")
             elif key == "Wo" and fuse_o:
@@ -2659,7 +2758,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 weights[p + key] = _pack(w, "qkv")
             else:
                 weights[p + key] = bf16(w).reshape(-1)
-        if FUSE_QKV_GEMV:
+        if FUSE_QKV_GEMV and not lin:
             want = 1 + g.kv_parts
             assert len(qkv_parts) == want, (
                 f"L{l}: expected {want} concat parts ({'Wq, Wk, Wv' if g.has_v else 'Wq, Wk'}); "
@@ -2717,41 +2816,43 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # `g.capacity`/`g.kv_block` are the values its operators were built with, not a second
         # derivation of them, which is how this line used to size a global cache at `g.window`
         # and hand the append a buffer a quarter the size it declares.
-        _kvl = KVLayout(Hkv=g.hkv, S=g.capacity, HD=g.hd, T=g.kv_block)
-        weights[p + "kc"] = np.zeros(_kvl.total_elems, BF16)
-        weights[p + "vc"] = np.zeros(_kvl.total_elems, BF16)
-        cache_names += [p + "kc", p + "vc"]
-        ang = "rope_global" if sp.is_global(l) else "rope_local"
+        ang = None
+        if not lin:
+            _kvl = KVLayout(Hkv=g.hkv, S=g.capacity, HD=g.hd, T=g.kv_block)
+            weights[p + "kc"] = np.zeros(_kvl.total_elems, BF16)
+            weights[p + "vc"] = np.zeros(_kvl.total_elems, BF16)
+            cache_names += [p + "kc", p + "vc"]
+            ang = "rope_global" if sp.is_global(l) else "rope_local"
 
-        # q/k/v are byte slices of ONE `qkv` buffer in the fused arm -- op_qkv writes all three in
-        # one pass, and q|k adjacency is what lets a single RoPE cover both. Declared with an
-        # explicit size because a parent that is only ever referenced sliced has no arg spec to
-        # take its length from (iron/common/sequence.py: calculate_buffer_layout).
-        if g.op_qkv_dp is not None:
-            # The fused head appends k and v to the caches itself, so neither ever becomes an L3
-            # buffer and only `q` survives as an intermediate.
-            ref_q = p + "q"
-            bufsz[ref_q] = g.qd * 2
-        elif FUSE_QKV_GEMV:
-            qkvb, kb, vb = p + "qkv", g.qd * 2, (g.qd + g.kvd) * 2
-            ref_q, ref_k = f"{qkvb}[0:{kb}]", f"{qkvb}[{kb}:{vb}]"
-            ref_qk = f"{qkvb}[0:{vb}]"
-            if g.has_v:
-                ref_v = f"{qkvb}[{vb}:{vb + g.kvd * 2}]"
-                vhb, vho = qkvb, vb
+            # q/k/v are byte slices of ONE `qkv` buffer in the fused arm -- op_qkv writes all three in
+            # one pass, and q|k adjacency is what lets a single RoPE cover both. Declared with an
+            # explicit size because a parent that is only ever referenced sliced has no arg spec to
+            # take its length from (iron/common/sequence.py: calculate_buffer_layout).
+            if g.op_qkv_dp is not None:
+                # The fused head appends k and v to the caches itself, so neither ever becomes an L3
+                # buffer and only `q` survives as an intermediate.
+                ref_q = p + "q"
+                bufsz[ref_q] = g.qd * 2
+            elif FUSE_QKV_GEMV:
+                qkvb, kb, vb = p + "qkv", g.qd * 2, (g.qd + g.kvd) * 2
+                ref_q, ref_k = f"{qkvb}[0:{kb}]", f"{qkvb}[{kb}:{vb}]"
+                ref_qk = f"{qkvb}[0:{vb}]"
+                if g.has_v:
+                    ref_v = f"{qkvb}[{vb}:{vb + g.kvd * 2}]"
+                    vhb, vho = qkvb, vb
+                else:
+                    # No v_proj: the concatenation ends at k, and `v` is its own buffer that v_norm
+                    # writes from the k slice. It cannot alias the k slice -- k is normed and rotated
+                    # in place afterwards, and V must be the RAW projection.
+                    ref_v, vhb, vho = p + "v", p + "v", 0
+                    bufsz[p + "v"] = g.kvd * 2
+                # per-head norm slice base + byte offset, for q, k and v alike
+                qhb, qho, khb, kho = qkvb, 0, qkvb, kb
+                bufsz[qkvb] = (g.qd + g.kv_parts * g.kvd) * 2
             else:
-                # No v_proj: the concatenation ends at k, and `v` is its own buffer that v_norm
-                # writes from the k slice. It cannot alias the k slice -- k is normed and rotated
-                # in place afterwards, and V must be the RAW projection.
-                ref_v, vhb, vho = p + "v", p + "v", 0
-                bufsz[p + "v"] = g.kvd * 2
-            # per-head norm slice base + byte offset, for q, k and v alike
-            qhb, qho, khb, kho = qkvb, 0, qkvb, kb
-            bufsz[qkvb] = (g.qd + g.kv_parts * g.kvd) * 2
-        else:
-            ref_q, ref_k, ref_v = p + "q", p + "k", p + "v"
-            qhb, qho, khb, kho, vhb, vho = p + "q", 0, p + "k", 0, p + "v", 0
-            bufsz.update({p + "q": g.qd * 2, p + "k": g.kvd * 2, p + "v": g.kvd * 2})
+                ref_q, ref_k, ref_v = p + "q", p + "k", p + "v"
+                qhb, qho, khb, kho, vhb, vho = p + "q", 0, p + "k", 0, p + "v", 0
+                bufsz.update({p + "q": g.qd * 2, p + "k": g.kvd * 2, p + "v": g.kvd * 2})
         # kr/vr/vt are the GQA-broadcast and V-transpose intermediates, and each exists ONLY in the
         # arm whose op writes it. Declaring them unconditionally allocated them anyway: an entry in
         # `buffer_sizes` that no runlist op references still lands in the scratch arena, because
@@ -2778,11 +2879,14 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                {step[-1]: D * 2 for step in o_runlist(p, g)}),
             p + "hn": D * 2, p + "hf": D * 2,
         })
-        if not GROUPED_K:
+        if lin:
+            for k in ("kc", "vc", "sc", "sw"):
+                del bufsz[p + k]
+        if not GROUPED_K and not lin:
             bufsz[p + "kr"] = Hq * g.window * g.hd * 2
-        if not (GROUPED_V or g.uses_tmv_ctx):
+        if not (GROUPED_V or g.uses_tmv_ctx or lin):
             bufsz[p + "vr"] = Hq * g.window * g.hd * 2
-        if not g.uses_tmv_ctx:
+        if not (g.uses_tmv_ctx or lin):
             bufsz[p + "vt"] = Hq * g.window * g.hd * 2
         # `a` is purely internal to op_mlp_dp's own fuse_o path (never an L3 buffer -- see
         # design.py) once folded; only declare it when something outside that design still reads
@@ -2806,7 +2910,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                        p + "cx", p + "n_pf", p + "Wo", p + "Wg", p + "Wu", p + "Wd",
                        "mlp_gh", "mlp_a_scratch", nxt))
         else:
-            if g.op_attn_block is not None:
+            if lin:
+                attn_rl = deltanet_rl(p, cur)
+            elif g.op_attn_block is not None:
                 # One device replaces norm/QKV/qk-norm/RoPE/KV-append/scores/softmax/ctx below; see
                 # attn_block_why for the per-geometry eligibility this reuses. o_runlist (Wo) and
                 # the MLP half are unaffected -- attn_block_dp stops at `cx`, same as op_ctx does.
@@ -2829,6 +2935,13 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                     rope = ([(g.op_rope_qk, ref_qk, ang, ref_qk)] if fuse_rope else
                             [(g.op_rope_q, ref_q, ang, ref_q),
                              (g.op_rope_k, ref_k, ang, ref_k)])
+                    if op_rope_part is not None:
+                        # Partial rotary: the first rope_rotary_dim dims of each head, in place.
+                        rb = sp.rope_rotary_dim * 2
+                        rope = [(op_rope_part, sl, ang, sl) for sl in
+                                [f"{b}[{o + h * g.hd * 2}:{o + h * g.hd * 2 + rb}]"
+                                 for b, o, n in ((qhb, qho, Hq), (khb, kho, g.hkv))
+                                 for h in range(n)]]
                     if g.op_v_norm is not None:
                         # Per kv head over head_dim, NOT rotated -- RoPE is a q/k-only step. Three args:
                         # this is the qk-norm design, so it takes a gain, and `ones` is what makes it
@@ -2869,6 +2982,12 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                       [(g.op_trv, p + ("vc" if GROUPED_V else "vr"), p + "vt")]),
                     (g.op_ctx, p + ("vc" if g.uses_tmv_ctx else "vt"), p + "sw", p + "cx"),
                 ]
+            if sp.attn_output_gate and not lin:
+                # cx *= sigmoid(gate), gate = Wgate @ hn -- `hn` is the head's own normed input.
+                bufsz[p + "gt"] = QD * 2
+                attn_rl += [(op_gate_proj, p + "Wgate", p + "hn", p + "gt"),
+                            (op_gate_act, p + "gt", p + "gt"),
+                            (op_gate_mul, p + "cx", p + "gt", p + "cx")]
             rl += [*attn_rl, *([] if fuse_o else o_runlist(p, g))]
             if sp.sandwich_norms:
                 rl.append((op_norm, p + "a", p + "n_pa", p + "a"))
@@ -2977,7 +3096,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # `rope_global` there makes calculate_buffer_layout refuse the design -- "Input argument
     # rope_global not found in runlist buffers" -- because no op consumes it. Same rule as
     # the per-layer `ang` selection above, read over the range that was emitted.
-    angs = {"rope_global" if sp.is_global(l) else "rope_local" for l in range(NL)}
+    angs = {"rope_global" if sp.is_global(l) else "rope_local" for l in range(NL)
+            if sp.mixer_for(l) == "full_attention"}
     inputs = ["x"] + [n for n in ("rope_global", "rope_local") if n in angs]
     # cores-per-col=1 spreads each operator's workers one per column instead of stacking them four
     # deep in two columns, which is what the default column-major SequentialPlacer does. Every op
@@ -3325,6 +3445,9 @@ def main():
                           # whose rope_type is "default", which is every one but Gemma-4's global
                           # layers.
                           "rope_partial_rotary": sp.rope_partial_rotary,
+                          # Ordinary partial rotary: the angle row is this wide and its
+                          # frequencies are over this width, not over head_dim.
+                          "rope_rotary_dim": sp.rope_rotary_dim,
                           # final_logit_softcapping: tanh(logits/c)*c, applied by the host after
                           # the logits cross back. Null unless the checkpoint sets it.
                           "logit_softcap": sp.logit_softcap},
