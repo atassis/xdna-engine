@@ -100,3 +100,26 @@ def test_a_nan_value_in_a_hidden_slot_is_not_survivable():
     vp = v.copy()
     vp[hidden] = np.nan
     assert np.isnan(flash_attention(q, k, vp, vis, 1 / 16, b_kv=B_KV)).any()
+
+
+def test_negative_unguarded_empty_block_is_nan():
+    q, k, v = qkv(7, 2 * M, RING + M, 256)
+    out = flash_attention(q, k, v, sliding_visible(0, 2), 1 / 16, b_kv=B_KV, guard_empty=False)
+    assert np.isnan(out).all()
+
+
+def test_negative_no_rescale_misses_tolerance():
+    w, hd = 1024, 512
+    q, k, v = qkv(3, M, w, hd)
+    k *= np.linspace(0.1, 3.0, w, dtype=np.float32)[:, None]   # later blocks raise the max
+    vis = global_visible(w - M, w, 1)
+    ref = full_attention(q, k, v, vis, 1 / np.sqrt(hd))
+    out = flash_attention(q, k, v, vis, 1 / np.sqrt(hd), b_kv=B_KV, rescale=False)
+    assert rel_l2(out, ref) > 100 * TOL
+
+
+def test_negative_additive_mask_lets_a_nan_key_through():
+    q, k, v, vis, hidden = _holed_case()
+    kp = k.copy()
+    kp[hidden] = np.nan
+    assert np.isnan(flash_attention(q, kp, v, vis, 1 / 16, b_kv=B_KV, additive_mask=True)).any()
