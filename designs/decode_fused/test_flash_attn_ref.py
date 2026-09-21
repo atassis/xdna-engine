@@ -75,3 +75,28 @@ def test_sliding_flash_matches_full_attention(base):
     out = flash_attention(q, k, v, vis, scale, b_kv=B_KV)
     assert np.isfinite(out).all()
     assert rel_l2(out, full_attention(q, k, v, vis, scale)) < TOL
+
+
+def _holed_case():
+    q, k, v = qkv(9, 2 * M, RING + M, 256)
+    vis = sliding_visible(1536, 2)
+    hidden = ~vis.any(axis=0)
+    assert hidden[512] and hidden.sum() == 1   # slot 512: hidden for every row, inside block 8
+    return q, k, v, vis, hidden
+
+
+def test_nan_keys_and_huge_values_in_hidden_slots_change_nothing():
+    q, k, v, vis, hidden = _holed_case()
+    kp, vp = k.copy(), v.copy()
+    kp[hidden], vp[hidden] = np.nan, 1.0e4
+    clean = flash_attention(q, k, v, vis, 1 / 16, b_kv=B_KV)
+    assert np.array_equal(clean, flash_attention(q, kp, vp, vis, 1 / 16, b_kv=B_KV))
+
+
+def test_a_nan_value_in_a_hidden_slot_is_not_survivable():
+    # 0 * NaN is NaN in the x V product, so correct masking cannot protect against a NaN V row:
+    # the KV cache tail must hold finite values (it is zero-filled today).
+    q, k, v, vis, hidden = _holed_case()
+    vp = v.copy()
+    vp[hidden] = np.nan
+    assert np.isnan(flash_attention(q, k, vp, vis, 1 / 16, b_kv=B_KV)).any()
