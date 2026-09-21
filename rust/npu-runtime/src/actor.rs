@@ -585,8 +585,8 @@ fn run_named_evicting(cfg: &Config, reg: &mut Registry, loader: &dyn ModelLoader
         if cfg.server.evict_policy == EvictPolicy::None { return None; }
         reg.lru_victim_except(name)
     };
-    // A clone is made only when a retry could plausibly follow, so the common (no exhaustion) path
-    // allocates nothing extra.
+    // `run` consumes the request, so a retry needs a copy taken up front: one clone per request
+    // whenever another model could be evicted, none when this is the only resident model.
     let mut spare = victim(reg, &name).is_some().then(|| req.clone());
     let mut req = Some(req);
     loop {
