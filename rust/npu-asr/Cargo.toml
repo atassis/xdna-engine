@@ -42,11 +42,3 @@ sha2 = "0.10"
 [dev-dependencies]
 tempfile = "3"
 
-[[bin]]
-name = "encode_server"
-path = "src/bin/encode_server.rs"
-
-[[bin]]
-name = "gen_kernel_manifest"
-path = "src/bin/gen_kernel_manifest.rs"
-

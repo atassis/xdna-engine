@@ -70,8 +70,8 @@ fn every_registry_entry_names_a_file_that_reads_it() {
 //
 // SCOPE, matched to `env_flags.rs`'s own module doc rather than invented here: crates in
 // `rust/Cargo.toml`'s `[workspace] default-members` (derived at test time by parsing that array,
-// so a new workspace member cannot slip past this gate unscoped -- `npu-probes` is excluded simply
-// because it is not in that list), scanning only each crate's `src/` tree (so `build.rs`, which
+// so a new workspace member cannot slip past this gate unscoped -- this covers `npu-dev`'s
+// subcommands too), scanning only each crate's `src/` tree (so `build.rs`, which
 // runs at build time and never ships, and `tests/`, which is test-only, are out of scope by
 // directory, not by a name list). Within `src/`, a read inside a `#[cfg(test)]` region is excluded
 // (never compiled into a shipped binary). And a small fixed set of names is out of scope regardless
@@ -415,8 +415,8 @@ fn is_out_of_scope_by_name(name: &str) -> bool {
 }
 
 /// `rust/Cargo.toml`'s `[workspace] default-members` array, parsed at test time (not hardcoded) so
-/// a new workspace member is scoped automatically. `npu-probes` is excluded simply by not being
-/// listed there, matching `env_flags.rs`'s own scoping -- not by a name check here.
+/// a new workspace member is scoped automatically, matching `env_flags.rs`'s own scoping -- not by
+/// a name check here.
 fn shipped_crate_dirs(rust_root: &std::path::Path) -> Vec<std::path::PathBuf> {
     let text = std::fs::read_to_string(rust_root.join("Cargo.toml")).expect("rust/Cargo.toml must exist");
     let key_pos = text.find("default-members").expect("Cargo.toml has no default-members");

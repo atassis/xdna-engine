@@ -22,11 +22,3 @@ ndarray = "0.16"
 
 [dev-dependencies]
 tempfile = "3"
-
-[[bin]]
-name = "s2_design_probe"
-path = "src/bin/s2_design_probe.rs"
-
-[[bin]]
-name = "s2_chain_probe"
-path = "src/bin/s2_chain_probe.rs"

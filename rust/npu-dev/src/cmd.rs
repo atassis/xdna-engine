@@ -1,0 +1,17 @@
+pub mod conveyor_parity;
+pub mod fused_elf;
+pub mod kernels_build;
+pub mod kernels_manifest;
+pub mod kernels_verify;
+pub mod mha_decode;
+pub mod parakeet_encode;
+pub mod prefill_golden;
+pub mod prefill_time;
+pub mod prefill_token_gate;
+pub mod s2_chain;
+pub mod s2_design;
+pub mod tcache_parity;
+pub mod verify_parakeet;
+pub mod verify_whisper;
+pub mod verify_whisper_decode;
+pub mod whisper_e2e;

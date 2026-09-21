@@ -4,7 +4,7 @@
 //! active. `npu flags` (npu-cli) is this list rendered against the live process environment.
 //!
 //! Scope: crates in `rust/Cargo.toml`'s `default-members` (what `cargo build` at the workspace
-//! root produces), excluding `npu-probes` (dev tooling, not shipped) and any read inside
+//! root produces, which includes `npu-dev`'s subcommands) and any read inside
 //! `#[cfg(test)]` (never compiled into a shipped binary -- e.g. `QWEN3_TOKENIZER_DIR`,
 //! `NPU_LLM_DEVICE_GATE`, `S2_ARTIFACT_DIR`). Build-time vars (`CARGO_*`, `OUT_DIR`) and pure
 //! environment (`HOME`, `PATH`, `LD_LIBRARY_PATH`, `XRT_*`) are out of scope too.
@@ -226,6 +226,44 @@ pub const FLAGS: &[Flag] = &[
         semantics: Value, default: "18.0",
         doc: "max transcription window span in seconds; span-granularity only now that both ASR \
               backends window internally (not re-measured against them)." },
+
+    // -- npu-dev ----------------------------------------------------------------------------------
+    Flag { name: "CONV_PARITY_T", owner: "npu-dev", site: "npu-dev/src/cmd/conveyor_parity.rs",
+        semantics: Value, default: "176 (CONV_BUILT_T, full keys)",
+        doc: "key count for the conveyor-parity probe; T < BUILT_T probes the missing key-mask \
+              (expected to FAIL: pad keys pollute the softmax denominator)." },
+    Flag { name: "FUSED_DEBUG", owner: "npu-dev", site: "npu-dev/src/cmd/fused_elf.rs",
+        semantics: Value, default: "unset (no dump)",
+        doc: "comma-separated scratch-buffer names to read back post-dispatch and print, for \
+              localising a fused-elf wiring bug." },
+    Flag { name: "FUSED_TIME", owner: "npu-dev", site: "npu-dev/src/cmd/fused_elf.rs",
+        semantics: IsOk, default: "false",
+        doc: "times ELF re-registration, dispatch alone, and the full per-token \
+              patch+reload+dispatch sequence on the fused-elf probe." },
+    Flag { name: "GATE_DUMP_DIR", owner: "npu-dev", site: "npu-dev/src/cmd/fused_elf.rs",
+        semantics: Value, default: "unset (no dump)",
+        doc: "directory to dump raw device output bytes to, for Tier 1 (scripts/gate_numeric.py) \
+              element-wise judging; also read by prefill_golden.rs's per-layer KV dump." },
+    Flag { name: "NPU_DISPATCH_SEQ", owner: "npu-dev", site: "npu-dev/src/cmd/parakeet_encode.rs",
+        semantics: Value, default: "unset (not written)",
+        doc: "path to write the NPU_DISPATCH_LOG xclbin-transition sequence to." },
+    Flag { name: "PROBE_POS", owner: "npu-dev", site: "npu-dev/src/cmd/fused_elf.rs",
+        semantics: Value, default: "unset (single-shot mode)",
+        doc: "decode position to drive a resident-scratchpad fused-elf dispatch at (current token \
+              at pos, context pos+1); only takes effect when the artifact has a scratchpad." },
+    Flag { name: "PROBE_TIME", owner: "npu-dev", site: "npu-dev/src/cmd/prefill_golden.rs",
+        semantics: Value, default: "unset (no timing)",
+        doc: "warm dispatch iteration count for the prefill-golden probe's layer-scaling timing." },
+    Flag { name: "SCALE_INJECT", owner: "npu-dev", site: "npu-dev/src/cmd/verify_whisper.rs",
+        semantics: Value, default: "unset (control not run)",
+        doc: "multiplicative factor to perturb the last block's output by, as a control that \
+              scale_split recovers a known injected scale error." },
+    Flag { name: "WHISPER_ROOT", owner: "npu-dev", site: "npu-dev/src/cmd/verify_whisper_decode.rs",
+        semantics: Value, default: "\"..\" (worktree root when run from rust/)",
+        doc: "root that the ONNX decoder and host-decoder weight paths resolve under." },
+    Flag { name: "WHISPER_SCENARIO", owner: "npu-dev", site: "npu-dev/src/cmd/whisper_e2e.rs",
+        semantics: Value, default: "scenarios/asr-whisper-small.toml",
+        doc: "scenario file the whisper-e2e bench builds, so the same harness can drive turbo." },
 
     // -- npu-dispatch -----------------------------------------------------------------------------
     Flag { name: "NPU_MARSH_PROF", owner: "npu-dispatch", site: "npu-dispatch/src/lib.rs",
@@ -516,12 +554,12 @@ pub const FLAGS: &[Flag] = &[
               =0 allocates a normal device BO, so sync_from_device is a real transfer rather than \
               a coherency assumption. Pairs with NPU_S2_RESYNC -- one absorbs the symptom, this \
               one removes the condition it needs." },
-    Flag { name: "NPU_S2_DUMP", owner: "npu-s2", site: "npu-s2/src/bin/s2_chain_probe.rs",
+    Flag { name: "NPU_S2_DUMP", owner: "npu-s2", site: "npu-dev/src/cmd/s2_chain.rs",
         semantics: Value, default: "unset (no dump)",
         doc: "path to write run 1's output to as raw little-endian f32, BEFORE any gate runs, so a \
               failing part can be aligned against the reference rail's own per-stage tensors \
               offline instead of being re-run once per hypothesis." },
-    Flag { name: "NPU_S2_DUMP2", owner: "npu-s2", site: "npu-s2/src/bin/s2_chain_probe.rs",
+    Flag { name: "NPU_S2_DUMP2", owner: "npu-s2", site: "npu-dev/src/cmd/s2_chain.rs",
         semantics: Value, default: "unset (no dump)",
         doc: "same for run 2 of the run-to-run determinism check, so the two runs can be diffed \
               outside the harness. Only written when a second run happened." },
@@ -538,7 +576,7 @@ pub const FLAGS: &[Flag] = &[
               separates `breaks because the run is longer` from `breaks because more designs were \
               evicted`. The 68-design chain needs the pool at all because the driver caps live \
               hardware contexts at 16." },
-    Flag { name: "NPU_S2_LATENT_FRAMES", owner: "npu-s2", site: "npu-s2/src/bin/s2_chain_probe.rs",
+    Flag { name: "NPU_S2_LATENT_FRAMES", owner: "npu-s2", site: "npu-dev/src/cmd/s2_chain.rs",
         semantics: Value, default: "unset (the whole latent)",
         doc: "truncate the latent to its first N frames, range-checked against the input. Every op \
               in the chain is a local sliding window, so a prefix reproduces the corresponding \
