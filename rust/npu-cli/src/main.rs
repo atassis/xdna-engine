@@ -116,7 +116,7 @@ fn run(cli: &Cli, path: &Path) -> Result<()> {
             chat(prompt.as_deref(), model.as_deref(), sampling, *no_stream, as_json),
         Cmd::Embed { text, model } => embed(text, model.as_deref(), as_json),
         Cmd::Decide { state, question, kind, options, model } =>
-            decide(state, question, *kind, options, model),
+            decide(state, question, *kind, options, model, as_json),
         Cmd::Top { interval, once } => top(*interval, *once),
         Cmd::Stats { log, diff } => stats_cmd(log, diff.as_deref()),
         Cmd::Replay { log, realtime, frames } => replay_cmd(log, *realtime, *frames),
@@ -1083,14 +1083,31 @@ fn decide_body(state: &str, question: &str, kind: DecideType, options: &[String]
     Ok(serde_json::json!({ "model": model, "state": state, "questions": { "q": q } }))
 }
 
-fn decide(state: &str, question: &str, kind: DecideType, options: &[String], model: &str) -> Result<()> {
+/// One answer object (`v["answers"]["q"]`) as a human line: the noul side with p >= 0.5 and its
+/// probability, the choice and its confidence, or the score (2dp) and its confidence.
+fn decide_human(a: &serde_json::Value) -> String {
+    match a["type"].as_str().unwrap_or_default() {
+        "noul" => {
+            let p = a["noul"].as_f64().unwrap_or(0.0);
+            if p >= 0.5 { format!("true {p:.4}") } else { format!("false {:.4}", 1.0 - p) }
+        }
+        "choice" => format!("{} {:.4}", a["choice"].as_str().unwrap_or_default(),
+            a["confidence"].as_f64().unwrap_or(0.0)),
+        "score" => format!("{:.2} (confidence {:.4})", a["score"].as_f64().unwrap_or(0.0),
+            a["confidence"].as_f64().unwrap_or(0.0)),
+        _ => a.to_string(),
+    }
+}
+
+fn decide(state: &str, question: &str, kind: DecideType, options: &[String], model: &str, as_json: bool) -> Result<()> {
     quiet_one_shot();
     let state = match state.strip_prefix('@') {
-        Some(p) => std::fs::read_to_string(p).with_context(|| format!("reading the state from {p}"))?,
+        Some(p) => std::fs::read_to_string(p).with_context(|| format!("read {p}"))?,
         None => state.to_string(),
     };
     let v = socket_client::call_json("/v1/systemone", &decide_body(&state, question, kind, options, model)?)?;
-    println!("{}", v["answers"]["q"]);
+    let a = &v["answers"]["q"];
+    if as_json { println!("{a}"); } else { println!("{}", decide_human(a)); }
     Ok(())
 }
 
@@ -2356,6 +2373,104 @@ mod tests {
         join.join().unwrap();
     }
 
+    /// A model that answers `Capability::GENERATE`'s `Request::Decide` deterministically from what
+    /// it received: noul answers a fixed 0.75, choice/score answer the FIRST option -- enough for a
+    /// wire test to prove the server parsed the CLI's body rather than echoing it untouched.
+    struct EchoDecide;
+    impl npu_runtime::loader::Servable for EchoDecide {
+        fn capabilities(&self) -> Capability { Capability::GENERATE }
+        fn run(&mut self, req: npu_engine::capability::Request)
+            -> Result<npu_engine::capability::Response, npu_engine::EngineError> {
+            let d = match req {
+                npu_engine::capability::Request::Decide(d) => d,
+                other => panic!("EchoDecide cannot serve {other:?}"),
+            };
+            let answers = d.questions.iter().map(|q| match q.kind {
+                npu_engine::QuestionKind::Noul => npu_engine::DecideAnswer::Noul { id: q.id.clone(), p_true: 0.75 },
+                npu_engine::QuestionKind::Choice => {
+                    let n = q.options.len() as f64;
+                    npu_engine::DecideAnswer::Choice {
+                        id: q.id.clone(), choice: q.options[0].0.clone(),
+                        probabilities: q.options.iter().map(|(k, _)| (k.clone(), 1.0 / n)).collect(),
+                        confidence: 1.0 / n,
+                    }
+                }
+                npu_engine::QuestionKind::Score => {
+                    let n = q.options.len();
+                    npu_engine::DecideAnswer::Score {
+                        id: q.id.clone(), score: 0.0,
+                        probabilities: vec![1.0 / n as f64; n], confidence: 1.0 / n as f64,
+                    }
+                }
+            }).collect();
+            Ok(npu_engine::capability::Response::Decisions(answers))
+        }
+    }
+    impl npu_runtime::loader::StreamServable for EchoDecide {}
+    struct EchoDecideLoader;
+    impl ModelLoader for EchoDecideLoader {
+        fn load(&self, _cfg: &ModelCfg) -> Result<Box<dyn npu_runtime::loader::StreamServable>, npu_engine::EngineError> {
+            Ok(Box::new(EchoDecide))
+        }
+        fn declared_capability(&self, _cfg: &ModelCfg) -> Option<Capability> { Some(Capability::GENERATE) }
+    }
+    fn decide_socket_harness(port: u16) -> (npu_runtime::actor::Handle, std::thread::JoinHandle<()>, tempfile::TempDir) {
+        let cfg = Config {
+            server: ServerCfg { port, idle_unload_s: 0, ..Default::default() },
+            defaults: Defaults::from_pairs([(Capability::GENERATE, "qwen3.5-4b".to_string())]),
+            models: vec![ModelCfg { name: "qwen3.5-4b".into(), scenario: "x".into(), resident: false }],
+        };
+        let (handle, join) = start_lazy(cfg, Box::new(EchoDecideLoader)).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::remove_var("RUNTIME_DIRECTORY");
+        std::env::set_var("XDG_RUNTIME_DIR", dir.path());
+        let sock_path = npu_runtime::control_socket::socket_path().unwrap();
+        let listener = npu_runtime::control_socket::bind(&sock_path).unwrap();
+        let (h2, live, cfg_path) = (handle.clone(), handle.live_status(), dir.path().join("engine.toml"));
+        std::thread::spawn(move || npu_runtime::control_socket::serve(listener, h2, live, cfg_path));
+        (handle, join, dir)
+    }
+
+    /// Same oracle as `embed_over_the_socket_matches_the_http_route_byte_for_byte`, once per
+    /// question kind: `decide_body`'s output sent both ways must produce identical 200s, and the
+    /// echoed answer must name what `decide_body` actually sent (the choice test's FIRST option
+    /// key), proving the server parsed the CLI's body rather than the harness rubber-stamping it.
+    #[test]
+    fn decide_over_the_socket_matches_the_http_route_byte_for_byte() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        const PORT: u16 = 19198;
+        let (handle, join, dir) = decide_socket_harness(PORT);
+        let cfg_path = dir.path().join("engine.toml");
+
+        let cases: [(DecideType, &[String]); 3] = [
+            (DecideType::Noul, &[]),
+            (DecideType::Choice, &["alpha=first".to_string(), "beta=second".to_string()]),
+            (DecideType::Score, &["low".to_string(), "high".to_string()]),
+        ];
+        for (kind, opts) in cases {
+            let body = decide_body("s", "q?", kind, opts, "qwen3.5-4b").unwrap();
+            let via_socket = socket_client::call_json("/v1/systemone", &body).unwrap();
+
+            let req = npu_runtime::http::Request {
+                method: "POST".into(), path: "/v1/systemone".into(),
+                boundary: String::new(), body: body.to_string().into_bytes(),
+            };
+            let (code, resp) = npu_runtime::http::route(&req, &handle, &cfg_path);
+            assert_eq!(code, 200, "{}", resp.text());
+            let via_http: serde_json::Value = serde_json::from_str(resp.text()).unwrap();
+            assert_eq!(via_socket, via_http, "{kind:?}: the CLI-over-socket and HTTP route must agree exactly");
+
+            if kind == DecideType::Choice {
+                assert_eq!(via_socket["answers"]["q"]["choice"], "alpha",
+                    "the echoed choice must be the FIRST option decide_body sent");
+            }
+        }
+
+        std::env::remove_var("XDG_RUNTIME_DIR");
+        handle.shutdown();
+        join.join().unwrap();
+    }
+
     struct MockTts;
     impl npu_runtime::loader::Servable for MockTts {
         fn capabilities(&self) -> Capability { Capability::TTS }
@@ -3319,6 +3434,16 @@ mod decide_cli {
     fn a_choice_or_score_needs_two_options() {
         assert!(decide_body("s", "q", DecideType::Choice, &["a=x".to_string()], "m").is_err());
         assert!(decide_body("s", "q", DecideType::Score, &["low".to_string()], "m").is_err());
+    }
+
+    #[test]
+    fn decide_human_renders_each_kind() {
+        assert_eq!(decide_human(&serde_json::json!({"type": "noul", "noul": 0.9963})), "true 0.9963");
+        assert_eq!(decide_human(&serde_json::json!({"type": "noul", "noul": 0.0037})), "false 0.9963");
+        assert_eq!(decide_human(&serde_json::json!(
+            {"type": "choice", "choice": "b", "confidence": 0.9953})), "b 0.9953");
+        assert_eq!(decide_human(&serde_json::json!(
+            {"type": "score", "score": 1.5, "confidence": 0.73})), "1.50 (confidence 0.7300)");
     }
 }
 
