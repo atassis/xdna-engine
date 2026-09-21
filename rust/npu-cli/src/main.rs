@@ -16,7 +16,7 @@ mod stats;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser};
 
-use cli_def::{CheckpointCmd, Cli, Cmd, ConfigCmd, ModelCmd, OutFormat, OutputFormat, SamplingArgs, SpeechFormat};
+use cli_def::{CheckpointCmd, Cli, Cmd, ConfigCmd, DecideType, ModelCmd, OutFormat, OutputFormat, SamplingArgs, SpeechFormat};
 use clap_complete::Shell;
 use std::io::IsTerminal;
 use npu_engine::telemetry::wire;
@@ -115,6 +115,8 @@ fn run(cli: &Cli, path: &Path) -> Result<()> {
         Cmd::Chat { prompt, model, sampling, no_stream } =>
             chat(prompt.as_deref(), model.as_deref(), sampling, *no_stream, as_json),
         Cmd::Embed { text, model } => embed(text, model.as_deref(), as_json),
+        Cmd::Decide { state, question, kind, options, model } =>
+            decide(state, question, *kind, options, model),
         Cmd::Top { interval, once } => top(*interval, *once),
         Cmd::Stats { log, diff } => stats_cmd(log, diff.as_deref()),
         Cmd::Replay { log, realtime, frames } => replay_cmd(log, *realtime, *frames),
@@ -1037,6 +1039,58 @@ fn embed(text: &str, model: Option<&str>, as_json: bool) -> Result<()> {
         let arr = embedding.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",");
         println!("[{arr}]");
     }
+    Ok(())
+}
+
+/// The `/v1/systemone` body for one question, id `q`.
+fn decide_body(state: &str, question: &str, kind: DecideType, options: &[String], model: &str)
+    -> Result<serde_json::Value> {
+    let pair = |o: &String| o.split_once('=').map(|(k, d)| (k.to_string(), d.to_string()))
+        .ok_or_else(|| anyhow!("--option {o:?} is not key=description"));
+    let mut q = serde_json::json!({ "instructions": question });
+    match kind {
+        DecideType::Noul => {
+            q["type"] = "noul".into();
+            if !options.is_empty() {
+                let mut c = serde_json::Map::new();
+                for o in options {
+                    let (k, d) = pair(o)?;
+                    if k != "true" && k != "false" {
+                        bail!("noul options are true=... and false=..., got {k:?}");
+                    }
+                    c.insert(k, d.into());
+                }
+                q["criteria"] = c.into();
+            }
+        }
+        DecideType::Choice => {
+            if options.len() < 2 { bail!("a choice needs at least two --option key=description"); }
+            let mut c = serde_json::Map::new();
+            for o in options {
+                let (k, d) = pair(o)?;
+                c.insert(k, d.into());
+            }
+            q["type"] = "choice".into();
+            q["criteria"] = c.into();
+        }
+        DecideType::Score => {
+            if options.len() < 2 { bail!("a score needs at least two --option levels"); }
+            q["type"] = "score".into();
+            q["criteria"] = options.iter().map(|o| serde_json::Value::from(o.as_str()))
+                .collect::<Vec<_>>().into();
+        }
+    }
+    Ok(serde_json::json!({ "model": model, "state": state, "questions": { "q": q } }))
+}
+
+fn decide(state: &str, question: &str, kind: DecideType, options: &[String], model: &str) -> Result<()> {
+    quiet_one_shot();
+    let state = match state.strip_prefix('@') {
+        Some(p) => std::fs::read_to_string(p).with_context(|| format!("reading the state from {p}"))?,
+        None => state.to_string(),
+    };
+    let v = socket_client::call_json("/v1/systemone", &decide_body(&state, question, kind, options, model)?)?;
+    println!("{}", v["answers"]["q"]);
     Ok(())
 }
 
@@ -3205,6 +3259,66 @@ mod tests {
         // No mlir-aie/.../whole_array/build dir exists under td at all -- if the check were not
         // scoped, this would fail on MissingDir. It must pass because nothing here is Parakeet.
         preflight_artifacts(&cfg, td.path()).expect("non-parakeet config must skip the check");
+    }
+}
+
+#[cfg(test)]
+mod decide_cli {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Cmd {
+        Cli::try_parse_from(args).expect("parses").cmd
+    }
+
+    #[test]
+    fn a_bare_question_is_a_noul_on_qwen35() {
+        match parse(&["npu", "decide", "the state", "--question", "is it?"]) {
+            Cmd::Decide { kind, model, options, .. } => {
+                assert_eq!(kind, DecideType::Noul);
+                assert_eq!(model, "qwen3.5-4b");
+                assert!(options.is_empty());
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn choice_options_keep_their_order() {
+        let opts = ["zeta=last letter".to_string(), "alpha=first letter".to_string()];
+        let b = decide_body("s", "which?", DecideType::Choice, &opts, "m").unwrap();
+        let keys: Vec<&String> = b["questions"]["q"]["criteria"].as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["zeta", "alpha"]);
+        assert_eq!(b["questions"]["q"]["type"], "choice");
+        assert_eq!(b["state"], "s");
+        assert_eq!(b["model"], "m");
+    }
+
+    #[test]
+    fn score_levels_are_an_array_lowest_first() {
+        let opts = ["low".to_string(), "mid".to_string(), "high".to_string()];
+        let b = decide_body("s", "how much?", DecideType::Score, &opts, "m").unwrap();
+        assert_eq!(b["questions"]["q"]["criteria"], serde_json::json!(["low", "mid", "high"]));
+        assert_eq!(b["questions"]["q"]["type"], "score");
+    }
+
+    #[test]
+    fn noul_criteria_are_only_true_and_false() {
+        let ok = ["true=it holds".to_string(), "false=it does not".to_string()];
+        let b = decide_body("s", "q", DecideType::Noul, &ok, "m").unwrap();
+        assert_eq!(b["questions"]["q"]["criteria"]["true"], "it holds");
+        assert!(decide_body("s", "q", DecideType::Noul, &["yes=x".to_string()], "m").is_err());
+    }
+
+    #[test]
+    fn an_option_without_equals_is_refused() {
+        let opts = ["a=x".to_string(), "no-equals".to_string()];
+        assert!(decide_body("s", "q", DecideType::Choice, &opts, "m").is_err());
+    }
+
+    #[test]
+    fn a_choice_or_score_needs_two_options() {
+        assert!(decide_body("s", "q", DecideType::Choice, &["a=x".to_string()], "m").is_err());
+        assert!(decide_body("s", "q", DecideType::Score, &["low".to_string()], "m").is_err());
     }
 }
 

@@ -115,6 +115,20 @@ pub enum Cmd {
         /// Embedding model name; omit to use the configured embed default.
         #[arg(long)] model: Option<String>,
     },
+    /// One typed decision over a state (TypeSafe's `/v1/systemone`), one question per call.
+    ///
+    /// Prints the answer object. `@path` reads the state from a file.
+    Decide {
+        #[arg(allow_hyphen_values = true)] state: String,
+        /// The criterion the model applies to the state.
+        #[arg(long, allow_hyphen_values = true)] question: String,
+        #[arg(long = "type", value_enum, default_value_t = DecideType::Noul)] kind: DecideType,
+        /// Repeated. `key=description` for a choice's options (in order) or noul's `true=` /
+        /// `false=`; for a score, each value is one level, lowest first.
+        #[arg(long = "option", allow_hyphen_values = true)] options: Vec<String>,
+        /// Generation model name.
+        #[arg(long, default_value = "qwen3.5-4b")] model: String,
+    },
     /// One-shot text generation, streamed to stdout by default.
     ///
     /// The prompt goes through the model's chat template, so an instruction-tuned model answers it
@@ -311,6 +325,10 @@ impl SpeechFormat {
         match self { SpeechFormat::Wav => "wav", SpeechFormat::Pcm => "pcm" }
     }
 }
+
+/// `npu decide --type`: TypeSafe's question kinds.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum DecideType { Noul, Choice, Score }
 
 #[derive(Subcommand)]
 pub enum CheckpointCmd {

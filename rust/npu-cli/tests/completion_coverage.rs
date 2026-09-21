@@ -156,6 +156,9 @@ const FREE_FORM_ARGS: &[(&str, &str)] = &[
     ("interval", "refresh seconds -- an arbitrary number"),
     ("diff", "second JSONL run log to compare against"),
     ("voice", "TTS voice name -- no model resolves one yet, arbitrary string"),
+    ("state", "the decision's state -- arbitrary string, or `@path` to a file"),
+    ("question", "the decision's criterion -- arbitrary string"),
+    ("options", "`key=description` decision options -- arbitrary, repeatable strings"),
 ];
 
 #[test]
