@@ -136,6 +136,31 @@ pub struct RunConditions {
     pub resident: Option<bool>,
     pub kernel: Option<String>,
     pub started_unix: i64,
+    /// The device's runtime-PM state, sampled once before this request's first NPU dispatch. `None`
+    /// when the sysfs file could not be read. See [`NpuWake`] -- amdxdna runtime-suspends the device
+    /// a few seconds after the last job and destroys every firmware context on suspend, so a request
+    /// that lands cold pays a wake this field is what makes visible.
+    pub npu_wake: Option<NpuWake>,
+}
+
+/// A runtime-PM read of the NPU device, sampled once before the request's first NPU dispatch.
+///
+/// `cold` is the one fact the sample can state with certainty (the device WAS suspended/suspending
+/// at that moment); `idle_ms` and `first_dispatch_us` are the engine's own honest proxies for what
+/// that cost this request, not a per-dispatch trace -- see [`GenerationReport::first_dispatch_us`].
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NpuWake {
+    /// `runtime_status` read as `suspended` or `suspending`.
+    pub cold: bool,
+    /// The raw sysfs value (`active`, `suspended`, `suspending`, `resuming`).
+    pub status: String,
+    /// Wall time since this process last finished a GENERATE request's NPU work. `None` for the
+    /// first generate request a process serves. Scoped to generate: a Serve request (ASR/embed/TTS)
+    /// in between is not counted, so this can overstate true device idleness in a mixed workload.
+    pub idle_ms: Option<u64>,
+    /// This generation's own [`GenerationReport::first_dispatch_us`], filled in once it is known
+    /// (after the generation finishes, not at sample time).
+    pub first_dispatch_us: Option<u64>,
 }
 
 /// One (xclbin, instruction-stream) pair's blocking dispatch time inside a generation, from
@@ -350,6 +375,17 @@ impl GenerationReport {
         self.steps.iter().filter(|s| s.token.is_some())
     }
 
+    /// Wall time of this generation's first NPU-touching phase: prefill, when the request primed a
+    /// prompt, otherwise the first decode step. The finest boundary the host loop already measures --
+    /// not a per-dispatch trace, and this is what a cold [`RunConditions::npu_wake`] is priced against.
+    pub fn first_dispatch_us(&self) -> Option<u64> {
+        if self.prefill.tokens > 0 {
+            Some(self.prefill.us)
+        } else {
+            self.steps.first().map(|s| s.phases.step_us)
+        }
+    }
+
     /// Roll the records up. Total is measured, not summed: `total_us` is the wall clock, and
     /// `residual_us` is what the named phases failed to account for. Reporting the residual rather
     /// than distributing it is the whole point -- a breakdown whose parts are defined to add up
@@ -561,6 +597,19 @@ mod tests {
         steps[1].dispatches = Some(1);
         steps[2].dispatches = Some(1);
         assert_eq!(report(steps).summarize().dispatches, Some(3));
+    }
+
+    #[test]
+    fn first_dispatch_is_prefill_when_the_request_primed_a_prompt_else_the_first_step() {
+        let mut r = report(vec![step(0, 90_000, 80), step(1, 20, 5)]);
+        r.prefill = PrefillRecord { tokens: 8, batched: 0, stepwise: 8, us: 4_000, dispatches: None };
+        assert_eq!(r.first_dispatch_us(), Some(4_000), "prefill wall time when there was a prompt");
+
+        r.prefill = PrefillRecord::default();
+        assert_eq!(r.first_dispatch_us(), Some(80), "else the first decode step's own device time");
+
+        let empty = GenerationReport::default();
+        assert_eq!(empty.first_dispatch_us(), None, "nothing measured, nothing to report");
     }
 
     #[test]

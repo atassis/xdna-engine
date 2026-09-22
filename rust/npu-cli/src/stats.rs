@@ -167,6 +167,17 @@ pub fn table(r: &GenerationReport) -> String {
             Some(false) => "COLD -- model loaded during this request",
             None => "residency unknown",
         }));
+    match &r.conditions.npu_wake {
+        Some(w) if w.cold => o.push_str(&format!(
+            "  npu wake       COLD -- device was runtime-{} ({} since the previous generate job) \
+             · first dispatch {:.1} ms\n",
+            w.status,
+            w.idle_ms.map_or("gap unknown".to_string(), |ms| format!("{ms} ms")),
+            w.first_dispatch_us.map_or(0.0, |us| us as f64 / 1e3),
+        )),
+        Some(w) => o.push_str(&format!("  npu wake       warm (device was {})\n", w.status)),
+        None => o.push_str("  npu wake       not readable on this device (no runtime_status sysfs node)\n"),
+    }
     if r.conditions.power_mode.is_none() {
         // Not a nag: without the mode this run cannot be compared to another one, and the usual
         // cause of an unexplained regression on this device is that the mode moved.
@@ -378,6 +389,29 @@ mod tests {
         assert!(t.contains("prefill.xclbin"), "{t}");
         assert!(t.contains("decode.xclbin"), "{t}");
         assert!(!t.contains("one xclbin/stream"), "a real split must not use the degraded line: {t}");
+    }
+
+    #[test]
+    fn a_cold_wake_is_called_out_with_the_idle_gap_and_first_dispatch_time() {
+        let mut r = run(18_000, &[1, 2, 3]);
+        r.conditions.npu_wake = Some(npu_engine::NpuWake {
+            cold: true, status: "suspended".into(), idle_ms: Some(6_200), first_dispatch_us: Some(142_300),
+        });
+        let t = table(&r);
+        assert!(t.contains("COLD"), "{t}");
+        assert!(t.contains("6200 ms"), "{t}");
+        assert!(t.contains("142.3 ms"), "{t}");
+    }
+
+    #[test]
+    fn a_warm_wake_and_an_unreadable_one_render_distinctly() {
+        let mut r = run(18_000, &[1, 2, 3]);
+        r.conditions.npu_wake =
+            Some(npu_engine::NpuWake { cold: false, status: "active".into(), idle_ms: Some(20), first_dispatch_us: Some(45_700) });
+        assert!(table(&r).contains("warm (device was active)"));
+
+        r.conditions.npu_wake = None;
+        assert!(table(&r).contains("not readable"));
     }
 
     #[test]
