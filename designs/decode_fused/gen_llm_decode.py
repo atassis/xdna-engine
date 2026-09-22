@@ -551,12 +551,30 @@ if G4_W_PROLOGUE and not FUSE_QKV_GEMV:
     # `cur`+gain directly; the split Wq/Wk/Wv branch still expects `hn`, which the un-fused path
     # would then never compute.
     raise SystemExit("G4_W_PROLOGUE needs FUSE_QKV_GEMV=1 (only the fused Wqkv call is rewired)")
+# Folds post-attn-norm + the first residual add + pre-ffn-norm into the gate/up matvec's own
+# prologue (gemv/design.py's prologue="residual"): x1 = x + gain_a*a/rms(a); h = gain_b*x1/rms(x1).
+# One core (column 0) additionally exports x1 -- needed by the layer's SECOND residual add, which
+# this stage does not touch. Superset of the plain prenorm capability, so EVERY member of the
+# merged family (Wqkv, lm-head, gate, up, down) must compile with prologue_capability="residual"
+# once this is on, not just gate/up -- design_key()'s capability, not the mode, is what groups
+# them. gemma4-w-prologue-epilogue, variant B stage 2 (before gate/up only; the layer-end form
+# -- x_next = s*(x1 + gain_c*d/rms(d)) -- is a separate, unbuilt fusion on Wd's OUTPUT, not this
+# GEMV's own B-side prologue, and needs stage 3's quantized-epilogue infrastructure first).
+G4_W_RESIDUAL = os.environ.get("G4_W_RESIDUAL", "0") == "1"
+if G4_W_RESIDUAL and not G4_W_PROLOGUE:
+    raise SystemExit("G4_W_RESIDUAL needs G4_W_PROLOGUE=1 (residual capability supersedes prenorm)")
 
 
 def _w_prologue(mode):
     """prologue kwarg for a member of the merged W family. {} (GEMV's own "none" default) unless
-    G4_W_PROLOGUE is set, so the flag defaults to today's graph byte for byte."""
-    return {"prologue": mode} if G4_W_PROLOGUE else {}
+    G4_W_PROLOGUE is set, so the flag defaults to today's graph byte for byte. Once G4_W_RESIDUAL
+    is also set, every member (not just gate/up) compiles the wider "residual" capability."""
+    if not G4_W_PROLOGUE:
+        return {}
+    kw = {"prologue": mode}
+    if G4_W_RESIDUAL:
+        kw["prologue_capability"] = "residual"
+    return kw
 # Same axis for the attention output projection. Gemma-4's GLOBAL layers have head_dim 512, so
 # o_proj is K=8192 there and needs 2 chunks while its sliding layers at K=4096 need none -- a
 # PER-LAYER split, which this per-spec version does not yet express (it needs q_dim_for(layer),
@@ -2552,9 +2570,10 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         and not _spec("mlp").quantized
         and _gate_tso % 32 == 0
     )
-    op_gate = gemv(FF, D, ctx, **mlp_quant_kw, **_w_prologue("off"),
+    op_gate = gemv(FF, D, ctx, **mlp_quant_kw,
+                   **_w_prologue("residual" if G4_W_RESIDUAL else "off"),
                    **(dict(epilogue=sp.act) if fuse_act else {}))
-    op_up = gemv(FF, D, ctx, **mlp_quant_kw, **_w_prologue("off"))
+    op_up = gemv(FF, D, ctx, **mlp_quant_kw, **_w_prologue("residual" if G4_W_RESIDUAL else "off"))
     op_act = None
     op_mlp_dp = None
     if ACT_POLY:
@@ -3305,7 +3324,11 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                             (op_gate_act, p + "gt", p + "gt"),
                             (op_gate_mul, p + "cx", p + "gt", p + "cx")]
             rl += [*attn_rl, *([] if fuse_o else o_runlist(p, g))]
-            if sp.sandwich_norms:
+            # G4_W_RESIDUAL folds this post-attn norm into the gate/up prologue below instead of
+            # running it as its own device -- but only on the path that ALSO owns the residual add
+            # and pre-ffn norm it fuses with (op_mlp_dp's own fused design does both norms
+            # internally and reaches here regardless).
+            if sp.sandwich_norms and not (G4_W_RESIDUAL and op_mlp_dp is None):
                 rl.append((op_norm, p + "a", p + "n_pa", p + "a"))
             if op_mlp_dp is not None:
                 # cur + a -> x1 -> norm -> gate/up -> silu -> mul -> down -> +x1, all inside one design.
@@ -3324,6 +3347,23 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 else:
                     rl.append((op_mlp_dp, cur, p + "a", p + "n_pf", p + "Wg", p + "Wu", p + "Wd",
                                "mlp_gh", *([p + "n_pff"] if sp.sandwich_norms else []), nxt))
+            elif G4_W_RESIDUAL:
+                # x1 = cur + n_pa*a/rms(a); h = n_pf*x1/rms(x1) -- fused into gate/up's own
+                # prologue (gemv/design.py prologue="residual"), replacing the 3 ops above
+                # (post-attn norm, residual add, pre-ffn norm) with 0. Both Wg and Wu run the
+                # fusion redundantly and each exports x1 (column 0), an idempotent duplicate
+                # write of the same K*2 bytes rather than a second mode to skip it.
+                _tail = [
+                    *([] if op_act is None else [(op_act, g_, g_) for g_ in ff_slices(p + "g")]),
+                    *[(op_mul_ffn, g_, u_, gh_) for g_, u_, gh_ in
+                      zip(ff_slices(p + "g"), ff_slices(p + "u"), ff_slices(p + "gh"))],
+                    *down_runlist(p),
+                ]
+                rl += [
+                    (op_gate, p + "Wg", p + "a", cur, p + "n_pa", p + "n_pf", p + "g", p + "x1"),
+                    (op_up, p + "Wu", p + "a", cur, p + "n_pa", p + "n_pf", p + "u", p + "x1"),
+                    *_tail,
+                ]
             else:
                 rl += [
                     (op_add, cur, p + "a", p + "x1"),
@@ -3451,6 +3491,41 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         rl, weight_families = unify_weight_gemvs(rl)
         for K_, tsi_, tso_, Ms_ in weight_families:
             print(f"[gen] weight GEMV family K={K_}: tsi {tsi_} tso {tso_} tiles_rtp over M={Ms_}")
+        if G4_W_RESIDUAL:
+            # unify_weight_gemvs' own tiling search has no knowledge of the residual prologue's
+            # extra L1 (3 more B objects, b_norm, the x1 output -- gemv/design.py's PROLOGUE L1
+            # comment): it picks the tsi a PLAIN GEMV fits at, which overflows once residual is on
+            # (measured: tsi=4 needs 67584 B against a 65536 B budget at this family's shape).
+            # tsi=2 halves A's term and fits (58944 B); RE-VERIFIED here against the same formula
+            # design.py's own K008 check uses, not just asserted, so a shape change that breaks the
+            # fit fails at generation time with a clear message instead of silently at aiecc.
+            import dataclasses
+            import aie.utils as _aie_utils
+            from iron.operators.gemv.design import l1_budget_bytes, l1_footprint_bytes
+            from iron.common.quant import row_stride_bytes
+            RESIDUAL_TSI = 2
+            _family = [op for op, *_ in rl
+                      if isinstance(op, GEMV) and op._resolved_prologue_capability == "residual"]
+            if not _family:
+                raise SystemExit("G4_W_RESIDUAL: no GEMV in the runlist resolved to "
+                                 "prologue_capability='residual' -- op_gate/op_up wiring is dead")
+            _o = _family[0]
+            _row_w = row_stride_bytes(_o.K, _o.group_size, _o.weight_dtype, _o.scale_dtype)
+            _base = l1_footprint_bytes(RESIDUAL_TSI, _o.tile_size_output, _o.K, _row_w, 1, 1)
+            _extra = 3 * _o.K * 2 + _o.K * 2 + _o.K * 2
+            _budget = l1_budget_bytes(_aie_utils.get_current_device())
+            if _base + _extra + 4096 > _budget:
+                raise SystemExit(
+                    f"G4_W_RESIDUAL: RESIDUAL_TSI={RESIDUAL_TSI} no longer fits L1 "
+                    f"({_base + _extra + 4096} > {_budget}) -- re-derive it, do not lower blind"
+                )
+            _retiled = {}
+            for op in _family:
+                if op.tile_size_input != RESIDUAL_TSI and id(op) not in _retiled:
+                    _retiled[id(op)] = dataclasses.replace(op, tile_size_input=RESIDUAL_TSI)
+            rl = [(_retiled.get(id(op), op), *bufs) for op, *bufs in rl]
+            print(f"[gen] G4_W_RESIDUAL: retiled the residual-capable family to "
+                 f"tsi={RESIDUAL_TSI} ({len(_retiled)} op object(s))")
     pointwise_widths = []
     if POINTWISE_MODES:
         rl, pointwise_widths = pointwise_modes(rl)
