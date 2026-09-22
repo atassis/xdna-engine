@@ -625,6 +625,12 @@ ATTN_SPLIT = int(os.environ.get("ATTN_SPLIT", "0"))
 #
 # Needs decode_layer_dp to be eligible (there is no other design here holding a window) and every
 # rung must be < max_seq and satisfy the same divisibility the top window does.
+# RMSNorm's gain multiply, native bf16-pair instead of the emulated f32 vector multiply --
+# rms_norm.cc's RMS_BF16_SCALE (118 -> 22 bundles/32 elem). A precision change (rel-L2 2.317e-3
+# against the f32 form's 1.664e-3), so default OFF; gate on device parity, not on rel-L2.
+# kb/the-norm-kernels-pay-an-emulated-f32-vector-multiply.
+RMS_BF16_SCALE = os.environ.get("RMS_BF16_SCALE", "0") == "1"
+
 WINDOW_RUNGS = tuple(
     int(w) for w in os.environ.get("WINDOW_RUNGS", "").replace(" ", "").split(",") if w
 )
@@ -808,6 +814,11 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tm
         parts.append("rtext")
     if FUSE_ACT:
         parts.append("fuseact")
+    # Same predicate every RMSNorm(...) call site reads (RMS_BF16_SCALE), not re-derived: a
+    # kernel-object-only difference would let a cached bf16_scale=False .mlir/.o satisfy a
+    # bf16_scale=True request. See RMSNorm.bf16_scale (iron/operators/rms_norm/op.py).
+    if RMS_BF16_SCALE:
+        parts.append("rmsbf16")
     # Flat, not nested under decode_layer_active: _trace.py wires into every design.py this file
     # can build, fused or not, so the suffix must apply on both paths.
     if IRON_TRACE_SIZE > 0:
@@ -1701,7 +1712,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # luck: the sizes happened to disagree. Had D//4 divided evenly into the dumped weight it would
     # have run and been quietly wrong.
     op_norm = RMSNorm(size=D, num_aie_columns=1, num_channels=1, tile_size=D,
-                      weighted=True, epsilon=sp.eps, context=ctx)
+                      weighted=True, epsilon=sp.eps, bf16_scale=RMS_BF16_SCALE, context=ctx)
     # Wo weight-stream dtype axis (see QUANT_ATTN_DTYPE above). bf16 (default) is byte-for-byte the
     # pre-existing path.
     attn_quant_kw = _quant_kw("attn_o")
@@ -2079,9 +2090,11 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         rtp_extent = {"vector_size_parameter": mask_slot} if ATTN_RUNTIME_EXTENT else {}
         dp_why = qkv_dp_why[(hd, hkv, has_v)]
         op_qk_norm = RMSNorm(size=hd, num_aie_columns=1, num_channels=1, tile_size=hd,
-                             weighted=True, epsilon=sp.eps, context=ctx) if sp.qk_norm else None
+                             weighted=True, epsilon=sp.eps, bf16_scale=RMS_BF16_SCALE,
+                             context=ctx) if sp.qk_norm else None
         op_qk_norm_b = (RMSNorm(size=hd, num_aie_columns=1, num_channels=1, tile_size=hd,
-                                weighted=True, epsilon=sp.eps, context=ctx)
+                                weighted=True, epsilon=sp.eps, bf16_scale=RMS_BF16_SCALE,
+                                context=ctx)
                         if (sp.qk_norm and SPLIT_QKNORM) else op_qk_norm)
         # QKV projection: one GEMV over the concatenated weight, or the three separate ones. op_kv
         # is built in both arms because share_designs pairs Wk with Wv only in the unfused one.
@@ -2484,13 +2497,14 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         op_mix_act = SiLUAct(size=LCH, num_aie_columns=COLS, tile_size=LCH // COLS, context=ctx)
         # l2norm(x) = rmsnorm at eps/dk, divided by sqrt(dk): the division rides the gain (l2q/l2k).
         op_l2 = RMSNorm(size=LDK, num_aie_columns=1, num_channels=1, tile_size=LDK,
-                        weighted=True, epsilon=sp.eps / LDK, context=ctx)
+                        weighted=True, epsilon=sp.eps / LDK, bf16_scale=RMS_BF16_SCALE,
+                        context=ctx)
         op_gdr = GatedDeltaRule(v_heads=sp.lin_v_heads, k_heads=sp.lin_k_heads, dk=LDK, dv=LDK,
                                 ab_len=LZAB, ab_off=LVD, mixed_len=LTAPS * LCH, q_off=LWIN,
                                 k_off=LWIN + LKD, v_off=LWIN + 2 * LKD, num_aie_columns=COLS,
                                 limbs=GDR_LIMBS or None, context=ctx)
         op_gnorm = RMSNorm(size=LDK, num_aie_columns=1, num_channels=1, tile_size=LDK,
-                           weighted=True, epsilon=sp.eps, context=ctx)
+                           weighted=True, epsilon=sp.eps, bf16_scale=RMS_BF16_SCALE, context=ctx)
         op_z_act = SiLUAct(size=LVD, num_aie_columns=COLS, tile_size=LVD // COLS, context=ctx)
         op_o_mul = ElementwiseMul(size=LVD, tile_size=LVD // COLS, num_aie_columns=COLS, context=ctx)
     if sp.attn_output_gate:
