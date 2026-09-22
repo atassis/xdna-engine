@@ -54,6 +54,16 @@ for entry in "$store"/*; do
 done
 link_into "$models" models
 
+# A worktree without these two cannot build, and the failure misdirects: XDNA_CACHE defaults to
+# <repo>/.cache (cache_env.sh), so the pinned MLIR distro reads as "not provisioned" and the error
+# points at fetch_mlir_distro.sh -- at re-downloading what is already in the shared cache. The IRON
+# venv is built once, in the primary checkout, and every worktree links to it.
+main_wt="$(git worktree list --porcelain | awk 'NR==1 {print $2}')"
+if [ -n "$main_wt" ] && [ "$main_wt" != "$root" ]; then
+  link_into "$(readlink -f "$main_wt/.cache" 2>/dev/null)" .cache
+  link_into "$main_wt/.venv-iron" .venv-iron
+fi
+
 target_dir="$build_root/$name/target"
 mkdir -p "$target_dir" "$root/.cargo"
 cat > "$root/.cargo/config.toml" <<CARGO
