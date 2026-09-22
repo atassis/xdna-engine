@@ -154,12 +154,13 @@ pub struct NpuWake {
     pub cold: bool,
     /// The raw sysfs value (`active`, `suspended`, `suspending`, `resuming`).
     pub status: String,
-    /// Wall time since this process last finished a GENERATE request's NPU work. `None` for the
-    /// first generate request a process serves. Scoped to generate: a Serve request (ASR/embed/TTS)
-    /// in between is not counted, so this can overstate true device idleness in a mixed workload.
+    /// Wall time since this process last finished ANY NPU job (generate or serve). `None` for the
+    /// first request a process serves.
     pub idle_ms: Option<u64>,
-    /// This generation's own [`GenerationReport::first_dispatch_us`], filled in once it is known
-    /// (after the generation finishes, not at sample time).
+    /// A GENERATE report's own [`GenerationReport::first_dispatch_us`], filled in once it is known
+    /// (after the generation finishes, not at sample time). `None` on a Serve request -- see
+    /// `actor::spawn`'s `Cmd::Serve` handling, which reports its cost through the log line instead,
+    /// there being no per-request report for ASR/embed/TTS to carry it in.
     pub first_dispatch_us: Option<u64>,
 }
 

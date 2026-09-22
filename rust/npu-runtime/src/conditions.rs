@@ -141,6 +141,21 @@ pub fn cold_wake_count() -> u64 {
     COLD_WAKES.load(Ordering::Relaxed)
 }
 
+/// One eprintln for a cold wake, at the engine's normal log level -- shared by every command kind
+/// that can observe one. `kind` is the capability name (`"generate"`, `"asr"`, ...); `cost_label`/
+/// `cost_ms` name what is reported as the cost, since Generate and Serve measure different things
+/// (a phase inside a `GenerationReport` vs. the whole request's wall time in the actor) and neither
+/// should be silently relabelled as the other.
+pub fn log_cold_wake(kind: &str, model: &str, w: &npu_engine::NpuWake, cost_label: &str, cost_ms: f64) {
+    note_cold_wake();
+    eprintln!(
+        "[npu-runtime] cold NPU wake for {model} ({kind}): device was runtime-{} ({} since the \
+         previous NPU job), {cost_label} took {cost_ms:.1} ms",
+        w.status,
+        w.idle_ms.map_or("gap unknown".to_string(), |ms| format!("{ms} ms")),
+    );
+}
+
 /// The conditions a serving thread can see at the moment a run starts.
 ///
 /// One constructor, used by both the service's run log and the CLI's `--output json`. They had
@@ -203,6 +218,16 @@ mod wake_tests {
         note_cold_wake();
         note_cold_wake();
         assert_eq!(cold_wake_count(), before + 2);
+    }
+
+    #[test]
+    fn log_cold_wake_counts_the_wake_it_logs() {
+        let before = cold_wake_count();
+        let w = npu_engine::NpuWake {
+            cold: true, status: "suspended".into(), idle_ms: Some(500), first_dispatch_us: None,
+        };
+        log_cold_wake("asr", "parakeet", &w, "request", 142.3);
+        assert_eq!(cold_wake_count(), before + 1);
     }
 }
 
