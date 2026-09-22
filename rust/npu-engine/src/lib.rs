@@ -12,7 +12,9 @@ pub use cancel::{Cancel, CancelReason};
 pub use decide::{DecideAnswer, DecideQuestion, DecideRequest, DecideStats, Decisions, QuestionKind, QuestionStats};
 pub use pipeline::{ChatMessage, Chunk, ToolCall, DEFAULT_MAX_TOKENS, FinishReason, GenerateParams, GenerateUsage, Prompt,
                    TextGenerator};
-pub use telemetry::{Bound, GenerationReport, PrefillRecord, RunConditions, StepPhases, StepRecord, Summary};
+pub use telemetry::{
+    Bound, GenerationReport, NpuWake, PrefillRecord, RunConditions, StepPhases, StepRecord, Summary,
+};
 
 #[doc(hidden)] pub mod config;
 #[doc(hidden)] pub mod pipeline;

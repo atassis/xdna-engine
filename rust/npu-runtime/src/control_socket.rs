@@ -134,8 +134,9 @@ pub fn render(port: u16, started_unix: u64, status: &[ModelStatus]) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     format!(
-        "{{\"written_unix\":{now},\"started_unix\":{started_unix},\"pid\":{},\"port\":{port},\"models\":{}}}",
-        std::process::id(), crate::http::models_json(status))
+        "{{\"written_unix\":{now},\"started_unix\":{started_unix},\"pid\":{},\"port\":{port},\
+         \"npu_cold_wakes\":{},\"models\":{}}}",
+        std::process::id(), crate::conditions::cold_wake_count(), crate::http::models_json(status))
 }
 
 /// Accept loop, one thread per connection.

@@ -270,6 +270,11 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
         // trim runs once per idle stretch, and is re-armed by a request or by an unload freeing more.
         let mut last_request = Instant::now();
         let mut released = false;
+        // When this actor last finished ANY command's NPU work -- the idle-gap denominator for
+        // `conditions::npu_wake`. Updated by both `Cmd::Serve` and `Cmd::Generate` after the
+        // dispatch, whether it succeeded or failed: the device context was open in front of it
+        // either way, and "failed before any dispatch" is the rarer case.
+        let mut last_npu_job_end: Option<Instant> = None;
         // Before the first command or sweep, so a reader at boot sees what reconcile made resident
         // rather than an empty list it cannot distinguish from a server with no models.
         live.set(reg.status_at(Instant::now()));
@@ -300,14 +305,30 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
                             // capabilities that finish in one dispatch: nothing ever reads it before
                             // `clear()` removes it again. `run_named_evicting` re-publishes it on
                             // every retry attempt.
+                            //
+                            // Sampled here, before this request's first NPU dispatch -- same point
+                            // as `Cmd::Generate`'s own sample, below.
+                            let idle_ms = last_npu_job_end
+                                .map(|t| Instant::now().saturating_duration_since(t).as_millis() as u64);
+                            let npu_wake = crate::conditions::npu_wake(idle_ms);
                             let t_serve = Instant::now();
                             let (name, out) = run_named_evicting(&cfg, &mut reg, loader.as_ref(), cap,
                                 model.as_deref(), name, req, cancel, &inflight);
                             inflight.clear();
+                            let serve_dur = t_serve.elapsed();
                             // Charged whether it succeeded or failed: a request that held the
                             // device and then errored still held it, and occupancy that only
                             // counted successes would understate exactly the runs worth noticing.
-                            reg.charge(&name, t_serve.elapsed().as_micros() as u64);
+                            reg.charge(&name, serve_dur.as_micros() as u64);
+                            last_npu_job_end = Some(Instant::now());
+                            // No per-request report carries this for Serve (ASR/embed/TTS/... answer
+                            // with a bare `Response`, unlike Generate's `GenerationReport`) -- so a
+                            // cold wake is reported here directly: the log line, plus the same
+                            // `/v1/models` counter `Cmd::Generate` bumps.
+                            if let Some(w) = npu_wake.as_ref().filter(|w| w.cold) {
+                                crate::conditions::log_cold_wake(
+                                    cap.0, &name, w, "request", serve_dur.as_secs_f64() * 1e3);
+                            }
                             match out {
                                 Ok(value) => Ok(Served { model: name, value, queue_us, load_us }),
                                 Err(e) => {
@@ -350,6 +371,11 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
                             // `Handle::generate` answer routing errors before an SSE body ever opens.
                             if ack.send(Ok(name.clone())).is_ok() {
                                 let was_resident = resident_before.contains(&name);
+                                // Sampled here, before `run_generate` issues this request's first
+                                // NPU dispatch -- same point `Cmd::Serve` samples from, above.
+                                let idle_ms = last_npu_job_end
+                                    .map(|t| Instant::now().saturating_duration_since(t).as_millis() as u64);
+                                let npu_wake = crate::conditions::npu_wake(idle_ms);
                                 let conditions = npu_engine::RunConditions {
                                     engine_version: env!("CARGO_PKG_VERSION").to_string(),
                                     model: name.clone(),
@@ -359,6 +385,7 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
                                     started_unix: std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .map(|d| d.as_secs() as i64).unwrap_or(0),
+                                    npu_wake,
                                 };
                                 let power_start_uw = crate::conditions::npu_power_uw();
                                 let mut sink = |c: Chunk<'_>| -> bool {
@@ -377,6 +404,18 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
                                             report.load_us = load_us;
                                             report.npu_power_start_uw = power_start_uw;
                                             report.npu_power_end_uw = crate::conditions::npu_power_uw();
+                                            // Only knowable now that the generation has actually
+                                            // run -- see `GenerationReport::first_dispatch_us`.
+                                            let first_dispatch_us = report.first_dispatch_us();
+                                            if let Some(w) = &mut report.conditions.npu_wake {
+                                                w.first_dispatch_us = first_dispatch_us;
+                                                if w.cold {
+                                                    crate::conditions::log_cold_wake(
+                                                        Capability::GENERATE.0, &report.conditions.model, w,
+                                                        "first dispatch",
+                                                        first_dispatch_us.map_or(0.0, |us| us as f64 / 1e3));
+                                                }
+                                            }
                                             StreamItem::Done { reason, usage, report: Box::new(report) }
                                         }
                                     };
@@ -395,6 +434,7 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
                                     .unwrap_or_else(|msg| Err(EngineError::Device(msg)));
                                 inflight.clear();
                                 reg.charge(&name, t_serve.elapsed().as_micros() as u64);
+                                last_npu_job_end = Some(Instant::now());
                                 if let Err(e) = out {
                                     if condemns_model(&e) {
                                         reg.mark_failed(&name, &e.to_string());

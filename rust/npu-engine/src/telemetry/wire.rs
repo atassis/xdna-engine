@@ -23,8 +23,8 @@ use serde_json::{json, Map, Value};
 
 use crate::pipeline::{FinishReason, ToolCall};
 use crate::telemetry::{
-    ArmProvenance, Bound, DesignCost, GenerationReport, PrefillRecord, RunConditions, SamplePhases,
-    StepPhases, StepRecord, Summary,
+    ArmProvenance, Bound, DesignCost, GenerationReport, NpuWake, PrefillRecord, RunConditions,
+    SamplePhases, StepPhases, StepRecord, Summary,
 };
 
 /// Identity every line in one file shares.
@@ -86,6 +86,15 @@ fn design_breakdown_json(v: &[DesignCost]) -> Value {
     Value::Array(v.iter().map(|d| json!({
         "label": d.label, "dispatches": d.dispatches, "ms": d.secs * 1e3,
     })).collect())
+}
+
+fn npu_wake_json(w: &NpuWake) -> Value {
+    json!({
+        "cold": w.cold,
+        "status": w.status,
+        "idle_ms": w.idle_ms,
+        "first_dispatch_ms": w.first_dispatch_us.map(us_f),
+    })
 }
 
 fn provenance_json(p: &ArmProvenance) -> Value {
@@ -202,6 +211,7 @@ pub fn summary_line(r: &GenerationReport, m: &RunMeta, reason: FinishReason) -> 
             "kernel": r.conditions.kernel,
             // Two samples at the ends of the generation, never an integral -- see the field docs.
             "npu_power_uw": { "start": r.npu_power_start_uw, "end": r.npu_power_end_uw },
+            "npu_wake": r.conditions.npu_wake.as_ref().map(npu_wake_json),
         },
     });
     // A tool call this server could not read reaches the client as ordinary assistant text, which
@@ -418,6 +428,10 @@ pub fn parse_run(text: &str) -> Result<Run, String> {
                     resident: v["resident"].as_bool(),
                     kernel: v["kernel"].as_str().map(str::to_string),
                     started_unix: v["started_unix"].as_i64().unwrap_or(0),
+                    // Not in the header, like `resident` above -- both are known only once the
+                    // actor has served the request, and reach `npu.run.summary`'s `conditions`
+                    // object instead. A log-derived `Run.conditions` never carries either.
+                    npu_wake: None,
                 };
             }
             "npu.prefill" => {
@@ -531,6 +545,7 @@ mod tests {
                 resident: Some(true),
                 kernel: Some("7.2.0".into()),
                 started_unix: 1_700_000_000,
+                npu_wake: None,
             },
             queue_us: 1_200,
             load_us: 0,

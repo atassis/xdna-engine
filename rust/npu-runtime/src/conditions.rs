@@ -6,6 +6,8 @@
 //! code can differ by double digits. A report that cannot say which mode it ran under cannot be
 //! compared to another one, and the commonest apparent regression is a mode difference.
 
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 /// Resolved once per process, off the request path. `None` covers both "probe has not finished"
@@ -99,6 +101,61 @@ pub fn npu_power_uw() -> Option<u64> {
     None
 }
 
+/// Cumulative cold NPU wakes this process has served -- see [`note_cold_wake`].
+static COLD_WAKES: AtomicU64 = AtomicU64::new(0);
+
+/// The amdxdna device node every `Device::open` call in this workspace opens (`grep -rn
+/// "Device::open("` finds no other index), so this mirrors that invariant rather than reading it
+/// back from a handle that exposes no index.
+const RUNTIME_STATUS_PATH: &str = "/sys/class/accel/accel0/device/power/runtime_status";
+
+fn read_runtime_status_at(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// `runtime_status` read as `suspended` or `suspending` -- both mean the firmware context is gone
+/// or going and the next dispatch pays a device wake. `resuming` is deliberately excluded: by the
+/// time a request can observe it the wake this sample would price is already under way.
+fn is_cold(status: &str) -> bool {
+    matches!(status, "suspended" | "suspending")
+}
+
+/// Sample the device's runtime-PM state -- one sysfs read, no polling thread. Call it before the
+/// request's first NPU dispatch, not from a background timer: the point is what the device was
+/// doing at THIS request's arrival, not a periodic guess. `idle_ms` is the caller's own idle-gap
+/// measurement (this module does not track one itself -- see `actor::spawn`'s `last_npu_job_end`).
+/// `None` when the sysfs file is missing or unreadable -- absent, never a guessed "active".
+pub fn npu_wake(idle_ms: Option<u64>) -> Option<npu_engine::NpuWake> {
+    let status = read_runtime_status_at(Path::new(RUNTIME_STATUS_PATH))?;
+    let cold = is_cold(&status);
+    Some(npu_engine::NpuWake { cold, status, idle_ms, first_dispatch_us: None })
+}
+
+/// Count one cold wake for `/v1/models`'s aggregate line. Never decremented -- it counts requests
+/// that paid the wake, not devices currently suspended.
+pub fn note_cold_wake() {
+    COLD_WAKES.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn cold_wake_count() -> u64 {
+    COLD_WAKES.load(Ordering::Relaxed)
+}
+
+/// One eprintln for a cold wake, at the engine's normal log level -- shared by every command kind
+/// that can observe one. `kind` is the capability name (`"generate"`, `"asr"`, ...); `cost_label`/
+/// `cost_ms` name what is reported as the cost, since Generate and Serve measure different things
+/// (a phase inside a `GenerationReport` vs. the whole request's wall time in the actor) and neither
+/// should be silently relabelled as the other.
+pub fn log_cold_wake(kind: &str, model: &str, w: &npu_engine::NpuWake, cost_label: &str, cost_ms: f64) {
+    note_cold_wake();
+    eprintln!(
+        "[npu-runtime] cold NPU wake for {model} ({kind}): device was runtime-{} ({} since the \
+         previous NPU job), {cost_label} took {cost_ms:.1} ms",
+        w.status,
+        w.idle_ms.map_or("gap unknown".to_string(), |ms| format!("{ms} ms")),
+    );
+}
+
 /// The conditions a serving thread can see at the moment a run starts.
 ///
 /// One constructor, used by both the service's run log and the CLI's `--output json`. They had
@@ -106,6 +163,8 @@ pub fn npu_power_uw() -> Option<u64> {
 /// service wrote a full one -- which is exactly the drift that makes two surfaces disagree about
 /// one run. `resident` is not here: only the device actor knows whether the model was already
 /// loaded, so it travels in the summary line instead of being guessed at the top of the file.
+/// `npu_wake` is not here for the identical reason -- it must be sampled at the actor's dispatch
+/// point, not when this header is written.
 pub fn at_start(model: &str, created: i64) -> npu_engine::RunConditions {
     npu_engine::RunConditions {
         engine_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -114,6 +173,61 @@ pub fn at_start(model: &str, created: i64) -> npu_engine::RunConditions {
         resident: None,
         kernel: kernel_release(),
         started_unix: created,
+        npu_wake: None,
+    }
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use super::*;
+
+    #[test]
+    fn suspended_and_suspending_classify_cold_active_and_resuming_do_not() {
+        assert!(is_cold("suspended"));
+        assert!(is_cold("suspending"));
+        assert!(!is_cold("active"));
+        assert!(!is_cold("resuming"));
+        assert!(!is_cold("garbage"));
+    }
+
+    #[test]
+    fn reads_and_trims_a_real_sysfs_style_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime_status");
+        std::fs::write(&path, "suspended\n").unwrap();
+        assert_eq!(read_runtime_status_at(&path), Some("suspended".to_string()));
+    }
+
+    #[test]
+    fn a_missing_file_is_absent_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_runtime_status_at(&dir.path().join("no-such-file")), None);
+    }
+
+    #[test]
+    fn an_empty_file_is_absent_not_a_guessed_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime_status");
+        std::fs::write(&path, "\n").unwrap();
+        assert_eq!(read_runtime_status_at(&path), None);
+    }
+
+    #[test]
+    fn note_cold_wake_is_cumulative_and_never_decrements() {
+        let before = cold_wake_count();
+        note_cold_wake();
+        note_cold_wake();
+        assert_eq!(cold_wake_count(), before + 2);
+    }
+
+    #[test]
+    fn log_cold_wake_counts_the_wake_it_logs() {
+        let before = cold_wake_count();
+        let w = npu_engine::NpuWake {
+            cold: true, status: "suspended".into(), idle_ms: Some(500), first_dispatch_us: None,
+        };
+        log_cold_wake("asr", "parakeet", &w, "request", 142.3);
+        assert_eq!(cold_wake_count(), before + 1);
     }
 }
 
