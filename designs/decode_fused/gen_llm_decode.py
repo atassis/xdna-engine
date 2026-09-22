@@ -201,6 +201,13 @@ def _quant_kw(site, force_header_first=False):
     return kw
 
 
+def _k_split_row_bytes(K, quant_kw):
+    """One row's byte width at this K, for k_chunks_for -- same rule as gemv_tiling's, so the
+    chunk-count decision and the tiling decision cannot disagree about what a row costs."""
+    wdt = quant_kw.get("weight_dtype", "bf16")
+    return None if wdt == "bf16" else row_stride_bytes(K, quant_kw["group_size"], wdt)
+
+
 _SITE_OF_SUFFIX = {"Wqkv": "qkv", "Wq": "qkv", "Wk": "qkv", "Wv": "qkv", "Wo": "attn_o",
                    "Wg": "mlp", "Wu": "mlp", "Wd": "mlp", "W_head": "head",
                    "kc": "kv", "vc": "kv"}
@@ -536,6 +543,13 @@ COLLAPSE_MERGED_CONFIGURES = os.environ.get("COLLAPSE_MERGED_CONFIGURES", "0") =
 # PER-LAYER split, which this per-spec version does not yet express (it needs q_dim_for(layer),
 # a Gemma-4 spec axis). What is here covers every spec whose q_dim is uniform.
 FORCE_O_SPLIT = int(os.environ.get("FORCE_O_SPLIT", "0"))
+# k_chunks_for's own L1 model double-buffers B (2*K*2) and assumes a bf16 A row (K*2) even for a
+# quantized GEMV -- design.py's B ObjectFifo is depth `n_vec` (single-buffered: B is filled once
+# per run and never re-acquired mid-run), and a quantized row is `row_stride_bytes`, narrower than
+# bf16's. Gated because it changes which K-splits exist: gemma4-12b's down projection (K=15360,
+# 4 chunks today) and global o_proj (K=8192, 2 chunks) both fit UNSPLIT once corrected --
+# gemma4-w-device-runtime-k-unsplit.
+GEMV_B_SINGLE = os.environ.get("GEMV_B_SINGLE", "0") == "1"
 
 
 def packed_zero_rows(n_rows, K, group_size, weight_dtype):
@@ -818,6 +832,8 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tm
         parts.append("wgm")
     if pointwise_widths:
         parts.append("pwm")
+    if GEMV_B_SINGLE:
+        parts.append("bsingle")
     if ATTN_RUNTIME_EXTENT:
         parts.append("rtext")
     if FUSE_ACT:
@@ -1321,7 +1337,8 @@ def gemv_tiling(M, K, **kw):
     n_vec = group_reuse_n_vec(M, COLS, kw.get("num_batches", 1), kw.get("batch_group", 1),
                               K if wdt == "bf16" else a_row_bytes,
                               kw.get("alloc_M"), kw.get("block_size"))
-    tsi, tso = gemv_tile_output(M, K, a_row_bytes=a_row_bytes, n_vec=n_vec)
+    tsi, tso = gemv_tile_output(M, K, a_row_bytes=a_row_bytes, n_vec=n_vec,
+                                b_single_buffered=GEMV_B_SINGLE)
     if kw.get("layout") == "row_group_planar":
         # The free search picks tsi for the LARGEST legal C tile, which can be SMALLER than the
         # row_group needs -- a planar block cannot be cut, so tsi must be a MULTIPLE of it
@@ -1336,7 +1353,8 @@ def gemv_tiling(M, K, **kw):
                               vec_size=widest_chunk(kw["group_size"], wdt),
                               scale_dtype=_BUILD_STATE["scale_dtype"])
         if tsi % rg:
-            tsi, tso = gemv_tile_output(M, K, a_row_bytes=a_row_bytes, tsi=rg, n_vec=n_vec)
+            tsi, tso = gemv_tile_output(M, K, a_row_bytes=a_row_bytes, tsi=rg, n_vec=n_vec,
+                                        b_single_buffered=GEMV_B_SINGLE)
     return tsi, tso
 
 
@@ -2142,7 +2160,10 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # standalone op_o at all -- Wo rides the MLP design's weight channel -- so the split is
         # moot. k_chunks_for reads q_dim, so the chunk COUNT is per-geometry too, and it reaches
         # the weight loop through this namespace rather than as a build-wide constant.
-        o_chunks = 1 if fuse_o else (FORCE_O_SPLIT or k_chunks_for(D, qd, COLS))
+        o_chunks = 1 if fuse_o else (FORCE_O_SPLIT or k_chunks_for(
+            D, qd, COLS,
+            a_row_bytes=_k_split_row_bytes(qd, _quant_kw("attn_o")) if GEMV_B_SINGLE else None,
+            b_single_buffered=GEMV_B_SINGLE))
         op_o = None if fuse_o else gemv(D, qd // o_chunks, ctx, **_quant_kw("attn_o"))
         op_rope_qk = RoPE(rows=Hq + hkv, cols=hd, angle_rows=1, context=ctx) if fuse_rope else None
         op_qkv_dp = None
@@ -2505,7 +2526,10 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # Down projection, split over K when it does not fit L1 (or when FORCE_K_SPLIT prices it).
     # One GEMV per chunk at K=FF/n plus n-1 adds; the chunk GEMVs are the SAME op object, so the
     # split costs one design and n runs, not n designs.
-    down_chunks = FORCE_K_SPLIT or k_chunks_for(D, FF, COLS)
+    down_chunks = FORCE_K_SPLIT or k_chunks_for(
+        D, FF, COLS,
+        a_row_bytes=_k_split_row_bytes(FF, mlp_quant_kw) if GEMV_B_SINGLE else None,
+        b_single_buffered=GEMV_B_SINGLE)
     if down_chunks > 1:
         assert FF % down_chunks == 0, f"FF={FF} not divisible by {down_chunks} K chunks"
         op_down = gemv(D, FF // down_chunks, ctx, **mlp_quant_kw)
@@ -2690,6 +2714,36 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                                          scale_dtype=_BUILD_STATE["scale_dtype"],
                                          layout=op_mlp_dp.layout, row_group=op_mlp_dp.row_group)
 
+    def _dequant_from_probed_kchunks(hf, M, K_total, quant_kw):
+        """[M, K_total] float32 for a Wd/Wo whose dump is chunked at a DIFFERENT count than
+        today's build wants -- GEMV_B_SINGLE unsplitting a K the dump split, or the reverse.
+        Probes the dump's OWN chunk count from disk (however many `.kchunkN` exist) rather than
+        trusting down_chunks/o_chunks, which describe today's build, not the files. Exact:
+        quantize_weight's groups never straddle a chunk boundary (a chunk is a multiple of
+        group_size wide), so a group's q/scale is the same value whichever way the row was cut --
+        only row_group_planar's BLOCK layout depends on the chunk width, so it is re-derived for
+        the chunk K rather than read from an operator built for a different K. None if `hf` has
+        no chunked packed form on disk.
+        """
+        n = 0
+        while f"{hf}.kchunk{n}" in PACKED:
+            n += 1
+        if n == 0:
+            return None
+        if dequantize_weight_chunked is None:
+            raise SystemExit(f"{hf}: kchunk dump needs iron.common.quant.dequantize_weight_chunked "
+                             "(post-6a347dc IRON tree)")
+        dequant_kw = {"scale_dtype": quant_kw.get("scale_dtype", "f32")}
+        if quant_kw.get("layout") == "row_group_planar":
+            dequant_kw["layout"] = "row_group_planar"
+            dequant_kw["row_group"] = derive_row_group(
+                [K_total // n], quant_kw["group_size"], quant_kw["weight_dtype"],
+                vec_size=widest_chunk(quant_kw["group_size"], quant_kw["weight_dtype"]),
+                scale_dtype=quant_kw.get("scale_dtype", "f32"))
+        packed = np.concatenate([np.asarray(npy_raw(f"{hf}.kchunk{i}")) for i in range(n)])
+        return dequantize_weight_chunked(packed, M, K_total, quant_kw["group_size"],
+                                         quant_kw["weight_dtype"], n_chunks=n, **dequant_kw)
+
     def _pack_wd_row_parallel(hf, n_chunks):
         """row_parallel_down's Wd: ONE buffer of `n_chunks` independently-quantized column-shard
         blocks (design.py's ROW_PARALLEL_DOWN). This dump has no unchunked Wd to slice -- only
@@ -2825,9 +2879,14 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                         _spec("mlp").group_size, _spec("mlp").dtype)])
                 weights[p + key] = wp
                 continue
-            w = (_dequant_wd_from_kchunks(hf)
-                 if key == "Wd" and mlp_dp_why is None and f"{hf}.kchunk0" in PACKED
-                 else npy(hf))  # [M, K], f32
+            if key == "Wd" and mlp_dp_why is None and f"{hf}.kchunk0" in PACKED:
+                w = _dequant_wd_from_kchunks(hf)
+            elif key in ("Wd", "Wo") and f"{hf}.kchunk0" in PACKED:
+                w = _dequant_from_probed_kchunks(
+                    hf, D, FF if key == "Wd" else g.qd,
+                    mlp_quant_kw if key == "Wd" else _quant_kw("attn_o"))
+            else:
+                w = npy(hf)  # [M, K], f32
             if key == "Wq" and sp.attn_output_gate:
                 # HF views q_proj per head as [q | gate]; the gate half is its own GEMV.
                 wq = w.reshape(Hq, 2, g.hd, D)
