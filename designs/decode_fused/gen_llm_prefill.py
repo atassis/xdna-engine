@@ -107,6 +107,7 @@ import glob
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 from types import SimpleNamespace
@@ -202,6 +203,11 @@ SM_WIDTHS = "sm_widths"
 # instead of append-then-read, which is the only order safe past the wrap for M > 1: today's
 # append-then-read destroys ring data before later rows in the same chunk can read it.
 SLIDING_RING = os.environ.get("PREFILL_SLIDING_RING", "0") == "1"
+# PREFILL_MERGE_KCHUNKS=1: read a K-chunked weight dump as ONE full-K weight instead of one GEMM
+# per chunk plus a bf16 add tree. The prefill GEMM has no L1 reason to split (it tiles K itself);
+# the split exists only because the dump is chunked for decode's GEVM. Required to pair with a
+# decode built GEMV_B_SINGLE=1, which allocates no kacc/kpart for the fold to accumulate into.
+MERGE_KCHUNKS = os.environ.get("PREFILL_MERGE_KCHUNKS", "0") == "1"
 # The ring mask, one (hole_lo, hole_hi, width) int32 triple per softmax row -- SM_WIDTHS's sibling
 # for the rows_hole softmax mode.
 SM_RING = "sm_ring"
@@ -351,6 +357,23 @@ def quant_source_files(src_dir, prefix, tensor):
     return files
 
 
+def merge_kchunk_rows(rows, N, K, group_size, scale_dtype):
+    """Full-K row-packed weight from a K-chunked dump: every chunk's scales in group order, then
+    every chunk's payload. EXACT, not a requantization -- a quant group never straddles a chunk
+    boundary, so each q and scale is the byte the dump holds; verified byte-identical against a
+    full-K `quantize_weight` + `repack_gemm_weight`. `header_first` only: row_group_planar
+    interleaves scales per row-group block and would need its own merge.
+    """
+    n = len(rows)
+    chunk_k = K // n
+    sb = {"f32": 4, "bf16": 2}[scale_dtype]
+    hdr, pay = (chunk_k // group_size) * sb, chunk_k // 2
+    cs = [np.asarray(r).view(np.uint8).reshape(N, hdr + pay) for r in rows]
+    merged = np.concatenate([np.concatenate([c[:, :hdr] for c in cs], axis=1),
+                             np.concatenate([c[:, hdr:] for c in cs], axis=1)], axis=1)
+    return merged.reshape(-1).view(np.int8)
+
+
 def pack_quant_weights(quant_pack, bdir, quant_plan):
     """Write `bdir/<buf>.bin` for every `quant_pack` entry (Task 5): unlike x/rope/sm_widths,
     these are STATIC model weights, packed ONCE, here, at build time. Each is a permutation of the
@@ -374,17 +397,24 @@ def pack_quant_weights(quant_pack, bdir, quant_plan):
         src_digests = {}
     for e in quant_pack:
         dest = os.path.join(bdir, f"{e['buf']}.bin")
+        srcs = e.get("src_files") or [e["src_file"]]
         if use_cache:
-            src_path = os.path.join(e["src_dir"], e["src_file"])
-            if src_path not in src_digests:
-                src_digests[src_path] = pack_cache.sha256_file(src_path)
-            key = pack_cache.content_key(e, src_digests[src_path], packer_digest,
+            digests = []
+            for sf in srcs:
+                src_path = os.path.join(e["src_dir"], sf)
+                if src_path not in src_digests:
+                    src_digests[src_path] = pack_cache.sha256_file(src_path)
+                digests.append(src_digests[src_path])
+            key = pack_cache.content_key(e, "+".join(digests), packer_digest,
                                          generator_digest)
             if store.materialize(key, dest):
                 hits += 1
                 continue
             misses += 1
-        row_packed = np.load(os.path.join(e["src_dir"], e["src_file"]))
+        loaded = [np.load(os.path.join(e["src_dir"], sf)) for sf in srcs]
+        row_packed = (loaded[0] if len(loaded) == 1 else
+                      merge_kchunk_rows(loaded, e["N"], e["K"], e["group_size"],
+                                        e["scale_dtype"]))
         _, mmul_s, mmul_t = e["mmul"]
         packed = quant_mod.repack_gemm_weight(row_packed, e["N"], e["K"], e["tile_k"],
                                               e["tile_n"], e["group_size"], e["weight_dtype"],
@@ -1214,11 +1244,22 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
             if K % n:
                 raise ValueError(f"{plain}: K={K} not divisible by its own {n} dumped chunks")
             chunk_k = K // n
-            if n == 1:
+            # PREFILL_MERGE_KCHUNKS=1: pack the dump's chunks into ONE full-K weight (the merge is
+            # byte-exact, see merge_kchunk_rows) and run one full-K GEMM. Two reasons beyond the
+            # dispatch count. It drops the fold's bf16 adds, which this file's own measurement
+            # names as a prefill/decode divergence of the same order as PREFILL_ROUND_EVEN. And it
+            # removes the only reason prefill needs decode's kacc/kpart scratch, which a decode
+            # built with GEMV_B_SINGLE does not allocate at all -- without this, an unsplit decode
+            # cannot be paired with any prefill.
+            merge_chunks = n > 1 and MERGE_KCHUNKS
+            pack_srcs = None
+            if n == 1 or merge_chunks:
                 # No split at all: `plain_op` (the caller's already-built full-K op, site= already
                 # baked in) is exactly the right shape -- packing a second, redundant "_k{K}of1"
                 # design would be pure waste.
                 chunk_op, add_op = plain_op, None
+                if merge_chunks:
+                    pack_srcs, chunk_k, n = list(srcs), K, 1
             else:
                 # C stays bf16 regardless of B's weight_dtype (GEMM's own "A and C stay bf16"),
                 # so this is the SAME D-wide kacc/kpart/kpart2 the decode-arena branch below
@@ -1250,11 +1291,14 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
             def wk(i):
                 name = f"{plain}_qp{f'_c{i}' if n > 1 else ''}"
                 bufsz[name] = nbytes
-                quant_pack.append(dict(buf=name, src_dir=src_dir, src_file=srcs[i],
-                                       N=Nout, K=chunk_k, tile_k=chunk_op.tile_k,
-                                       tile_n=chunk_op.tile_n, group_size=group,
-                                       weight_dtype=dtype, cols=chunk_op.num_aie_columns,
-                                       scale_dtype=scale_dtype, mmul=chunk_op._mmul_rst))
+                entry = dict(buf=name, src_dir=src_dir, src_file=srcs[i],
+                             N=Nout, K=chunk_k, tile_k=chunk_op.tile_k,
+                             tile_n=chunk_op.tile_n, group_size=group,
+                             weight_dtype=dtype, cols=chunk_op.num_aie_columns,
+                             scale_dtype=scale_dtype, mmul=chunk_op._mmul_rst)
+                if pack_srcs is not None:
+                    entry["src_file"], entry["src_files"] = pack_srcs[0], pack_srcs
+                quant_pack.append(entry)
                 return f"{name}[0:{nbytes}]"
         elif not dec_meta_path:
             return [(plain_op, a_buf, f"{plain}[0:{K * Nout * 2}]", out_buf)]
@@ -1627,6 +1671,18 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     # DO declare), and every batched generation came back as one token repeated. Checkable only on
     # the shared-arena path -- with --no-arena-share nothing is provided and every weight is an
     # orphan by construction.
+    # Gemma-4's v_norm is GAINLESS: the weighted-RMS op takes a constant ones vector as its gain,
+    # and decode has always owned that buffer. A decode built FUSE_ATTN_WEIGHTLESS=1 runs v_norm
+    # inside the attention block and allocates no `ones_h*` at all, so prefill owns it here. The
+    # runtime already uploads a prefill-declared weight that decode's layout lacks, from prefill's
+    # own buffers dir (npu_decode.rs, "a prefill-only weight stays legal").
+    const_pack = {}
+    for nm in sorted({b.split("[")[0] for _op, *bs in rl for b in bs}):
+        m = re.fullmatch(r"ones_h(\d+)", nm)
+        if m and nm not in dec_sizes:
+            hd_ones = int(m.group(1))
+            bufsz[nm] = hd_ones * 2
+            const_pack[nm] = np.ones(hd_ones, dtype=BF16)
     if dec_meta_path:
         read, written = set(), set()
         for op, *bufs in rl:
@@ -1637,7 +1693,8 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         # weight, filled by THIS build (main(), after compile) rather than left for a request to
         # write -- see weight_gemm/qkv_operand's quantized branch and quant_pack above.
         quant_names = {e["buf"] for e in quant_pack}
-        orphans = sorted(read - written - set(dec_sizes) - set(inputs) - quant_names)
+        orphans = sorted(read - written - set(dec_sizes) - set(inputs) - quant_names
+                         - set(const_pack))
         if orphans:
             raise ValueError(
                 f"{len(orphans)} buffer(s) are read by the prefill graph, never written by it, and "
@@ -1739,7 +1796,7 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     # that is not one of decode's own shared names is prefill's, regardless of how late it was
     # added.
     prefill_local = sorted(n for n in bufsz if n not in dec_sizes)
-    dims = dict(NL=NL, M=M, S=S, inputs=inputs, cache_names=cache_names,
+    dims = dict(const_pack=const_pack, NL=NL, M=M, S=S, inputs=inputs, cache_names=cache_names,
                 recurrent_counts=(dict(buffer=GDR_COUNT, tokens_per_call=GDR_T, calls=M // GDR_T,
                                        slot_bytes=LDK * 2, hist_param="hist_off",
                                        hist_row_elems=LCH) if lin_layers else None),
@@ -2350,6 +2407,11 @@ def main():
 
     if dims["quant_pack"]:
         pack_quant_weights(dims["quant_pack"], bdir, quant_plan)
+    for nm, arr in dims["const_pack"].items():
+        arr.tofile(os.path.join(bdir, f"{nm}.bin"))
+    if dims["const_pack"]:
+        print(f"[gen] wrote {len(dims['const_pack'])} prefill-owned constant buffer(s): "
+              f"{sorted(dims['const_pack'])}")
 
     golden_files, gate = {}, None
     if not a.no_golden:
@@ -2426,7 +2488,8 @@ def main():
         # Cache names are excluded too: decode ships no `.bin` for them (they're zero-filled by
         # length, not read), and `cache_buffers` below is where a consumer looks for them.
         "weights": [n for n in dims["shared"] if n not in dims["cache_names"]]
-        + sorted({e["buf"] for e in dims["quant_pack"]}),
+        + sorted({e["buf"] for e in dims["quant_pack"]})
+        + sorted(dims["const_pack"]),
         "weights_from": (os.path.join(os.path.dirname(os.path.abspath(dec_meta_path)), "buffers")
                          if dec_meta_path else None),
         "cache_buffers": dims["cache_names"],
