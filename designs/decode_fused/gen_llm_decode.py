@@ -582,6 +582,14 @@ FUSE_DECODE_LAYER = os.environ.get("FUSE_DECODE_LAYER", "1") == "1"
 # which reuses qkv_dp_why/_tmv_declined rather than re-deriving the same rules decode_layer_why
 # already checks. Default OFF: device-free only so far.
 FUSE_ATTN_BLOCK = os.environ.get("FUSE_ATTN_BLOCK", "0") == "1"
+# attn_block_dp MINUS its input RMSNorm and Wqkv matvec (gemma4-weightless-attention-block,
+# variant A_s/A_g). Same per-geometry eligibility as FUSE_ATTN_BLOCK (Hkv==COLS, SCALE_IN_QNORM,
+# GROUPED_K+TMV_CTX, a v_proj) since it is the SAME downstream machinery; the difference is what it
+# replaces in the runlist -- everything from the per-head qk-norm through context, never the input
+# norm or the W device's own Wqkv run, which stay exactly as they are today. Mutually exclusive
+# with FUSE_ATTN_BLOCK per geometry: a geometry FUSE_ATTN_BLOCK already covers keeps that arm.
+# Default OFF: device-free only so far.
+FUSE_ATTN_WEIGHTLESS = os.environ.get("FUSE_ATTN_WEIGHTLESS", "0") == "1"
 # Thread decode_layer_dp's window_parameter through: the AIE core reads its attention window from
 # a per-dispatch ScratchpadParameter ("attn_window", int32) instead of baking N_KV_CHUNKS into the
 # build. Only takes effect when decode_layer_dp itself is eligible (decode_layer_why is None below)
@@ -663,8 +671,9 @@ def load_weight_buffer(buf, arr):
 
 
 def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tmv_declined=(),
-                  tmv_chunked=(), attn_block_geoms=(), ff_chunks=1, weight_families=0,
-                  pointwise_widths=0, scores_blocks=(), mlp_dp_active=False, mlp_o_active=False):
+                  tmv_chunked=(), attn_block_geoms=(), attn_weightless_geoms=(), ff_chunks=1,
+                  weight_families=0, pointwise_widths=0, scores_blocks=(), mlp_dp_active=False,
+                  mlp_o_active=False):
     """Name the fused sequence after everything that changes its graph, not just the model.
 
     IRON keys the cached artifact by this name. Every knob below produces a DIFFERENT ELF, so
@@ -779,6 +788,11 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tm
     # attn_block_why. Empty when no geometry qualifies, so an on-but-inert flag keeps the name.
     if attn_block_geoms:
         parts.append("ab" + "".join(f"_{h}" for h in sorted(attn_block_geoms)))
+    # attn_block_dp_weightless -- same reasoning as attn_block_geoms above, its sibling arm. "aw"
+    # never collides with "ab": a geometry sits in at most one of the two lists (mutually
+    # exclusive per attn_weightless_why).
+    if attn_weightless_geoms:
+        parts.append("aw" + "".join(f"_{h}" for h in sorted(attn_weightless_geoms)))
     # The window override changes the graph (rpc, the KV ring, every sliding design's max_seq),
     # so it has to reach the name or two arms share one cached artifact -- this function's own
     # docstring is about exactly that failure. Experiment knob; absent on every shipped arm.
@@ -1797,6 +1811,27 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # head_dims that actually qualify, for sequence_name()'s suffix -- computed once here, same
     # discipline as _tmv_declined/_tmv_chunked above, rather than re-derived at the call site.
     _attn_block_fused = tuple(sorted(g[0] for g in geoms if attn_block_why[g] is None))
+
+    # attn_block_dp_weightless: the SAME downstream shape as attn_block_dp (it is that design
+    # minus the input norm and Wqkv), so the SAME per-geometry clauses, gated on the sibling flag.
+    # A geometry attn_block_dp already covers keeps that arm -- the two are not stacked.
+    def _attn_weightless_why(g):
+        hd, hkv, has_v = g
+        return ("FUSE_ATTN_WEIGHTLESS=0" if not FUSE_ATTN_WEIGHTLESS else
+                "attn_block_dp already covers this geometry" if attn_block_why[g] is None else
+                qkv_shape_why[g] if qkv_shape_why[g] else
+                f"needs Hkv ({hkv}) == COLS ({COLS})" if hkv != COLS else
+                "this geometry has no v_proj" if not has_v else
+                "needs SCALE_IN_QNORM=1 (no separate scale stage)"
+                if not (SCALE_IN_QNORM and sp.qk_norm) else
+                "needs GQA_GROUPED_K=1 and TMV_CTX=1 (computes exactly that variant internally)"
+                if not (GROUPED_K and TMV_CTX and hd not in _tmv_declined) else
+                "needs v_norm=True (this design has no un-normed passthrough for v)"
+                if not sp.v_norm
+                else None)
+
+    attn_weightless_why = {g: _attn_weightless_why(g) for g in geoms}
+    _attn_weightless_fused = tuple(sorted(g[0] for g in geoms if attn_weightless_why[g] is None))
     # Filled by attn_ops (below) as each geometry is built, then handed to sequence_name -- the
     # SAME value the op was constructed with, not a re-derivation of the gate.
     _scores_blocks = []
@@ -1875,6 +1910,10 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         why = attn_block_why[g]
         tag = "" if len(geoms) == 1 else f" [head_dim={g[0]}, kv_heads={g[1]}]"
         print(f"[gen] fused arm attn_block_dp{tag}: {'OFF -- ' + why if why else 'on'}")
+    for g in geoms:
+        why = attn_weightless_why[g]
+        tag = "" if len(geoms) == 1 else f" [head_dim={g[0]}, kv_heads={g[1]}]"
+        print(f"[gen] fused arm attn_block_dp_weightless{tag}: {'OFF -- ' + why if why else 'on'}")
     print(f"[gen] fused arm swiglu_mlp_dp: {'OFF -- ' + mlp_dp_why if mlp_dp_why else 'on'}")
     if fuse_o:
         if _spec("attn_o") != _spec("mlp"):
@@ -2267,6 +2306,17 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 wqkv_head_major=True, kv_offset_parameter=slot, mask_parameter=mask_slot,
                 kv_alloc=None if KVA_g == w else KVA_g, kv_block_size=None if T_g == w else T_g,
                 v_norm=sp.v_norm, **_quant_kw("qkv", force_header_first=True))
+        # attn_block_dp_weightless: same memoization trap, same slot names. Never both -- a
+        # geometry attn_block_dp already covers keeps that arm (attn_weightless_why says so).
+        op_attn_weightless = None
+        if attn_weightless_why[(hd, hkv, has_v)] is None:
+            from iron.operators.attn_block_dp.op import AttnBlockDataParallel as _ABWL
+            op_attn_weightless = _ABWL(
+                D=D, HD=hd, Hq=Hq, Hkv=hkv, max_seq=w, num_aie_columns=hkv, epsilon=sp.eps,
+                context=ctx, weight_depth=WEIGHT_DEPTH,
+                kv_offset_parameter=slot, mask_parameter=mask_slot,
+                kv_alloc=None if KVA_g == w else KVA_g, kv_block_size=None if T_g == w else T_g,
+                v_norm=True, weightless=True)
         g = SimpleNamespace(
             hd=hd, hkv=hkv, qd=qd, kvd=kvd, gqa=gqa, kv_slot=slot, o_chunks=o_chunks,
             op_qk_norm=op_qk_norm, op_qk_norm_b=op_qk_norm_b, op_qkv=op_qkv, op_q=op_q,
@@ -2276,7 +2326,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             op_ctx=op_ctx, op_v_norm=op_v_norm, has_v=has_v, kv_parts=kv_parts,
             uses_tmv_ctx=uses_tmv, scores_groups=scores_groups, scores_block=T_k,
             op_softmax=op_softmax, op_scale=op_scale, mask_slot=mask_slot, window=w,
-            capacity=KVA_g, kv_block=T_g,
+            capacity=KVA_g, kv_block=T_g, op_attn_weightless=op_attn_weightless,
             op_attn_block=op_attn_block, circular=(w != S))
         _attn_cache[(hd, hkv, has_v)] = g
         return g
@@ -2605,9 +2655,11 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # The gainless v-norm's gain, one per head_dim and shared by EVERY layer -- a true constant,
         # unlike the per-layer learned gains beside it, so it is registered once here rather than in
         # the layer loop.
-        # Only the geometries the UNFUSED arm carries: attn_block_dp holds the gain as a
-        # compile-time L1 constant, so a fused geometry has no L3 buffer here to look up.
-        for _hd in sorted({gk[0] for gk in geoms if attn_block_why[gk] is not None}):
+        # Only the geometries the UNFUSED arm carries: attn_block_dp and attn_block_dp_weightless
+        # both hold the gain as a compile-time L1 constant, so a fused geometry (either one) has
+        # no L3 buffer here to look up.
+        for _hd in sorted({gk[0] for gk in geoms
+                          if attn_block_why[gk] is not None and attn_weightless_why[gk] is not None}):
             weights[f"ones_h{_hd}"] = np.ones(_hd, dtype=BF16)
 
     def _dequant_wd_from_kchunks(hf):
@@ -2967,6 +3019,18 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 # the MLP half are unaffected -- attn_block_dp stops at `cx`, same as op_ctx does.
                 attn_rl = [(g.op_attn_block, cur, p + "n_in", p + "Wqkv", p + "n_qn", p + "n_kn",
                             ang, p + "kc", p + "vc", p + "cx")]
+            elif g.op_attn_weightless is not None:
+                # A_s/A_g (gemma4-weightless-attention-block): the input norm and the Wqkv GEMV
+                # stay exactly as they are today (op_norm, g.op_qkv -- attn_weightless_why[g] is
+                # None only when FUSE_QKV_GEMV already concatenated them); everything from the
+                # per-head qk-norm through context collapses into one device, same as
+                # attn_block_dp but reading `qkv` instead of carrying the weight itself.
+                attn_rl = [
+                    (op_norm, cur, p + "n_in", p + "hn"),
+                    (g.op_qkv, p + "Wqkv", p + "hn", p + "qkv"),
+                    (g.op_attn_weightless, p + "qkv", p + "n_qn", p + "n_kn", ang,
+                     p + "kc", p + "vc", p + "cx"),
+                ]
             else:
                 qk = proj = rope = vnorm = []
                 if sp.qk_norm and g.op_qkv_dp is None:
@@ -3229,6 +3293,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             seg_bufsz[seg_out] = D * 2
         _sn = sequence_name(sp, NL, S, placer_flags, tmv_declined=_tmv_declined,
                             tmv_chunked=_tmv_chunked, attn_block_geoms=_attn_block_fused,
+                            attn_weightless_geoms=_attn_weightless_fused,
                             decode_layer_active=op_decode_layer is not None, T=T,
                             ff_chunks=ff_chunks, weight_families=len(weight_families),
                             pointwise_widths=len(pointwise_widths),
