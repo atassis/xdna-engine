@@ -23,6 +23,9 @@ import argparse
 import hashlib
 import json
 import os
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "decode_fused"))
+from buffer_blob import write_blob  # noqa: E402
 
 import numpy as np
 import ml_dtypes
@@ -98,8 +101,8 @@ def main():
         o2 = o2.reshape(-1)
 
     def wbuf(name, vals):
-        with open(os.path.join(args.out, "buffers", f"{name}.bin"), "wb") as f:
-            f.write(np.asarray(vals, dtype=BF16).tobytes())
+        write_blob(os.path.join(args.out, "buffers", f"{name}.bin"),
+                   np.asarray(vals, dtype=BF16).tobytes())
 
     # K-AUGMENT Wfc1 to [FF, D+32]: cols 0:D = (gf*Wfc1).T, col D = bias_fc1, cols
     # D+1:D+32 = 0. The device fc1 GEMM folds the bias in (vector mac over the bias

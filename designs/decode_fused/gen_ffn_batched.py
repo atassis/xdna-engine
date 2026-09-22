@@ -22,6 +22,7 @@ Run inside the IRON env (newstack_compat first; aiebu-asm on PATH). See scripts/
 import argparse
 import json
 import os
+from buffer_blob import write_blob
 
 import numpy as np
 import ml_dtypes
@@ -141,8 +142,8 @@ def main():
         out_g[b] = bf16(o1.astype(np.float32) + b_fc2_bf.astype(np.float32))
 
     def wbuf(name, vals):
-        with open(os.path.join(args.out, "buffers", f"{name}.bin"), "wb") as f:
-            f.write(np.asarray(vals, dtype=BF16).tobytes())
+        write_blob(os.path.join(args.out, "buffers", f"{name}.bin"),
+                   np.asarray(vals, dtype=BF16).tobytes())
 
     wbuf("x", X.reshape(-1))
     wbuf("Wfc1", mat_fc1.reshape(-1))

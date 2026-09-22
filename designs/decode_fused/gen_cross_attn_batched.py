@@ -19,6 +19,7 @@ Validation uses T_enc=T_pad (no softmax mask) at a small TP to bound the per-str
 import argparse
 import json
 import os
+from buffer_blob import write_blob
 
 import numpy as np
 import ml_dtypes
@@ -170,8 +171,8 @@ def main():
         attn_out_g[b] = attn
 
     def wbuf(name, vals):
-        with open(os.path.join(args.out, "buffers", f"{name}.bin"), "wb") as f:
-            f.write(np.asarray(vals, dtype=BF16).tobytes())
+        write_blob(os.path.join(args.out, "buffers", f"{name}.bin"),
+                   np.asarray(vals, dtype=BF16).tobytes())
 
     wbuf("x", X.reshape(-1)); wbuf("Wcq", mat_q_bf.reshape(-1)); wbuf("bias_q", bias_q_b.reshape(-1))
     wbuf("Wco", Wco_bf.reshape(-1)); wbuf("bias_o", bco_b.reshape(-1))

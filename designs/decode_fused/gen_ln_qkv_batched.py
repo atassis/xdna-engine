@@ -16,6 +16,7 @@ Gate (npu-dev fused-elf): rel-L2(device qkv, per-stream bf16 golden) <= 0.08. Ru
 import argparse
 import json
 import os
+from buffer_blob import write_blob
 
 import numpy as np
 import ml_dtypes
@@ -111,8 +112,8 @@ def main():
         out_g[b] = qkv
 
     def wbuf(name, vals):
-        with open(os.path.join(args.out, "buffers", f"{name}.bin"), "wb") as f:
-            f.write(np.asarray(vals, dtype=BF16).tobytes())
+        write_blob(os.path.join(args.out, "buffers", f"{name}.bin"),
+                   np.asarray(vals, dtype=BF16).tobytes())
 
     wbuf("x", X.reshape(-1))
     wbuf("Wqkv", mat_qkv_bf.reshape(-1))

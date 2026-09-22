@@ -20,6 +20,7 @@ masked by the static softmax width. Run inside IRON env (aiebu-asm on PATH).
 import argparse
 import json
 import os
+from buffer_blob import write_blob
 
 import numpy as np
 import ml_dtypes
@@ -180,8 +181,8 @@ def main():
     attn_out = bf16(attn.astype(np.float32) + bias_o.astype(np.float32))
 
     def wbuf(name, vals):
-        with open(os.path.join(args.out, "buffers", f"{name}.bin"), "wb") as f:
-            f.write(np.asarray(vals, dtype=BF16).tobytes())
+        write_blob(os.path.join(args.out, "buffers", f"{name}.bin"),
+                   np.asarray(vals, dtype=BF16).tobytes())
 
     wbuf("x", x)
     wbuf("Wcq", mat_q.reshape(-1)); wbuf("bias_q", bias_q)

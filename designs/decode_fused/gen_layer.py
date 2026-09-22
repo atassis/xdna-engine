@@ -17,6 +17,7 @@ Run inside IRON env (aiebu-asm on PATH).
 import argparse
 import json
 import os
+from buffer_blob import write_blob
 
 import numpy as np
 import ml_dtypes
@@ -222,7 +223,7 @@ def main():
     ff = bf16(bf16(bf16(Wf2.T.copy()).astype(np.float32) @ h2.astype(np.float32)).astype(np.float32) + bf16(bf2).astype(np.float32))
     x3 = bf16(x2.astype(np.float32) + ff.astype(np.float32))
 
-    def wb(n, v): open(os.path.join(a.out, "buffers", f"{n}.bin"), "wb").write(np.asarray(v, BF16).tobytes())
+    def wb(n, v): write_blob(os.path.join(a.out, "buffers", f"{n}.bin"), np.asarray(v, BF16).tobytes())
     wb("x", x); wb("x3", x3)
     wb("Wqkv", bf16(mat_qkv).reshape(-1)); wb("bias_qkv", bf16(bias_qkv))
     wb("Wso", bf16(Wso.T.copy()).reshape(-1)); wb("bso", bf16(bso))
