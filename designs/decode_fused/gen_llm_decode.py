@@ -881,6 +881,12 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tm
         parts.append("pwm")
     if GEMV_B_SINGLE:
         parts.append("bsingle")
+    # Missing entirely until now: G4_W_PROLOGUE drops the standalone pre-Wqkv/pre-lm-head
+    # RMSNorm run (measured -48 configures/-49 runs at L=48, same recipe) without changing any
+    # other suffix here, so an on and an off build of the same flag set shared this function's
+    # name -- exactly the collision this function's own docstring warns about.
+    if G4_W_PROLOGUE:
+        parts.append("wpro")
     if ATTN_RUNTIME_EXTENT:
         parts.append("rtext")
     if FUSE_ACT:
