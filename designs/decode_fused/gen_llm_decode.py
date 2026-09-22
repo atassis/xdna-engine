@@ -2056,7 +2056,14 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # Wqkv's own dtype axis. The concatenated [Wq|Wk|Wv] GEMV has its own weight ObjectFifo, so
     # it takes a format independently -- which the fused layer's attention half does NOT, because
     # attn_block_dp streams Wqkv, K and V down one fifo per core (P002/P003 above).
-    op_qkv = (gemv(QD + 2 * KVD, D, ctx, **_quant_kw("qkv"), **_w_prologue("on"))
+    # prologue="on" only where the runlist actually feeds op_qkv raw `cur`+gain: a
+    # weightless-covered geometry's branch (below) always pre-normalizes via a standalone op_norm
+    # and calls op_qkv with the 3-buffer off/none form, so tagging it "on" there makes
+    # get_arg_spec() demand a 4th (gain) buffer the call never supplies. "off", not "none", keeps
+    # it in the same merged-device family as op_head/op_gate (design_key's prologue-!=-none bit).
+    _qkv_prologue = ("off" if _geom1 is not None and attn_weightless_why[_geom1] is None
+                     else "on")
+    op_qkv = (gemv(QD + 2 * KVD, D, ctx, **_quant_kw("qkv"), **_w_prologue(_qkv_prologue))
              if FUSE_QKV_GEMV else None)
     op_q = gemv(QD, D, ctx)
     op_kv = gemv(KVD, D, ctx)
@@ -2237,7 +2244,10 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # GEMV shape and the qkv buffer layout are per-geometry. V is then derived from k rather
         # than projected -- see the runlist, where v_norm reads the k slice.
         kv_parts = 2 if has_v else 1
-        op_qkv = (gemv(qd + kv_parts * kvd, D, ctx, **_quant_kw("qkv"), **_w_prologue("on"))
+        # See the len(geoms)==1 op_qkv above: "off" wherever attn_weightless_why[g] is None, same
+        # reason -- that branch's runlist always pre-normalizes and calls this with 3 buffers.
+        _qkv_prologue_g = ("off" if attn_weightless_why[(hd, hkv, has_v)] is None else "on")
+        op_qkv = (gemv(qd + kv_parts * kvd, D, ctx, **_quant_kw("qkv"), **_w_prologue(_qkv_prologue_g))
                  if FUSE_QKV_GEMV else None)
         op_q = gemv(qd, D, ctx, **_quant_kw("qkv"))
         op_kv = gemv(kvd, D, ctx, **_quant_kw("qkv"))
@@ -2636,7 +2646,11 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         assert FF % down_chunks == 0, f"FF={FF} not divisible by {down_chunks} K chunks"
         op_down = gemv(D, FF // down_chunks, ctx, **mlp_quant_kw, **_w_prologue("off"))
     else:
-        op_down = gemv(D, FF, ctx, **mlp_quant_kw, **_w_prologue("off"))
+        # Unsplit (GEMV_B_SINGLE): K=FF, not the merged family's K=D, so unify_weight_gemvs never
+        # groups this with anything and never sets tiles_rtp -- "off" would trip design.py's
+        # "prologue rides tiles_rtp" assert. A singleton gains nothing from prologue-sharing
+        # anyway, so plain "none" (no _w_prologue call) is both correct and inert here.
+        op_down = gemv(D, FF, ctx, **mlp_quant_kw)
     op_add = ElementwiseAdd(size=D, tile_size=D // COLS, num_aie_columns=COLS, context=ctx)
     # Gated DeltaNet (linear attention) op vocabulary, shared by every such layer. A layer of this
     # kind produces `cx` like attention does, and out_proj takes Wo's slot, so everything from o_proj
