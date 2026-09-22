@@ -2086,14 +2086,10 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # Wqkv's own dtype axis. The concatenated [Wq|Wk|Wv] GEMV has its own weight ObjectFifo, so
     # it takes a format independently -- which the fused layer's attention half does NOT, because
     # attn_block_dp streams Wqkv, K and V down one fifo per core (P002/P003 above).
-    # prologue="on" only where the runlist actually feeds op_qkv raw `cur`+gain: a
-    # weightless-covered geometry's branch (below) always pre-normalizes via a standalone op_norm
-    # and calls op_qkv with the 3-buffer off/none form, so tagging it "on" there makes
-    # get_arg_spec() demand a 4th (gain) buffer the call never supplies. "off", not "none", keeps
-    # it in the same merged-device family as op_head/op_gate (design_key's prologue-!=-none bit).
-    _qkv_prologue = ("off" if _geom1 is not None and attn_weightless_why[_geom1] is None
-                     else "on")
-    op_qkv = (gemv(QD + 2 * KVD, D, ctx, **_quant_kw("qkv"), **_w_prologue(_qkv_prologue))
+    # prologue="on" unconditionally: under G4_W_PROLOGUE every runlist branch that calls op_qkv
+    # (vanilla and the attn_weightless branch below) now feeds it raw `cur`+gain, so every
+    # instance needs the same 4-buffer arg spec. See attn_rl below for the weightless branch.
+    op_qkv = (gemv(QD + 2 * KVD, D, ctx, **_quant_kw("qkv"), **_w_prologue("on"))
              if FUSE_QKV_GEMV else None)
     op_q = gemv(QD, D, ctx)
     op_kv = gemv(KVD, D, ctx)
@@ -2274,10 +2270,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # GEMV shape and the qkv buffer layout are per-geometry. V is then derived from k rather
         # than projected -- see the runlist, where v_norm reads the k slice.
         kv_parts = 2 if has_v else 1
-        # See the len(geoms)==1 op_qkv above: "off" wherever attn_weightless_why[g] is None, same
-        # reason -- that branch's runlist always pre-normalizes and calls this with 3 buffers.
-        _qkv_prologue_g = ("off" if attn_weightless_why[(hd, hkv, has_v)] is None else "on")
-        op_qkv = (gemv(qd + kv_parts * kvd, D, ctx, **_quant_kw("qkv"), **_w_prologue(_qkv_prologue_g))
+        # See the len(geoms)==1 op_qkv above: "on" unconditionally, every op_qkv-calling branch
+        # (including the attn_weightless one below) now feeds it raw `cur`+gain under G4_W_PROLOGUE.
+        op_qkv = (gemv(qd + kv_parts * kvd, D, ctx, **_quant_kw("qkv"), **_w_prologue("on"))
                  if FUSE_QKV_GEMV else None)
         op_q = gemv(qd, D, ctx, **_quant_kw("qkv"))
         op_kv = gemv(kvd, D, ctx, **_quant_kw("qkv"))
@@ -3231,14 +3226,20 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 attn_rl = [(g.op_attn_block, cur, p + "n_in", p + "Wqkv", p + "n_qn", p + "n_kn",
                             ang, p + "kc", p + "vc", p + "cx")]
             elif g.op_attn_weightless is not None:
-                # A_s/A_g (gemma4-weightless-attention-block): the input norm and the Wqkv GEMV
-                # stay exactly as they are today (op_norm, g.op_qkv -- attn_weightless_why[g] is
-                # None only when FUSE_QKV_GEMV already concatenated them); everything from the
-                # per-head qk-norm through context collapses into one device, same as
-                # attn_block_dp but reading `qkv` instead of carrying the weight itself.
+                # A_s/A_g (gemma4-weightless-attention-block): the Wqkv GEMV stays exactly as it
+                # is today (attn_weightless_why[g] is None only when FUSE_QKV_GEMV already
+                # concatenated them); everything from the per-head qk-norm through context
+                # collapses into one device, same as attn_block_dp but reading `qkv` instead of
+                # carrying the weight itself.
+                #
+                # The input norm: under G4_W_PROLOGUE this folds into op_qkv's own prologue (same
+                # mechanism as the vanilla branch's `proj`, above) instead of running as a
+                # standalone RMSNorm -- op_qkv is tagged prologue="on" unconditionally now, so
+                # every call site must use this 4-buffer form once the flag is set.
                 attn_rl = [
-                    (op_norm, cur, p + "n_in", p + "hn"),
-                    (g.op_qkv, p + "Wqkv", p + "hn", p + "qkv"),
+                    *([(g.op_qkv, p + "Wqkv", cur, p + "n_in", p + "qkv")] if G4_W_PROLOGUE else
+                      [(op_norm, cur, p + "n_in", p + "hn"),
+                       (g.op_qkv, p + "Wqkv", p + "hn", p + "qkv")]),
                     (g.op_attn_weightless, p + "qkv", p + "n_qn", p + "n_kn", ang,
                      p + "kc", p + "vc", p + "cx"),
                 ]
