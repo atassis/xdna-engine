@@ -314,6 +314,17 @@ SPLIT_QKNORM = int(os.environ.get("SPLIT_QKNORM", "0"))
 # outcomes far apart, one build.
 DUMMY_NORM_RUNS = int(os.environ.get("DUMMY_NORM_RUNS", "0"))
 
+# Per-shape GEMV tile override: "MxK=tsi:tso,...". gemv_tile_output() picks the LARGEST legal C
+# tile, which at the MLP gate/up shape is the whole column (M//cols = tso), so the design runs ONE
+# C tile per column and nothing on the output side pipelines. That choice is a heuristic -- the
+# comment on it argues tile COUNT, never measured time -- and this is what lets a sweep put a
+# number on it. Same role gemm_tile_registry.py plays for prefill's GEMMs.
+GEMV_TILE_OVERRIDES = {}
+for _t in filter(None, os.environ.get("GEMV_TILES", "").split(",")):
+    _shape, _tile = _t.split("=")
+    _m, _k = (int(v) for v in _shape.split("x"))
+    GEMV_TILE_OVERRIDES[(_m, _k)] = tuple(int(v) for v in _tile.split(":"))
+
 # INSTRUMENT, not a feature -- the sibling of SPLIT_QKNORM above, aimed at the other count.
 # SPLIT_QKNORM isolated a CONFIGURE by turning one design into many; this chops swiglu_mlp_dp's gh
 # drain group into k groups over the SAME drains in the SAME order, so bytes, shim tasks, BDs,
@@ -765,6 +776,8 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tm
         parts.append(f"splitqk{SPLIT_QKNORM}")
     if DUMMY_NORM_RUNS:
         parts.append(f"dummyrun{DUMMY_NORM_RUNS}")
+    for _mk in sorted(GEMV_TILE_OVERRIDES):
+        parts.append("gt%dx%d_%d_%d" % (*_mk, *GEMV_TILE_OVERRIDES[_mk]))
     # Suffix stays ON the default here, unlike the other switches: the shipped artifact was BUILT
     # and gated under this name, and aiecc is not byte-reproducible, so a rename would mean the
     # next rebuild produces a different ELF under a name nothing was ever gated against.
@@ -1348,7 +1361,7 @@ def gemv_tiling(M, K, **kw):
 
 def gemv(M, K, ctx, **kw):
     """GEMV tiled as large as both the design asserts AND L1 allow."""
-    tsi, tso = gemv_tiling(M, K, **kw)
+    tsi, tso = GEMV_TILE_OVERRIDES.get((M, K)) or gemv_tiling(M, K, **kw)
     wdt = kw.get("weight_dtype", "bf16")
     g = kw.get("group_size", 0)
     if g and g < 64:

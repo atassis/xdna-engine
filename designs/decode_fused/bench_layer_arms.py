@@ -242,7 +242,7 @@ def main():
     census = {}
     for spec in a.arms:
         m = re.fullmatch(r"(\d+)(f?)(?:c(\d+))?(?:d(\d+))?(?:s(\d+))?(?:g(\d+))?"
-                         r"(?:h(\d))?(?:r(\d+))?(?:q(.+))?", spec)
+                         r"(?:h(\d))?(?:r(\d+))?(?:t(\d+))?(?:q(.+))?", spec)
         if not m:
             raise SystemExit(f"bad arm spec {spec!r}")
         L = int(m.group(1))
@@ -253,7 +253,8 @@ def main():
         sqk = int(m.group(6)) if m.group(6) else 0
         share = m.group(7) if m.group(7) else "1"
         dummy = int(m.group(8)) if m.group(8) else 0
-        qdt = m.group(9) or "bf16"
+        tso = int(m.group(9)) if m.group(9) else 0
+        qdt = m.group(10) or "bf16"
         # These are captured at gen_llm_decode IMPORT time, so flipping os.environ here would be
         # silently ignored -- set the module globals the generator actually reads.
         G.FUSE_MLP_O = fmo
@@ -269,6 +270,10 @@ def main():
         # is the env and not a module global like the rest.
         os.environ["SHARE_DESIGNS"] = share
         G.DUMMY_NORM_RUNS = dummy
+        # The MLP gate/up shape only -- the op carrying 30% of the token's bytes, and the one whose
+        # default tile is the whole column (one C tile per core, nothing pipelined on the output).
+        _sp = SPECS[a.spec]
+        G.GEMV_TILE_OVERRIDES = ({(_sp.ffn, _sp.d_model): (2, tso)} if tso else {})
         t0 = time.perf_counter()
         sp, fused, weights, md = build_graph(a.spec, a.weights, L, a.max_seq,
                                              precision_plan=plan)
@@ -278,7 +283,7 @@ def main():
         census[spec].update(fuse_mlp_o=fmo, mlp_dp_cols=cols,
                             quant_mlp=str(G.PRECISION_PLAN.get("mlp")),
                             weight_depth=wdepth, split_gh=sgh, split_qknorm=sqk,
-                            share_designs=share, dummy_runs=dummy)
+                            share_designs=share, dummy_runs=dummy, gemv_tso=tso or "default")
         print(f"[layer-arms] built {spec} in {time.perf_counter()-t0:.1f}s  census={census[spec]}",
               flush=True)
         if a.build_only:
@@ -298,7 +303,7 @@ def main():
         del weights
         scale = np.sqrt(sp.d_model) if sp.embed_scale == "sqrt_d_model" else 1.0
         arms.append(dict(spec=spec, L=L, fmo=fmo, cols=cols, qdt=qdt, wdepth=wdepth, sgh=sgh,
-                         sqk=sqk, share=share, dummy=dummy,
+                         sqk=sqk, share=share, dummy=dummy, tso=tso,
                          sp=sp, c=c,
                          params=params,
                          # The runtime attention window, when the arm built one. An arm whose core
@@ -369,7 +374,7 @@ def main():
         report[sp_] = {"reps": xs, "median_ms": med, "spread_pct": spread, "L": arm["L"],
                        "fuse_mlp_o": arm["fmo"], "cols": arm["cols"], "qdt": arm["qdt"],
                        "wdepth": arm["wdepth"], "sgh": arm["sgh"], "sqk": arm["sqk"],
-                       "share": arm["share"], "dummy": arm["dummy"],
+                       "share": arm["share"], "dummy": arm["dummy"], "tso": arm["tso"],
                        "mb": census[sp_].get("mb"), "min_ms": min(xs), "census": census[sp_]}
         print(f"{sp_:>10} {arm['L']:4} {census[sp_].get('configures', 0):5} "
               f"{census[sp_].get('mb', float('nan')):9.2f} {len(xs):4} "
