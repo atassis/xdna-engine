@@ -798,7 +798,15 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         KVA_g = (kv_alloc or w) if w == S else w
         T_g = min(kv_T, w)
         kv_slot = "kv_off" if not geom_slots else f"kv_off{len(geom_slots)}"
-        geom_slots.append((kv_slot, hd, w, kv_slot))
+        # `w` (4th field, WINDOW) feeds the "positions covered" text below; `KVA_g` (5th,
+        # CAPACITY) is what scratchpad.kv_windows's "window" JSON key actually means --
+        # gen_llm_decode.py's own geom_slots already carries KVA_g there. This file used to emit
+        # `w` into that key, so a KV_ALLOC prefill's meta.json reported its global geometry's
+        # capacity as 8192 (--seq) instead of the true 262144 (--kv-alloc): confirmed on the
+        # shipped prefill_m64_w8192_ka262144_l48_seg4_ring artifact. check_prefill_pairing reads
+        # that key as capacity, so it could not validate this pairing even were its own
+        # narrowed-geometry skip fixed.
+        geom_slots.append((kv_slot, hd, w, kv_slot, KVA_g))
         # scores: B is the kv cache read as [N=w, K=hd] -> b_col_maj. ctx: the SAME bytes read as
         # [K=w, N=hd] -> plain. N/K is THIS geometry's own window `w`, matching `kv_slab()`'s own
         # w-sized span -- an S-wide operand here would read past a narrowed geometry's buffer.
@@ -2386,7 +2394,7 @@ def main():
     # declares. They are produced by different halves of the build and nothing else compares them,
     # so a geometry whose `output_offset_parameter` was never threaded through ships an artifact
     # that cannot load -- which is how this one was found, at `LlmArtifact::load_prefill`.
-    undeclared = [n for n, _, _, _ in dims["geom_slots"] if n not in scratchpad_params]
+    undeclared = [n for n, _, _, _, _ in dims["geom_slots"] if n not in scratchpad_params]
     if undeclared:
         raise SystemExit(f"ERROR: geom_slots names scratchpad parameter(s) {undeclared} that the "
                          f"ELF does not declare (params.txt has {sorted(scratchpad_params)})")
@@ -2464,11 +2472,13 @@ def main():
             # No scalar causal width in either arm: `rows` streams a per-row vector instead, and
             # `none` masks nothing at all.
             "mask_param": None,
-            "kv_params": [{"param": n, "head_dim": hd} for n, hd, _, _ in dims["geom_slots"]],
+            "kv_params": [{"param": n, "head_dim": hd} for n, hd, _, _, _ in dims["geom_slots"]],
             # Per-geometry KV capacity, the pairing check reads this to catch a decode geometry
             # narrower than S with no matching prefill capacity -- see `geom_slots`'s own comment.
-            "kv_windows": [{"kv_param": n, "head_dim": hd, "window": ww, "mask_param": mp}
-                           for n, hd, ww, mp in dims["geom_slots"]],
+            # `cap`, not `ww`: the JSON key is spelled "window" (matching decode's own spelling)
+            # but both sides read it as CAPACITY.
+            "kv_windows": [{"kv_param": n, "head_dim": hd, "window": cap, "mask_param": mp}
+                           for n, hd, ww, mp, cap in dims["geom_slots"]],
             "head_dim": HD, "kv_heads": Hkv,
         },
         "dims": {"layers": NL, "M": M, "S": S, "d_model": D, "ffn": FF,
@@ -2541,7 +2551,7 @@ def main():
             # `mask_ring` block below, not a re-derivation. A capped-at-the-window limitation
             # inherited onto a ring artifact reads as a property of the graph while describing the
             # one it replaced.
-            f"batched prefill covers positions [0, {min(ww for _, _, ww, _ in dims['geom_slots'])}) "
+            f"batched prefill covers positions [0, {min(ww for _, _, ww, _, _ in dims['geom_slots'])}) "
             f"only, not the full S={S}: past the narrowest geometry's capacity its circular cache "
             "holds a wrapped interval and mask_bf16's suffix mask cannot express one. The host "
             "stops there (npu_prefill.rs::batchable_window) and finishes the prompt stepwise."
@@ -2552,7 +2562,7 @@ def main():
             "needing >= 2 pad rows past a capacity is skipped and the tail finishes stepwise "
             "(npu_prefill.rs::ring_tail_end), so a prompt whose length is not a whole number of "
             "M-chunks still ends per-token.",
-        ] if dims["causal"] == "rows" and any(ww < S for _, _, ww, _ in dims["geom_slots"]) else []) + ([
+        ] if dims["causal"] == "rows" and any(ww < S for _, _, ww, _, _ in dims["geom_slots"]) else []) + ([
             f"KV cache is blocked (T={dims['kv_block']}): the scores/ctx GEMMs address it in "
             "place, "
             "through a rewritten B descriptor (GEMM's b_block_rows/b_block_stride), so blocking "

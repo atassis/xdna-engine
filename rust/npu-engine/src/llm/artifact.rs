@@ -208,6 +208,16 @@ pub struct LlmArtifact {
     /// own `rows_per_chunk` over a capacity wider than the window, and a circular sliding one does
     /// not, so one build carries two of each.
     pub kv_windows: Vec<(ScratchpadParam, usize, usize, ScratchpadParam, usize, usize)>,
+    /// Whether `meta.json` actually carried a non-empty `scratchpad.kv_windows` array, as opposed
+    /// to `kv_windows` above being the loader's OWN fallback synthesis (one entry per `kv_offs`
+    /// slot at `capacity = max_seq`, built above). The distinction matters because the fallback's
+    /// "capacity" is this ARTIFACT's own `max_seq` -- exact for decode (capacity really is max_seq
+    /// when nothing narrows it) but not a statement prefill ever made about a SHARED geometry: a
+    /// prefill legitimately compiled at a narrower window than its decode's flat capacity (same
+    /// block size, no per-geometry awareness at all) synthesizes a "capacity" equal to its own
+    /// window, which disagrees with decode's on purpose and would wrongly fail
+    /// [`Self::check_prefill_pairing`]'s per-geometry comparison if treated as a real declaration.
+    pub kv_windows_declared: bool,
     /// The scalar causal-width parameter. Required on a decode artifact. `None` on every prefill
     /// artifact the current generator emits, in BOTH arms and for two different reasons: the
     /// causal one masks with [`Self::mask_widths`] instead, and the non-causal control masks
@@ -694,6 +704,9 @@ impl LlmArtifact {
         // existed, so fall back to `kv_offs` at the full build capacity paired with the single
         // shared `sm_mask` -- see `kv_windows`'s own doc comment for why that fallback is exact,
         // not an approximation.
+        let kv_windows_declared = matches!(
+            sp.get("kv_windows").and_then(|v| v.as_array()), Some(list) if !list.is_empty()
+        );
         let kv_windows = match sp.get("kv_windows").and_then(|v| v.as_array()) {
             Some(list) if !list.is_empty() => {
                 let mut out = Vec::with_capacity(list.len());
@@ -1168,6 +1181,7 @@ impl LlmArtifact {
             kv_off,
             kv_offs,
             kv_windows,
+            kv_windows_declared,
             sm_mask,
             attn_window,
             window_granule,
@@ -1516,15 +1530,37 @@ impl LlmArtifact {
         // masks with `mask_widths`, never a scratchpad `sm_mask`, and an empty `sm_mask` is what
         // makes `kv_windows` fall back to empty at load (see the loader). So a decode with any
         // narrowed geometry can never pair with a prefill that has no way to say so.
+        //
+        // This used to skip every geometry decode itself does not narrow (`capacity >=
+        // self.max_seq`), on the theory that only decode-side narrowing needs checking. KV_ALLOC
+        // narrows from PREFILL's side instead -- prefill's own window (`max_seq`) is narrower than
+        // this geometry's shared capacity while decode's stays flat (`capacity == self.max_seq`) --
+        // so that skip let exactly that pairing through unvalidated: neither this loop (skipped) nor
+        // the flat `dims.kv_block` check above (equal on both sides by construction) ever compared
+        // the one number that differs.
+        //
+        // Checking every geometry unconditionally is NOT the fix: `a_non_circular_multi_geometry_
+        // pair_passes` below is a decode with no narrowed geometry paired with a prefill that
+        // declares NO `kv_windows` at all (the flat, pre-per-geometry shape `dims.kv_block` alone
+        // already covers), and that pairing is genuinely fine -- prefill says nothing about this
+        // head_dim, not something WRONG about it. The distinction the old skip collapsed: "prefill
+        // is silent about this geometry" (fine when decode does not narrow it either) is not the
+        // same as "prefill DECLARES a capacity for this geometry and it disagrees" (never fine,
+        // whichever side narrows). So key on presence, not on decode's own narrowing.
         for &(_, head_dim, capacity, _, _, _) in &self.kv_windows {
-            if capacity >= self.max_seq {
-                continue;
-            }
-            let matched = prefill
-                .kv_windows
-                .iter()
-                .any(|&(_, hd, cap, _, _, _)| hd == head_dim && cap == capacity);
-            if matched {
+            let decode_narrows = capacity < self.max_seq;
+            // `kv_windows_declared` gates this, not just a lookup on `prefill.kv_windows`: when
+            // prefill's generator declared nothing, the Vec is the LOADER's own fallback synthesis
+            // (capacity = prefill's own max_seq), never a statement prefill made about this shared
+            // geometry -- see `kv_windows_declared`'s own doc comment.
+            let prefill_entry = prefill.kv_windows_declared
+                .then(|| prefill.kv_windows.iter().find(|&&(_, hd, _, _, _, _)| hd == head_dim))
+                .flatten();
+            let ok = match prefill_entry {
+                Some(&(_, _, cap, ..)) => cap == capacity,
+                None => !decode_narrows,
+            };
+            if ok {
                 continue;
             }
             // Illustrative, not the gate above: kv head 1's own element offset under prefill's flat
@@ -1542,13 +1578,24 @@ impl LlmArtifact {
                 .min_by_key(|&(_, len)| len)
                 .map(|(name, len)| format!(" -- `{name}` (declared len {len} B) is that buffer"))
                 .unwrap_or_default();
+            let narrowing = if decode_narrows { "circular" } else { "flat" };
+            let prefill_side = match prefill_entry {
+                Some(&(_, _, cap, ..)) => format!(
+                    "but prefill declares capacity={cap} for the same head_dim -- narrowed only \
+                     by prefill's own KV_ALLOC"
+                ),
+                None => format!(
+                    "but prefill declares no matching kv_windows entry -- it applies its one flat \
+                     dims.kv_block={} to every geometry",
+                    prefill.kv_block
+                ),
+            };
             return Err(EngineError::Load(format!(
                 "prefill/decode disagree on KV geometry: decode's head_dim={head_dim} geometry is \
-                 circular at capacity={capacity} (dims.S={}), but prefill declares no matching \
-                 kv_windows entry -- it applies its one flat dims.kv_block={} to every geometry, so \
-                 kv head 1 alone lands at byte offset {head1_off}, already past a buffer sized for \
+                 {narrowing} at capacity={capacity} (dims.S={}), {prefill_side}, so kv head 1 \
+                 alone lands at byte offset {head1_off}, already past a buffer sized for \
                  {capacity} positions{named}",
-                self.max_seq, prefill.kv_block
+                self.max_seq
             )));
         }
         // The model constants prefill may inherit rather than declare. Where it DOES declare one,
@@ -2885,6 +2932,57 @@ mod tests {
         let (_d, _p, da, pa) = load_pair(&dec, &pre);
         assert_eq!(pa.kv_windows.len(), 2);
         da.check_prefill_pairing(&pa).expect("prefill states the same capacity for the narrow geometry");
+    }
+
+    #[test]
+    fn a_non_circular_multi_geometry_pair_still_passes_when_prefill_says_nothing() {
+        // Regression pin for the fix below: a decode with no narrowed geometry must still pair with
+        // a prefill that declares no `kv_windows` at all -- "prefill is silent about this geometry"
+        // is not the defect; "prefill states a disagreeing capacity for it" is.
+        let mut dec = gemma4_shaped_decode_meta();
+        dec["scratchpad"]["kv_windows"] = serde_json::json!([
+            {"kv_param": "kv_off", "head_dim": 256, "window": 6912, "mask_param": "sm_mask"},
+            {"kv_param": "kv_off1", "head_dim": 512, "window": 6912, "mask_param": "sm_mask1"},
+        ]);
+        let pre = flat_prefill_meta_for_gemma4(2, 2);
+        let (_d, _p, da, pa) = load_pair(&dec, &pre);
+        assert!(pa.kv_windows.is_empty());
+        da.check_prefill_pairing(&pa).expect("no narrowed geometry, nothing for prefill to miss");
+    }
+
+    #[test]
+    fn a_kv_alloc_prefill_that_reports_its_window_as_the_flat_geometrys_capacity_fails_loud() {
+        // THE defect found 2026-09-19 on the shipped gemma4-12b KV_ALLOC prefill (device-free
+        // census, not re-derived): gen_llm_prefill.py's geom_slots recorded the GLOBAL geometry's
+        // own compiled window (its `--seq`) into the JSON key this check reads as CAPACITY, instead
+        // of the geometry's true allocated capacity (`--kv-alloc`, matching decode's). Confirmed
+        // against the real on-disk prefill_m64_w8192_ka262144_l48_seg4_ring/meta.json, which
+        // declares "window": 8192 for head_dim=512 where its paired decode
+        // (decode_s262144_sckt/meta.json) declares capacity 262144 for the same head_dim -- this is
+        // that shape at the smaller test scale (2048 standing in for 8192, 6912 for 262144).
+        //
+        // Before the `check_prefill_pairing` fix above (dropping the `capacity >= self.max_seq`
+        // skip in favor of presence-keyed matching), this geometry was invisible to the loop --
+        // decode's own capacity for it equals decode's own `max_seq`, so it was always skipped --
+        // and the flat `dims.kv_block` check earlier in this function passes trivially (both
+        // artifacts copy the same scalar). Nothing compared 6912 against 2048.
+        let dec = gemma4_shaped_decode_meta(); // hd=256 circular@1024, hd=512 flat@6912
+        let mut pre = flat_prefill_meta_for_gemma4(2, 2048);
+        pre["scratchpad"]["params"]["sm_mask"] = serde_json::json!({"byte_offset": 4, "kind": "core"});
+        pre["scratchpad"]["params"]["kv_off1"] = serde_json::json!({"byte_offset": 8, "kind": "addr"});
+        pre["scratchpad"]["params"]["sm_mask1"] = serde_json::json!({"byte_offset": 12, "kind": "core"});
+        pre["scratchpad"]["kv_windows"] = serde_json::json!([
+            {"kv_param": "kv_off", "head_dim": 256, "window": 1024, "mask_param": "sm_mask"},
+            // THE BUG: 2048 is prefill's own compiled window (dims.S), not the 6912 decode
+            // actually allocated for this (unnarrowed, flat) geometry.
+            {"kv_param": "kv_off1", "head_dim": 512, "window": 2048, "mask_param": "sm_mask1"},
+        ]);
+        let (_d, _p, da, pa) = load_pair(&dec, &pre);
+        let err = da.check_prefill_pairing(&pa).unwrap_err().to_string();
+        assert!(err.contains("head_dim=512"), "{err}");
+        assert!(err.contains("capacity=6912"), "{err}");
+        assert!(err.contains("flat"), "must say decode does not itself narrow this geometry: {err}");
+        assert!(err.contains("declares capacity=2048"), "must name prefill's disagreeing value: {err}");
     }
 
     #[test]
