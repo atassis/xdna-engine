@@ -469,9 +469,7 @@ BUCKET_SCRATCH_ORDER = os.environ.get("BUCKET_SCRATCH_ORDER", "0") == "1"
 # Pin this build's scratch arena to a REFERENCE decode's own packing order (its meta.json,
 # offset-sorted), so a prefill compiled against that reference still shares one arena with THIS
 # decode (check_prefill_arena_pairing.py) even though this graph's runlist traversal visits
-# buffer names in a different order. Placement only, not the op graph -- same reasoning
-# BUCKET_SCRATCH_ORDER above uses for carrying no sequence_name() suffix. Default unset (empty
-# string): every other build is untouched.
+# buffer names in a different order. Default unset (empty string): every other build is untouched.
 SCRATCH_ORDER_FROM = os.environ.get("SCRATCH_ORDER_FROM", "")
 if SCRATCH_ORDER_FROM and BUCKET_SCRATCH_ORDER:
     raise SystemExit("SCRATCH_ORDER_FROM and BUCKET_SCRATCH_ORDER both want to set scratch_order, "
@@ -479,20 +477,57 @@ if SCRATCH_ORDER_FROM and BUCKET_SCRATCH_ORDER:
                       "pick one")
 
 
-def _reference_scratch_layout(path):
-    """(offset-ordered scratch names WITH gaps filled by synthetic same-sized placeholders,
-    {name: byte length}) from another build's meta.json -- the reference's OWN packing, not
-    re-derived. MEASURED on the served gemma4-12b decode: 641 gaps, 16399872 B total, between
-    named scratch buffers that this file's own calculate_buffer_layout (a plain sequential
-    packer, add_buffers()) cannot explain -- some other alignment this codebase does not expose
-    a rule for. Filling each gap with a same-sized anonymous placeholder reproduces the exact
-    packing regardless of why the gap exists, which is more robust than re-deriving the rule.
-    For SCRATCH_ORDER_FROM."""
+def _load_reference_scratch_entries(path):
+    """(offset, len, name) for every SCRATCH buffer in another build's meta.json, offset-sorted --
+    the one read of that file. sequence_name()'s SCRATCH_ORDER_HASH and
+    _reference_scratch_layout()'s padded order both derive from calling this ONCE (module scope,
+    below), not two independent reads, so a name and the layout it names cannot disagree about
+    what the reference said."""
     import json
     with open(path) as f:
         layout = json.load(f)["layout"]
-    entries = sorted((v["offset"], v["len"], n) for n, v in layout.items()
-                     if v.get("type") == "scratch")
+    return sorted((v["offset"], v["len"], n) for n, v in layout.items()
+                  if v.get("type") == "scratch")
+
+
+# Read once at import (None when unset, so every other build does zero file I/O for this).
+_SCRATCH_ORDER_ENTRIES = (
+    _load_reference_scratch_entries(SCRATCH_ORDER_FROM) if SCRATCH_ORDER_FROM else None
+)
+
+
+def _scratch_order_hash(entries):
+    """8-hex digest of a reference layout's (offset, len, name) list -- SCRATCH_ORDER_FROM's
+    sequence_name() token. It changes the arena offsets the runtime sequence bakes into its own
+    BDs, so two builds differing only in which reference they were pinned to are different ELFs
+    and must not share a build-cache name -- the same hazard BUCKET_SCRATCH_ORDER's own missing
+    suffix already has (not a precedent to omit one here)."""
+    import hashlib
+    h = hashlib.sha256()
+    for off, length, name in entries:
+        h.update(f"{off}:{length}:{name}\n".encode())
+    return h.hexdigest()[:8]
+
+
+SCRATCH_ORDER_HASH = _scratch_order_hash(_SCRATCH_ORDER_ENTRIES) if _SCRATCH_ORDER_ENTRIES else ""
+
+
+def _reference_scratch_layout(entries):
+    """(offset-ordered scratch names WITH gaps filled by synthetic same-sized placeholders,
+    {name: byte length}) from a pre-loaded reference entries list (_load_reference_scratch_entries).
+
+    A reference meta.json's `layout` only lists buffers the graph DECLARES (weights, caches,
+    inputs, outputs) -- rust/npu-engine/src/llm/artifact.rs's check_shared_layout_agrees documents
+    the same gap reading it: "IRON also packs undeclared launch-to-launch intermediates into
+    scratch, and those are invisible here". MEASURED on the served gemma4-12b decode: 641 such
+    invisible spans, 16399872 B total (not unexplained alignment, as an earlier version of this
+    comment guessed). This graph's own copy of those intermediates (g/u/d/a/x1/hn/hf/... --
+    bufsz-only, never in `weights`/`wnames`, so never exported to `layout` either) still gets
+    placed, as "the rest" after this list, so filling each invisible span with a same-sized
+    anonymous placeholder reproduces the reference's exact offsets for every buffer this list DOES
+    name; this graph's own (unused-here) intermediates just cost extra scratch bytes rather than
+    a wrong offset -- harmless, since FusedArena::build_with sizes the shared arena to the max of
+    every bound artifact's scratch_size (rust/npu-engine/src/llm/npu_decode.rs)."""
     ordered, lens, prev_end, pad_i = [], {}, 0, 0
     for off, length, name in entries:
         if off > prev_end:
@@ -951,6 +986,8 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tm
     # of its own, so a plain-prologue build and a residual build of the same flag set collided.
     if G4_W_RESIDUAL:
         parts.append("wres")
+    if SCRATCH_ORDER_HASH:
+        parts.append(f"so{SCRATCH_ORDER_HASH}")
     if ATTN_RUNTIME_EXTENT:
         parts.append("rtext")
     if FUSE_ACT:
@@ -3645,7 +3682,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         if BUCKET_SCRATCH_ORDER:
             _scratch_order_kw = {"scratch_order": list(weights.keys())}
         elif SCRATCH_ORDER_FROM:
-            _ref_order, _ref_lens = _reference_scratch_layout(SCRATCH_ORDER_FROM)
+            _ref_order, _ref_lens = _reference_scratch_layout(_SCRATCH_ORDER_ENTRIES)
             _candidates = set(weights) | set(seg_bufsz)
             # A reference name this graph dropped (e.g. ones_h256, unused on a weightless-covered
             # geometry) gets a same-sized placeholder RESERVATION here -- buffer_sizes-only, no
