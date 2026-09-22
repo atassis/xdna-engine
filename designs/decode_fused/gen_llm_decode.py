@@ -531,6 +531,18 @@ MERGE_WEIGHT_GEMVS = os.environ.get("MERGE_WEIGHT_GEMVS", "0") == "1"
 POINTWISE_MODES = os.environ.get("POINTWISE_MODES", "0") == "1"
 # Back-to-back runs on a merged device share one configure (IRON collapse_configures).
 COLLAPSE_MERGED_CONFIGURES = os.environ.get("COLLAPSE_MERGED_CONFIGURES", "0") == "1"
+# Per-head qk/v norms (today: 32 runs/sliding layer, 18/global, all size=head_dim rows=1) become
+# one run per GAIN GROUP -- q's Hq heads in one call, k's and v's hkv heads each in one call --
+# using RMSNorm's row axis (`size = rows * tile_size`, tile_size unchanged at head_dim) and
+# tiles_rtp so the differing row counts still share one device (IRON merge_devices, same idiom as
+# MERGE_WEIGHT_GEMVS). gemma4-decode-excess-op-removal E1.
+MERGE_QK_NORMS = os.environ.get("MERGE_QK_NORMS", "0") == "1"
+# k (after RoPE) and v (after its norm) write straight into their kc/vc cache slot, relocated by
+# the geometry's own kv_off, instead of a StridedCopy reading them back out of a scratch buffer.
+# Only where the cache write is FLAT (one contiguous span): a geometry with hkv>1 addresses
+# `[Hkv,capacity,HD]` per head, which needs a strided multi-head output neither RoPE nor RMSNorm
+# has -- that shape stays on StridedCopy. gemma4-decode-excess-op-removal E2.
+FUSE_KV_APPEND = os.environ.get("FUSE_KV_APPEND", "0") == "1"
 # Same axis for the attention output projection. Gemma-4's GLOBAL layers have head_dim 512, so
 # o_proj is K=8192 there and needs 2 chunks while its sliding layers at K=4096 need none -- a
 # PER-LAYER split, which this per-spec version does not yet express (it needs q_dim_for(layer),
@@ -664,7 +676,8 @@ def load_weight_buffer(buf, arr):
 
 def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tmv_declined=(),
                   tmv_chunked=(), attn_block_geoms=(), ff_chunks=1, weight_families=0,
-                  pointwise_widths=0, scores_blocks=(), mlp_dp_active=False, mlp_o_active=False):
+                  pointwise_widths=0, scores_blocks=(), mlp_dp_active=False, mlp_o_active=False,
+                  qk_norm_merged=False, direct_kv_append_geoms=()):
     """Name the fused sequence after everything that changes its graph, not just the model.
 
     IRON keys the cached artifact by this name. Every knob below produces a DIFFERENT ELF, so
@@ -804,6 +817,10 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tm
         parts.append("wgm")
     if pointwise_widths:
         parts.append("pwm")
+    if qk_norm_merged:
+        parts.append("qnm")
+    if direct_kv_append_geoms:
+        parts.append("kvd" + "".join(f"_{h}" for h in sorted(direct_kv_append_geoms)))
     if ATTN_RUNTIME_EXTENT:
         parts.append("rtext")
     if FUSE_ACT:
@@ -1800,6 +1817,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # Filled by attn_ops (below) as each geometry is built, then handed to sequence_name -- the
     # SAME value the op was constructed with, not a re-derivation of the gate.
     _scores_blocks = []
+    # Same discipline: which geometries' k/v cache-append moved onto op_rope_k_direct/
+    # op_v_norm_direct (FUSE_KV_APPEND), keyed by head_dim like _attn_block_fused above.
+    _direct_kv_append = []
 
     # HOISTED ABOVE THE UNFUSED ATTENTION OPERATORS, and the move is load-bearing rather than
     # tidy-up. When the fused layer wins, op_rep_k/op_rep_v/op_scores/op_softmax/op_trv/op_ctx are
@@ -2083,6 +2103,20 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         op_qk_norm_b = (RMSNorm(size=hd, num_aie_columns=1, num_channels=1, tile_size=hd,
                                 weighted=True, epsilon=sp.eps, context=ctx)
                         if (sp.qk_norm and SPLIT_QKNORM) else op_qk_norm)
+        # MERGE_QK_NORMS: one run per gain group instead of one per head -- q's Hq heads in one
+        # call (op_qk_norm_q), k's and v's hkv heads each in one call (op_qk_norm_kv, same object,
+        # two runs with different gain/src/dst, same "designs shared by object identity"
+        # convention op_v_norm already used per-head below). Both take tiles_rtp: q and k/v differ
+        # in row count, and without a runtime row count that is two devices instead of one
+        # (rms_norm/op.py's tiles_rtp doc).
+        op_qk_norm_q = op_qk_norm_kv = None
+        if MERGE_QK_NORMS and sp.qk_norm:
+            op_qk_norm_q = RMSNorm(size=Hq * hd, num_aie_columns=1, num_channels=1, tile_size=hd,
+                                   weighted=True, tiles_rtp=True, epsilon=sp.eps, context=ctx)
+            op_qk_norm_kv = (op_qk_norm_q if hkv == Hq else
+                             RMSNorm(size=hkv * hd, num_aie_columns=1, num_channels=1,
+                                     tile_size=hd, weighted=True, tiles_rtp=True,
+                                     epsilon=sp.eps, context=ctx))
         # QKV projection: one GEMV over the concatenated weight, or the three separate ones. op_kv
         # is built in both arms because share_designs pairs Wk with Wv only in the unfused one.
         #
@@ -2128,7 +2162,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # contiguous same-design block instead of two. Bit-identical, not approximately: the
         # weighted path is the same gainless normalise followed by a multiply, and bf16 1.0 is an
         # exact multiplicative identity. Costs one 512 B buffer per geometry, shared by every layer.
-        op_v_norm = op_qk_norm if sp.v_norm else None
+        op_v_norm = ((op_qk_norm_kv if MERGE_QK_NORMS else op_qk_norm) if sp.v_norm else None)
         if sp.v_norm and dp_why is None and attn_block_why[(hd, hkv, has_v)] is not None:
             # Fires only when op_qkv_dp is the arm that actually runs (attn_block_dp declined
             # this geometry). The fused head drains k and v straight into the caches, so `v`
@@ -2156,6 +2190,31 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # circular sliding one's does not. Both are per geometry; emitting `w` here was the same
         # confusion the buffer sizing carried, one layer further out (at the host boundary).
         geom_slots.append((slot, hd, KVA_g, mask_slot, T_g, hkv))
+        # FUSE_KV_APPEND: k's post-RoPE output and v's post-norm output write straight into their
+        # kc/vc cache slot, relocated by this geometry's OWN `slot`, in place of StridedCopy's
+        # separate read-back-and-copy. Only where that write is FLAT (hkv==1): a hkv>1 cache is
+        # `[Hkv,capacity,HD]` per head (see `append_op`'s `output_strides` below), which needs a
+        # strided multi-head output neither RoPE nor RMSNorm has -- see their own op.py doc on
+        # `output_offset_parameter`. Built as SEPARATE objects rather than adding the parameter to
+        # op_rope_k/op_v_norm above: the relocation logic changes the generated device body, so
+        # composing this with MERGE_QK_NORMS's tiles_rtp merge on the same object is a further
+        # step, not attempted here.
+        op_rope_k_direct = op_v_norm_direct = None
+        if FUSE_KV_APPEND and hkv == 1:
+            # kc/vc's real allocation (KVLayout.total_elems at Hkv=1 is KVA_g*hd): get_arg_spec
+            # must declare THIS, not the hkv*hd this op transfers, or calculate_buffer_layout
+            # rejects the two operators sharing kc/vc as disagreeing about its shape.
+            _alloc = KVA_g * hd
+            op_rope_k_direct = RoPE(rows=hkv, cols=hd, angle_rows=1,
+                                    output_offset_parameter=slot, output_alloc_elems=_alloc,
+                                    context=ctx)
+            _direct_kv_append.append(hd)
+            if sp.v_norm:
+                op_v_norm_direct = RMSNorm(size=hd, num_aie_columns=1, num_channels=1,
+                                           tile_size=hd, weighted=True,
+                                           output_offset_parameter=slot,
+                                           output_alloc_elems=_alloc, epsilon=sp.eps,
+                                           context=ctx)
         # The per-head stride comes from the cache's OWN layout, so K and V each write the one
         # they are read through. `KVLayout(S=w, T=w).head_stride` is `w*hd`, the literal this
         # replaces, so every flat geometry is unchanged.
@@ -2269,9 +2328,12 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 v_norm=sp.v_norm, **_quant_kw("qkv", force_header_first=True))
         g = SimpleNamespace(
             hd=hd, hkv=hkv, qd=qd, kvd=kvd, gqa=gqa, kv_slot=slot, o_chunks=o_chunks,
-            op_qk_norm=op_qk_norm, op_qk_norm_b=op_qk_norm_b, op_qkv=op_qkv, op_q=op_q,
+            op_qk_norm=op_qk_norm, op_qk_norm_b=op_qk_norm_b,
+            op_qk_norm_q=op_qk_norm_q, op_qk_norm_kv=op_qk_norm_kv,
+            op_qkv=op_qkv, op_q=op_q,
             op_kv=op_kv, op_o=op_o, op_rope_qk=op_rope_qk, op_qkv_dp=op_qkv_dp,
             op_rope_q=op_rope_q, op_rope_k=op_rope_k, op_sck=op_sck, op_scv=op_scv,
+            op_rope_k_direct=op_rope_k_direct, op_v_norm_direct=op_v_norm_direct,
             op_rep_k=op_rep_k, op_rep_v=op_rep_v, op_scores=op_scores, op_trv=op_trv,
             op_ctx=op_ctx, op_v_norm=op_v_norm, has_v=has_v, kv_parts=kv_parts,
             uses_tmv_ctx=uses_tmv, scores_groups=scores_groups, scores_block=T_k,
@@ -2969,20 +3031,29 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                             ang, p + "kc", p + "vc", p + "cx")]
             else:
                 qk = proj = rope = vnorm = []
-                if sp.qk_norm and g.op_qkv_dp is None:
+                if sp.qk_norm and g.op_qkv_dp is None and MERGE_QK_NORMS:
+                    # One run per gain group: `ref_q`/`ref_k` are already each geometry's whole
+                    # Hq/hkv-head span (op_qkv writes them contiguously), so no per-head slicing.
+                    qk = [(g.op_qk_norm_q, ref_q, p + "n_qn", ref_q),
+                          (g.op_qk_norm_kv, ref_k, p + "n_kn", ref_k)]
+                elif sp.qk_norm and g.op_qkv_dp is None:
                     hq = [f"{qhb}[{qho + h*g.hd*2}:{qho + (h+1)*g.hd*2}]" for h in range(Hq)]
                     hk = [f"{khb}[{kho + h*g.hd*2}:{kho + (h+1)*g.hd*2}]" for h in range(g.hkv)]
                     qk = [*[((g.op_qk_norm if h % 2 == 0 else g.op_qk_norm_b),
                              hq[h], p + "n_qn", hq[h]) for h in range(Hq)],
                           *[((g.op_qk_norm if h % 2 == 0 else g.op_qk_norm_b),
                              hk[h], p + "n_kn", hk[h]) for h in range(g.hkv)]]
+                # FUSE_KV_APPEND: only where the cache write is FLAT (hkv==1, g.op_rope_k_direct
+                # built) -- see its construction site for why hkv>1 is not attempted.
+                direct_kv = FUSE_KV_APPEND and g.op_rope_k_direct is not None
                 if g.op_qkv_dp is None:
                     proj = ([(g.op_qkv, p + "Wqkv", p + "hn", p + "qkv")] if FUSE_QKV_GEMV else
                             [(g.op_q, p + "Wq", p + "hn", ref_q),
                              (g.op_kv, p + "Wk", p + "hn", ref_k),
                              *([(g.op_kv, p + "Wv", p + "hn", ref_v)] if g.has_v else [])])
-                    rope = ([(g.op_rope_qk, ref_qk, ang, ref_qk)] if fuse_rope else
+                    rope = ([(g.op_rope_qk, ref_qk, ang, ref_qk)] if (fuse_rope and not direct_kv) else
                             [(g.op_rope_q, ref_q, ang, ref_q),
+                             (g.op_rope_k_direct, ref_k, ang, p + "kc") if direct_kv else
                              (g.op_rope_k, ref_k, ang, ref_k)])
                     if op_rope_part is not None:
                         # Partial rotary: the first rope_rotary_dim dims of each head, in place.
@@ -2991,6 +3062,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                                 [f"{b}[{o + h * g.hd * 2}:{o + h * g.hd * 2 + rb}]"
                                  for b, o, n in ((qhb, qho, Hq), (khb, kho, g.hkv))
                                  for h in range(n)]]
+                    v_direct = False
                     if g.op_v_norm is not None:
                         # Per kv head over head_dim, NOT rotated -- RoPE is a q/k-only step. Three args:
                         # this is the qk-norm design, so it takes a gain, and `ones` is what makes it
@@ -3003,10 +3075,18 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                         #
                         # ORDER is load-bearing in the second case and free in the first, so it is placed
                         # for the second: BEFORE the qk-norm and RoPE entries, which mutate k in place.
-                        hv = [f"{vhb}[{vho + h*g.hd*2}:{vho + (h+1)*g.hd*2}]" for h in range(g.hkv)]
-                        src = ([f"{khb}[{kho + h*g.hd*2}:{kho + (h+1)*g.hd*2}]" for h in range(g.hkv)]
-                               if not g.has_v else hv)
-                        vnorm = [(g.op_v_norm, a, f"ones_h{g.hd}", b) for a, b in zip(src, hv)]
+                        v_direct = FUSE_KV_APPEND and g.op_v_norm_direct is not None
+                        if v_direct:
+                            vnorm = [(g.op_v_norm_direct, ref_k if not g.has_v else ref_v,
+                                      f"ones_h{g.hd}", p + "vc")]
+                        elif MERGE_QK_NORMS:
+                            vnorm = [(g.op_v_norm, ref_k if not g.has_v else ref_v,
+                                      f"ones_h{g.hd}", ref_v)]
+                        else:
+                            hv = [f"{vhb}[{vho + h*g.hd*2}:{vho + (h+1)*g.hd*2}]" for h in range(g.hkv)]
+                            src = ([f"{khb}[{kho + h*g.hd*2}:{kho + (h+1)*g.hd*2}]" for h in range(g.hkv)]
+                                   if not g.has_v else hv)
+                            vnorm = [(g.op_v_norm, a, f"ones_h{g.hd}", b) for a, b in zip(src, hv)]
                 # The fused head replaces the norm, the projection, every qk-norm and the RoPE with one
                 # design; `hn` lives and dies in L1 instead of round-tripping DDR between four of them.
                 # The fused head absorbs the KV append too: k and v are drained straight into the caches
@@ -3017,7 +3097,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                           ref_q, p + "kc", p + "vc")]
                         if g.op_qkv_dp is not None else
                         [(op_norm, cur, p + "n_in", p + "hn"), *proj, *vnorm, *qk, *rope,
-                         (g.op_sck, ref_k, p + "kc"), (g.op_scv, ref_v, p + "vc")])
+                         *([] if direct_kv else [(g.op_sck, ref_k, p + "kc")]),
+                         *([] if v_direct else [(g.op_scv, ref_v, p + "vc")])])
                 attn_rl = [
                     *head,
                     *([] if GROUPED_K else [(g.op_rep_k, p + "kc", p + "kr")]),
@@ -3183,7 +3264,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         rl, pointwise_widths = pointwise_modes(rl)
         for size_, tile_, modes_ in pointwise_widths:
             print(f"[gen] pointwise width {size_} (tile {tile_}): modes {modes_}")
-    merge = bool(weight_families or pointwise_widths)
+    merge = bool(weight_families or pointwise_widths) or (MERGE_QK_NORMS and sp.qk_norm)
 
     if DECODE_SEGMENTS > NL:
         raise SystemExit(f"DECODE_SEGMENTS={DECODE_SEGMENTS} exceeds the {NL} layers there are to "
@@ -3233,7 +3314,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                             ff_chunks=ff_chunks, weight_families=len(weight_families),
                             pointwise_widths=len(pointwise_widths),
                             scores_blocks=tuple(_scores_blocks),
-                            mlp_dp_active=op_mlp_dp is not None, mlp_o_active=fuse_o)
+                            mlp_dp_active=op_mlp_dp is not None, mlp_o_active=fuse_o,
+                            qk_norm_merged=MERGE_QK_NORMS and sp.qk_norm,
+                            direct_kv_append_geoms=tuple(_direct_kv_append))
         name = _sn if len(cuts) == 1 else f"{_sn}_seg{si}of{len(cuts)}"
         # A rung is THIS runlist with the layer design substituted. Only for an unsplit
         # stack: a rung rewrites one runlist, and a segmented stack has one per segment
