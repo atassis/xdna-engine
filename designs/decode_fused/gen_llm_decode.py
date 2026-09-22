@@ -905,6 +905,12 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tm
     # name -- exactly the collision this function's own docstring warns about.
     if G4_W_PROLOGUE:
         parts.append("wpro")
+    # Same gap, same class: G4_W_RESIDUAL retiles the whole merged family to tsi=2 and deletes
+    # the post-attn-norm/residual-add/pre-ffn-norm chain before gate/up (measured -192 configures
+    # at L=48 against the served baseline, -144 of that beyond G4_W_PROLOGUE alone) with no suffix
+    # of its own, so a plain-prologue build and a residual build of the same flag set collided.
+    if G4_W_RESIDUAL:
+        parts.append("wres")
     if ATTN_RUNTIME_EXTENT:
         parts.append("rtext")
     if FUSE_ACT:
