@@ -39,6 +39,8 @@ struct Meta {
     inputs: Vec<String>,
     weights: Vec<String>,
     weights_from: String,
+    #[serde(default)]
+    cache_buffers: Vec<String>,
     golden: HashMap<String, String>,
     #[serde(default)]
     dims: HashMap<String, serde_json::Value>,
@@ -121,6 +123,12 @@ pub fn run(argv: Vec<String>) {
         let b = read(&dir.join("buffers").join(format!("{n}.bin")));
         assert_eq!(b.len(), len, "{n}: blob {} != layout {len}", b.len());
         arena.write_at(a, off, &b).unwrap();
+    }
+    // Decode ships no `.bin` for its cache buffers (zero-fill by length, not by blob) -- write
+    // the zeros this probe used to get for free by reading them off decode's `weights_from`.
+    for n in &meta.cache_buffers {
+        let (a, off, len) = arena_of(&meta, n);
+        arena.write_at(a, off, &vec![0u8; len]).unwrap();
     }
     arena.sync_to_device().unwrap();
     println!("uploaded {} weights + {} inputs", meta.weights.len(), meta.inputs.len());

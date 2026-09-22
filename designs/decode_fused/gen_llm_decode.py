@@ -3404,6 +3404,11 @@ def main():
                 f"plan ({PRECISION_PLAN.get(_site_of(n_), precision.BF16_SPEC)} at site "
                 f"{_site_of(n_)!r}) is not the format the operator holding this buffer was built "
                 "for -- see precision.py P003.")
+        # A cache buffer's blob is always zero (the host zeroes it at load, never trusts the
+        # disk) -- ship no `.bin` at all rather than 4.63 GB of holes. `layout` still declares
+        # it, so the loader zero-fills by name+length instead of an unfilled scratch buffer.
+        if n_ in cache_names:
+            continue
         write_blob(os.path.join(bdir, f"{n_}.bin"), b)
     if embed_blob != "W_head":
         # Host-only, deliberately not in `wnames`: see the tied-embedding note at its build site.
@@ -3420,7 +3425,10 @@ def main():
         "sequence_name": fused.name,
         "input_size": int(in_sz), "output_size": int(out_sz), "scratch_size": int(scr),
         "layout": {n: {"type": v[0], "offset": int(v[1]), "len": int(v[2])} for n, v in lay.items()},
-        "inputs": inputs, "weights": wnames, "output": "logits",
+        # Cache buffers are excluded here (they carry no blob -- see the write loop above) but
+        # stay in `layout` and `cache_buffers` below, so an old consumer that only reads `weights`
+        # simply uploads fewer names and the loader's own `cache_buffers` pass still zeroes them.
+        "inputs": inputs, "weights": [n for n in wnames if n not in cache_names], "output": "logits",
         # Which blob the HOST gathers embed[token] from. Always bf16 [vocab, d_model]; it is
         # W_head itself unless the lm-head was quantised, in which case W_head is packed and this
         # names the bf16 sidecar. Absent in older artifacts -- consumers default to "W_head".

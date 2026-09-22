@@ -2423,7 +2423,10 @@ def main():
         # `buffers/` dir, because they are a different byte layout from anything decode holds
         # (see weight_gemm's quantized branch). Rust's loader already has a path for exactly this
         # ("a prefill-only weight stays legal", npu_decode.rs) -- it just had no producer before.
-        "weights": dims["shared"] + sorted({e["buf"] for e in dims["quant_pack"]}),
+        # Cache names are excluded too: decode ships no `.bin` for them (they're zero-filled by
+        # length, not read), and `cache_buffers` below is where a consumer looks for them.
+        "weights": [n for n in dims["shared"] if n not in dims["cache_names"]]
+        + sorted({e["buf"] for e in dims["quant_pack"]}),
         "weights_from": (os.path.join(os.path.dirname(os.path.abspath(dec_meta_path)), "buffers")
                          if dec_meta_path else None),
         "cache_buffers": dims["cache_names"],
