@@ -23,7 +23,7 @@ use std::borrow::Cow;
 use std::path::Path;
 use std::rc::Rc;
 
-use npu_xrt::{Arena, Device, ElfResident, FusedArena};
+use npu_xrt::{Device, ElfResident, FusedArena};
 use sha2::{Digest, Sha256};
 
 use crate::api::EngineError;
@@ -685,23 +685,18 @@ impl DecodeStep for NpuDecodeStep {
         !self.artifact.recurrent_buffers.is_empty()
     }
 
-    /// Reads `recurrent_buffers` back after a device sync of the arenas that hold them. The scratch
-    /// sync covers the whole scratch BO (there is no ranged sync); `snapshot_us` measures it.
+    /// Reads `recurrent_buffers` back after a device sync of the scratch arena, where the artifact
+    /// loader requires them to live. The sync covers the whole scratch BO (there is no ranged
+    /// sync); `snapshot_us` measures it.
     fn snapshot_recurrent(&mut self) -> Result<RecurrentSnapshot, EngineError> {
-        let locs: Vec<_> = self.artifact.recurrent_buffers.iter().map(|n| self.artifact.loc(n)).collect();
-        if locs.iter().any(|l| l.arena == Arena::Scratch) {
-            self.arena
-                .sync_scratch_from_device()
-                .map_err(|e| EngineError::Device(format!("sync recurrent state: {e}")))?;
-        }
-        if locs.iter().any(|l| l.arena == Arena::Output) {
-            self.arena
-                .sync_from_device()
-                .map_err(|e| EngineError::Device(format!("sync recurrent state: {e}")))?;
-        }
-        locs.iter()
-            .zip(&self.artifact.recurrent_buffers)
-            .map(|(l, name)| {
+        self.arena
+            .sync_scratch_from_device()
+            .map_err(|e| EngineError::Device(format!("sync recurrent state: {e}")))?;
+        self.artifact
+            .recurrent_buffers
+            .iter()
+            .map(|name| {
+                let l = self.artifact.loc(name);
                 let mut b = vec![0u8; l.len];
                 self.arena
                     .read_at(l.arena, l.off, &mut b)

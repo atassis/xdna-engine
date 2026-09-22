@@ -79,7 +79,7 @@ encoder does not implement.
 | --- | --- | --- |
 | Qwen3-0.6B | Supported | `scenarios/generate-qwen3-0.6b.toml`; `rust/npu-engine/src/llm/npu_decode.rs`'s `NpuDecodeStep` drives a real `ElfResident`/`FusedArena` device dispatch, one fused ELF per token |
 | Gemma 3-270M, Gemma 4-12B | Supported | `scenarios/generate-gemma3-270m.toml`, `scenarios/generate-gemma4-12b.toml`; the same `NpuDecodeStep` dispatch as Qwen3, via `designs/decode_fused/llm_decode_spec.py`'s `GEMMA3_270M`/`GEMMA4_12B` specs |
-| Qwen3.5-4B | Supported (typed decisions) | scenarios/generate-qwen3.5-4b.toml; 24 Gated DeltaNet + 8 gated-attention layers, int4 g32 weights, batched prefill M=256 over decode's arena; serves /v1/systemone and npu decide |
+| Qwen3.5-4B | Supported (typed decisions) | `scenarios/generate-qwen3.5-4b.toml`; 24 Gated DeltaNet + 8 gated-attention layers, int4 g32 weights, batched prefill M=256 over decode's arena; serves `/v1/systemone` and `npu decide` |
 | opt-125m | Host-only | see below |
 
 **opt-125m** (`rust/npu-probes/src/bin/opt125m_decode.rs`) is a greedy-decode host

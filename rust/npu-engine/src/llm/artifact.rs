@@ -444,6 +444,10 @@ impl LlmArtifact {
                 .ok_or_else(|| ctx(format!("layout[{name}] has no numeric `len`")))? as usize;
             layout.insert(name.clone(), BufLoc { arena, off, len });
         }
+        // `snapshot_recurrent` syncs only the scratch arena back from the device.
+        if let Some(n) = recurrent_buffers.iter().find(|n| layout.get(*n).is_some_and(|l| l.arena != Arena::Scratch)) {
+            return Err(ctx(format!("recurrent buffer `{n}` is not in the scratch arena")));
+        }
 
         let dims = meta.get("dims").ok_or_else(|| ctx("missing top-level `dims`".to_string()))?;
         let dim = |k: &str| -> Result<usize, EngineError> {
@@ -1880,6 +1884,13 @@ mod tests {
         write_meta(dir.path(), &meta);
         let err = LlmArtifact::load(dir.path()).unwrap_err().to_string();
         assert!(err.contains("recurrent buffer `S1`"), "{err}");
+
+        meta["layout"]["S0"]["type"] = serde_json::json!("output");
+        meta["output_size"] = serde_json::json!(24);
+        meta["recurrent_buffers"] = serde_json::json!(["S0"]);
+        write_meta(dir.path(), &meta);
+        let err = LlmArtifact::load(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("not in the scratch arena"), "{err}");
     }
 
     /// A prefill's angle table is M rows of the rotary width, which the prefill-role row check

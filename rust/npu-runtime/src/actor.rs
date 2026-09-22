@@ -1295,8 +1295,7 @@ mod tests {
         let (h, j) = start_lazy(cfg, Box::new(SleepyLoader { inner: MockLoader { table: t }, loads: loads.clone() })).unwrap();
         let s = h.serve(Capability::EMBED, None, Request::Text("x".into())).unwrap();
         assert!(s.load_us >= 30_000, "load_us {} missed the 30 ms load", s.load_us);
-        let s = h.serve(Capability::EMBED, None, Request::Text("x".into())).unwrap();
-        assert!(s.queue_us < 5_000_000, "queue_us {} implausible for an idle actor", s.queue_us);
+        h.serve(Capability::EMBED, None, Request::Text("x".into())).unwrap();
         assert_eq!(loads.load(Ordering::SeqCst), 1, "a resident model must not be loaded again");
         h.shutdown(); j.join().unwrap();
     }

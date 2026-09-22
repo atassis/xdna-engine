@@ -2316,7 +2316,9 @@ mod decide_tests {
             self.absorb(tok, pos);
             Ok((0..16).map(|i| ((self.state >> (i * 4)) & 0xf) as f32).collect())
         }
+        /// A positional backend keeps its cache, as the real one does without recurrent buffers.
         fn reset(&mut self) -> Result<CacheState, EngineError> {
+            if !self.recurrent { return Ok(CacheState::Retained); }
             self.state = 0;
             Ok(CacheState::Cleared)
         }
@@ -2467,6 +2469,7 @@ mod decide_tests {
         d.recurrent = false;
         let (_, stats, prefills) = run(d, true, &questions(2), &ids);
         assert_eq!(stats.shared_prefix_tokens, 0);
-        assert!(prefills.iter().all(|&(from, _)| from == 0), "{prefills:?}");
+        let q2_from = batched_resume_point(if reuse_on_batched_prefill() { 600 } else { 0 }, Some(256));
+        assert_eq!(prefills, [(0, 699), (q2_from, 699)], "one prefill per question, no primed prefix");
     }
 }
