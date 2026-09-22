@@ -538,6 +538,25 @@ MERGE_WEIGHT_GEMVS = os.environ.get("MERGE_WEIGHT_GEMVS", "0") == "1"
 POINTWISE_MODES = os.environ.get("POINTWISE_MODES", "0") == "1"
 # Back-to-back runs on a merged device share one configure (IRON collapse_configures).
 COLLAPSE_MERGED_CONFIGURES = os.environ.get("COLLAPSE_MERGED_CONFIGURES", "0") == "1"
+# Fold the pre-Wqkv and pre-lm-head RMSNorm into those GEMVs as a prologue (gemv/design.py's
+# prologue="on"/"off"): the gain rides bf16 on the activation side, never folded into the int4
+# weights. Needs MERGE_WEIGHT_GEMVS -- every member of the merged W family must share the
+# prologue-capable core body (design_key()'s boolean), so this also tags Wg/Wu/Wd "off" even
+# though they never normalize. gemma4-w-prologue-epilogue task, variant B stage 1.
+G4_W_PROLOGUE = os.environ.get("G4_W_PROLOGUE", "0") == "1"
+if G4_W_PROLOGUE and not MERGE_WEIGHT_GEMVS:
+    raise SystemExit("G4_W_PROLOGUE needs MERGE_WEIGHT_GEMVS=1 (it tags the same merged family)")
+if G4_W_PROLOGUE and not FUSE_QKV_GEMV:
+    # The runlist below only rewires the FUSED Wqkv call (proj's FUSE_QKV_GEMV branch) to read
+    # `cur`+gain directly; the split Wq/Wk/Wv branch still expects `hn`, which the un-fused path
+    # would then never compute.
+    raise SystemExit("G4_W_PROLOGUE needs FUSE_QKV_GEMV=1 (only the fused Wqkv call is rewired)")
+
+
+def _w_prologue(mode):
+    """prologue kwarg for a member of the merged W family. {} (GEMV's own "none" default) unless
+    G4_W_PROLOGUE is set, so the flag defaults to today's graph byte for byte."""
+    return {"prologue": mode} if G4_W_PROLOGUE else {}
 # Same axis for the attention output projection. Gemma-4's GLOBAL layers have head_dim 512, so
 # o_proj is K=8192 there and needs 2 chunks while its sliding layers at K=4096 need none -- a
 # PER-LAYER split, which this per-spec version does not yet express (it needs q_dim_for(layer),
@@ -1975,7 +1994,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # Wqkv's own dtype axis. The concatenated [Wq|Wk|Wv] GEMV has its own weight ObjectFifo, so
     # it takes a format independently -- which the fused layer's attention half does NOT, because
     # attn_block_dp streams Wqkv, K and V down one fifo per core (P002/P003 above).
-    op_qkv = gemv(QD + 2 * KVD, D, ctx, **_quant_kw("qkv")) if FUSE_QKV_GEMV else None
+    op_qkv = (gemv(QD + 2 * KVD, D, ctx, **_quant_kw("qkv"), **_w_prologue("on"))
+             if FUSE_QKV_GEMV else None)
     op_q = gemv(QD, D, ctx)
     op_kv = gemv(KVD, D, ctx)
     op_o = None if fuse_o else gemv(D, QD, ctx, **_quant_kw("attn_o"))
@@ -2153,7 +2173,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # GEMV shape and the qkv buffer layout are per-geometry. V is then derived from k rather
         # than projected -- see the runlist, where v_norm reads the k slice.
         kv_parts = 2 if has_v else 1
-        op_qkv = gemv(qd + kv_parts * kvd, D, ctx, **_quant_kw("qkv")) if FUSE_QKV_GEMV else None
+        op_qkv = (gemv(qd + kv_parts * kvd, D, ctx, **_quant_kw("qkv"), **_w_prologue("on"))
+                 if FUSE_QKV_GEMV else None)
         op_q = gemv(qd, D, ctx, **_quant_kw("qkv"))
         op_kv = gemv(kvd, D, ctx, **_quant_kw("qkv"))
         # o_proj, split over K on the same terms as the down projection. Under fuse_o there is no
@@ -2434,9 +2455,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         and not _spec("mlp").quantized
         and _gate_tso % 32 == 0
     )
-    op_gate = gemv(FF, D, ctx, **mlp_quant_kw,
+    op_gate = gemv(FF, D, ctx, **mlp_quant_kw, **_w_prologue("off"),
                    **(dict(epilogue=sp.act) if fuse_act else {}))
-    op_up = gemv(FF, D, ctx, **mlp_quant_kw)
+    op_up = gemv(FF, D, ctx, **mlp_quant_kw, **_w_prologue("off"))
     op_act = None
     op_mlp_dp = None
     if ACT_POLY:
@@ -2532,9 +2553,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         b_single_buffered=GEMV_B_SINGLE)
     if down_chunks > 1:
         assert FF % down_chunks == 0, f"FF={FF} not divisible by {down_chunks} K chunks"
-        op_down = gemv(D, FF // down_chunks, ctx, **mlp_quant_kw)
+        op_down = gemv(D, FF // down_chunks, ctx, **mlp_quant_kw, **_w_prologue("off"))
     else:
-        op_down = gemv(D, FF, ctx, **mlp_quant_kw)
+        op_down = gemv(D, FF, ctx, **mlp_quant_kw, **_w_prologue("off"))
     op_add = ElementwiseAdd(size=D, tile_size=D // COLS, num_aie_columns=COLS, context=ctx)
     # Gated DeltaNet (linear attention) op vocabulary, shared by every such layer. A layer of this
     # kind produces `cx` like attention does, and out_proj takes Wo's slot, so everything from o_proj
@@ -2671,7 +2692,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # W_head weight-stream dtype axis (see QUANT_HEAD_DTYPE above -- READ THE TIED-EMBEDDING NOTE
     # before turning this on).
     head_quant_kw = _quant_kw("head")
-    op_head = gemv(VOCAB, D, ctx, **head_quant_kw)
+    op_head = gemv(VOCAB, D, ctx, **head_quant_kw, **_w_prologue("on"))
 
     weights, bufsz, cache_names, rl = {}, {}, [], []
     recurrent_names = []   # the cache buffers a position mask cannot hide; see npu_decode.rs reset()
@@ -3100,7 +3121,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                           *[((g.op_qk_norm if h % 2 == 0 else g.op_qk_norm_b),
                              hk[h], p + "n_kn", hk[h]) for h in range(g.hkv)]]
                 if g.op_qkv_dp is None:
-                    proj = ([(g.op_qkv, p + "Wqkv", p + "hn", p + "qkv")] if FUSE_QKV_GEMV else
+                    proj = ([(g.op_qkv, p + "Wqkv", cur, p + "n_in", p + "qkv")]
+                            if (FUSE_QKV_GEMV and G4_W_PROLOGUE) else
+                            [(g.op_qkv, p + "Wqkv", p + "hn", p + "qkv")] if FUSE_QKV_GEMV else
                             [(g.op_q, p + "Wq", p + "hn", ref_q),
                              (g.op_kv, p + "Wk", p + "hn", ref_k),
                              *([(g.op_kv, p + "Wv", p + "hn", ref_v)] if g.has_v else [])])
@@ -3136,10 +3159,14 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 # at `kv_off` instead of into buffers a StridedCopy then re-reads and re-writes. The caches
                 # were their only consumer, so the intermediate had no reader -- it existed because the
                 # append was a separate operator. Two runs and one more configure per layer.
+                # G4_W_PROLOGUE folds this op_norm into op_qkv's own prologue (proj, above) -- same
+                # RMSNorm(cur, n_in), computed redundantly per core instead of once on 1 column, in
+                # exchange for deleting the run and the DDR round trip of `hn`.
                 head = ([(g.op_qkv_dp, cur, p + "n_in", p + "Wqkv", p + "n_qn", p + "n_kn", ang,
                           ref_q, p + "kc", p + "vc")]
                         if g.op_qkv_dp is not None else
-                        [(op_norm, cur, p + "n_in", p + "hn"), *proj, *vnorm, *qk, *rope,
+                        [*([] if G4_W_PROLOGUE else [(op_norm, cur, p + "n_in", p + "hn")]),
+                         *proj, *vnorm, *qk, *rope,
                          (g.op_sck, ref_k, p + "kc"), (g.op_scv, ref_v, p + "vc")])
                 attn_rl = [
                     *head,
@@ -3247,10 +3274,16 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         weights["W_head"] = bf16(head_f32).reshape(-1)
     if not scale_in_qnorm:
         weights["attn_scale"] = np.full(Hq * S, sp.attn_scale, BF16)
-    rl += [(op_norm, cur, "n_final", "xf")]
-    if not SPLIT_LM_HEAD:
-        rl += [(op_head, "W_head", "xf", "logits")]
-    bufsz["xf"] = D * 2
+    if G4_W_PROLOGUE and not SPLIT_LM_HEAD:
+        # Folds the final RMSNorm into op_head's own prologue (same mechanism as Wqkv's, above):
+        # deletes this run and, since op_head is a standalone device (no downstream configure
+        # shares it), the configure too.
+        rl += [(op_head, "W_head", cur, "n_final", "logits")]
+    else:
+        rl += [(op_norm, cur, "n_final", "xf")]
+        if not SPLIT_LM_HEAD:
+            rl += [(op_head, "W_head", "xf", "logits")]
+        bufsz["xf"] = D * 2
     bufsz["logits"] = VOCAB * 2
 
     if os.environ.get("DUMP_OPS"):
