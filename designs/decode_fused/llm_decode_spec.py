@@ -271,7 +271,7 @@ L1_RESERVE = 8192     # stack + the allocator's own slack; measured headroom, no
 C_TILE_GRANULE = 8    # tile_size_output must be a multiple of this (16 bytes of bf16); see gemv_tile_output
 
 
-def gemv_tile_output(M, K, cols=8, tsi=None, a_row_bytes=None, n_vec=1):
+def gemv_tile_output(M, K, cols=8, tsi=None, a_row_bytes=None, n_vec=1, b_single_buffered=False):
     """Largest legal `tile_size_output` for a GEMV that also FITS L1.
 
     Two independent constraints, and only the first is checked by the toolchain:
@@ -301,10 +301,19 @@ def gemv_tile_output(M, K, cols=8, tsi=None, a_row_bytes=None, n_vec=1):
     opt-in rather than derived from weight_dtype here because changing it silently would re-tile
     every existing artifact.
 
+    `b_single_buffered`: B is a SECOND stale copy of design.py's own model
+    (`iron.operators.gemv.design.l1_footprint_bytes`), which sizes B's ObjectFifo at depth
+    `n_vec`, not `2*n_vec` -- B is filled once per run and never re-acquired mid-run, so there is
+    nothing to double-buffer. Default False keeps every existing tiling byte-identical; True is
+    the GEMV_B_SINGLE lever (gemma4-w-device-runtime-k-unsplit) that lets Gemma-4-12B's down
+    projection (K=15360, wants 61440 of 57344 B under the doubled model) and global o_proj
+    (K=8192) fit unsplit.
+
     Returns (tile_size_input, tile_size_output).
     """
     a_row_bytes = K * 2 if a_row_bytes is None else a_row_bytes
     per_col = M // cols
+    b_bytes = (1 if b_single_buffered else 2) * n_vec * (K * 2)
     # m_input must shrink too: the A tile is m_input x K, so at K=3072 (the FFN down projection)
     # A+B double-buffered already exceed L1 at m_input=4 and leave the C tile nothing. Search
     # m_input downward and take the first that admits any legal C tile.
@@ -317,8 +326,7 @@ def gemv_tile_output(M, K, cols=8, tsi=None, a_row_bytes=None, n_vec=1):
     for cand_tsi in ([tsi] if tsi is not None else (4, 2, 1)):
         if per_col % cand_tsi:
             continue
-        budget = (L1_BYTES - L1_RESERVE - 2 * n_vec * (cand_tsi * a_row_bytes)
-                  - 2 * n_vec * (K * 2))
+        budget = L1_BYTES - L1_RESERVE - 2 * n_vec * (cand_tsi * a_row_bytes) - b_bytes
         if budget <= 0:
             continue
         cap = budget // (4 * n_vec)        # C is double-buffered, 2 bytes per element
@@ -340,31 +348,43 @@ def gemv_tile_output(M, K, cols=8, tsi=None, a_row_bytes=None, n_vec=1):
                      f"{C_TILE_GRANULE}")
 
 
-def gemv_fits(M, K, cols=8):
+def gemv_fits(M, K, cols=8, a_row_bytes=None, b_single_buffered=False):
     """Does ANY legal (tile_size_input, tile_size_output) exist for this GEMV within L1?
 
     A predicate over gemv_tile_output rather than a second budget calculation -- a duplicated fit
     model is exactly what moving this here was meant to delete.
     """
     try:
-        gemv_tile_output(M, K, cols=cols)
+        gemv_tile_output(M, K, cols=cols, a_row_bytes=a_row_bytes,
+                         b_single_buffered=b_single_buffered)
         return True
     except ValueError:
         return False
 
 
-def k_chunks_for(M, K, cols=8):
+def k_chunks_for(M, K, cols=8, a_row_bytes=None, b_single_buffered=False):
     """Fewest power-of-two chunks of K whose GEMV fits L1. 1 when the shape already fits.
 
-    The B vector is double-buffered at 2*K*2 bytes and is INDEPENDENT of every tiling knob, so a
+    B is double-buffered at 2*K*2 bytes by default and INDEPENDENT of every tiling knob, so a
     large enough K does not fit at ANY (tsi, tso): Gemma-4-12B's down projection needs 61440 B of
     57344 usable before a single weight or output byte is counted. Splitting the reduction over K
     and summing the partials is the fix and needs no new operator. It is NOT free in bf16 -- each
     partial is rounded to bf16 before the sum.
+
+    `b_single_buffered` (GEMV_B_SINGLE) fits B at K*2 instead -- see gemv_tile_output.
+
+    `a_row_bytes`, if given, is the row width in BYTES AT THIS `K` (bf16's `K*2` if None, same
+    default as gemv_tile_output -- every caller here has always left it at that, which overstates
+    a quantized row and over-splits). Scaled by `K_chunk/K` per candidate rather than recomputed
+    from `iron.common.quant`, which this file does not import: a symmetric or affine row's header
+    and payload both scale with K at a fixed group_size (`block_stride_bytes` calls this
+    proportionality load-bearing for swiglu_mlp_dp), so the ratio is exact wherever `K % n == 0`.
     """
     n = 1
     while n <= 64:
-        if K % n == 0 and gemv_fits(M, K // n, cols):
+        chunk_row_bytes = None if a_row_bytes is None else a_row_bytes * (K // n) // K
+        if K % n == 0 and gemv_fits(M, K // n, cols, a_row_bytes=chunk_row_bytes,
+                                    b_single_buffered=b_single_buffered):
             return n
         n *= 2
     raise ValueError(f"GEMV M={M} K={K}: no power-of-two K split up to 64 fits L1")

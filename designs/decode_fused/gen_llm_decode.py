@@ -201,6 +201,13 @@ def _quant_kw(site, force_header_first=False):
     return kw
 
 
+def _k_split_row_bytes(K, quant_kw):
+    """One row's byte width at this K, for k_chunks_for -- same rule as gemv_tiling's, so the
+    chunk-count decision and the tiling decision cannot disagree about what a row costs."""
+    wdt = quant_kw.get("weight_dtype", "bf16")
+    return None if wdt == "bf16" else row_stride_bytes(K, quant_kw["group_size"], wdt)
+
+
 _SITE_OF_SUFFIX = {"Wqkv": "qkv", "Wq": "qkv", "Wk": "qkv", "Wv": "qkv", "Wo": "attn_o",
                    "Wg": "mlp", "Wu": "mlp", "Wd": "mlp", "W_head": "head",
                    "kc": "kv", "vc": "kv"}
@@ -488,6 +495,81 @@ SLIDING_KV_CIRCULAR = os.environ.get("SLIDING_KV_CIRCULAR", "0") == "1"
 # window-sized softmax scratch (sc/sw, Hq*S) sits ahead of them and shifts every later offset:
 # measured, buckets at window 256 and 512 over one allocation disagreed on 304 of 313 offsets.
 BUCKET_SCRATCH_ORDER = os.environ.get("BUCKET_SCRATCH_ORDER", "0") == "1"
+# Pin this build's scratch arena to a REFERENCE decode's own packing order (its meta.json,
+# offset-sorted), so a prefill compiled against that reference still shares one arena with THIS
+# decode (check_prefill_arena_pairing.py) even though this graph's runlist traversal visits
+# buffer names in a different order. Default unset (empty string): every other build is untouched.
+SCRATCH_ORDER_FROM = os.environ.get("SCRATCH_ORDER_FROM", "")
+if SCRATCH_ORDER_FROM and BUCKET_SCRATCH_ORDER:
+    raise SystemExit("SCRATCH_ORDER_FROM and BUCKET_SCRATCH_ORDER both want to set scratch_order, "
+                      "for unrelated reasons (prefill-arena pairing vs window-rung bucketing) -- "
+                      "pick one")
+
+
+def _load_reference_scratch_entries(path):
+    """(offset, len, name) for every SCRATCH buffer in another build's meta.json, offset-sorted --
+    the one read of that file. sequence_name()'s SCRATCH_ORDER_HASH and
+    _reference_scratch_layout()'s padded order both derive from calling this ONCE (module scope,
+    below), not two independent reads, so a name and the layout it names cannot disagree about
+    what the reference said."""
+    import json
+    with open(path) as f:
+        layout = json.load(f)["layout"]
+    return sorted((v["offset"], v["len"], n) for n, v in layout.items()
+                  if v.get("type") == "scratch")
+
+
+# Read once at import (None when unset, so every other build does zero file I/O for this).
+_SCRATCH_ORDER_ENTRIES = (
+    _load_reference_scratch_entries(SCRATCH_ORDER_FROM) if SCRATCH_ORDER_FROM else None
+)
+
+
+def _scratch_order_hash(entries):
+    """8-hex digest of a reference layout's (offset, len, name) list -- SCRATCH_ORDER_FROM's
+    sequence_name() token. It changes the arena offsets the runtime sequence bakes into its own
+    BDs, so two builds differing only in which reference they were pinned to are different ELFs
+    and must not share a build-cache name -- the same hazard BUCKET_SCRATCH_ORDER's own missing
+    suffix already has (not a precedent to omit one here)."""
+    import hashlib
+    h = hashlib.sha256()
+    for off, length, name in entries:
+        h.update(f"{off}:{length}:{name}\n".encode())
+    return h.hexdigest()[:8]
+
+
+SCRATCH_ORDER_HASH = _scratch_order_hash(_SCRATCH_ORDER_ENTRIES) if _SCRATCH_ORDER_ENTRIES else ""
+
+
+def _reference_scratch_layout(entries):
+    """(offset-ordered scratch names WITH gaps filled by synthetic same-sized placeholders,
+    {name: byte length}) from a pre-loaded reference entries list (_load_reference_scratch_entries).
+
+    A reference meta.json's `layout` only lists buffers the graph DECLARES (weights, caches,
+    inputs, outputs) -- rust/npu-engine/src/llm/artifact.rs's check_shared_layout_agrees documents
+    the same gap reading it: "IRON also packs undeclared launch-to-launch intermediates into
+    scratch, and those are invisible here". MEASURED on the served gemma4-12b decode: 641 such
+    invisible spans, 16399872 B total (not unexplained alignment, as an earlier version of this
+    comment guessed). This graph's own copy of those intermediates (g/u/d/a/x1/hn/hf/... --
+    bufsz-only, never in `weights`/`wnames`, so never exported to `layout` either) still gets
+    placed, as "the rest" after this list, so filling each invisible span with a same-sized
+    anonymous placeholder reproduces the reference's exact offsets for every buffer this list DOES
+    name; this graph's own (unused-here) intermediates just cost extra scratch bytes rather than
+    a wrong offset -- harmless, since FusedArena::build_with sizes the shared arena to the max of
+    every bound artifact's scratch_size (rust/npu-engine/src/llm/npu_decode.rs)."""
+    ordered, lens, prev_end, pad_i = [], {}, 0, 0
+    for off, length, name in entries:
+        if off > prev_end:
+            pad = f"__scratch_order_pad{pad_i}"
+            pad_i += 1
+            ordered.append(pad)
+            lens[pad] = off - prev_end
+        ordered.append(name)
+        lens[name] = length
+        prev_end = max(prev_end, off + length)
+    return ordered, lens
+
+
 # Weight tile ROWS for the fused MLP. Trades against WEIGHT_DEPTH at constant L1.
 MLP_TILE_ROWS = int(os.environ.get("MLP_TILE_ROWS", "0"))
 # Row-parallel down: each core keeps only its own FF slice of `gh` and the partials are
@@ -560,11 +642,55 @@ MERGE_WEIGHT_GEMVS = os.environ.get("MERGE_WEIGHT_GEMVS", "0") == "1"
 POINTWISE_MODES = os.environ.get("POINTWISE_MODES", "0") == "1"
 # Back-to-back runs on a merged device share one configure (IRON collapse_configures).
 COLLAPSE_MERGED_CONFIGURES = os.environ.get("COLLAPSE_MERGED_CONFIGURES", "0") == "1"
+# Fold the pre-Wqkv and pre-lm-head RMSNorm into those GEMVs as a prologue (gemv/design.py's
+# prologue="on"/"off"): the gain rides bf16 on the activation side, never folded into the int4
+# weights. Needs MERGE_WEIGHT_GEMVS -- every member of the merged W family must share the
+# prologue-capable core body (design_key()'s boolean), so this also tags Wg/Wu/Wd "off" even
+# though they never normalize. gemma4-w-prologue-epilogue task, variant B stage 1.
+G4_W_PROLOGUE = os.environ.get("G4_W_PROLOGUE", "0") == "1"
+if G4_W_PROLOGUE and not MERGE_WEIGHT_GEMVS:
+    raise SystemExit("G4_W_PROLOGUE needs MERGE_WEIGHT_GEMVS=1 (it tags the same merged family)")
+if G4_W_PROLOGUE and not FUSE_QKV_GEMV:
+    # The runlist below only rewires the FUSED Wqkv call (proj's FUSE_QKV_GEMV branch) to read
+    # `cur`+gain directly; the split Wq/Wk/Wv branch still expects `hn`, which the un-fused path
+    # would then never compute.
+    raise SystemExit("G4_W_PROLOGUE needs FUSE_QKV_GEMV=1 (only the fused Wqkv call is rewired)")
+# Folds post-attn-norm + the first residual add + pre-ffn-norm into the gate/up matvec's own
+# prologue (gemv/design.py's prologue="residual"): x1 = x + gain_a*a/rms(a); h = gain_b*x1/rms(x1).
+# One core (column 0) additionally exports x1 -- needed by the layer's SECOND residual add, which
+# this stage does not touch. Superset of the plain prenorm capability, so EVERY member of the
+# merged family (Wqkv, lm-head, gate, up, down) must compile with prologue_capability="residual"
+# once this is on, not just gate/up -- design_key()'s capability, not the mode, is what groups
+# them. gemma4-w-prologue-epilogue, variant B stage 2 (before gate/up only; the layer-end form
+# -- x_next = s*(x1 + gain_c*d/rms(d)) -- is a separate, unbuilt fusion on Wd's OUTPUT, not this
+# GEMV's own B-side prologue, and needs stage 3's quantized-epilogue infrastructure first).
+G4_W_RESIDUAL = os.environ.get("G4_W_RESIDUAL", "0") == "1"
+if G4_W_RESIDUAL and not G4_W_PROLOGUE:
+    raise SystemExit("G4_W_RESIDUAL needs G4_W_PROLOGUE=1 (residual capability supersedes prenorm)")
+
+
+def _w_prologue(mode):
+    """prologue kwarg for a member of the merged W family. {} (GEMV's own "none" default) unless
+    G4_W_PROLOGUE is set, so the flag defaults to today's graph byte for byte. Once G4_W_RESIDUAL
+    is also set, every member (not just gate/up) compiles the wider "residual" capability."""
+    if not G4_W_PROLOGUE:
+        return {}
+    kw = {"prologue": mode}
+    if G4_W_RESIDUAL:
+        kw["prologue_capability"] = "residual"
+    return kw
 # Same axis for the attention output projection. Gemma-4's GLOBAL layers have head_dim 512, so
 # o_proj is K=8192 there and needs 2 chunks while its sliding layers at K=4096 need none -- a
 # PER-LAYER split, which this per-spec version does not yet express (it needs q_dim_for(layer),
 # a Gemma-4 spec axis). What is here covers every spec whose q_dim is uniform.
 FORCE_O_SPLIT = int(os.environ.get("FORCE_O_SPLIT", "0"))
+# k_chunks_for's own L1 model double-buffers B (2*K*2) and assumes a bf16 A row (K*2) even for a
+# quantized GEMV -- design.py's B ObjectFifo is depth `n_vec` (single-buffered: B is filled once
+# per run and never re-acquired mid-run), and a quantized row is `row_stride_bytes`, narrower than
+# bf16's. Gated because it changes which K-splits exist: gemma4-12b's down projection (K=15360,
+# 4 chunks today) and global o_proj (K=8192, 2 chunks) both fit UNSPLIT once corrected --
+# gemma4-w-device-runtime-k-unsplit.
+GEMV_B_SINGLE = os.environ.get("GEMV_B_SINGLE", "0") == "1"
 
 
 def packed_zero_rows(n_rows, K, group_size, weight_dtype):
@@ -611,6 +737,28 @@ FUSE_DECODE_LAYER = os.environ.get("FUSE_DECODE_LAYER", "1") == "1"
 # which reuses qkv_dp_why/_tmv_declined rather than re-deriving the same rules decode_layer_why
 # already checks. Default OFF: device-free only so far.
 FUSE_ATTN_BLOCK = os.environ.get("FUSE_ATTN_BLOCK", "0") == "1"
+# attn_block_dp MINUS its input RMSNorm and Wqkv matvec (gemma4-weightless-attention-block,
+# variant A_s/A_g). Same per-geometry eligibility as FUSE_ATTN_BLOCK (Hkv==COLS, SCALE_IN_QNORM,
+# GROUPED_K+TMV_CTX, a v_proj) since it is the SAME downstream machinery; the difference is what it
+# replaces in the runlist -- everything from the per-head qk-norm through context, never the input
+# norm or the W device's own Wqkv run, which stay exactly as they are today. Mutually exclusive
+# with FUSE_ATTN_BLOCK per geometry: a geometry FUSE_ATTN_BLOCK already covers keeps that arm.
+# Default OFF: device-free only so far.
+FUSE_ATTN_WEIGHTLESS = os.environ.get("FUSE_ATTN_WEIGHTLESS", "0") == "1"
+# gemma4-weightless-attention-block variant A_g: positions split across the columns instead of
+# one kv head per core (there is only one kv head globally, so there is nothing else to split
+# by). Composes with FUSE_ATTN_WEIGHTLESS -- the two govern DISJOINT geometries (this one only the
+# GLOBAL one, hkv==sp.global_n_kv_heads) and never both cover the same geometry. Replaces the
+# scores GEMV, softmax and context step; the per-head norm, RoPE, v-norm and the K/V StridedCopy
+# append stay exactly as they are today (attn_global_dp/design.py's module docstring says why).
+# Default OFF: device-free only so far.
+FUSE_ATTN_GLOBAL_SPLIT = os.environ.get("FUSE_ATTN_GLOBAL_SPLIT", "0") == "1"
+# head_groups>1 trades L1 for bytes: process Hq/head_groups heads at a time, re-reading this
+# column's whole K/V slice once per group. 1 (default) fits at Gemma-4's shape with room to spare
+# (measured: 63952-64976 B of 65536 depending on GLOBAL_SPLIT_WEIGHT_DEPTH); kept as an escape
+# hatch, not because 1 needed it here.
+GLOBAL_SPLIT_HEAD_GROUPS = int(os.environ.get("GLOBAL_SPLIT_HEAD_GROUPS", "1"))
+GLOBAL_SPLIT_WEIGHT_DEPTH = int(os.environ.get("GLOBAL_SPLIT_WEIGHT_DEPTH", "2"))
 # Thread decode_layer_dp's window_parameter through: the AIE core reads its attention window from
 # a per-dispatch ScratchpadParameter ("attn_window", int32) instead of baking N_KV_CHUNKS into the
 # build. Only takes effect when decode_layer_dp itself is eligible (decode_layer_why is None below)
@@ -654,6 +802,12 @@ ATTN_SPLIT = int(os.environ.get("ATTN_SPLIT", "0"))
 #
 # Needs decode_layer_dp to be eligible (there is no other design here holding a window) and every
 # rung must be < max_seq and satisfy the same divisibility the top window does.
+# RMSNorm's gain multiply, native bf16-pair instead of the emulated f32 vector multiply --
+# rms_norm.cc's RMS_BF16_SCALE (118 -> 22 bundles/32 elem). A precision change (rel-L2 2.317e-3
+# against the f32 form's 1.664e-3), so default OFF; gate on device parity, not on rel-L2.
+# kb/the-norm-kernels-pay-an-emulated-f32-vector-multiply.
+RMS_BF16_SCALE = os.environ.get("RMS_BF16_SCALE", "0") == "1"
+
 WINDOW_RUNGS = tuple(
     int(w) for w in os.environ.get("WINDOW_RUNGS", "").replace(" ", "").split(",") if w
 )
@@ -692,8 +846,9 @@ def load_weight_buffer(buf, arr):
 
 
 def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tmv_declined=(),
-                  tmv_chunked=(), attn_block_geoms=(), ff_chunks=1, weight_families=0,
-                  pointwise_widths=0, scores_blocks=(), mlp_dp_active=False, mlp_o_active=False):
+                  tmv_chunked=(), attn_block_geoms=(), attn_weightless_geoms=(),
+                  attn_global_geoms=(), ff_chunks=1, weight_families=0, pointwise_widths=0,
+                  scores_blocks=(), mlp_dp_active=False, mlp_o_active=False):
     """Name the fused sequence after everything that changes its graph, not just the model.
 
     IRON keys the cached artifact by this name. Every knob below produces a DIFFERENT ELF, so
@@ -812,6 +967,19 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tm
     # attn_block_why. Empty when no geometry qualifies, so an on-but-inert flag keeps the name.
     if attn_block_geoms:
         parts.append("ab" + "".join(f"_{h}" for h in sorted(attn_block_geoms)))
+    # attn_block_dp_weightless -- same reasoning as attn_block_geoms above, its sibling arm. "aw"
+    # never collides with "ab": a geometry sits in at most one of the two lists (mutually
+    # exclusive per attn_weightless_why).
+    if attn_weightless_geoms:
+        parts.append("aw" + "".join(f"_{h}" for h in sorted(attn_weightless_geoms)))
+    # attn_global_dp -- same reasoning, its sibling arm for the GLOBAL geometry. "ags" cannot
+    # collide with "ab"/"aw": the three cover disjoint geometries by construction.
+    if attn_global_geoms:
+        parts.append("ags" + "".join(f"_{h}" for h in sorted(attn_global_geoms)))
+        if GLOBAL_SPLIT_HEAD_GROUPS != 1:
+            parts.append(f"hg{GLOBAL_SPLIT_HEAD_GROUPS}")
+        if GLOBAL_SPLIT_WEIGHT_DEPTH != 2:
+            parts.append(f"gwd{GLOBAL_SPLIT_WEIGHT_DEPTH}")
     # The window override changes the graph (rpc, the KV ring, every sliding design's max_seq),
     # so it has to reach the name or two arms share one cached artifact -- this function's own
     # docstring is about exactly that failure. Experiment knob; absent on every shipped arm.
@@ -837,10 +1005,31 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tm
         parts.append("wgm")
     if pointwise_widths:
         parts.append("pwm")
+    if GEMV_B_SINGLE:
+        parts.append("bsingle")
+    # Missing entirely until now: G4_W_PROLOGUE drops the standalone pre-Wqkv/pre-lm-head
+    # RMSNorm run (measured -48 configures/-49 runs at L=48, same recipe) without changing any
+    # other suffix here, so an on and an off build of the same flag set shared this function's
+    # name -- exactly the collision this function's own docstring warns about.
+    if G4_W_PROLOGUE:
+        parts.append("wpro")
+    # Same gap, same class: G4_W_RESIDUAL retiles the whole merged family to tsi=2 and deletes
+    # the post-attn-norm/residual-add/pre-ffn-norm chain before gate/up (measured -192 configures
+    # at L=48 against the served baseline, -144 of that beyond G4_W_PROLOGUE alone) with no suffix
+    # of its own, so a plain-prologue build and a residual build of the same flag set collided.
+    if G4_W_RESIDUAL:
+        parts.append("wres")
+    if SCRATCH_ORDER_HASH:
+        parts.append(f"so{SCRATCH_ORDER_HASH}")
     if ATTN_RUNTIME_EXTENT:
         parts.append("rtext")
     if FUSE_ACT:
         parts.append("fuseact")
+    # Same predicate every RMSNorm(...) call site reads (RMS_BF16_SCALE), not re-derived: a
+    # kernel-object-only difference would let a cached bf16_scale=False .mlir/.o satisfy a
+    # bf16_scale=True request. See RMSNorm.bf16_scale (iron/operators/rms_norm/op.py).
+    if RMS_BF16_SCALE:
+        parts.append("rmsbf16")
     # Flat, not nested under decode_layer_active: _trace.py wires into every design.py this file
     # can build, fused or not, so the suffix must apply on both paths.
     if IRON_TRACE_SIZE > 0:
@@ -1340,7 +1529,8 @@ def gemv_tiling(M, K, **kw):
     n_vec = group_reuse_n_vec(M, COLS, kw.get("num_batches", 1), kw.get("batch_group", 1),
                               K if wdt == "bf16" else a_row_bytes,
                               kw.get("alloc_M"), kw.get("block_size"))
-    tsi, tso = gemv_tile_output(M, K, a_row_bytes=a_row_bytes, n_vec=n_vec)
+    tsi, tso = gemv_tile_output(M, K, a_row_bytes=a_row_bytes, n_vec=n_vec,
+                                b_single_buffered=GEMV_B_SINGLE)
     if kw.get("layout") == "row_group_planar":
         # The free search picks tsi for the LARGEST legal C tile, which can be SMALLER than the
         # row_group needs -- a planar block cannot be cut, so tsi must be a MULTIPLE of it
@@ -1355,7 +1545,8 @@ def gemv_tiling(M, K, **kw):
                               vec_size=widest_chunk(kw["group_size"], wdt),
                               scale_dtype=_BUILD_STATE["scale_dtype"])
         if tsi % rg:
-            tsi, tso = gemv_tile_output(M, K, a_row_bytes=a_row_bytes, tsi=rg, n_vec=n_vec)
+            tsi, tso = gemv_tile_output(M, K, a_row_bytes=a_row_bytes, tsi=rg, n_vec=n_vec,
+                                        b_single_buffered=GEMV_B_SINGLE)
     return tsi, tso
 
 
@@ -1734,7 +1925,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # luck: the sizes happened to disagree. Had D//4 divided evenly into the dumped weight it would
     # have run and been quietly wrong.
     op_norm = RMSNorm(size=D, num_aie_columns=1, num_channels=1, tile_size=D,
-                      weighted=True, epsilon=sp.eps, context=ctx)
+                      weighted=True, epsilon=sp.eps, bf16_scale=RMS_BF16_SCALE, context=ctx)
     # Wo weight-stream dtype axis (see QUANT_ATTN_DTYPE above). bf16 (default) is byte-for-byte the
     # pre-existing path.
     attn_quant_kw = _quant_kw("attn_o")
@@ -1830,6 +2021,52 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # head_dims that actually qualify, for sequence_name()'s suffix -- computed once here, same
     # discipline as _tmv_declined/_tmv_chunked above, rather than re-derived at the call site.
     _attn_block_fused = tuple(sorted(g[0] for g in geoms if attn_block_why[g] is None))
+
+    # attn_block_dp_weightless: the SAME downstream shape as attn_block_dp (it is that design
+    # minus the input norm and Wqkv), so the SAME per-geometry clauses, gated on the sibling flag.
+    # A geometry attn_block_dp already covers keeps that arm -- the two are not stacked.
+    def _attn_weightless_why(g):
+        hd, hkv, has_v = g
+        return ("FUSE_ATTN_WEIGHTLESS=0" if not FUSE_ATTN_WEIGHTLESS else
+                "attn_block_dp already covers this geometry" if attn_block_why[g] is None else
+                qkv_shape_why[g] if qkv_shape_why[g] else
+                f"needs Hkv ({hkv}) == COLS ({COLS})" if hkv != COLS else
+                "this geometry has no v_proj" if not has_v else
+                "needs SCALE_IN_QNORM=1 (no separate scale stage)"
+                if not (SCALE_IN_QNORM and sp.qk_norm) else
+                "needs GQA_GROUPED_K=1 and TMV_CTX=1 (computes exactly that variant internally)"
+                if not (GROUPED_K and TMV_CTX and hd not in _tmv_declined) else
+                "needs v_norm=True (this design has no un-normed passthrough for v)"
+                if not sp.v_norm
+                else None)
+
+    attn_weightless_why = {g: _attn_weightless_why(g) for g in geoms}
+    _attn_weightless_fused = tuple(sorted(g[0] for g in geoms if attn_weightless_why[g] is None))
+
+    # attn_global_dp (A_g): the GLOBAL geometry only (identified the same way attn_ops does --
+    # matching spec.global_head_dim/global_n_kv_heads, not an explicit per-geometry flag). None of
+    # attn_weightless_why's clauses apply (no Hkv==COLS rule -- A_g's whole point is that Hkv=1
+    # does NOT equal COLS; no SCALE_IN_QNORM/GROUPED_K/TMV_CTX opinion, since A_g computes scores
+    # and context itself and never constructs op_scale/op_rep_k/op_ctx for a geometry it covers).
+    #
+    # NOT qkv_shape_why[g] -- that predicate is qkv_dp_reason's, i.e. qkv_head_dp/attn_block_dp's
+    # OWN rule ("cur/n_in ride an HD-wide misc channel, so d_model must be a whole number of
+    # head_dim"), read off THEIR __post_init__ (K014: ask the operator, don't restate its rule).
+    # A_g has no misc-broadcast D-wide channel at all -- it never touches `cur`/`n_in` -- so that
+    # rule does not apply to it. The real precondition is just FUSE_QKV_GEMV itself, which is what
+    # makes `ref_q` (a slice of the concatenated qkv buffer) exist for the runlist to pass in.
+    def _attn_global_why(g):
+        hd, hkv, has_v = g
+        is_global_geom = hd == sp.global_head_dim and hkv == sp.global_n_kv_heads
+        return ("FUSE_ATTN_GLOBAL_SPLIT=0" if not FUSE_ATTN_GLOBAL_SPLIT else
+                f"not the global geometry (global is head_dim={sp.global_head_dim}, "
+                f"kv_heads={sp.global_n_kv_heads})" if not is_global_geom else
+                "needs FUSE_QKV_GEMV=1 for the concatenated qkv buffer ref_q slices"
+                if not FUSE_QKV_GEMV else
+                None)
+
+    attn_global_why = {g: _attn_global_why(g) for g in geoms}
+    _attn_global_fused = tuple(sorted(g[0] for g in geoms if attn_global_why[g] is None))
     # Filled by attn_ops (below) as each geometry is built, then handed to sequence_name -- the
     # SAME value the op was constructed with, not a re-derivation of the gate.
     _scores_blocks = []
@@ -1908,6 +2145,14 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         why = attn_block_why[g]
         tag = "" if len(geoms) == 1 else f" [head_dim={g[0]}, kv_heads={g[1]}]"
         print(f"[gen] fused arm attn_block_dp{tag}: {'OFF -- ' + why if why else 'on'}")
+    for g in geoms:
+        why = attn_weightless_why[g]
+        tag = "" if len(geoms) == 1 else f" [head_dim={g[0]}, kv_heads={g[1]}]"
+        print(f"[gen] fused arm attn_block_dp_weightless{tag}: {'OFF -- ' + why if why else 'on'}")
+    for g in geoms:
+        why = attn_global_why[g]
+        tag = "" if len(geoms) == 1 else f" [head_dim={g[0]}, kv_heads={g[1]}]"
+        print(f"[gen] fused arm attn_global_dp{tag}: {'OFF -- ' + why if why else 'on'}")
     print(f"[gen] fused arm swiglu_mlp_dp: {'OFF -- ' + mlp_dp_why if mlp_dp_why else 'on'}")
     if fuse_o:
         if _spec("attn_o") != _spec("mlp"):
@@ -1951,7 +2196,11 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # Wqkv's own dtype axis. The concatenated [Wq|Wk|Wv] GEMV has its own weight ObjectFifo, so
     # it takes a format independently -- which the fused layer's attention half does NOT, because
     # attn_block_dp streams Wqkv, K and V down one fifo per core (P002/P003 above).
-    op_qkv = gemv(QD + 2 * KVD, D, ctx, **_quant_kw("qkv")) if FUSE_QKV_GEMV else None
+    # prologue="on" unconditionally: under G4_W_PROLOGUE every runlist branch that calls op_qkv
+    # (vanilla and the attn_weightless branch below) now feeds it raw `cur`+gain, so every
+    # instance needs the same 4-buffer arg spec. See attn_rl below for the weightless branch.
+    op_qkv = (gemv(QD + 2 * KVD, D, ctx, **_quant_kw("qkv"), **_w_prologue("on"))
+             if FUSE_QKV_GEMV else None)
     op_q = gemv(QD, D, ctx)
     op_kv = gemv(KVD, D, ctx)
     op_o = None if fuse_o else gemv(D, QD, ctx, **_quant_kw("attn_o"))
@@ -2112,9 +2361,11 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         rtp_extent = {"vector_size_parameter": mask_slot} if ATTN_RUNTIME_EXTENT else {}
         dp_why = qkv_dp_why[(hd, hkv, has_v)]
         op_qk_norm = RMSNorm(size=hd, num_aie_columns=1, num_channels=1, tile_size=hd,
-                             weighted=True, epsilon=sp.eps, context=ctx) if sp.qk_norm else None
+                             weighted=True, epsilon=sp.eps, bf16_scale=RMS_BF16_SCALE,
+                             context=ctx) if sp.qk_norm else None
         op_qk_norm_b = (RMSNorm(size=hd, num_aie_columns=1, num_channels=1, tile_size=hd,
-                                weighted=True, epsilon=sp.eps, context=ctx)
+                                weighted=True, epsilon=sp.eps, bf16_scale=RMS_BF16_SCALE,
+                                context=ctx)
                         if (sp.qk_norm and SPLIT_QKNORM) else op_qk_norm)
         # Which of the two instances head `i` (q heads 0..Hq-1, then k heads Hq..Hq+Hkv-1) runs on.
         # Off, both names are one object and every head returns it, so there is one block.
@@ -2133,14 +2384,20 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # GEMV shape and the qkv buffer layout are per-geometry. V is then derived from k rather
         # than projected -- see the runlist, where v_norm reads the k slice.
         kv_parts = 2 if has_v else 1
-        op_qkv = gemv(qd + kv_parts * kvd, D, ctx, **_quant_kw("qkv")) if FUSE_QKV_GEMV else None
+        # See the len(geoms)==1 op_qkv above: "on" unconditionally, every op_qkv-calling branch
+        # (including the attn_weightless one below) now feeds it raw `cur`+gain under G4_W_PROLOGUE.
+        op_qkv = (gemv(qd + kv_parts * kvd, D, ctx, **_quant_kw("qkv"), **_w_prologue("on"))
+                 if FUSE_QKV_GEMV else None)
         op_q = gemv(qd, D, ctx, **_quant_kw("qkv"))
         op_kv = gemv(kvd, D, ctx, **_quant_kw("qkv"))
         # o_proj, split over K on the same terms as the down projection. Under fuse_o there is no
         # standalone op_o at all -- Wo rides the MLP design's weight channel -- so the split is
         # moot. k_chunks_for reads q_dim, so the chunk COUNT is per-geometry too, and it reaches
         # the weight loop through this namespace rather than as a build-wide constant.
-        o_chunks = 1 if fuse_o else (FORCE_O_SPLIT or k_chunks_for(D, qd, COLS))
+        o_chunks = 1 if fuse_o else (FORCE_O_SPLIT or k_chunks_for(
+            D, qd, COLS,
+            a_row_bytes=_k_split_row_bytes(qd, _quant_kw("attn_o")) if GEMV_B_SINGLE else None,
+            b_single_buffered=GEMV_B_SINGLE))
         op_o = None if fuse_o else gemv(D, qd // o_chunks, ctx, **_quant_kw("attn_o"))
         op_rope_qk = RoPE(rows=Hq + hkv, cols=hd, angle_rows=1, context=ctx) if fuse_rope else None
         op_qkv_dp = None
@@ -2304,6 +2561,33 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 wqkv_head_major=True, kv_offset_parameter=slot, mask_parameter=mask_slot,
                 kv_alloc=None if KVA_g == w else KVA_g, kv_block_size=None if T_g == w else T_g,
                 v_norm=sp.v_norm, **_quant_kw("qkv", force_header_first=True))
+        # attn_block_dp_weightless: same memoization trap, same slot names. Never both -- a
+        # geometry attn_block_dp already covers keeps that arm (attn_weightless_why says so).
+        op_attn_weightless = None
+        if attn_weightless_why[(hd, hkv, has_v)] is None:
+            from iron.operators.attn_block_dp.op import AttnBlockDataParallel as _ABWL
+            op_attn_weightless = _ABWL(
+                D=D, HD=hd, Hq=Hq, Hkv=hkv, max_seq=w, num_aie_columns=hkv, epsilon=sp.eps,
+                context=ctx, weight_depth=WEIGHT_DEPTH,
+                kv_offset_parameter=slot, mask_parameter=mask_slot,
+                kv_alloc=None if KVA_g == w else KVA_g, kv_block_size=None if T_g == w else T_g,
+                v_norm=True, weightless=True)
+        # attn_global_dp (A_g): the position-split global block. Flat cache only (T_g==KVA_g) --
+        # design.py's own module docstring names this as a scope narrowing, not a bug.
+        op_attn_global_worker = op_attn_global_merge = None
+        if attn_global_why[(hd, hkv, has_v)] is None:
+            if T_g != KVA_g:
+                raise NotImplementedError(
+                    f"attn_global_dp only supports a flat KV cache (T=={KVA_g}); this geometry "
+                    f"is blocked at T={T_g}. Set FUSE_ATTN_GLOBAL_SPLIT=0 for it, or extend "
+                    f"attn_global_dp/design.py for blocked capacity."
+                )
+            from iron.operators.attn_global_dp.op import AttnGlobalWorker, AttnGlobalMerge
+            op_attn_global_worker = AttnGlobalWorker(
+                HD=hd, Hq=Hq, S=w, num_aie_columns=COLS, head_groups=GLOBAL_SPLIT_HEAD_GROUPS,
+                weight_depth=GLOBAL_SPLIT_WEIGHT_DEPTH, mask_parameter=mask_slot, context=ctx)
+            op_attn_global_merge = AttnGlobalMerge(
+                HD=hd, Hq=Hq, num_aie_columns=COLS, context=ctx)
         g = SimpleNamespace(
             hd=hd, hkv=hkv, qd=qd, kvd=kvd, gqa=gqa, kv_slot=slot, o_chunks=o_chunks,
             op_qk_norm=op_qk_norm, op_qk_norm_b=op_qk_norm_b, qkn=_qkn, op_qkv=op_qkv, op_q=op_q,
@@ -2313,7 +2597,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             op_ctx=op_ctx, op_v_norm=op_v_norm, has_v=has_v, kv_parts=kv_parts,
             uses_tmv_ctx=uses_tmv, scores_groups=scores_groups, scores_block=T_k,
             op_softmax=op_softmax, op_scale=op_scale, mask_slot=mask_slot, window=w,
-            capacity=KVA_g, kv_block=T_g,
+            capacity=KVA_g, kv_block=T_g, op_attn_weightless=op_attn_weightless,
+            op_attn_global_worker=op_attn_global_worker, op_attn_global_merge=op_attn_global_merge,
             op_attn_block=op_attn_block, circular=(w != S))
         _attn_cache[(hd, hkv, has_v)] = g
         return g
@@ -2401,8 +2686,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         and _gate_tso % 32 == 0
     )
     op_gate = gemv(FF, D, ctx, **mlp_quant_kw,
+                   **_w_prologue("residual" if G4_W_RESIDUAL else "off"),
                    **(dict(epilogue=sp.act) if fuse_act else {}))
-    op_up = gemv(FF, D, ctx, **mlp_quant_kw)
+    op_up = gemv(FF, D, ctx, **mlp_quant_kw, **_w_prologue("residual" if G4_W_RESIDUAL else "off"))
     op_act = None
     op_mlp_dp = None
     if ACT_POLY:
@@ -2492,11 +2778,18 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # Down projection, split over K when it does not fit L1 (or when FORCE_K_SPLIT prices it).
     # One GEMV per chunk at K=FF/n plus n-1 adds; the chunk GEMVs are the SAME op object, so the
     # split costs one design and n runs, not n designs.
-    down_chunks = FORCE_K_SPLIT or k_chunks_for(D, FF, COLS)
+    down_chunks = FORCE_K_SPLIT or k_chunks_for(
+        D, FF, COLS,
+        a_row_bytes=_k_split_row_bytes(FF, mlp_quant_kw) if GEMV_B_SINGLE else None,
+        b_single_buffered=GEMV_B_SINGLE)
     if down_chunks > 1:
         assert FF % down_chunks == 0, f"FF={FF} not divisible by {down_chunks} K chunks"
-        op_down = gemv(D, FF // down_chunks, ctx, **mlp_quant_kw)
+        op_down = gemv(D, FF // down_chunks, ctx, **mlp_quant_kw, **_w_prologue("off"))
     else:
+        # Unsplit (GEMV_B_SINGLE): K=FF, not the merged family's K=D, so unify_weight_gemvs never
+        # groups this with anything and never sets tiles_rtp -- "off" would trip design.py's
+        # "prologue rides tiles_rtp" assert. A singleton gains nothing from prologue-sharing
+        # anyway, so plain "none" (no _w_prologue call) is both correct and inert here.
         op_down = gemv(D, FF, ctx, **mlp_quant_kw)
     op_add = ElementwiseAdd(size=D, tile_size=D // COLS, num_aie_columns=COLS, context=ctx)
     # Gated DeltaNet (linear attention) op vocabulary, shared by every such layer. A layer of this
@@ -2521,13 +2814,14 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         op_mix_act = SiLUAct(size=LCH, num_aie_columns=COLS, tile_size=LCH // COLS, context=ctx)
         # l2norm(x) = rmsnorm at eps/dk, divided by sqrt(dk): the division rides the gain (l2q/l2k).
         op_l2 = RMSNorm(size=LDK, num_aie_columns=1, num_channels=1, tile_size=LDK,
-                        weighted=True, epsilon=sp.eps / LDK, context=ctx)
+                        weighted=True, epsilon=sp.eps / LDK, bf16_scale=RMS_BF16_SCALE,
+                        context=ctx)
         op_gdr = GatedDeltaRule(v_heads=sp.lin_v_heads, k_heads=sp.lin_k_heads, dk=LDK, dv=LDK,
                                 ab_len=LZAB, ab_off=LVD, mixed_len=LTAPS * LCH, q_off=LWIN,
                                 k_off=LWIN + LKD, v_off=LWIN + 2 * LKD, num_aie_columns=COLS,
                                 limbs=GDR_LIMBS or None, context=ctx)
         op_gnorm = RMSNorm(size=LDK, num_aie_columns=1, num_channels=1, tile_size=LDK,
-                           weighted=True, epsilon=sp.eps, context=ctx)
+                           weighted=True, epsilon=sp.eps, bf16_scale=RMS_BF16_SCALE, context=ctx)
         op_z_act = SiLUAct(size=LVD, num_aie_columns=COLS, tile_size=LVD // COLS, context=ctx)
         op_o_mul = ElementwiseMul(size=LVD, tile_size=LVD // COLS, num_aie_columns=COLS, context=ctx)
     if sp.attn_output_gate:
@@ -2634,7 +2928,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # W_head weight-stream dtype axis (see QUANT_HEAD_DTYPE above -- READ THE TIED-EMBEDDING NOTE
     # before turning this on).
     head_quant_kw = _quant_kw("head")
-    op_head = gemv(VOCAB, D, ctx, **head_quant_kw)
+    op_head = gemv(VOCAB, D, ctx, **head_quant_kw, **_w_prologue("on"))
 
     weights, bufsz, cache_names, rl = {}, {}, [], []
     recurrent_names = []   # the cache buffers a position mask cannot hide; see npu_decode.rs reset()
@@ -2642,9 +2936,11 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # The gainless v-norm's gain, one per head_dim and shared by EVERY layer -- a true constant,
         # unlike the per-layer learned gains beside it, so it is registered once here rather than in
         # the layer loop.
-        # Only the geometries the UNFUSED arm carries: attn_block_dp holds the gain as a
-        # compile-time L1 constant, so a fused geometry has no L3 buffer here to look up.
-        for _hd in sorted({gk[0] for gk in geoms if attn_block_why[gk] is not None}):
+        # Only the geometries the UNFUSED arm carries: attn_block_dp and attn_block_dp_weightless
+        # both hold the gain as a compile-time L1 constant, so a fused geometry (either one) has
+        # no L3 buffer here to look up.
+        for _hd in sorted({gk[0] for gk in geoms
+                          if attn_block_why[gk] is not None and attn_weightless_why[gk] is not None}):
             weights[f"ones_h{_hd}"] = np.ones(_hd, dtype=BF16)
 
     def _dequant_wd_from_kchunks(hf):
@@ -2674,6 +2970,36 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                                          n_chunks=down_chunks,
                                          scale_dtype=_BUILD_STATE["scale_dtype"],
                                          layout=op_mlp_dp.layout, row_group=op_mlp_dp.row_group)
+
+    def _dequant_from_probed_kchunks(hf, M, K_total, quant_kw):
+        """[M, K_total] float32 for a Wd/Wo whose dump is chunked at a DIFFERENT count than
+        today's build wants -- GEMV_B_SINGLE unsplitting a K the dump split, or the reverse.
+        Probes the dump's OWN chunk count from disk (however many `.kchunkN` exist) rather than
+        trusting down_chunks/o_chunks, which describe today's build, not the files. Exact:
+        quantize_weight's groups never straddle a chunk boundary (a chunk is a multiple of
+        group_size wide), so a group's q/scale is the same value whichever way the row was cut --
+        only row_group_planar's BLOCK layout depends on the chunk width, so it is re-derived for
+        the chunk K rather than read from an operator built for a different K. None if `hf` has
+        no chunked packed form on disk.
+        """
+        n = 0
+        while f"{hf}.kchunk{n}" in PACKED:
+            n += 1
+        if n == 0:
+            return None
+        if dequantize_weight_chunked is None:
+            raise SystemExit(f"{hf}: kchunk dump needs iron.common.quant.dequantize_weight_chunked "
+                             "(post-6a347dc IRON tree)")
+        dequant_kw = {"scale_dtype": quant_kw.get("scale_dtype", "f32")}
+        if quant_kw.get("layout") == "row_group_planar":
+            dequant_kw["layout"] = "row_group_planar"
+            dequant_kw["row_group"] = derive_row_group(
+                [K_total // n], quant_kw["group_size"], quant_kw["weight_dtype"],
+                vec_size=widest_chunk(quant_kw["group_size"], quant_kw["weight_dtype"]),
+                scale_dtype=quant_kw.get("scale_dtype", "f32"))
+        packed = np.concatenate([np.asarray(npy_raw(f"{hf}.kchunk{i}")) for i in range(n)])
+        return dequantize_weight_chunked(packed, M, K_total, quant_kw["group_size"],
+                                         quant_kw["weight_dtype"], n_chunks=n, **dequant_kw)
 
     def _pack_wd_row_parallel(hf, n_chunks):
         """row_parallel_down's Wd: ONE buffer of `n_chunks` independently-quantized column-shard
@@ -2813,9 +3139,14 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                         _spec("mlp").group_size, _spec("mlp").dtype)])
                 weights[p + key] = wp
                 continue
-            w = (_dequant_wd_from_kchunks(hf)
-                 if key == "Wd" and mlp_dp_why is None and f"{hf}.kchunk0" in PACKED
-                 else npy(hf))  # [M, K], f32
+            if key == "Wd" and mlp_dp_why is None and f"{hf}.kchunk0" in PACKED:
+                w = _dequant_wd_from_kchunks(hf)
+            elif key in ("Wd", "Wo") and f"{hf}.kchunk0" in PACKED:
+                w = _dequant_from_probed_kchunks(
+                    hf, D, FF if key == "Wd" else g.qd,
+                    mlp_quant_kw if key == "Wd" else _quant_kw("attn_o"))
+            else:
+                w = npy(hf)  # [M, K], f32
             if key == "Wq" and sp.attn_output_gate:
                 # HF views q_proj per head as [q | gate]; the gate half is its own GEMV.
                 wq = w.reshape(Hq, 2, g.hd, D)
@@ -2968,6 +3299,10 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                {step[-1]: D * 2 for step in o_runlist(p, g)}),
             p + "hn": D * 2, p + "hf": D * 2,
         })
+        if g.op_attn_global_worker is not None:
+            # [column][head]-major f32 handoff between AttnGlobalWorker and AttnGlobalMerge --
+            # see attn_global_dp/design.py's module docstring for why that order, not the other.
+            bufsz[p + "gpartial"] = COLS * Hq * (g.hd + 2) * 4
         if lin:
             for k in ("kc", "vc", "sc", "sw"):
                 del bufsz[p + k]
@@ -3007,6 +3342,24 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 # the MLP half are unaffected -- attn_block_dp stops at `cx`, same as op_ctx does.
                 attn_rl = [(g.op_attn_block, cur, p + "n_in", p + "Wqkv", p + "n_qn", p + "n_kn",
                             ang, p + "kc", p + "vc", p + "cx")]
+            elif g.op_attn_weightless is not None:
+                # A_s/A_g (gemma4-weightless-attention-block): the Wqkv GEMV stays exactly as it
+                # is today (attn_weightless_why[g] is None only when FUSE_QKV_GEMV already
+                # concatenated them); everything from the per-head qk-norm through context
+                # collapses into one device, same as attn_block_dp but reading `qkv` instead of
+                # carrying the weight itself.
+                #
+                # The input norm: under G4_W_PROLOGUE this folds into op_qkv's own prologue (same
+                # mechanism as the vanilla branch's `proj`, above) instead of running as a
+                # standalone RMSNorm -- op_qkv is tagged prologue="on" unconditionally now, so
+                # every call site must use this 4-buffer form once the flag is set.
+                attn_rl = [
+                    *([(g.op_qkv, p + "Wqkv", cur, p + "n_in", p + "qkv")] if G4_W_PROLOGUE else
+                      [(op_norm, cur, p + "n_in", p + "hn"),
+                       (g.op_qkv, p + "Wqkv", p + "hn", p + "qkv")]),
+                    (g.op_attn_weightless, p + "qkv", p + "n_qn", p + "n_kn", ang,
+                     p + "kc", p + "vc", p + "cx"),
+                ]
             else:
                 qk = proj = rope = vnorm = []
                 if sp.qk_norm and g.op_qkv_dp is None:
@@ -3020,7 +3373,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                     qk = [*qk, *[(g.op_qk_norm, hq[0], p + "n_qn", f"dead_h{g.hd}")
                                  for _ in range(DUMMY_NORM_RUNS)]]
                 if g.op_qkv_dp is None:
-                    proj = ([(g.op_qkv, p + "Wqkv", p + "hn", p + "qkv")] if FUSE_QKV_GEMV else
+                    proj = ([(g.op_qkv, p + "Wqkv", cur, p + "n_in", p + "qkv")]
+                            if (FUSE_QKV_GEMV and G4_W_PROLOGUE) else
+                            [(g.op_qkv, p + "Wqkv", p + "hn", p + "qkv")] if FUSE_QKV_GEMV else
                             [(g.op_q, p + "Wq", p + "hn", ref_q),
                              (g.op_kv, p + "Wk", p + "hn", ref_k),
                              *([(g.op_kv, p + "Wv", p + "hn", ref_v)] if g.has_v else [])])
@@ -3056,24 +3411,39 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 # at `kv_off` instead of into buffers a StridedCopy then re-reads and re-writes. The caches
                 # were their only consumer, so the intermediate had no reader -- it existed because the
                 # append was a separate operator. Two runs and one more configure per layer.
+                # G4_W_PROLOGUE folds this op_norm into op_qkv's own prologue (proj, above) -- same
+                # RMSNorm(cur, n_in), computed redundantly per core instead of once on 1 column, in
+                # exchange for deleting the run and the DDR round trip of `hn`.
                 head = ([(g.op_qkv_dp, cur, p + "n_in", p + "Wqkv", p + "n_qn", p + "n_kn", ang,
                           ref_q, p + "kc", p + "vc")]
                         if g.op_qkv_dp is not None else
-                        [(op_norm, cur, p + "n_in", p + "hn"), *proj, *vnorm, *qk, *rope,
+                        [*([] if G4_W_PROLOGUE else [(op_norm, cur, p + "n_in", p + "hn")]),
+                         *proj, *vnorm, *qk, *rope,
                          (g.op_sck, ref_k, p + "kc"), (g.op_scv, ref_v, p + "vc")])
-                attn_rl = [
-                    *head,
-                    *([] if GROUPED_K else [(g.op_rep_k, p + "kc", p + "kr")]),
-                    # TMV_CTX subsumes the v-side grouping: TMatVec reads vc per kv head itself, so a
-                    # Repeat would materialise a `vr` nothing consumes.
-                    *([] if (GROUPED_V or g.uses_tmv_ctx) else [(g.op_rep_v, p + "vc", p + "vr")]),
-                    *scores_runlist(p, g, ref_q),
-                    *([] if scale_in_qnorm else [(g.op_scale, p + "sc", "attn_scale", p + "sc")]),
-                    (g.op_softmax, p + "sc", p + "sw"),
-                    *([] if g.uses_tmv_ctx else
-                      [(g.op_trv, p + ("vc" if GROUPED_V else "vr"), p + "vt")]),
-                    (g.op_ctx, p + ("vc" if g.uses_tmv_ctx else "vt"), p + "sw", p + "cx"),
-                ]
+                if g.op_attn_global_worker is not None:
+                    # A_g: the input norm, Wqkv, per-head norm/RoPE/v-norm and the K/V append
+                    # (`head`, above) stay exactly as they are -- only the scores GEMV, softmax
+                    # and context TMatVec are replaced. See attn_global_dp/design.py's module
+                    # docstring for why those three and not the rest.
+                    attn_rl = [
+                        *head,
+                        (g.op_attn_global_worker, ref_q, p + "kc", p + "vc", p + "gpartial"),
+                        (g.op_attn_global_merge, p + "gpartial", p + "cx"),
+                    ]
+                else:
+                    attn_rl = [
+                        *head,
+                        *([] if GROUPED_K else [(g.op_rep_k, p + "kc", p + "kr")]),
+                        # TMV_CTX subsumes the v-side grouping: TMatVec reads vc per kv head itself, so a
+                        # Repeat would materialise a `vr` nothing consumes.
+                        *([] if (GROUPED_V or g.uses_tmv_ctx) else [(g.op_rep_v, p + "vc", p + "vr")]),
+                        *scores_runlist(p, g, ref_q),
+                        *([] if scale_in_qnorm else [(g.op_scale, p + "sc", "attn_scale", p + "sc")]),
+                        (g.op_softmax, p + "sc", p + "sw"),
+                        *([] if g.uses_tmv_ctx else
+                          [(g.op_trv, p + ("vc" if GROUPED_V else "vr"), p + "vt")]),
+                        (g.op_ctx, p + ("vc" if g.uses_tmv_ctx else "vt"), p + "sw", p + "cx"),
+                    ]
             if sp.attn_output_gate and not lin:
                 # cx *= sigmoid(gate), gate = Wgate @ hn -- `hn` is the head's own normed input.
                 bufsz[p + "gt"] = QD * 2
@@ -3081,7 +3451,11 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                             (op_gate_act, p + "gt", p + "gt"),
                             (op_gate_mul, p + "cx", p + "gt", p + "cx")]
             rl += [*attn_rl, *([] if fuse_o else o_runlist(p, g))]
-            if sp.sandwich_norms:
+            # G4_W_RESIDUAL folds this post-attn norm into the gate/up prologue below instead of
+            # running it as its own device -- but only on the path that ALSO owns the residual add
+            # and pre-ffn norm it fuses with (op_mlp_dp's own fused design does both norms
+            # internally and reaches here regardless).
+            if sp.sandwich_norms and not (G4_W_RESIDUAL and op_mlp_dp is None):
                 rl.append((op_norm, p + "a", p + "n_pa", p + "a"))
             if op_mlp_dp is not None:
                 # cur + a -> x1 -> norm -> gate/up -> silu -> mul -> down -> +x1, all inside one design.
@@ -3100,6 +3474,23 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 else:
                     rl.append((op_mlp_dp, cur, p + "a", p + "n_pf", p + "Wg", p + "Wu", p + "Wd",
                                "mlp_gh", *([p + "n_pff"] if sp.sandwich_norms else []), nxt))
+            elif G4_W_RESIDUAL:
+                # x1 = cur + n_pa*a/rms(a); h = n_pf*x1/rms(x1) -- fused into gate/up's own
+                # prologue (gemv/design.py prologue="residual"), replacing the 3 ops above
+                # (post-attn norm, residual add, pre-ffn norm) with 0. Both Wg and Wu run the
+                # fusion redundantly and each exports x1 (column 0), an idempotent duplicate
+                # write of the same K*2 bytes rather than a second mode to skip it.
+                _tail = [
+                    *([] if op_act is None else [(op_act, g_, g_) for g_ in ff_slices(p + "g")]),
+                    *[(op_mul_ffn, g_, u_, gh_) for g_, u_, gh_ in
+                      zip(ff_slices(p + "g"), ff_slices(p + "u"), ff_slices(p + "gh"))],
+                    *down_runlist(p),
+                ]
+                rl += [
+                    (op_gate, p + "Wg", p + "a", cur, p + "n_pa", p + "n_pf", p + "g", p + "x1"),
+                    (op_up, p + "Wu", p + "a", cur, p + "n_pa", p + "n_pf", p + "u", p + "x1"),
+                    *_tail,
+                ]
             else:
                 rl += [
                     (op_add, cur, p + "a", p + "x1"),
@@ -3167,10 +3558,16 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         weights["W_head"] = bf16(head_f32).reshape(-1)
     if not scale_in_qnorm:
         weights["attn_scale"] = np.full(Hq * S, sp.attn_scale, BF16)
-    rl += [(op_norm, cur, "n_final", "xf")]
-    if not SPLIT_LM_HEAD:
-        rl += [(op_head, "W_head", "xf", "logits")]
-    bufsz["xf"] = D * 2
+    if G4_W_PROLOGUE and not SPLIT_LM_HEAD:
+        # Folds the final RMSNorm into op_head's own prologue (same mechanism as Wqkv's, above):
+        # deletes this run and, since op_head is a standalone device (no downstream configure
+        # shares it), the configure too.
+        rl += [(op_head, "W_head", cur, "n_final", "logits")]
+    else:
+        rl += [(op_norm, cur, "n_final", "xf")]
+        if not SPLIT_LM_HEAD:
+            rl += [(op_head, "W_head", "xf", "logits")]
+        bufsz["xf"] = D * 2
     bufsz["logits"] = VOCAB * 2
 
     if os.environ.get("DUMP_OPS"):
@@ -3221,6 +3618,41 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         rl, weight_families = unify_weight_gemvs(rl)
         for K_, tsi_, tso_, Ms_ in weight_families:
             print(f"[gen] weight GEMV family K={K_}: tsi {tsi_} tso {tso_} tiles_rtp over M={Ms_}")
+        if G4_W_RESIDUAL:
+            # unify_weight_gemvs' own tiling search has no knowledge of the residual prologue's
+            # extra L1 (3 more B objects, b_norm, the x1 output -- gemv/design.py's PROLOGUE L1
+            # comment): it picks the tsi a PLAIN GEMV fits at, which overflows once residual is on
+            # (measured: tsi=4 needs 67584 B against a 65536 B budget at this family's shape).
+            # tsi=2 halves A's term and fits (58944 B); RE-VERIFIED here against the same formula
+            # design.py's own K008 check uses, not just asserted, so a shape change that breaks the
+            # fit fails at generation time with a clear message instead of silently at aiecc.
+            import dataclasses
+            import aie.utils as _aie_utils
+            from iron.operators.gemv.design import l1_budget_bytes, l1_footprint_bytes
+            from iron.common.quant import row_stride_bytes
+            RESIDUAL_TSI = 2
+            _family = [op for op, *_ in rl
+                      if isinstance(op, GEMV) and op._resolved_prologue_capability == "residual"]
+            if not _family:
+                raise SystemExit("G4_W_RESIDUAL: no GEMV in the runlist resolved to "
+                                 "prologue_capability='residual' -- op_gate/op_up wiring is dead")
+            _o = _family[0]
+            _row_w = row_stride_bytes(_o.K, _o.group_size, _o.weight_dtype, _o.scale_dtype)
+            _base = l1_footprint_bytes(RESIDUAL_TSI, _o.tile_size_output, _o.K, _row_w, 1, 1)
+            _extra = 3 * _o.K * 2 + _o.K * 2 + _o.K * 2
+            _budget = l1_budget_bytes(_aie_utils.get_current_device())
+            if _base + _extra + 4096 > _budget:
+                raise SystemExit(
+                    f"G4_W_RESIDUAL: RESIDUAL_TSI={RESIDUAL_TSI} no longer fits L1 "
+                    f"({_base + _extra + 4096} > {_budget}) -- re-derive it, do not lower blind"
+                )
+            _retiled = {}
+            for op in _family:
+                if op.tile_size_input != RESIDUAL_TSI and id(op) not in _retiled:
+                    _retiled[id(op)] = dataclasses.replace(op, tile_size_input=RESIDUAL_TSI)
+            rl = [(_retiled.get(id(op), op), *bufs) for op, *bufs in rl]
+            print(f"[gen] G4_W_RESIDUAL: retiled the residual-capable family to "
+                 f"tsi={RESIDUAL_TSI} ({len(_retiled)} op object(s))")
     pointwise_widths = []
     if POINTWISE_MODES:
         rl, pointwise_widths = pointwise_modes(rl)
@@ -3272,6 +3704,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             seg_bufsz[seg_out] = D * 2
         _sn = sequence_name(sp, NL, S, placer_flags, tmv_declined=_tmv_declined,
                             tmv_chunked=_tmv_chunked, attn_block_geoms=_attn_block_fused,
+                            attn_weightless_geoms=_attn_weightless_fused,
+                            attn_global_geoms=_attn_global_fused,
                             decode_layer_active=op_decode_layer is not None, T=T,
                             ff_chunks=ff_chunks, weight_families=len(weight_families),
                             pointwise_widths=len(pointwise_widths),
@@ -3287,6 +3721,25 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         if _extra:
             print(f"# {sp.name}: window rungs {sorted(rung_ops)} + top {S}, "
                   f"{len(_extra) + 1} named control codes in one ELF")
+        _scratch_order_kw = {}
+        if BUCKET_SCRATCH_ORDER:
+            _scratch_order_kw = {"scratch_order": list(weights.keys())}
+        elif SCRATCH_ORDER_FROM:
+            _ref_order, _ref_lens = _reference_scratch_layout(_SCRATCH_ORDER_ENTRIES)
+            _candidates = set(weights) | set(seg_bufsz)
+            # A reference name this graph dropped (e.g. ones_h256, unused on a weightless-covered
+            # geometry) gets a same-sized placeholder RESERVATION here -- buffer_sizes-only, no
+            # weights entry, nothing in the runlist references it. calculate_buffer_layout's
+            # add_buffers() gives an explicit_buffer_sizes-only name a real (offset, length) same
+            # as any runlist-referenced one; get_layout_for_buffer resolves it from that same
+            # table. What crashed before (attn_weightless_geoms, 50a8c1c) was a WEIGHTS-dict
+            # entry nothing referenced, walked later via wnames=list(weights.keys()) -- this
+            # placeholder is never in weights, so it never reaches that list.
+            for _n in _ref_order:
+                if _n not in _candidates:
+                    seg_bufsz[_n] = _ref_lens[_n]
+                    _candidates.add(_n)
+            _scratch_order_kw = {"scratch_order": [n for n in _ref_order if n in _candidates]}
         seq = OperatorSequence(name, entries,
                                input_args=seg_inputs, output_args=[seg_out],
                                buffer_sizes=seg_bufsz, context=ctx, extra_flags=placer_flags,
@@ -3295,8 +3748,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                                **({"collapse_configures": True}
                                   if merge and COLLAPSE_MERGED_CONFIGURES else {}),
                                **({"extra_runlists": _extra} if _extra else {}),
-                               **({"scratch_order": list(weights.keys())}
-                                  if BUCKET_SCRATCH_ORDER else {}))
+                               **_scratch_order_kw)
         seq.compile()
         # Per-segment weight set, refs-filtered even when unsplit: under SPLIT_LM_HEAD `weights`
         # still holds W_head but no op in this graph reads it, so a consumer that loads by this list

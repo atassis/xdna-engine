@@ -126,6 +126,15 @@ pub trait DecodeStep {
     /// text-only request against a device backend that does implement it).
     fn set_media(&mut self, _media: crate::llm::multimodal::MediaEmbeds) {}
 
+    /// Tell the backend whether the generation now starting samples greedily (`temperature <=
+    /// 0.0`, [`sampling::sample`]'s own short-circuit condition). A backend whose `step` applies a
+    /// strictly monotonic transform to the logits (Gemma's tanh softcap) may skip it when this is
+    /// `true`: it cannot change which entry `argmax` picks. Call before the first `step` of a
+    /// generation; a caller that never calls this (every host mock here, and every non-generation
+    /// caller of `step`, e.g. `decide`'s option comparisons) gets the default `false`, which
+    /// reproduces the pre-existing always-apply behaviour exactly.
+    fn set_greedy(&mut self, _greedy: bool) {}
+
     /// Live device BO bytes this backend holds, or 0 for a host backend that holds none.
     ///
     /// Reported so `npu model ls` can weigh the biggest resident thing on the box. An LLM's weights,
@@ -583,6 +592,10 @@ impl<D: DecodeStep> LlmGenerator<D> {
     fn decide_ids_with(&mut self, share: bool, qs: &[crate::decide::DecideQuestion], ids: &[Vec<u32>], slots: &[u32])
         -> Result<crate::decide::Decisions, EngineError> {
         use crate::decide::{answer, DecideStats, Decisions, QuestionStats};
+        // `decide` reads specific candidate logits, not an argmax over the whole vocabulary --
+        // never skip the softcap here, regardless of what the last `generate()` on this backend
+        // left `set_greedy` at.
+        self.decode.set_greedy(false);
         let mut stats = DecideStats::default();
         let snap = match share {
             true => self.prime_shared_prefix(ids, &mut stats)?,
@@ -787,6 +800,9 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
             frequency_penalty: gen.frequency_penalty,
             presence_penalty: gen.presence_penalty,
         };
+        // Both `step` calls below (prompt-priming and the per-token loop) feed this same
+        // `sampling_cfg`, so one call before either covers both.
+        self.decode.set_greedy(sampling_cfg.temperature <= 0.0);
         let mut rng = SplitMix64::new(params.seed.unwrap_or_else(default_seed));
         // Penalties see the whole context, prompt included -- OpenAI's own wording ("existing
         // frequency in the text so far") and every mainstream server read this as prompt+completion.
@@ -1468,6 +1484,32 @@ mod tests {
             gen.generate_to_string(&Prompt::Raw("hello world foo".to_string()), &params).unwrap();
         assert_eq!(usage.prompt_tokens, 3);
         assert_eq!(text, "world");
+    }
+
+    /// `generate` must tell the backend whether THIS generation is greedy before the first
+    /// `step`, from `sampling_cfg`'s own short-circuit condition (`temperature <= 0.0`) -- not
+    /// from some other reading of `GenerateParams`.
+    #[test]
+    fn generate_reports_greediness_from_temperature_before_the_first_step() {
+        struct RecordingGreedy(ScriptedDecodeStep, std::rc::Rc<std::cell::Cell<Option<bool>>>);
+        impl DecodeStep for RecordingGreedy {
+            fn step(&mut self, t: u32, p: usize) -> Result<Vec<f32>, EngineError> { self.0.step(t, p) }
+            fn set_greedy(&mut self, greedy: bool) { self.1.set(Some(greedy)); }
+        }
+        let peak = |id: usize| { let mut v = vec![0.0; 7]; v[id] = 9.0; v };
+        let seen = std::rc::Rc::new(std::cell::Cell::new(None));
+        let decode = RecordingGreedy(ScriptedDecodeStep::new(vec![peak(0), peak(2)]), seen.clone());
+        let mut gen = LlmGenerator::new(build_cfg(None), decode);
+        let params = GenerateParams { max_tokens: Some(1), temperature: Some(0.0), ..GenerateParams::default() };
+        gen.generate_to_string(&Prompt::Raw("hello world".to_string()), &params).unwrap();
+        assert_eq!(seen.get(), Some(true), "temperature 0.0 is greedy");
+
+        seen.set(None);
+        let decode = RecordingGreedy(ScriptedDecodeStep::new(vec![peak(0), peak(2)]), seen.clone());
+        let mut gen = LlmGenerator::new(build_cfg(None), decode);
+        let params = GenerateParams { max_tokens: Some(1), temperature: Some(0.8), ..GenerateParams::default() };
+        gen.generate_to_string(&Prompt::Raw("hello world".to_string()), &params).unwrap();
+        assert_eq!(seen.get(), Some(false), "temperature 0.8 samples, not greedy");
     }
 
     #[test]

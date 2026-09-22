@@ -264,6 +264,10 @@ pub struct NpuDecodeStep {
     /// default, which reproduces this rail's pre-multimodal behaviour exactly (a hash lookup that
     /// always misses -- see [`MediaEmbeds`]'s doc).
     media: MediaEmbeds,
+    /// Per-GENERATION, set by [`Self::set_greedy`] before a generation starts. `false` by default
+    /// (every construction path and every generation that never calls the setter), which keeps
+    /// applying the softcap -- the pre-existing behaviour.
+    greedy: bool,
 }
 
 /// The host embedding gather, shared verbatim by the per-token and the batched path. Sharing the
@@ -574,7 +578,7 @@ impl NpuDecodeStep {
 
         Ok(NpuDecodeStep {
             artifact, arena, buckets, embed, rope_writes, prefill, provenance,
-            media: MediaEmbeds::default(),
+            media: MediaEmbeds::default(), greedy: false,
         })
     }
 
@@ -770,6 +774,10 @@ impl DecodeStep for NpuDecodeStep {
         self.media = media;
     }
 
+    fn set_greedy(&mut self, greedy: bool) {
+        self.greedy = greedy;
+    }
+
     /// The prefill artifact's `dims.M`, or `None` when this instance has no prefill ELF, the
     /// batched path is switched off (`NPU_LLM_PREFILL_BATCHED=0`), or this generation carries media
     /// (see [`Self::prefill`]'s doc). Returning `None` is what makes the A/B a one-variable change:
@@ -909,7 +917,10 @@ impl DecodeStep for NpuDecodeStep {
             .map_err(|e| EngineError::Device(format!("read {out_name}: {e}")))?;
         let mut logits = unpack_bf16_bytes(&bytes);
         logits.truncate(self.embed.vocab());
-        apply_logit_softcap(&mut logits, self.artifact.logit_softcap);
+        // Strictly monotonic, so a greedy (argmax) step gets the same token either way -- skip it.
+        if !self.greedy {
+            apply_logit_softcap(&mut logits, self.artifact.logit_softcap);
+        }
         Ok(logits)
     }
 }
