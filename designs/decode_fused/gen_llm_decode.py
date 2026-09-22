@@ -232,15 +232,28 @@ def _stream_pad_rows(wqkv, op):
     return np.pad(wqkv, ((0, 0), (0, TB - WB)))
 
 
-def _pack(w, site):
-    """Host-side pack of one weight under its site's spec, into the packer's wire format."""
+def _pack(w, site, grid=None):
+    """Host-side pack of one weight under its site's spec, into the packer's wire format.
+
+    `grid`: (full_range, clip_search) to use INSTEAD of the site's scale_kind-derived defaults.
+    Only for REPACKING already-quantized bytes (dequantize then requantize, e.g.
+    `_dequant_from_probed_kchunks`'s caller): the grid there is the DUMP'S, already fixed by
+    whatever it was quantized onto -- not a fresh choice the live precision plan gets to make.
+    Getting this wrong is exactly int4-qat-needs-the-sixteenth-level: this dump's quant.json has
+    full_range=true (its checkpoint is QAT-trained onto all 16 levels), the live plan's `mlp`
+    scale_kind is `none` (full_range=False), and re-quantizing a dequantized q=-8 value onto the
+    narrower 15-level grid moves its WHOLE GROUP's scale, not just that one element.
+    """
     spec = _spec(site)
     if not spec.quantized:
         return bf16(w).reshape(-1)
     kw = {}
     if spec.dtype in precision.SYMMETRIC:
-        kw["clip_search"] = spec.scale_kind in ("clip", "clip_full")
-        if spec.scale_kind == "clip_full":
+        full_range, clip_search = (grid if grid is not None
+                                   else (spec.scale_kind == "clip_full",
+                                         spec.scale_kind in ("clip", "clip_full")))
+        kw["clip_search"] = clip_search
+        if full_range:
             kw["full_range"] = True
     else:
         kw["affine_zero_on_grid"] = spec.scale_kind == "zero_grid"
@@ -2827,12 +2840,19 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                         _spec("mlp").group_size, _spec("mlp").dtype)])
                 weights[p + key] = wp
                 continue
+            # REPACK GRID: a dequant-then-requant round trip must reuse the DUMP's own grid
+            # (quant.json's full_range/clip_search), not the live plan's scale_kind -- see
+            # _pack()'s docstring. `_repack_grid` is None on the ordinary (fresh-from-checkpoint)
+            # path below, where the live plan's choice is exactly what should apply.
+            _repack_grid = None
             if key == "Wd" and mlp_dp_why is None and f"{hf}.kchunk0" in PACKED:
                 w = _dequant_wd_from_kchunks(hf)
+                _repack_grid = (_qmf.get("full_range", False), _qmf.get("clip_search", False))
             elif key in ("Wd", "Wo") and f"{hf}.kchunk0" in PACKED:
                 w = _dequant_from_probed_kchunks(
                     hf, D, FF if key == "Wd" else g.qd,
                     mlp_quant_kw if key == "Wd" else _quant_kw("attn_o"))
+                _repack_grid = (_qmf.get("full_range", False), _qmf.get("clip_search", False))
             else:
                 w = npy(hf)  # [M, K], f32
             if key == "Wq" and sp.attn_output_gate:
@@ -2841,7 +2861,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 weights[p + "Wgate"] = _pack(np.ascontiguousarray(wq[:, 1].reshape(-1, D)), "qkv")
                 w = np.ascontiguousarray(wq[:, 0].reshape(-1, D))
             if key in mlp_keys:
-                weights[p + key] = _pack(w, "mlp")
+                weights[p + key] = _pack(w, "mlp", grid=_repack_grid)
             elif key == "Wo" and fuse_o:
                 # Pad FIRST, then quantize: the pad rows must be a whole number of groups in the
                 # same wire format as the rest of the channel. Zero rows quantize to amax=0 ->
@@ -2855,11 +2875,11 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 # module docstring for the full derivation).
                 pad_rows = op_mlp_dp._wo_rows_padded - D
                 w_padded = np.pad(w, ((0, pad_rows), (0, 0)))
-                weights[p + key] = _pack(w_padded, "mlp")
+                weights[p + key] = _pack(w_padded, "mlp", grid=_repack_grid)
             elif key == "Wo" and _spec("attn_o").quantized:
                 # AFTER the fuse_o branch, not before it: fused Wo needs the pad, and testing the
                 # dtype first would send a quantized+fused Wo down the unpadded path.
-                weights[p + key] = _pack(w, "attn_o")
+                weights[p + key] = _pack(w, "attn_o", grid=_repack_grid)
             elif key in qkv_keys and FUSE_QKV_GEMV:
                 qkv_parts.append(_pack(w, "qkv"))         # row-major, so concatenation IS stacking
             elif key in qkv_keys and _spec("qkv").quantized:
