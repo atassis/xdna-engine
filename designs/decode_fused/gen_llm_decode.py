@@ -466,6 +466,46 @@ SLIDING_KV_CIRCULAR = os.environ.get("SLIDING_KV_CIRCULAR", "0") == "1"
 # window-sized softmax scratch (sc/sw, Hq*S) sits ahead of them and shifts every later offset:
 # measured, buckets at window 256 and 512 over one allocation disagreed on 304 of 313 offsets.
 BUCKET_SCRATCH_ORDER = os.environ.get("BUCKET_SCRATCH_ORDER", "0") == "1"
+# Pin this build's scratch arena to a REFERENCE decode's own packing order (its meta.json,
+# offset-sorted), so a prefill compiled against that reference still shares one arena with THIS
+# decode (check_prefill_arena_pairing.py) even though this graph's runlist traversal visits
+# buffer names in a different order. Placement only, not the op graph -- same reasoning
+# BUCKET_SCRATCH_ORDER above uses for carrying no sequence_name() suffix. Default unset (empty
+# string): every other build is untouched.
+SCRATCH_ORDER_FROM = os.environ.get("SCRATCH_ORDER_FROM", "")
+if SCRATCH_ORDER_FROM and BUCKET_SCRATCH_ORDER:
+    raise SystemExit("SCRATCH_ORDER_FROM and BUCKET_SCRATCH_ORDER both want to set scratch_order, "
+                      "for unrelated reasons (prefill-arena pairing vs window-rung bucketing) -- "
+                      "pick one")
+
+
+def _reference_scratch_layout(path):
+    """(offset-ordered scratch names WITH gaps filled by synthetic same-sized placeholders,
+    {name: byte length}) from another build's meta.json -- the reference's OWN packing, not
+    re-derived. MEASURED on the served gemma4-12b decode: 641 gaps, 16399872 B total, between
+    named scratch buffers that this file's own calculate_buffer_layout (a plain sequential
+    packer, add_buffers()) cannot explain -- some other alignment this codebase does not expose
+    a rule for. Filling each gap with a same-sized anonymous placeholder reproduces the exact
+    packing regardless of why the gap exists, which is more robust than re-deriving the rule.
+    For SCRATCH_ORDER_FROM."""
+    import json
+    with open(path) as f:
+        layout = json.load(f)["layout"]
+    entries = sorted((v["offset"], v["len"], n) for n, v in layout.items()
+                     if v.get("type") == "scratch")
+    ordered, lens, prev_end, pad_i = [], {}, 0, 0
+    for off, length, name in entries:
+        if off > prev_end:
+            pad = f"__scratch_order_pad{pad_i}"
+            pad_i += 1
+            ordered.append(pad)
+            lens[pad] = off - prev_end
+        ordered.append(name)
+        lens[name] = length
+        prev_end = max(prev_end, off + length)
+    return ordered, lens
+
+
 # Weight tile ROWS for the fused MLP. Trades against WEIGHT_DEPTH at constant L1.
 MLP_TILE_ROWS = int(os.environ.get("MLP_TILE_ROWS", "0"))
 # Row-parallel down: each core keeps only its own FF slice of `gh` and the partials are
@@ -3601,6 +3641,25 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         if _extra:
             print(f"# {sp.name}: window rungs {sorted(rung_ops)} + top {S}, "
                   f"{len(_extra) + 1} named control codes in one ELF")
+        _scratch_order_kw = {}
+        if BUCKET_SCRATCH_ORDER:
+            _scratch_order_kw = {"scratch_order": list(weights.keys())}
+        elif SCRATCH_ORDER_FROM:
+            _ref_order, _ref_lens = _reference_scratch_layout(SCRATCH_ORDER_FROM)
+            _candidates = set(weights) | set(seg_bufsz)
+            # A reference name this graph dropped (e.g. ones_h256, unused on a weightless-covered
+            # geometry) gets a same-sized placeholder RESERVATION here -- buffer_sizes-only, no
+            # weights entry, nothing in the runlist references it. calculate_buffer_layout's
+            # add_buffers() gives an explicit_buffer_sizes-only name a real (offset, length) same
+            # as any runlist-referenced one; get_layout_for_buffer resolves it from that same
+            # table. What crashed before (attn_weightless_geoms, 50a8c1c) was a WEIGHTS-dict
+            # entry nothing referenced, walked later via wnames=list(weights.keys()) -- this
+            # placeholder is never in weights, so it never reaches that list.
+            for _n in _ref_order:
+                if _n not in _candidates:
+                    seg_bufsz[_n] = _ref_lens[_n]
+                    _candidates.add(_n)
+            _scratch_order_kw = {"scratch_order": [n for n in _ref_order if n in _candidates]}
         seq = OperatorSequence(name, entries,
                                input_args=seg_inputs, output_args=[seg_out],
                                buffer_sizes=seg_bufsz, context=ctx, extra_flags=placer_flags,
@@ -3609,8 +3668,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                                **({"collapse_configures": True}
                                   if merge and COLLAPSE_MERGED_CONFIGURES else {}),
                                **({"extra_runlists": _extra} if _extra else {}),
-                               **({"scratch_order": list(weights.keys())}
-                                  if BUCKET_SCRATCH_ORDER else {}))
+                               **_scratch_order_kw)
         seq.compile()
         # Per-segment weight set, refs-filtered even when unsplit: under SPLIT_LM_HEAD `weights`
         # still holds W_head but no op in this graph reads it, so a consumer that loads by this list
