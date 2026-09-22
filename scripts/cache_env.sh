@@ -22,5 +22,16 @@
 XDNA_WS="${XDNA_WS:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/../.." && pwd)}"
 export XDNA_WS
 XDNA_REPO="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
+# A linked WORKTREE inherits the main checkout's cache. `.cache` is gitignored, so `git worktree
+# add` never creates the symlink (2) above describes -- and the `mkdir -p` below would then mint a
+# private EMPTY cache, whose visible failure is "MLIR distro not provisioned" and whose invisible
+# one is a full toolchain rebuild into a directory nothing else will ever find. A worktree's `.git`
+# is a FILE naming an admin dir under the main checkout, which is what makes the main root
+# recoverable here.
+if [ -z "${XDNA_CACHE:-}" ] && [ ! -e "$XDNA_REPO/.cache" ] && [ -f "$XDNA_REPO/.git" ]; then
+  _ce_main="$(git -C "$XDNA_REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+  [ -n "$_ce_main" ] && [ -d "${_ce_main%/.git}/.cache" ] && XDNA_CACHE="${_ce_main%/.git}/.cache"
+  unset _ce_main
+fi
 export XDNA_CACHE="${XDNA_CACHE:-$XDNA_REPO/.cache}"
 mkdir -p "$XDNA_CACHE" 2>/dev/null || true

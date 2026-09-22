@@ -288,13 +288,42 @@ def _quantize_cached(w, group_size, dtype, kw):
 
 DECODE_PLACER_FLAGS_DEFAULT = "--cores-per-col 1"
 
-# INSTRUMENT, not a feature. Alternates the per-head qk-norm between two IDENTICAL RMSNorm
-# instances. RMSNorm has no design_key, so two instances are two DESIGNS: the 24 consecutive runs
-# stop sharing one aiex.configure and become 24. Runs, bytes and output are unchanged, so it
-# isolates the cost of a CHEAP configure (18 KB of views) the way share_designs isolated an
-# expensive one. Predicted +644 configures/token; at the measured 61.9 us for a big configure that
-# is +39.9 ms if the cost is flat, and ~0 if it tracks the view count.
-SPLIT_QKNORM = os.environ.get("SPLIT_QKNORM", "0") == "1"
+# INSTRUMENT, not a feature. Deals the per-head qk-norm runs alternately to two IDENTICAL RMSNorm
+# instances in contiguous groups of SPLIT_QKNORM heads. RMSNorm has no design_key, so two instances
+# are two DESIGNS, and a group boundary is a design switch: the one contiguous block of
+# `n_q_heads + n_kv_heads` runs becomes ceil(N/G) blocks. Runs, bytes, designs (2 at every G>0) and
+# output are all unchanged across the sweep, so the only quantity that moves is the CONFIGURE
+# count -- which is the order-only control D009's rate needs, and the same shape that measured
+# prefill's rate: two arms, same designs and same runlist, differing only in how the identical runs
+# are ORDERED.
+#
+# G=1 is the old boolean arm (every run its own configure). G>1 gives the intermediate points a
+# fitted SLOPE needs rather than two absolutes (D031). The head index runs ACROSS the q and k
+# lists, so the block count is ceil((Hq+Hkv)/G) and does not depend on where q ends.
+SPLIT_QKNORM = int(os.environ.get("SPLIT_QKNORM", "0"))
+
+# INSTRUMENT, not a feature -- the MIRROR of SPLIT_QKNORM above, and the arm the performance
+# contract says no board arm provides: it moves RUNS at fixed configures, where SPLIT_QKNORM moved
+# configures at fixed runs. K extra qk-norm runs per layer are appended to the qk-norm block,
+# reading one head slice and writing a scratch buffer nothing reads. Same design, and contiguous
+# with the block they follow, so the configure count does not move; 1 KB per run against a layer's
+# 250 MB, so the byte count does not either. Output is unchanged because the destination is dead.
+#
+# D009 says runs ride free (-420 runs, -0.0%). The per-layer residual, if it is per-run, is
+# ~162 us each. At K=8 over 12 layers that is +96 runs: +15.6 ms if per-run, ~0 if free. Two
+# outcomes far apart, one build.
+DUMMY_NORM_RUNS = int(os.environ.get("DUMMY_NORM_RUNS", "0"))
+
+# Per-shape GEMV tile override: "MxK=tsi:tso,...". gemv_tile_output() picks the LARGEST legal C
+# tile, which at the MLP gate/up shape is the whole column (M//cols = tso), so the design runs ONE
+# C tile per column and nothing on the output side pipelines. That choice is a heuristic -- the
+# comment on it argues tile COUNT, never measured time -- and this is what lets a sweep put a
+# number on it. Same role gemm_tile_registry.py plays for prefill's GEMMs.
+GEMV_TILE_OVERRIDES = {}
+for _t in filter(None, os.environ.get("GEMV_TILES", "").split(",")):
+    _shape, _tile = _t.split("=")
+    _m, _k = (int(v) for v in _shape.split("x"))
+    GEMV_TILE_OVERRIDES[(_m, _k)] = tuple(int(v) for v in _tile.split(":"))
 
 # INSTRUMENT, not a feature -- the sibling of SPLIT_QKNORM above, aimed at the other count.
 # SPLIT_QKNORM isolated a CONFIGURE by turning one design into many; this chops swiglu_mlp_dp's gh
@@ -744,7 +773,11 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tm
             _frag += f"s{_BUILD_STATE['scale_dtype']}"
         parts.append(_frag)
     if SPLIT_QKNORM:
-        parts.append("splitqk")
+        parts.append(f"splitqk{SPLIT_QKNORM}")
+    if DUMMY_NORM_RUNS:
+        parts.append(f"dummyrun{DUMMY_NORM_RUNS}")
+    for _mk in sorted(GEMV_TILE_OVERRIDES):
+        parts.append("gt%dx%d_%d_%d" % (*_mk, *GEMV_TILE_OVERRIDES[_mk]))
     # Suffix stays ON the default here, unlike the other switches: the shipped artifact was BUILT
     # and gated under this name, and aiecc is not byte-reproducible, so a rename would mean the
     # next rebuild produces a different ELF under a name nothing was ever gated against.
@@ -1328,7 +1361,7 @@ def gemv_tiling(M, K, **kw):
 
 def gemv(M, K, ctx, **kw):
     """GEMV tiled as large as both the design asserts AND L1 allow."""
-    tsi, tso = gemv_tiling(M, K, **kw)
+    tsi, tso = GEMV_TILE_OVERRIDES.get((M, K)) or gemv_tiling(M, K, **kw)
     wdt = kw.get("weight_dtype", "bf16")
     g = kw.get("group_size", 0)
     if g and g < 64:
@@ -2083,6 +2116,10 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         op_qk_norm_b = (RMSNorm(size=hd, num_aie_columns=1, num_channels=1, tile_size=hd,
                                 weighted=True, epsilon=sp.eps, context=ctx)
                         if (sp.qk_norm and SPLIT_QKNORM) else op_qk_norm)
+        # Which of the two instances head `i` (q heads 0..Hq-1, then k heads Hq..Hq+Hkv-1) runs on.
+        # Off, both names are one object and every head returns it, so there is one block.
+        def _qkn(i, _a=op_qk_norm, _b=op_qk_norm_b, _g=SPLIT_QKNORM):
+            return _a if (not _g or (i // _g) % 2 == 0) else _b
         # QKV projection: one GEMV over the concatenated weight, or the three separate ones. op_kv
         # is built in both arms because share_designs pairs Wk with Wv only in the unfused one.
         #
@@ -2269,7 +2306,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 v_norm=sp.v_norm, **_quant_kw("qkv", force_header_first=True))
         g = SimpleNamespace(
             hd=hd, hkv=hkv, qd=qd, kvd=kvd, gqa=gqa, kv_slot=slot, o_chunks=o_chunks,
-            op_qk_norm=op_qk_norm, op_qk_norm_b=op_qk_norm_b, op_qkv=op_qkv, op_q=op_q,
+            op_qk_norm=op_qk_norm, op_qk_norm_b=op_qk_norm_b, qkn=_qkn, op_qkv=op_qkv, op_q=op_q,
             op_kv=op_kv, op_o=op_o, op_rope_qk=op_rope_qk, op_qkv_dp=op_qkv_dp,
             op_rope_q=op_rope_q, op_rope_k=op_rope_k, op_sck=op_sck, op_scv=op_scv,
             op_rep_k=op_rep_k, op_rep_v=op_rep_v, op_scores=op_scores, op_trv=op_trv,
@@ -2659,6 +2696,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         return np.concatenate([_pack(np.ascontiguousarray(part), "mlp")
                                for part in np.split(w, n_chunks, axis=1)])
 
+    if DUMMY_NORM_RUNS:
+        for _hd in sorted({gk[0] for gk in geoms}):
+            bufsz[f"dead_h{_hd}"] = _hd * 2
     cur = "x"
     # (runlist index, residual buffer entering this layer) per layer, so the stack can be cut into
     # segments AFTER it is built. Recorded rather than reconstructed: the residual chain is
@@ -2972,10 +3012,13 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 if sp.qk_norm and g.op_qkv_dp is None:
                     hq = [f"{qhb}[{qho + h*g.hd*2}:{qho + (h+1)*g.hd*2}]" for h in range(Hq)]
                     hk = [f"{khb}[{kho + h*g.hd*2}:{kho + (h+1)*g.hd*2}]" for h in range(g.hkv)]
-                    qk = [*[((g.op_qk_norm if h % 2 == 0 else g.op_qk_norm_b),
-                             hq[h], p + "n_qn", hq[h]) for h in range(Hq)],
-                          *[((g.op_qk_norm if h % 2 == 0 else g.op_qk_norm_b),
-                             hk[h], p + "n_kn", hk[h]) for h in range(g.hkv)]]
+                    qk = [*[(g.qkn(h), hq[h], p + "n_qn", hq[h]) for h in range(Hq)],
+                          *[(g.qkn(Hq + h), hk[h], p + "n_kn", hk[h]) for h in range(g.hkv)]]
+                if DUMMY_NORM_RUNS and g.op_qk_norm is not None:
+                    # Appended AFTER the qk entries, on the same design, so the block stays one
+                    # contiguous configure. Reads a live q head; writes a buffer with no reader.
+                    qk = [*qk, *[(g.op_qk_norm, hq[0], p + "n_qn", f"dead_h{g.hd}")
+                                 for _ in range(DUMMY_NORM_RUNS)]]
                 if g.op_qkv_dp is None:
                     proj = ([(g.op_qkv, p + "Wqkv", p + "hn", p + "qkv")] if FUSE_QKV_GEMV else
                             [(g.op_q, p + "Wq", p + "hn", ref_q),
