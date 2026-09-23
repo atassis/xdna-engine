@@ -1,0 +1,245 @@
+{
+ "template": "Premise: {premise}\nHypothesis: {hypothesis}",
+ "prompt": [
+  {
+   "premise": "  a {hypothesis} b \u001c",
+   "hypothesis": " h ",
+   "out": "Premise: a {hypothesis} b\nHypothesis: h"
+  },
+  {
+   "premise": "x",
+   "hypothesis": "y",
+   "out": "Premise: x\nHypothesis: y"
+  },
+  {
+   "premise": "\t\n",
+   "hypothesis": " ",
+   "out": "Premise: \nHypothesis: "
+  }
+ ],
+ "hypotheses": [
+  {
+   "q": {
+    "type": "noul",
+    "instructions": " Is it allowed? ",
+    "criteria": {
+     "true": "All hold."
+    }
+   },
+   "out": [
+    [
+     "yes",
+     "The answer to \"Is it allowed?\" is yes: All hold."
+    ],
+    [
+     "no",
+     "The answer to \"Is it allowed?\" is no: No"
+    ]
+   ]
+  },
+  {
+   "q": {
+    "type": "noul",
+    "instructions": "Q",
+    "criteria": null
+   },
+   "out": [
+    [
+     "yes",
+     "The answer to \"Q\" is yes: Yes"
+    ],
+    [
+     "no",
+     "The answer to \"Q\" is no: No"
+    ]
+   ]
+  },
+  {
+   "q": {
+    "type": "choice",
+    "instructions": "Route?",
+    "criteria": {
+     "billing": "",
+     "tech": "A fault."
+    }
+   },
+   "out": [
+    [
+     "billing",
+     "The answer to \"Route?\" is billing: billing"
+    ],
+    [
+     "tech",
+     "The answer to \"Route?\" is tech: A fault."
+    ]
+   ]
+  },
+  {
+   "q": {
+    "type": "score",
+    "instructions": "Rate",
+    "criteria": [
+     "bad",
+     "good",
+     "great"
+    ]
+   },
+   "out": [
+    [
+     "0",
+     "The answer to \"Rate\" is 0: bad"
+    ],
+    [
+     "1",
+     "The answer to \"Rate\" is 1: good"
+    ],
+    [
+     "2",
+     "The answer to \"Rate\" is 2: great"
+    ]
+   ]
+  }
+ ],
+ "windows": [
+  {
+   "premise": "Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé ",
+   "w": 24,
+   "out": [
+    "Zürich — ünïcödé Zürich ",
+    "h — ünïcödé Zürich — ünï",
+    "nïcödé Zürich — ünïcödé ",
+    "é Zürich — ünïcödé Züric",
+    "ich — ünïcödé Zürich — ü",
+    " ünïcödé Zürich — ünïcöd",
+    "ödé Zürich — ünïcödé Zür",
+    "ürich — ünïcödé Zürich —",
+    " — ünïcödé Zürich — ünïc",
+    "ïcödé Zürich — ünïcödé Z",
+    " Zürich — ünïcödé Zürich",
+    "ch — ünïcödé Zürich — ün",
+    "ünïcödé Zürich — ünïcödé",
+    "dé Zürich — ünïcödé Züri",
+    "rich — ünïcödé Zürich — ",
+    "— ünïcödé Zürich — ünïcö",
+    "cödé Zürich — ünïcödé Zü",
+    "Zürich — ünïcödé Zürich ",
+    "h — ünïcödé Zürich — ünï",
+    "nïcödé Zürich — ünïcödé ",
+    "é Zürich — ünïcödé Züric",
+    "ich — ünïcödé Zürich — ü",
+    " ünïcödé Zürich — ünïcöd",
+    "ödé Zürich — ünïcödé Zür",
+    "ürich — ünïcödé Zürich —",
+    " — ünïcödé Zürich — ünïc",
+    "ïcödé Zürich — ünïcödé Z",
+    " Zürich — ünïcödé Zürich",
+    "ch — ünïcödé Zürich — ün",
+    "ünïcödé Zürich — ünïcödé",
+    "dé Zürich — ünïcödé "
+   ]
+  },
+  {
+   "premise": "Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé ",
+   "w": 100,
+   "out": [
+    "Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcöd",
+    "— ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Züric",
+    "dé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünï",
+    "ch — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zü",
+    "ïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ",
+    "ürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé",
+    " ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich",
+    "é Zürich — ünïcödé Zürich — ünïcödé "
+   ]
+  },
+  {
+   "premise": "Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé ",
+   "w": 5000,
+   "out": [
+    "Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé "
+   ]
+  }
+ ],
+ "fit": [
+  {
+   "premise": "Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé ",
+   "hyps": [
+    "short",
+    "a much longer hypothesis text"
+   ],
+   "s": 64,
+   "out": [
+    "Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zü",
+    "ch — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich",
+    " ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ü",
+    "cödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé "
+   ]
+  },
+  {
+   "premise": "Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé ",
+   "hyps": [
+    "short",
+    "a much longer hypothesis text"
+   ],
+   "s": 300,
+   "out": [
+    "Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé "
+   ]
+  },
+  {
+   "premise": "Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé ",
+   "hyps": [
+    "short",
+    "a much longer hypothesis text"
+   ],
+   "s": 10000,
+   "out": [
+    "Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé Zürich — ünïcödé "
+   ]
+  }
+ ],
+ "normalise": [
+  {
+   "p": [
+    [
+     0.2,
+     0.6
+    ],
+    [
+     0.4,
+     0.1
+    ]
+   ],
+   "out": [
+    0.4,
+    0.6
+   ]
+  },
+  {
+   "p": [
+    [
+     0.0,
+     0.0
+    ]
+   ],
+   "out": [
+    0.0,
+    0.0
+   ]
+  },
+  {
+   "p": [
+    [
+     0.5,
+     0.25,
+     0.25
+    ]
+   ],
+   "out": [
+    0.5,
+    0.25,
+    0.25
+   ]
+  }
+ ]
+}
