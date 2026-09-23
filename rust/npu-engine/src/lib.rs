@@ -7,9 +7,11 @@
 pub mod api;
 pub mod cancel;
 pub mod decide;
+pub mod nli;
 pub use api::{Engine, EngineError, Model, ModelKind};
 pub use cancel::{Cancel, CancelReason};
 pub use decide::{DecideAnswer, DecideQuestion, DecideRequest, DecideStats, Decisions, QuestionKind, QuestionStats};
+pub use nli::{NliHead, NliRequest, NliScores};
 pub use pipeline::{ChatMessage, Chunk, ToolCall, DEFAULT_MAX_TOKENS, FinishReason, GenerateParams, GenerateUsage, Prompt,
                    TextGenerator};
 pub use telemetry::{

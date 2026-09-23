@@ -28,10 +28,15 @@ pub struct DecideQuestion {
     pub options: Vec<(String, String)>,
 }
 
+/// SemIf's description for a noul side the caller left out.
+pub(crate) fn semif_noul_default(k: &str) -> String {
+    format!("The proposition is {k}.")
+}
+
 impl DecideQuestion {
     /// A yes/no question. Missing criteria get SemIf's default wording.
     pub fn noul(id: &str, instructions: &str, when_true: Option<&str>, when_false: Option<&str>) -> Self {
-        let opt = |k: &str, d: Option<&str>| (k.to_string(), d.map_or(format!("The proposition is {k}."), str::to_string));
+        let opt = |k: &str, d: Option<&str>| (k.to_string(), d.map_or(semif_noul_default(k), str::to_string));
         Self { id: id.into(), kind: QuestionKind::Noul, instructions: instructions.into(),
                options: vec![opt("true", when_true), opt("false", when_false)] }
     }
