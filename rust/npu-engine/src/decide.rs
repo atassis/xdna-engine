@@ -127,7 +127,11 @@ pub fn answer(q: &DecideQuestion, letter_logits: &[f32]) -> DecideAnswer {
     let m = letter_logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
     let w: Vec<f64> = letter_logits.iter().map(|&x| (x as f64 - m).exp()).collect();
     let z: f64 = w.iter().sum();
-    let p: Vec<f64> = w.iter().map(|x| x / z).collect();
+    answer_from_probs(q, &w.iter().map(|x| x / z).collect::<Vec<_>>())
+}
+
+/// The answer from option probabilities already summing to one, in option order.
+pub fn answer_from_probs(q: &DecideQuestion, p: &[f64]) -> DecideAnswer {
     let entropy: f64 = p.iter().filter(|&&x| x > 0.0).map(|x| -x * x.ln()).sum();
     let confidence = 1.0 - entropy / (p.len() as f64).ln();
     let best = p.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i);
@@ -136,9 +140,9 @@ pub fn answer(q: &DecideQuestion, letter_logits: &[f32]) -> DecideAnswer {
         QuestionKind::Noul => DecideAnswer::Noul { id, p_true: p[0] },
         QuestionKind::Choice => DecideAnswer::Choice {
             id, choice: q.options[best].0.clone(),
-            probabilities: q.options.iter().map(|(k, _)| k.clone()).zip(p).collect(), confidence },
+            probabilities: q.options.iter().map(|(k, _)| k.clone()).zip(p.iter().copied()).collect(), confidence },
         QuestionKind::Score => DecideAnswer::Score {
-            id, score: p.iter().enumerate().map(|(i, x)| i as f64 * x).sum(), probabilities: p, confidence },
+            id, score: p.iter().enumerate().map(|(i, x)| i as f64 * x).sum(), probabilities: p.to_vec(), confidence },
     }
 }
 
@@ -188,5 +192,17 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(DecideQuestion::score("s", "?", vec!["only".into()]).validate().is_err());
+    }
+
+    #[test]
+    fn answer_from_probs_maps_without_a_second_softmax() {
+        let q = DecideQuestion::choice("c", "?", vec![("a".into(), "".into()), ("b".into(), "".into())]);
+        match answer_from_probs(&q, &[0.25, 0.75]) {
+            DecideAnswer::Choice { choice, probabilities, .. } => {
+                assert_eq!(choice, "b");
+                assert_eq!(probabilities[1].1, 0.75);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }
