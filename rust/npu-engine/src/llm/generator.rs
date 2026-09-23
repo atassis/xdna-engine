@@ -42,6 +42,12 @@ pub trait DecodeStep {
         Ok(None)
     }
 
+    /// After a `step`: the final-normed hidden of that position (`xf`). None when the backend does
+    /// not publish it.
+    fn final_hidden(&mut self) -> Result<Option<Vec<f32>>, EngineError> {
+        Ok(None)
+    }
+
     /// Drop any per-generation state before a new one starts, and SAY whether the KV cache was
     /// emptied doing it.
     ///
