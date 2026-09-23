@@ -4,7 +4,6 @@ import subprocess
 import sys
 
 import numpy as np
-import pytest
 import torch
 from safetensors.torch import save_file
 

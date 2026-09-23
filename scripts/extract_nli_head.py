@@ -25,8 +25,11 @@ def main():
     arch = (cfg.get("architectures") or [""])[0]
     if not arch.endswith("ForSequenceClassification"):
         sys.exit(f"{arch!r} is not a *ForSequenceClassification checkpoint")
-    d = (cfg.get("text_config") or cfg)["hidden_size"]
-    labels = [cfg["id2label"][str(i)] for i in range(len(cfg["id2label"]))]
+    d = (cfg.get("text_config") or cfg).get("hidden_size")
+    id2label = cfg.get("id2label")
+    if not d or not id2label:
+        sys.exit("config.json carries no hidden_size or id2label")
+    labels = [id2label[str(i)] for i in range(len(id2label))]
     if "entailment" not in labels:
         sys.exit(f"labels {labels} carry no 'entailment'")
     shards = [f for f in sorted(os.listdir(a.checkpoint_dir)) if f.endswith(".safetensors")]
@@ -35,6 +38,7 @@ def main():
         with safe_open(os.path.join(a.checkpoint_dir, s), framework="pt") as f:
             if "score.weight" in f.keys():
                 w = f.get_tensor("score.weight")
+                break
     if w is None or tuple(w.shape) != (len(labels), d):
         sys.exit(f"score.weight is {None if w is None else tuple(w.shape)}, want {(len(labels), d)}")
     os.makedirs(a.out, exist_ok=True)
