@@ -87,6 +87,8 @@ pub enum Request {
     Image { rgb: Vec<u8>, w: usize, h: usize },
     /// Typed decision questions over one state, answered off a generate model's logits.
     Decide(crate::decide::DecideRequest),
+    /// (premise, hypothesis) pairs for a generate model carrying an NLI head.
+    Nli(crate::nli::NliRequest),
 }
 
 impl Request {
@@ -98,6 +100,7 @@ impl Request {
             Request::Audio { .. } => "audio",
             Request::Image { .. } => "image",
             Request::Decide(_) => "decide",
+            Request::Nli(_) => "nli",
         }
     }
 }
@@ -131,6 +134,8 @@ pub enum Response {
     Segments(Vec<Segment>),
     /// One answer per question, in request order, and their cost.
     Decisions(crate::decide::Decisions),
+    /// Label probabilities per pair, and their cost.
+    NliScores(crate::nli::NliScores),
 }
 
 impl Response {
@@ -143,6 +148,7 @@ impl Response {
             Response::Image { .. } => "image",
             Response::Segments(_) => "segments",
             Response::Decisions(_) => "decisions",
+            Response::NliScores(_) => "nli-scores",
         }
     }
 }

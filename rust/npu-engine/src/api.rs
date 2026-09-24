@@ -193,6 +193,15 @@ impl Model {
         }
     }
 
+    /// NLI label probabilities per pair, read off a generate model's classification head.
+    pub fn nli(&mut self, req: &crate::nli::NliRequest) -> Result<crate::nli::NliScores, EngineError> {
+        let got = kind_of(&self.scen).capability();
+        match &mut self.scen {
+            Scenario::Generate(m) => m.nli(req),
+            _ => Err(EngineError::WrongKind { wanted: ModelKind::Generate.capability(), got }),
+        }
+    }
+
     /// Diarization: 16 kHz mono i16 PCM -> speaker-attributed spans.
     pub fn diarize(&self, pcm: &[i16], sample_rate: u32)
         -> Result<Vec<crate::capability::Segment>, EngineError> {
