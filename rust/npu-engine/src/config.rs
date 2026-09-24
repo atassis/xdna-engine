@@ -266,6 +266,10 @@ pub struct Artifacts {
     /// `tokenizer.json` file rather than its containing directory.
     #[serde(default)]
     pub tokenizer_dir: String,
+    /// `kind = "generate"` only: a sequence-classification head (`scripts/extract_nli_head.py`).
+    /// Naming one switches `decide` to openjev's rule and serves `/predict` and `/rerank`.
+    #[serde(default)]
+    pub nli_head: String,
     /// Declarative weight source: `"hf:<repo>[@rev]"` or `"path:/abs"`. When set, the engine
     /// resolves + bakes (on missing) a `npu-weights` checkpoint via this spec instead of reading the
     /// legacy npy `weights` dir. Optional and additive: omit it and the npy path is unchanged.
@@ -407,6 +411,14 @@ manifest = "artifacts/pyannote/diarize.json"
         )
         .expect("a scenario with no decode_buckets must parse");
         assert!(c.artifacts.decode_buckets.is_empty());
+    }
+
+    #[test]
+    fn a_generate_scenario_can_name_an_nli_head() {
+        let c = ScenarioConfig::from_str(
+            "[scenario]\nkind = \"generate\"\nname = \"m\"\n[artifacts]\ndecode = \"d\"\nweights = \"w\"\ntokenizer_dir = \"t\"\nnli_head = \"h\"\n",
+        ).unwrap();
+        assert_eq!(c.artifacts.nli_head, "h");
     }
 
     /// And when they ARE named, the buckets arrive in declaration order. Order is not load-bearing

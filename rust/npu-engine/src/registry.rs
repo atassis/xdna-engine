@@ -86,8 +86,12 @@ pub fn try_build(cfg_path: &Path, root: &Path) -> Result<Scenario, EngineError> 
                     &buckets,
                 )?
             };
-            Scenario::Generate(Box::new(crate::llm::LlmGenerator::new(model_cfg, decode)
-                .with_scenario_defaults(cfg.generation.to_defaults())))
+            let mut g = crate::llm::LlmGenerator::new(model_cfg, decode)
+                .with_scenario_defaults(cfg.generation.to_defaults());
+            if !cfg.artifacts.nli_head.is_empty() {
+                g = g.with_nli_head(crate::nli::NliHead::load(&root.join(&cfg.artifacts.nli_head))?);
+            }
+            Scenario::Generate(Box::new(g))
         }
         // NO open_dev(): nothing here composes onto the device yet (see `tts::TtsPipeline`), so a
         // `tts` scenario must not take a hardware context away from a model that coexists with it.
