@@ -365,8 +365,25 @@ name = "gemma4-12b"
 #   Rollback: point decode= back at decode_s6912_l48_are_wgm_pwm_rr and reinstall. The IRON-side
 #   knob is MVQ_UNROLL in aie_kernels/generic/mv_quant.cc; 1 restores the old loop.
 #
+# DEFAULT SINCE 2026-09-24: `decode_s6912_l48_are_wgm_pwm_rr_mvq2_aw_bsingle_main`, the recipe above
+#   plus FUSE_ATTN_WEIGHTLESS=1 (the sliding layers' attention as one design, Wqkv left in the
+#   merged weight device) and GEMV_B_SINGLE=1 (down/o_proj unsplit along K, one runtime-K GEMV).
+#   Paired with its own prefill below; the two move together.
+#   build  the recipe above + FUSE_ATTN_WEIGHTLESS=1 GEMV_B_SINGLE=1, IRON = integration-stack plus
+#            weightless attn_block_dp, runtime-K gemv and dequant_rows (local g4/pair-integ, a0acab1)
+#   repro  rebuilt from main 8bc9918: sequence name, scratch_size, all 680 layout entries and every
+#            buffer identical to the arm that was gated; ELF differs in 29 bytes (bootgen headers).
+#     latency   itl_ms.p50 through `npu serve`, 4131-token prompt + 200 greedy tokens, A-B-A-B with a
+#               restart per arm, platform profile performance: 252.45/251.69 -> 230.43/232.20,
+#               **-20.75 ms, -8.2%**, no overlap. Higher than the bench rows above because n_past
+#               here is ~4.1-4.3k, not 1/512.
+#     tokens    each arm's two reps byte-identical; the arms differ in text (reduction order).
+#     parity    L=6 oracle 8/8; teacher-forced cross-entropy on four fresh sequences is a coin flip
+#               against the previous default (179/384 steps).
+#   Rollback: point decode= and prefill= back at `..._mvq2` / `..._lsb` and reinstall.
+#
 [artifacts]
-decode = "artifacts/gemma4-12b/decode_s6912_l48_are_wgm_pwm_rr_mvq2"
+decode = "artifacts/gemma4-12b/decode_s6912_l48_are_wgm_pwm_rr_mvq2_aw_bsingle_main"
 #
 # DEFAULT SINCE 2026-09-18: `prefill_m64_s6912_l48_seg4_ring`, the same recipe plus
 # PREFILL_SLIDING_RING=1, which batches prefill past the 1024 sliding-window capacity.
@@ -410,7 +427,14 @@ decode = "artifacts/gemma4-12b/decode_s6912_l48_are_wgm_pwm_rr_mvq2"
 #   that swap, which is why the arm below stands as the control.
 #
 # Rollback: point `prefill =` back at `prefill_m64_s6912_l48_seg4_ring` and reinstall. Decode untouched.
-prefill = "artifacts/gemma4-12b/prefill_m64_s6912_l48_seg4_ring_lsb"
+#
+# DEFAULT SINCE 2026-09-24: `prefill_m64_s6912_l48_seg4_ring_lsb_awbs_main`, the `_lsb` recipe plus
+#   PREFILL_MERGE_KCHUNKS=1 (reads the K-chunked dump as one full-K weight, so it no longer borrows
+#   decode's K-split scratch) and DECODE_META at the decode above. Rebuilt from main: 334/334 buffers
+#   identical to the gated build, ELF differs in 21 bytes. Same A-B-A-B as the decode entry:
+#   38.48/38.16 -> 37.37/37.01 ms per prompt token, -2.9%. tier2P on the gated build matches the
+#   previous pair cell for cell (11/14 on both).
+prefill = "artifacts/gemma4-12b/prefill_m64_s6912_l48_seg4_ring_lsb_awbs_main"
 weights = "artifacts/gemma4-12b/weights_int4g32sbf16_planar_qat_rg"
 tokenizer_dir = "artifacts/gemma4-12b/tokenizer"
 
