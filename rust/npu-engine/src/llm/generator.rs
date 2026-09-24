@@ -500,11 +500,104 @@ pub struct LlmGenerator<D: DecodeStep> {
     /// state -- fluently, with no warning, and no happy-path test would see it. Every path that
     /// writes KV must update it or clear it. There is no third option.
     resident: Vec<u32>,
+    /// A sequence-classification readout over `decode`'s final hidden state, when this model
+    /// carries one. `None` for every letter-softmax (SemIf) model.
+    nli_head: Option<crate::nli::NliHead>,
 }
 
 impl<D: DecodeStep> LlmGenerator<D> {
     pub fn new(cfg: ModelConfig, decode: D) -> Self {
-        LlmGenerator { cfg, decode, scenario_defaults: Default::default(), resident: Vec::new() }
+        LlmGenerator { cfg, decode, scenario_defaults: Default::default(), resident: Vec::new(), nli_head: None }
+    }
+
+    /// Read the last position through a sequence-classification head instead of the vocabulary:
+    /// `decide` then answers by openjev's rule and `nli` is served.
+    pub fn with_nli_head(mut self, head: crate::nli::NliHead) -> Self {
+        self.nli_head = Some(head);
+        self
+    }
+
+    fn tokenize_raw(&self, text: &str) -> Result<Vec<u32>, EngineError> {
+        tokenize_prompt(&self.cfg, &Prompt::Raw(text.to_string()), None, &[])
+    }
+
+    /// Score `hyps` against `premise`: windows that fit the context, one priming pass per window
+    /// (hypotheses of a window share its prefix), label probabilities per (window, hypothesis).
+    fn nli_score(&mut self, share: bool, head: &crate::nli::NliHead, premise: &str, hyps: &[String],
+                 stats: &mut crate::decide::DecideStats) -> Result<Vec<Vec<Vec<f64>>>, EngineError> {
+        let s = self.decode.max_context().unwrap_or(usize::MAX);
+        let wins = {
+            let mut n = |t: &str| self.tokenize_raw(t).map(|v| v.len());
+            crate::nli::fit_windows(&head.template, premise, hyps, &mut n, s)?
+        };
+        let mut out = Vec::with_capacity(wins.len());
+        for w in &wins {
+            let ids = hyps.iter().map(|h| self.tokenize_raw(&crate::nli::prompt(&head.template, w, h)?))
+                .collect::<Result<Vec<_>, _>>()?;
+            out.push(self.prime_each(share, &ids, stats, |d, _, _| {
+                let xf = d.final_hidden()?.ok_or_else(|| EngineError::Unsupported(
+                    "this backend publishes no final hidden state to read an NLI head from".into()))?;
+                head.probs(&xf)
+            })?);
+        }
+        Ok(out)
+    }
+
+    fn require_head(&self) -> Result<crate::nli::NliHead, EngineError> {
+        self.nli_head.clone().ok_or_else(|| EngineError::Unsupported(
+            "this model has no NLI head (its readout is the SemIf letter softmax)".into()))
+    }
+
+    pub(crate) fn nli_with(&mut self, share: bool, req: &crate::nli::NliRequest)
+        -> Result<crate::nli::NliScores, EngineError> {
+        let head = self.require_head()?;
+        let mut stats = crate::decide::DecideStats::default();
+        let mut probs = vec![Vec::new(); req.pairs.len()];
+        let mut windows = vec![0; req.pairs.len()];
+        // Pairs with the same premise are scored together, so they share its prefix.
+        let mut order: Vec<&str> = Vec::new();
+        for (p, _) in &req.pairs { if !order.contains(&p.as_str()) { order.push(p); } }
+        for premise in order {
+            let idx: Vec<usize> = (0..req.pairs.len()).filter(|&i| req.pairs[i].0 == premise).collect();
+            let hyps: Vec<String> = idx.iter().map(|&i| req.pairs[i].1.clone()).collect();
+            let per_win = self.nli_score(share, &head, premise, &hyps, &mut stats)?;
+            for (k, &i) in idx.iter().enumerate() {
+                windows[i] = per_win.len();
+                probs[i] = per_win.iter().map(|w| w[k].clone())
+                    .max_by(|a, b| a[head.entailment()].total_cmp(&b[head.entailment()])).unwrap();
+            }
+        }
+        Ok(crate::nli::NliScores { labels: head.labels.clone(), probs, windows, stats })
+    }
+
+    pub(crate) fn decide_nli(&mut self, share: bool, req: &crate::decide::DecideRequest)
+        -> Result<crate::decide::Decisions, EngineError> {
+        use crate::decide::{answer_from_probs, Decisions, DecideStats};
+        let head = self.require_head()?;
+        for q in &req.questions { q.validate().map_err(EngineError::Unsupported)?; }
+        let evidence = match &req.evidence {
+            serde_json::Value::String(s) => s.clone(),
+            v => crate::llm::chat_template::json_dumps_py(v),
+        };
+        let per_q: Vec<Vec<(String, String)>> = req.questions.iter().map(crate::nli::decide_hypotheses).collect();
+        let hyps: Vec<String> = per_q.iter().flatten().map(|(_, h)| h.clone()).collect();
+        let mut stats = DecideStats::default();
+        let per_win = self.nli_score(share, &head, &evidence, &hyps, &mut stats)?;
+        let e = head.entailment();
+        let mut answers = Vec::with_capacity(req.questions.len());
+        let mut at = 0;
+        for (q, h) in req.questions.iter().zip(&per_q) {
+            let p_ent: Vec<Vec<f64>> = per_win.iter().map(|w| w[at..at + h.len()].iter().map(|p| p[e]).collect()).collect();
+            answers.push(answer_from_probs(q, &crate::nli::normalise_entailment(&p_ent)));
+            at += h.len();
+        }
+        // One stats row per (window, hypothesis), window-major: name each `<question>/<label>#w<i>`.
+        let names: Vec<String> = req.questions.iter().zip(&per_q)
+            .flat_map(|(q, h)| h.iter().map(move |(l, _)| format!("{}/{l}", q.id))).collect();
+        for (k, s) in stats.questions.iter_mut().enumerate() {
+            s.id = format!("{}#w{}", names[k % names.len()], k / names.len());
+        }
+        Ok(Decisions { answers, stats })
     }
 
     /// Prime `ids` and return the logits at their last position: `generate`'s prompt phase without
@@ -744,6 +837,9 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
     /// ledger allows.
     fn decide(&mut self, req: &crate::decide::DecideRequest)
         -> Result<crate::decide::Decisions, EngineError> {
+        if self.nli_head.is_some() {
+            return self.decide_nli(shared_state_enabled(), req);
+        }
         use crate::decide::{messages, LETTERS};
         let need = req.questions.iter().map(|q| q.options.len()).max().unwrap_or(0).min(LETTERS.len());
         let slots = LETTERS.chars().take(need)
@@ -761,6 +857,10 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
 
     fn bo_bytes(&self) -> u64 {
         self.decode.bo_bytes()
+    }
+
+    fn nli(&mut self, req: &crate::nli::NliRequest) -> Result<crate::nli::NliScores, EngineError> {
+        self.nli_with(shared_state_enabled(), req)
     }
 
     fn generate(
@@ -2357,13 +2457,20 @@ mod decide_tests {
         recurrent: bool,
         /// Like the real `NpuPrefill::prime`, which can stop at a batch-aligned absolute window:
         /// `prefill` absorbs only positions before `min(tokens.len(), window floored to batch)`.
+        /// This is a BATCHING artifact, not a capacity ceiling: a prompt longer than `window`
+        /// still succeeds, its tail stepped one token at a time. See `ctx` for the real bound.
         window: Option<usize>,
+        /// The hard context ceiling `max_context()` reports -- what `prime_to_last_logits` and
+        /// `prime_shared_prefix` actually refuse against. Kept distinct from `window`: reusing
+        /// `window` here made `a_window_limited_prefill_still_matches_the_fresh_path`'s
+        /// longer-than-window prompt refuse instead of stepwise-completing it.
+        ctx: Option<usize>,
         prefills: Vec<(usize, usize)>,
     }
 
     impl Recurrent {
         fn new(batch: usize) -> Self {
-            Recurrent { state: 0, batch, break_even: None, decline_prefill: false,
+            Recurrent { state: 0, batch, break_even: None, decline_prefill: false, ctx: None,
                         ignore_restore: false, recurrent: true, window: None, prefills: Vec::new() }
         }
         fn absorb(&mut self, tok: u32, pos: usize) {
@@ -2404,6 +2511,10 @@ mod decide_tests {
             }
             Ok(())
         }
+        fn final_hidden(&mut self) -> Result<Option<Vec<f32>>, EngineError> {
+            Ok(Some((0..2).map(|i| ((self.state >> (i * 16)) & 0xffff) as f32 / 65535.0).collect()))
+        }
+        fn max_context(&self) -> Option<usize> { self.ctx }
     }
 
     /// `shared` common tokens, then `tails[i]` distinct ones per question.
@@ -2420,6 +2531,65 @@ mod decide_tests {
             DecideQuestion::score("s", "?", vec!["lo".into(), "mid".into(), "hi".into(), "top".into()]),
         ];
         (0..n).map(|i| { let mut q = kinds[i % 3].clone(); q.id = format!("q{i}"); q }).collect()
+    }
+
+    fn head() -> crate::nli::NliHead {
+        crate::nli::NliHead::from_parts(vec!["contradiction".into(), "entailment".into(), "neutral".into()],
+            "Premise: {premise}\nHypothesis: {hypothesis}".into(),
+            vec![vec![1.0, -1.0], vec![-1.0, 1.0], vec![0.0, 0.0]]).unwrap()
+    }
+
+    fn nli_gen(d: Recurrent) -> LlmGenerator<Recurrent> {
+        LlmGenerator::new(build_cfg(None), d).with_nli_head(head())
+    }
+
+    #[test]
+    fn nli_scores_each_pair_and_sums_to_one() {
+        let mut g = nli_gen(Recurrent::new(256));
+        let r = g.nli_with(true, &crate::nli::NliRequest { pairs: vec![
+            ("A man plays a guitar.".into(), "Someone makes music.".into()),
+            ("A man plays a guitar.".into(), "Nobody is there.".into())] }).unwrap();
+        assert_eq!(r.probs.len(), 2);
+        for p in &r.probs { assert!((p.iter().sum::<f64>() - 1.0).abs() < 1e-9); }
+        assert_eq!(r.windows, vec![1, 1]);
+    }
+
+    #[test]
+    fn nli_shared_and_fresh_agree() {
+        let pairs: Vec<(String, String)> = (0..3).map(|i| ("p ".repeat(400), format!("h{i}"))).collect();
+        let a = nli_gen(Recurrent::new(256)).nli_with(true, &crate::nli::NliRequest { pairs: pairs.clone() }).unwrap();
+        let b = nli_gen(Recurrent::new(256)).nli_with(false, &crate::nli::NliRequest { pairs }).unwrap();
+        assert_eq!(a.probs, b.probs);
+    }
+
+    #[test]
+    fn a_letters_model_refuses_nli() {
+        let mut g = LlmGenerator::new(build_cfg(None), Recurrent::new(256));
+        assert!(matches!(g.nli_with(true, &crate::nli::NliRequest { pairs: vec![("a".into(), "b".into())] }),
+                         Err(EngineError::Unsupported(_))));
+    }
+
+    #[test]
+    fn nli_decide_answers_every_question_with_normalised_probabilities() {
+        let mut g = nli_gen(Recurrent::new(256));
+        let req = crate::decide::DecideRequest { evidence: serde_json::json!("The refund needs a receipt."),
+                                                 questions: questions(3) };
+        let d = g.decide_nli(true, &req).unwrap();
+        assert_eq!(d.answers.len(), 3);
+        match &d.answers[1] {
+            DecideAnswer::Choice { probabilities, .. } =>
+                assert!((probabilities.iter().map(|(_, p)| p).sum::<f64>() - 1.0).abs() < 1e-9),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_premise_longer_than_the_context_is_windowed() {
+        let mut d = Recurrent::new(256);
+        d.ctx = Some(512);
+        let mut g = nli_gen(d);
+        let r = g.nli_with(true, &crate::nli::NliRequest { pairs: vec![("word ".repeat(2000), "h".into())] }).unwrap();
+        assert!(r.windows[0] > 1, "{:?}", r.windows);
     }
 
     const SLOTS: [u32; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];

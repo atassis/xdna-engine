@@ -419,6 +419,11 @@ pub trait TextGenerator {
         Err(EngineError::Unsupported("this generator cannot answer typed decisions".to_string()))
     }
 
+    /// NLI label probabilities per (premise, hypothesis) pair, off a sequence-classification head.
+    fn nli(&mut self, _req: &crate::nli::NliRequest) -> Result<crate::nli::NliScores, EngineError> {
+        Err(EngineError::Unsupported("this generator has no NLI head".to_string()))
+    }
+
     /// Collect a whole generation into a String. Provided, not required: this is the buffered
     /// surface expressed in terms of the streaming one, which is the point of the single method.
     fn generate_to_string(
