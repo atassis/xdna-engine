@@ -369,8 +369,8 @@ name = "gemma4-12b"
 #   plus FUSE_ATTN_WEIGHTLESS=1 (the sliding layers' attention as one design, Wqkv left in the
 #   merged weight device) and GEMV_B_SINGLE=1 (down/o_proj unsplit along K, one runtime-K GEMV).
 #   Paired with its own prefill below; the two move together.
-#   build  the recipe above + FUSE_ATTN_WEIGHTLESS=1 GEMV_B_SINGLE=1, IRON = integration-stack plus
-#            weightless attn_block_dp, runtime-K gemv and dequant_rows (local g4/pair-integ, a0acab1)
+#   build  the recipe above + FUSE_ATTN_WEIGHTLESS=1 GEMV_B_SINGLE=1, IRON = integration-stack
+#            a0acab1 (weightless attn_block_dp, runtime-K gemv and dequant_rows)
 #   repro  rebuilt from main 8bc9918: sequence name, scratch_size, all 680 layout entries and every
 #            buffer identical to the arm that was gated; ELF differs in 29 bytes (bootgen headers).
 #     latency   itl_ms.p50 through `npu serve`, 4131-token prompt + 200 greedy tokens, A-B-A-B with a
