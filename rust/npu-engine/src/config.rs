@@ -401,6 +401,13 @@ manifest = "artifacts/pyannote/diarize.json"
         }
     }
 
+    #[test]
+    fn the_openjev_scenario_names_its_head() {
+        let c = ScenarioConfig::from_str(&std::fs::read_to_string("../../scenarios/nli-openjev-4b.toml").unwrap()).unwrap();
+        assert_eq!(c.artifacts.nli_head, "artifacts/openjev-4b/nli_head");
+        assert!(!c.artifacts.prefill.is_empty());
+    }
+
     /// Bucketing is opt-in and its ABSENCE must stay the single-bucket rail: every scenario
     /// shipped before it parses unchanged, declaring none. Asserted on an inline scenario rather
     /// than a shipped file, so it does not pin that file's current content.
