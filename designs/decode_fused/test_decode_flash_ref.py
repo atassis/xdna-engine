@@ -7,7 +7,7 @@
 import numpy as np
 import pytest
 
-from decode_flash_ref import blocks_per_column, decode_flash_attention, last_block_index
+from decode_flash_ref import blocks_per_column, decode_flash_attention, last_block_index, merge
 from flash_attn_ref import full_attention
 
 HQ, HD, CAP = 16, 512, 4096
@@ -57,6 +57,19 @@ def test_column_count_changes_order_not_result():
     q, k, v = qkv(3)
     assert rel_l2(decode_flash_attention(q, k, v, 3000, columns=1),
                   decode_flash_attention(q, k, v, 3000, columns=8)) < 1e-2
+
+
+def test_merge_skips_an_empty_leading_partial():
+    hq, hd = HQ, HD
+    empty = (np.full(hq, -np.inf, np.float32), np.zeros(hq, np.float32), np.zeros((hq, hd), np.float32))
+    rng = np.random.default_rng(9)
+    real = (rng.standard_normal(hq, dtype=np.float32),
+            rng.random(hq, dtype=np.float32) + 0.1,
+            rng.standard_normal((hq, hd), dtype=np.float32))
+    got = merge([empty, real])
+    want = merge([real])
+    assert np.isfinite(got).all()
+    np.testing.assert_array_equal(got, want)
 
 
 def test_columns_without_a_live_block_fold_as_no_ops():

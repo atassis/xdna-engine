@@ -15,6 +15,7 @@ def bf16(x):
 
 
 def blocks_per_column(n_live, block=64, columns=8):
+    """ceil(ceil(n_live / block) / columns): the blocks each column streams under round-robin dealing."""
     if n_live < 1:
         raise ValueError("n_live must be >= 1")
     return -(-(-(-n_live // block)) // columns)
@@ -47,6 +48,7 @@ def column_partial(q, k, v, n_live, col, block=64, columns=8):
 
 
 def merge(parts):
+    """Fold column partials in f32; a partial with no live block contributes nothing."""
     hq, hd = parts[0][2].shape
     m = np.full(hq, -np.inf, np.float32)
     l = np.zeros(hq, np.float32)
