@@ -19,6 +19,8 @@ use std::path::Path;
 use ndarray::prelude::*;
 use ndarray_npy::read_npy;
 
+use crate::onnx_init::{self, Tensor as OnnxTensor};
+
 pub const HIDDEN: usize = 640;
 pub const VOCAB_SIZE: usize = 8193; // token logits incl <blk>
 pub const NUM_DURATIONS: usize = 5; // output 8198 = 8193 + 5
@@ -95,6 +97,64 @@ impl TdtDecoder {
             joint_w: load_2d(&dir.join("joint_W.npy")),
             joint_b: load_1d(&dir.join("joint_b.npy")),
         }
+    }
+
+    /// Load weights straight out of `decoder_joint.onnx`'s initializers (`onnx_init.rs`), with
+    /// no onnxruntime and no `--dump-weights` pre-processing step. Mirrors
+    /// `scripts/parakeet_tdt_decoder_ref.py::load_weights` field-for-field: fixed names for the
+    /// embedding/bias tensors, LSTM node input names for the two LSTM weight triples (ONNX gives
+    /// LSTM weights compiler-generated names, so they're found via the node, not a string), and
+    /// exact-shape lookup for the three `onnx::MatMul_*` joint projections (unique per shape --
+    /// verified against the real decoder_joint.onnx, see the crate's tests).
+    pub fn load_from_onnx(onnx_path: &Path) -> onnx_init::Result<Self> {
+        let g = onnx_init::load(onnx_path)?;
+        let get = |name: &str| -> onnx_init::Result<&OnnxTensor> {
+            g.initializers.get(name).ok_or_else(|| format!("missing initializer {name}"))
+        };
+        let to_2d = |t: &OnnxTensor| -> Array2<f32> {
+            // LSTM W/R come as [num_directions=1, rows, cols]; drop the leading 1.
+            let (rows, cols) = match t.dims.as_slice() {
+                [r, c] => (*r as usize, *c as usize),
+                [1, r, c] => (*r as usize, *c as usize),
+                d => panic!("to_2d: unexpected dims {d:?}"),
+            };
+            Array2::from_shape_vec((rows, cols), t.data.clone()).unwrap()
+        };
+        let to_1d = |t: &OnnxTensor| -> Array1<f32> { Array1::from_vec(t.data.clone()) };
+
+        let lstm_nodes: Vec<&(String, Vec<String>)> =
+            g.nodes.iter().filter(|(op, _)| op == "LSTM").collect();
+        if lstm_nodes.len() != 2 {
+            return Err(format!("expected 2 LSTM nodes, found {}", lstm_nodes.len()));
+        }
+        let mut lstm_iter = lstm_nodes.into_iter();
+        let mut load_layer = || -> onnx_init::Result<LstmLayer> {
+            let (_, inputs) = lstm_iter.next().unwrap();
+            Ok(LstmLayer {
+                w: to_2d(get(&inputs[1])?),
+                r: to_2d(get(&inputs[2])?),
+                b: to_1d(get(&inputs[3])?),
+            })
+        };
+        let lstm = [load_layer()?, load_layer()?];
+
+        let find_by_shape = |dims: [i64; 2]| -> onnx_init::Result<&OnnxTensor> {
+            g.initializers
+                .values()
+                .find(|t| t.dims.as_slice() == dims)
+                .ok_or_else(|| format!("no initializer with shape {dims:?}"))
+        };
+
+        Ok(TdtDecoder {
+            embed: to_2d(get("decoder.prediction.embed.weight")?),
+            lstm,
+            enc_w: to_2d(find_by_shape([1024, HIDDEN as i64])?),
+            enc_b: to_1d(get("joint.enc.bias")?),
+            pred_w: to_2d(find_by_shape([HIDDEN as i64, HIDDEN as i64])?),
+            pred_b: to_1d(get("joint.pred.bias")?),
+            joint_w: to_2d(find_by_shape([HIDDEN as i64, (VOCAB_SIZE + NUM_DURATIONS) as i64])?),
+            joint_b: to_1d(get("joint.joint_net.2.bias")?),
+        })
     }
 
     /// One ONNX-LSTM cell step. Returns (h_new, c_new).
