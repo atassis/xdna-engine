@@ -586,58 +586,70 @@ impl<D: DecodeStep> LlmGenerator<D> {
             return Ok(None);
         }
         self.resident = ids[0][..b].to_vec();
-        stats.prefix_us = t.elapsed().as_micros() as u64;
+        stats.prefix_us += t.elapsed().as_micros() as u64;
         let t = Instant::now();
         let snap = self.decode.snapshot_recurrent()?;
-        stats.snapshot_us = t.elapsed().as_micros() as u64;
+        stats.snapshot_us += t.elapsed().as_micros() as u64;
         stats.shared_prefix_tokens = b;
         Ok(Some(snap))
     }
 
-    /// `decide` after tokenization; `share` is `NPU_DECIDE_SHARED_STATE` read once by the caller.
-    fn decide_ids_with(&mut self, share: bool, qs: &[crate::decide::DecideQuestion], ids: &[Vec<u32>], slots: &[u32])
-        -> Result<crate::decide::Decisions, EngineError> {
-        use crate::decide::{answer, DecideStats, Decisions, QuestionStats};
-        // `decide` reads specific candidate logits, not an argmax over the whole vocabulary --
-        // never skip the softcap here, regardless of what the last `generate()` on this backend
-        // left `set_greedy` at.
-        self.decode.set_greedy(false);
-        let mut stats = DecideStats::default();
+    /// Prime each of `ids` from a shared recurrent prefix when `share` allows (else fresh), and
+    /// hand each primed position to `read`. Stats are per prompt, in order, with an empty `id`.
+    fn prime_each<T>(&mut self, share: bool, ids: &[Vec<u32>], stats: &mut crate::decide::DecideStats,
+                     mut read: impl FnMut(&mut D, usize, &Primed) -> Result<T, EngineError>)
+        -> Result<Vec<T>, EngineError> {
+        use crate::decide::QuestionStats;
         let snap = match share {
-            true => self.prime_shared_prefix(ids, &mut stats)?,
+            true => self.prime_shared_prefix(ids, stats)?,
             false => None,
         };
-        let mut answers = Vec::with_capacity(qs.len());
-        for (q, ids) in qs.iter().zip(ids) {
-            let mut s = QuestionStats { id: q.id.clone(), prompt_tokens: ids.len(), ..Default::default() };
+        let mut out = Vec::with_capacity(ids.len());
+        for (i, q) in ids.iter().enumerate() {
+            let mut s = QuestionStats { prompt_tokens: q.len(), ..Default::default() };
+            let t = Instant::now();
             let p = match &snap {
                 Some(snap) => {
-                    let t = Instant::now();
                     self.decode.restore_recurrent(snap)?;
                     s.restore_us = t.elapsed().as_micros() as u64;
                     let t = Instant::now();
-                    let p = self.prime_suffix(ids, stats.shared_prefix_tokens)?;
+                    let p = self.prime_suffix(q, stats.shared_prefix_tokens)?;
                     s.prefill_us = t.elapsed().as_micros() as u64;
                     p
                 }
                 None => {
-                    let t = Instant::now();
-                    let p = self.prime_to_last_logits(ids)?;
+                    let p = self.prime_to_last_logits(q)?;
                     s.prefill_us = t.elapsed().as_micros() as u64;
                     p
                 }
             };
             (s.reused_tokens, s.batched_tokens, s.stepwise_tokens) = (p.reused, p.batched, p.stepwise);
             let t = Instant::now();
-            let want = &slots[..q.options.len()];
-            let picked = match self.decode.option_logits(want)? {
-                Some(v) => v,
-                None => want.iter().map(|&t| p.logits[t as usize]).collect(),
-            };
-            answers.push(answer(q, &picked));
+            out.push(read(&mut self.decode, i, &p)?);
             s.readout_us = t.elapsed().as_micros() as u64;
             stats.questions.push(s);
         }
+        Ok(out)
+    }
+
+    /// `decide` after tokenization; `share` is `NPU_DECIDE_SHARED_STATE` read once by the caller.
+    fn decide_ids_with(&mut self, share: bool, qs: &[crate::decide::DecideQuestion], ids: &[Vec<u32>], slots: &[u32])
+        -> Result<crate::decide::Decisions, EngineError> {
+        use crate::decide::{answer, DecideStats, Decisions};
+        // `decide` reads specific candidate logits, not an argmax over the whole vocabulary --
+        // never skip the softcap here, regardless of what the last `generate()` on this backend
+        // left `set_greedy` at.
+        self.decode.set_greedy(false);
+        let mut stats = DecideStats::default();
+        let answers = self.prime_each(share, ids, &mut stats, |d, i, p| {
+            let want = &slots[..qs[i].options.len()];
+            let picked = match d.option_logits(want)? {
+                Some(v) => v,
+                None => want.iter().map(|&t| p.logits[t as usize]).collect(),
+            };
+            Ok(answer(&qs[i], &picked))
+        })?;
+        for (s, q) in stats.questions.iter_mut().zip(qs) { s.id = q.id.clone(); }
         Ok(Decisions { answers, stats })
     }
 
