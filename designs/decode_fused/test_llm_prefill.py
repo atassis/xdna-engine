@@ -189,3 +189,47 @@ def test_operand_bounds_rejects_an_s_wide_read_of_a_narrowed_kv_slab():
     with pytest.raises(ValueError) as e:
         iron_gen.check_operand_bounds(*_scores_entry(6912))
     assert "L0_kc" in str(e.value) and "7208960" in str(e.value)
+
+
+class TestDqGroupForLength:
+    """`fuse_o` (decode default since 2026-09-08) zero-pads Wo past D to a whole `TSI_O=3`-row
+    tile boundary (`swiglu_mlp_dp`'s own tiling), and D=1024 (qwen3-0.6b) is not a multiple of 3
+    -- decode's arena then holds 1026 rows, not 1024, and `dq_group` used to demand an exact
+    `rows*K*2` byte count, so `build_prefill.sh 28 256 4096` failed on `L0_Wo` before a single
+    aiecc run. D=3840 (gemma4-12b) IS a multiple of 3, so it never hit this."""
+
+    def test_a_fuse_o_padded_bf16_wo_is_still_read_as_bf16(self):
+        D, K = 1024, 2048
+        assert D % 3 != 0
+        padded_rows = -(-D // 3) * 3          # decode's own TSI_O ceiling, reproduced ONLY to
+        assert padded_rows == 1026            # build the fixture, not inside the function under test
+        n = padded_rows * K * 2
+        assert iron_gen.dq_group_for_length(n, D, K) is None
+
+    def test_an_unpadded_bf16_wo_is_unaffected(self):
+        D, K = 1024, 2048
+        assert iron_gen.dq_group_for_length(D * K * 2, D, K) is None
+
+    def test_a_multiple_of_3_d_needs_no_pad_to_pass(self):
+        D, K = 3840, 8192           # gemma4-12b's own o-projection shape
+        assert D % 3 == 0
+        assert iron_gen.dq_group_for_length(D * K * 2, D, K) is None
+
+    def test_a_short_buffer_still_raises(self):
+        """The loud-fail half of K007: fewer bytes than D rows need is a real defect, not padding."""
+        D, K = 1024, 2048
+        with pytest.raises(ValueError, match="1024, 2048"):
+            iron_gen.dq_group_for_length(D * K * 2 - 2, D, K)
+
+    def test_a_partial_row_still_raises(self):
+        """More bytes than D rows need, but not a whole number of rows -- padding is whole rows,
+        never a fraction of one."""
+        D, K = 1024, 2048
+        with pytest.raises(ValueError, match="1024, 2048"):
+            iron_gen.dq_group_for_length(D * K * 2 + 1, D, K)
+
+    def test_an_int4_group_still_resolves_with_padding(self):
+        from iron.common.quant import row_stride_bytes
+        D, K, g = 1024, 2048, 64
+        stride = row_stride_bytes(K, g, "int4")
+        assert iron_gen.dq_group_for_length((D + 2) * stride, D, K) == g

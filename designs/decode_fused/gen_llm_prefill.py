@@ -426,6 +426,33 @@ def pack_quant_weights(quant_pack, bdir, quant_plan):
           f"(sites: {sorted({s for s in quant_plan})}){cache_note}")
 
 
+def dq_group_for_length(n: int, rows: int, K: int):
+    """`n` decode-arena BYTES holding `rows` rows of width `K`: `None` for bf16, else the int4
+    group size (32/64/128) -- shared by `dq_group` (the actual GEMM operand read) and this file's
+    own tests, so there is exactly one place this arithmetic lives.
+
+    `n` may cover MORE than `rows` rows: `fuse_o` zero-pads Wo to a whole `TSI_O`-tile boundary
+    past D for `swiglu_mlp_dp`'s own tiling (gen_llm_decode.py's `elif key == "Wo" and fuse_o:`
+    site owns `_wo_rows_padded`'s exact arithmetic; this does not re-derive it -- K007's "one
+    place", not a second copy). The single source of truth for how many rows decode actually
+    wrote is decode's own recorded length `n` -- the same trade `check_weight`'s golden check
+    makes (it slices `a[:ref.nbytes]` off whatever the arena holds rather than asserting its
+    exact size). So: `n` must be a WHOLE number of `rows`-width rows (never a partial row -- that
+    is the loud-fail case) and hold AT LEAST `rows` of them; `weight_rows` reads only the first
+    `rows`, so any padded tail rows (decode zero-fills them) are never read as output rows.
+    """
+    bf16_stride = K * 2
+    if n % bf16_stride == 0 and n // bf16_stride >= rows:
+        return None
+    hits = [g for g in (32, 64, 128)
+            if n % row_stride_bytes(K, g, "int4") == 0
+            and n // row_stride_bytes(K, g, "int4") >= rows]
+    if len(hits) != 1:
+        raise ValueError(f"{n} B is neither a whole-row bf16 buffer nor one int4 group size "
+                         f"holding at least [{rows}, {K}] (matches: {hits})")
+    return hits[0]
+
+
 def decode_arena_plan(meta_path):
     """Reconstruct the decode ELF's scratch arena as an ordered (name, size) list.
 
@@ -1174,16 +1201,14 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     wdq_elems = [0]
 
     def dq_group(buf, rows, K):
+        """`buf`'s wire format for `rows` rows of width `K`, or `ValueError` naming `buf`."""
         n = dec_sizes.get(buf)
         if n is None:
             raise ValueError(f"{buf}: not in the decode arena")
-        if n == rows * K * 2:
-            return None
-        hits = [g for g in (32, 64, 128) if n == rows * row_stride_bytes(K, g, "int4")]
-        if len(hits) != 1:
-            raise ValueError(f"{buf}: {n} B is neither bf16 nor one int4 group size for "
-                             f"[{rows}, {K}] (matches: {hits})")
-        return hits[0]
+        try:
+            return dq_group_for_length(n, rows, K)
+        except ValueError as e:
+            raise ValueError(f"{buf}: {e}") from None
 
     def weight_rows(buf, total_rows, row0, nrows, K, out_stride=None, out_col=0):
         """(runlist entries, operand) for rows [row0, row0+nrows) of decode's [total_rows, K]
