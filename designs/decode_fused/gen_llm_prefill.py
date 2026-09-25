@@ -127,6 +127,7 @@ import newstack_compat  # noqa: F401,E402 -- MUST precede iron imports
 from iron.common import AIEContext  # noqa: E402
 from iron.common.kv_layout import KVLayout  # noqa: E402
 from elf_dispatch_compat import OperatorSequence, load_elf  # noqa: E402
+from elf_zst import write_elf  # noqa: E402
 from iron.operators.gemm.op import GEMM  # noqa: E402
 from iron.operators.rms_norm.op import RMSNorm  # noqa: E402
 from iron.operators.rope.op import RoPE  # noqa: E402
@@ -2524,7 +2525,7 @@ def main():
         gate = gate_block(a.out, refs, floors)
 
     elf = load_elf(fused).view(np.uint8).tobytes()
-    open(os.path.join(a.out, "prefill.elf"), "wb").write(elf)
+    elf_prov = write_elf(os.path.join(a.out, "prefill.elf"), elf)
     in_sz, out_sz, scr = fused.buffer_sizes
 
     scratchpad_params = {}
@@ -2739,6 +2740,7 @@ def main():
     # collision visible in the log of the build that caused it.
     import hashlib as _hl
     meta["elf_md5"] = _hl.md5(elf).hexdigest()
+    meta.update(elf_prov)
     json.dump(meta, open(os.path.join(a.out, "meta.json"), "w"), indent=2)
     print(f"[ok] elf md5 {meta['elf_md5']} -- compare arms on THIS, never on the name")
     print(f"[ok] {NL}-layer {sp.name} prefill ELF ({len(elf)}B), M={M} S={S} "
