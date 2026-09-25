@@ -116,7 +116,7 @@ import numpy as np
 import ml_dtypes
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from llm_decode_spec import SPECS  # noqa: E402
+from llm_decode_spec import SPECS, BD_STRIDE_MAX  # noqa: E402
 from gemm_tile_registry import registry  # noqa: E402
 import pack_cache  # noqa: E402
 from prefill_ref import (f32, gate_block, layer_stack, npy_weights,  # noqa: E402
@@ -194,8 +194,6 @@ COLS = int(os.environ.get("PREFILL_COLS", "8"))
 XFER_ELEMS = int(os.environ.get("PREFILL_XFER_ELEMS", "16384"))
 # Per delta-rule call, the real tokens it steps: an int32 in each call's dk-wide bf16 slot.
 GDR_COUNT = "gdr_count"
-# aie.dma_bd's stride range, [1:1048576] elements: a 20-bit field of the shim BD.
-BD_STRIDE_MAX = 1 << 20
 # The causal mask, as a buffer name. One int32 per softmax row, host-written per chunk.
 SM_WIDTHS = "sm_widths"
 # Batch prefill past a sliding-window's circular KV ring. Default 0: byte-identical MLIR to
@@ -676,8 +674,15 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         bf16. A quantized weight is packed fresh (see weight_gemm/qkv_operand below), never
         decode's aliased arena slab, so `blocking` never applies to one.
         """
+        qkw = quant_kwargs(site)
+        # A bf16 [N, K] B walks N in steps of tile_n*cols rows, one BD stride of that many rows;
+        # this is the plain contiguous case (op.py has no rule for it, aiecc refuses the BD only
+        # at the end) -- `blocking` and a quantized `site` both address B differently, so the
+        # registry only owes this GEMM the stride rule when neither applies (K007: the rule now
+        # lives with the shape, not after it).
+        contiguous = b_col_maj and not qkw and not blocking
         ch = reg.lookup(M, K, Nout, emulate=emulate, prio_accuracy=prio_acc,
-                        b_col_maj=b_col_maj, label=label)
+                        b_col_maj=b_col_maj, label=label, check_bd_stride=contiguous)
         # The spec-shaped check as well as the registry's own: it names the SPEC and the op, which
         # is the message a shape error should carry, and it costs nothing.
         sp.check_prefill_projections(M, ((label, K, Nout),), tile_m=ch.tile_m, tile_k=ch.tile_k,
@@ -686,14 +691,11 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         tiles[label] = {"tile": [ch.tile_m, ch.tile_k, ch.tile_n], "cols": ch.cols,
                         "source": ch.source, "K": K, "N": Nout,
                         "measured": ch.measured}
-        qkw = quant_kwargs(site)
-        # A bf16 [N, K] B walks N in steps of tile_n*cols rows, one BD stride of that many rows;
-        # gemm_tiling_rejection has no stride rule, and aiecc refuses the BD only at the end.
         step = ch.tile_n * ch.cols
-        if b_col_maj and not qkw and not blocking and Nout > step and step * K > BD_STRIDE_MAX:
-            raise ValueError(f"GEMM {label} M={M} K={K} N={Nout}: tile_n({ch.tile_n})*cols({ch.cols})"
-                             f"*K = {step * K} exceeds the BD stride range {BD_STRIDE_MAX}; pick "
-                             f"tile_n*cols <= {BD_STRIDE_MAX // K}")
+        assert not (contiguous and Nout > step and step * K > BD_STRIDE_MAX), (
+            f"GEMM {label} M={M} K={K} N={Nout}: tile_n({ch.tile_n})*cols({ch.cols})*K="
+            f"{step * K} exceeds the BD stride range {BD_STRIDE_MAX} -- the registry lookup "
+            f"above was asked check_bd_stride=True and should never have returned this tiling")
         blk = dict(b_block_rows=blocking[0], b_block_stride=blocking[1]) \
             if (blocking and not qkw) else {}
         blk.update(extra or {})

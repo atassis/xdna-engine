@@ -40,7 +40,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gemm_tile_registry import Registry, key_of  # noqa: E402
 from llm_decode_spec import (  # noqa: E402
-    SPECS, gemm_tile_census, gemm_tile_grid, largest_valid_tile_n,
+    BD_STRIDE_MAX, SPECS, gemm_tile_census, gemm_tile_grid, largest_valid_tile_n,
 )
 
 HERE = Path(__file__).resolve().parent
@@ -459,6 +459,14 @@ def run_seed_current(args, registry_path):
                     tm, tk, tn, cols = tiles
                     if shape["N"] % (tn * cols):
                         tn = largest_valid_tile_n(shape["N"], cols, emulate)
+                    # A seeded entry's tile_n must also clear the BD stride rule (gen_llm_prefill's
+                    # `gemm_for` opts a b_col_maj/contiguous caller into it) -- pick down/gate_up's
+                    # entry small enough up front rather than seeding a value that only a later,
+                    # opted-in lookup discovers is illegal.
+                    if tn is not None and shape["b_col_maj"] and shape["N"] > tn * cols \
+                            and tn * cols * shape["K"] > BD_STRIDE_MAX:
+                        tn = largest_valid_tile_n(shape["N"], cols, emulate, K=shape["K"],
+                                                  b_col_maj=True)
                     reg.record(shape["M"], shape["K"], shape["N"], tm, tk, tn, cols,
                                emulate=emulate, prio_accuracy=prio, source=args.source,
                                b_col_maj=shape["b_col_maj"],
