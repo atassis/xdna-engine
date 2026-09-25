@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Add `<name>.elf.zst` beside every `*.elf` under the given artifact dirs, without a rebuild.
-# The plain `.elf` is left in place -- this only ADDS the compressed sibling.
+# The plain `.elf` is left in place -- this only ADDS the compressed sibling. Skips anything under
+# a `build/` path component -- aiecc's own intermediate work-dir ELFs, not the shipped artifact.
 #
 #   scripts/compress_artifact_elfs.sh <artifact_dir> [<artifact_dir>...]
 #
@@ -48,7 +49,7 @@ for root in "$@"; do
     LC_NUMERIC=C printf 'ok %s (%d -> %d, %.1fx)\n' "$elf" "$before" "$after" \
       "$(LC_NUMERIC=C awk "BEGIN{print $before/$after}")"
     ok=$((ok + 1))
-  done < <(find "$root" -type f -name '*.elf' -print0)
+  done < <(find "$root" -type f -name '*.elf' -not -path '*/build/*' -print0)
 done
 
 echo "compress_artifact_elfs: $ok compressed, $skip already had .elf.zst, $fail failed"
