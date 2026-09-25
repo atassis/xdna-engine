@@ -192,6 +192,7 @@ def test_operand_bounds_rejects_an_s_wide_read_of_a_narrowed_kv_slab():
 
 
 precision = pytest.importorskip("precision")
+gld = pytest.importorskip("gen_llm_decode")
 
 
 class TestDqGroupForLength:
@@ -200,10 +201,13 @@ class TestDqGroupForLength:
     `n` "at least" `rows` rows, which is exactly how qwen3.5-4b's `L0_Wg` broke: 14745600 B is
     the EXACT int4/g32 size for [9216, 2560] rows, but also satisfies "int4/g64, >= 9216 rows"
     with 10240 rows (1024 unexplained extra) -- an accidental fit the old ambiguity check
-    resolved wrong. `fuse_o` (decode default since 2026-09-08) separately zero-pads Wo past D to
-    a whole `TSI_O=3`-row tile (`swiglu_mlp_dp`'s own tiling); D=1024 (qwen3-0.6b) is not a
-    multiple of 3, so decode's arena holds 1026 rows, not 1024 -- the ONLY site allowed that
-    slack. D=3840 (gemma4-12b) IS a multiple of 3, so it never pads."""
+    resolved wrong.
+
+    ROW COUNT is exact too, no ">=" left anywhere: `padded_rows` (default `rows`, i.e. no pad) is
+    the caller's own claim, and `n` must equal `padded_rows * stride` exactly or this raises.
+    `dq_group` (the closure, not this pure function) is what supplies a non-default `padded_rows`
+    -- `wo_rows_padded()` (gen_llm_decode.py) for `attn_o` under `fuse_o`, `None` everywhere else
+    -- so this class fixes the numbers by hand rather than exercising that wiring."""
 
     MLP_G32 = {"mlp": precision.parse_spec("int4/g32/clip", "mlp")}
     MLP_G64 = {"mlp": precision.parse_spec("int4/g64/clip", "mlp")}
@@ -217,19 +221,30 @@ class TestDqGroupForLength:
 
     def test_the_same_length_at_the_wrong_plan_site_raises(self):
         """g64's row stride (1440 B) DOES divide 14745600 -- 10240 rows, 1024 more than the 9216
-        needed. That accidental fit is exactly the old bug; "mlp" is not "attn_o", so an
-        unexplained extra now fails instead of silently passing."""
+        needed. That accidental fit is exactly the old bug; without an explicit `padded_rows` the
+        extra is simply not `rows`, so it fails instead of silently passing."""
         n, rows, K = 14745600, 9216, 2560
         with pytest.raises(ValueError, match="9216, 2560"):
             iron_gen.dq_group_for_length(n, rows, K, site="mlp", plan=self.MLP_G64)
 
-    def test_a_fuse_o_padded_bf16_wo_is_still_read_as_bf16(self):
+    def test_the_exact_fuse_o_pad_is_accepted(self):
+        """qwen3-0.6b's own shape: `wo_rows_padded(1024, 2048, 4) == 1026` (see
+        test_wo_rows_padded.py). The EXACT padded count, passed explicitly, is what `dq_group`
+        itself would compute -- this class only fixes the number by hand."""
         D, K = 1024, 2048
-        assert D % 3 != 0
-        padded_rows = -(-D // 3) * 3          # decode's own TSI_O ceiling, reproduced ONLY to
-        assert padded_rows == 1026            # build the fixture, not inside the function under test
+        padded_rows = gld.wo_rows_padded(D, 2048, 4)
+        assert padded_rows == 1026
         n = padded_rows * K * 2
-        assert iron_gen.dq_group_for_length(n, D, K, site="attn_o") is None
+        assert iron_gen.dq_group_for_length(n, D, K, site="attn_o", padded_rows=padded_rows) is None
+
+    def test_one_row_more_than_the_exact_pad_is_rejected(self):
+        """No slack past the exact number: this is the ">=" tolerance the old code had, and it is
+        gone -- one row over the true pad is a real mismatch now, not a plausible pad."""
+        D, K = 1024, 2048
+        padded_rows = gld.wo_rows_padded(D, 2048, 4)
+        n = (padded_rows + 1) * K * 2
+        with pytest.raises(ValueError, match="1024, 2048"):
+            iron_gen.dq_group_for_length(n, D, K, site="attn_o", padded_rows=padded_rows)
 
     def test_an_unpadded_bf16_wo_is_unaffected(self):
         D, K = 1024, 2048
@@ -255,27 +270,23 @@ class TestDqGroupForLength:
         with pytest.raises(ValueError, match="1024, 2048"):
             iron_gen.dq_group_for_length(D * K * 2 + 1, D, K, site="attn_o")
 
-    def test_an_int4_group_still_resolves_with_padding(self):
+    def test_an_int4_group_still_resolves_with_the_exact_pad(self):
         D, K, g = 1024, 2048, 64
         spec = precision.parse_spec(f"int4/g{g}/clip", "attn_o")
         stride = precision.wire_row_units(spec, K)
-        assert iron_gen.dq_group_for_length((D + 2) * stride, D, K,
-                                            site="attn_o", plan={"attn_o": spec}) == g
+        padded_rows = gld.wo_rows_padded(D, 2048, 4)
+        assert iron_gen.dq_group_for_length(padded_rows * stride, D, K, site="attn_o",
+                                            plan={"attn_o": spec},
+                                            padded_rows=padded_rows) == g
 
     def test_a_pad_outside_attn_o_is_not_tolerated(self):
-        """Only Wo's fuse_o pad is a KNOWN pad; an mlp/qkv/head buffer with extra rows is a real
-        mismatch, not slack to wave through."""
+        """`dq_group_for_length` itself does not know which site is allowed slack -- that policy
+        lives in `dq_group`, which never passes a non-`rows` `padded_rows` for anything but
+        `attn_o`. Simulated here by simply not passing one: extra rows are then just a mismatch,
+        the same as they would be for `mlp`/`qkv`/`head` in the real generator."""
         D, K = 1024, 2048
         with pytest.raises(ValueError, match="1024, 2048"):
             iron_gen.dq_group_for_length((D + 2) * K * 2, D, K, site="mlp")
-
-    def test_a_pad_past_the_bound_still_raises(self):
-        """A bound, not an open door: even at `attn_o`, a pad bigger than any real TSI_O tiling
-        produces is a defect (this IS the shape of the qwen3.5 regression, restated at attn_o)."""
-        D, K = 1024, 2048
-        with pytest.raises(ValueError, match="1024, 2048"):
-            iron_gen.dq_group_for_length((D + iron_gen.MAX_FUSE_O_PAD_ROWS + 1) * K * 2, D, K,
-                                         site="attn_o")
 
 
 class TestPlanSpecForSite:

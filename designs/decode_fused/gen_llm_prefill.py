@@ -138,7 +138,7 @@ from iron.operators.elementwise_mul.op import ElementwiseMul  # noqa: E402
 from iron.operators.elementwise_add.op import ElementwiseAdd  # noqa: E402
 from iron.operators.strided_copy.op import StridedCopy  # noqa: E402
 from iron.operators.dequant_rows.op import DequantRows  # noqa: E402
-from gen_llm_decode import _site_of  # noqa: E402 -- the one buffer-suffix -> plan-site mapping
+from gen_llm_decode import _site_of, wo_rows_padded  # noqa: E402 -- single owners, not restated
 
 # Decode's ACT_POLY, mirrored: SiLU and sigmoid in f32 polynomial math instead of the SFU tanh LUT.
 # The two halves must agree, or prefill and decode compute different activations over one cache.
@@ -427,16 +427,6 @@ def pack_quant_weights(quant_pack, bdir, quant_plan):
           f"(sites: {sorted({s for s in quant_plan})}){cache_note}")
 
 
-#: fuse_o (decode default since 2026-09-08) zero-pads Wo past D to a whole TSI_O-row tile for
-#: `swiglu_mlp_dp`'s own tiling (gen_llm_decode.py's `elif key == "Wo" and fuse_o:` site owns
-#: `_wo_rows_padded`'s exact arithmetic -- `TSI_O = 6*D // QD`, a per-build value this file does
-#: not re-derive, K007's "one place", not a second copy). The pad is always a small per-core
-#: remainder (qwen3-0.6b's own case is 2 rows); this bound is deliberately generous -- a real
-#: fuse_o pad never approaches it -- so it catches a wrong-format match (thousands of rows off,
-#: see dq_group_for_length's docstring) without needing the exact per-build TSI_O.
-MAX_FUSE_O_PAD_ROWS = 15
-
-
 def plan_spec_for_site(text: str, site: str):
     """`precision.parse_spec`, tolerant of a scale_kind spelling decode's own meta writer used
     that `precision.py`'s build-legality vocabulary does not recognise -- e.g. gemma4-12b's
@@ -449,7 +439,8 @@ def plan_spec_for_site(text: str, site: str):
 
 
 def dq_group_for_length(n: int, rows: int, K: int, *, site: str | None = None,
-                        plan: dict | None = None, scale_dtype: str = "f32"):
+                        plan: dict | None = None, scale_dtype: str = "f32",
+                        padded_rows: int | None = None):
     """`n` decode-arena BYTES holding `rows` rows of width `K`, for the weight at `site`
     ("qkv"/"attn_o"/"mlp"/"head", or `None` for a buffer `precision`'s plan does not name):
     `None` for bf16, else the int4 group size -- shared by `dq_group` (the actual GEMM operand
@@ -461,13 +452,12 @@ def dq_group_for_length(n: int, rows: int, K: int, *, site: str | None = None,
     but 14745600 B also satisfies "int4/g64, >= 9216 rows" with 10240 rows -- an accidental fit
     (1024 rows of unexplained slack), not evidence. A missing/bf16 `plan[site]` means plain bf16.
 
-    ROW COUNT's single source of truth is decode's own recorded length `n` -- the same trade
-    `check_weight`'s golden check makes (it slices `a[:ref.nbytes]` off whatever the arena holds
-    rather than asserting its exact size). So: `n` must be a WHOLE number of rows at the plan's
-    own stride (never a partial row) and hold at least `rows` of them; `weight_rows` reads only
-    the first `rows`, so a real pad is never read as an output row. Any EXTRA rows must be
-    `attn_o`'s known `fuse_o` pad, bounded by `MAX_FUSE_O_PAD_ROWS` -- every other site, and any
-    `attn_o` overrun past that bound, fails loudly instead of silently accepting the slack.
+    ROW COUNT is checked for EXACT equality, never "at least": `padded_rows` (default `rows`,
+    i.e. no pad expected) is the caller's own claim of how many rows decode actually wrote --
+    for `attn_o` under `fuse_o` that is `wo_rows_padded()` (gen_llm_decode.py), the EXACT number
+    `SwiGLUMLPDataParallel._wo_rows_padded` computes, not a bound or a guess. `weight_rows` reads
+    only the first `rows`, so the pad rows this admits are never read as output rows; `n` must
+    equal `padded_rows * stride` exactly, or this fails loud naming both numbers.
     """
     spec = (plan or {}).get(site) if site else None
     if spec is None or not spec.quantized:
@@ -475,16 +465,14 @@ def dq_group_for_length(n: int, rows: int, K: int, *, site: str | None = None,
     else:
         stride = precision.wire_row_units(spec, K, scale_dtype)
         group = spec.group_size
-    if stride <= 0 or n % stride:
-        raise ValueError(f"{n} B is not a whole number of {stride} B rows for [{rows}, {K}] "
-                         f"at site={site!r} (plan={spec})")
-    padded_rows = n // stride
-    extra = padded_rows - rows
-    if extra < 0 or (extra > 0 and not (site == "attn_o" and extra <= MAX_FUSE_O_PAD_ROWS)):
-        raise ValueError(f"{n} B is {padded_rows} row(s) of {stride} B for [{rows}, {K}] at "
-                         f"site={site!r} (plan={spec}) -- "
-                         + (f"{-extra} row(s) short" if extra < 0
-                            else f"{extra} unexplained extra row(s)"))
+    want_rows = rows if padded_rows is None else padded_rows
+    if want_rows < rows:
+        raise ValueError(f"padded_rows={padded_rows} is fewer than the {rows} rows [{rows}, {K}] "
+                         f"actually needs -- a bad caller, not a decode-arena mismatch")
+    want = want_rows * stride
+    if n != want:
+        raise ValueError(f"{n} B != {want} B ({want_rows} row(s) of {stride} B) for "
+                         f"[{rows}, {K}] at site={site!r} (plan={spec})")
     return group
 
 
@@ -1120,6 +1108,7 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         bufsz["g"] = M * FF * 2
     dec_meta, dec_order, dec_sizes, dec_reserved = (None, [], {}, 0)
     dec_plan = {}
+    dec_wo_padded_rows = None
     if dec_meta_path:
         dec_meta, dec_order, dec_sizes, dec_reserved = decode_arena_plan(dec_meta_path)
         # decode's own declarative per-site format plan (precision.py), parsed once: the single
@@ -1127,6 +1116,18 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         # docstring for why this replaced guessing the format from the buffer's byte length.
         dec_plan = {site: plan_spec_for_site(spec, site)
                    for site, spec in dec_meta.get("weight_quant", {}).get("plan", {}).items()}
+        # attn_o's Wo is the only site fuse_o pads (gen_llm_decode.py's `elif key == "Wo" and
+        # fuse_o:`), and the exact pad depends on decode's own MLP_DP_COLS -- not recorded as a
+        # field, but decode's own `sequence_name` names both flags (doctrine: the sequence name
+        # is machine-generated from the build, so it cannot drift). `mlpo` <=> fuse_o; `mlpdp<N>`
+        # <=> N=MLP_DP_COLS, and always co-occurs with `mlpo` (fuse_o requires the mlp_dp design).
+        _seq = dec_meta.get("sequence_name", "")
+        if re.search(r"(?:^|_)mlpo(?:_|$)", _seq):
+            _m = re.search(r"mlpdp(\d+)", _seq)
+            if not _m:
+                raise ValueError(f"{dec_meta_path}: sequence_name names fuse_o (mlpo) but has "
+                                 f"no mlpdp<N> to recover MLP_DP_COLS from: {_seq!r}")
+            dec_wo_padded_rows = wo_rows_padded(D, QD, int(_m.group(1)))
         # Scratch for a K-split weight (weight_gemm below), added ONLY when the shared arena
         # actually holds one -- every shipped uniform-geometry spec never does, and this keeps
         # their arena byte-identical to before weight_gemm existed. Both down and o produce a
@@ -1247,12 +1248,14 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         `site` is the tensor's plan site ("qkv"/"attn_o"/"mlp"/"head") -- the caller's own,
         because a chunked buffer name (`L0_Wdk0`) carries no suffix `_site_of` recognises; `None`
         defaults to plain bf16 (dq_group_for_length's own default when a site has no plan entry).
+        `attn_o` is the one site that may be padded (`dec_wo_padded_rows`, computed once above).
         """
         n = dec_sizes.get(buf)
         if n is None:
             raise ValueError(f"{buf}: not in the decode arena")
+        padded = dec_wo_padded_rows if site == "attn_o" else None
         try:
-            return dq_group_for_length(n, rows, K, site=site, plan=dec_plan)
+            return dq_group_for_length(n, rows, K, site=site, plan=dec_plan, padded_rows=padded)
         except ValueError as e:
             raise ValueError(f"{buf}: {e}") from None
 

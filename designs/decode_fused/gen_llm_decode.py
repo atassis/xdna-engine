@@ -219,6 +219,26 @@ def _site_of(buffer_name):
                                if buffer_name.startswith("L") else buffer_name)
 
 
+def wo_rows_padded(D: int, QD: int, num_aie_columns: int, num_aie_rows: int = 1) -> int:
+    """Wo's own row count once `fuse_o` pads it for `swiglu_mlp_dp`'s TSI_O-row tiling.
+
+    The exact formula `SwiGLUMLPDataParallel._wo_rows_padded` (iron/operators/swiglu_mlp_dp/op.py)
+    computes from a live operator instance -- kept equal to it by
+    `test_wo_rows_padded_mirrors_the_operator`, which builds a real instance and compares, the
+    same trade `precision.py`'s own `wire_row_units` fallback makes against the packer it mirrors.
+    Extracted so this file's own two call sites (`elif key == "Wo" and fuse_o:`, both below) and
+    `gen_llm_prefill.py`'s `dq_group` -- which has no operator instance to ask -- share ONE
+    formula instead of each re-deriving or guessing it (K007).
+    """
+    N = num_aie_columns * num_aie_rows
+    D_PER_CORE = D // N
+    WTILE_ELEMS = 6 * D          # TSI_GU * D, design.py's shared-tile constant
+    TSI_O = WTILE_ELEMS // QD
+    N_O_TILES = -(-D_PER_CORE // TSI_O)
+    O_WINDOW = N_O_TILES * TSI_O
+    return D + (O_WINDOW - D_PER_CORE)
+
+
 def _stream_pad_rows(wqkv, op):
     """attn_block_dp strides its L3 Wqkv by the SHARED STREAM TILE, not by the packed row: one
     acquire is exactly one padded row (design.py's quant_tile_bytes). The fill is never read --
@@ -3219,7 +3239,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                     # left. Zero rows are built directly in the wire format instead; see
                     # packed_zero_rows for why a zero row is exactly [f32(1.0) x n_groups][zeros].
                     wp = np.concatenate([wp, packed_zero_rows(
-                        op_mlp_dp._wo_rows_padded - D, g.qd,
+                        wo_rows_padded(D, QD, MLP_DP_COLS) - D, g.qd,
                         _spec("mlp").group_size, _spec("mlp").dtype)])
                 weights[p + key] = wp
                 continue
@@ -3253,10 +3273,10 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 # byte-identically with Wg/Wu/Wd's weight channel; D/MLP_DP_COLS is never a
                 # multiple of 3 (D is a power of two), so every core reads one row PAST its own
                 # slice and the last core's read would run off the end of Wo -- padded here with
-                # `_wo_rows_padded - D` zero rows so that read stays in bounds. Their computed
-                # contribution is exactly zero and is never drained (see design.py's FUSE_O
-                # module docstring for the full derivation).
-                pad_rows = op_mlp_dp._wo_rows_padded - D
+                # `wo_rows_padded(D, QD, MLP_DP_COLS) - D` zero rows so that read stays in bounds.
+                # Their computed contribution is exactly zero and is never drained (see
+                # design.py's FUSE_O module docstring for the full derivation).
+                pad_rows = wo_rows_padded(D, QD, MLP_DP_COLS) - D
                 w_padded = np.pad(w, ((0, pad_rows), (0, 0)))
                 weights[p + key] = _pack(w_padded, "mlp", grid=_repack_grid)
             elif key == "Wo" and _spec("attn_o").quantized:
