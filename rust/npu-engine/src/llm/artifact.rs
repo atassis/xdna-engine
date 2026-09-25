@@ -342,6 +342,9 @@ pub struct LlmArtifact {
     /// against (`gen_llm_decode.py`, added 2026-09-05). `None` on any artifact built before this
     /// field existed. See [`LlmArtifact::load`]'s freshness check below.
     pub toolchain_hash: Option<String>,
+    /// `meta.json`'s `weight_quant.plan.kv` -- the KV cache element type. Defaults to `"bf16"`
+    /// when absent, see [`LlmArtifact::load`].
+    pub kv_dtype: String,
     /// `meta.json`'s `dims.prefill_break_even_tokens` -- the measured prompt-length crossover
     /// above which one batched dispatch (a fixed cost, independent of how many of its `dims.M`
     /// rows are real tokens) beats priming per-token. A property of the ARTIFACT, not a Rust
@@ -451,6 +454,16 @@ impl LlmArtifact {
             .and_then(|t| t.get("hash"))
             .and_then(|v| v.as_str())
             .map(str::to_string);
+        // `weight_quant.plan.kv`: the KV cache element type. Absent (every artifact predating
+        // this field, and any half silent about quantization) defaults to "bf16" -- the format
+        // every un-quantized KV buffer is written in today.
+        let kv_dtype = meta
+            .get("weight_quant")
+            .and_then(|w| w.get("plan"))
+            .and_then(|p| p.get("kv"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("bf16")
+            .to_string();
 
         let mut layout = HashMap::new();
         let layout_obj = meta
@@ -1280,6 +1293,7 @@ impl LlmArtifact {
             rope_partial_rotary,
             logit_softcap,
             toolchain_hash,
+            kv_dtype,
             prefill_break_even_tokens,
             segments,
         })
@@ -1686,6 +1700,14 @@ impl LlmArtifact {
                 "prefill/decode disagree on the RoPE base: decode ({:?}, {:?}), prefill ({:?}, {:?})",
                 self.rope_theta_global, self.rope_theta_local,
                 prefill.rope_theta_global, prefill.rope_theta_local
+            )));
+        }
+        // The KV cache element type -- both default to "bf16", so this also catches a decode
+        // quantized to a narrower KV format paired with a silent (bf16-assuming) prefill.
+        if self.kv_dtype != prefill.kv_dtype {
+            return Err(EngineError::Load(format!(
+                "prefill/decode disagree on kv_dtype: decode {}, prefill {}",
+                self.kv_dtype, prefill.kv_dtype
             )));
         }
         if prefill.embed_scale.is_some() && self.embed_scale != prefill.embed_scale {
@@ -3107,6 +3129,59 @@ mod tests {
         assert!(err.contains("capacity=6912"), "{err}");
         assert!(err.contains("flat"), "must say decode does not itself narrow this geometry: {err}");
         assert!(err.contains("declares capacity=2048"), "must name prefill's disagreeing value: {err}");
+    }
+
+    #[test]
+    fn a_global_capacity_mismatch_is_refused() {
+        // Regression pin, same shape as the KV_ALLOC defect above but isolated to the global
+        // (head_dim 512) geometry alone: prefill declares a capacity double decode's allocation
+        // (13824 not a whole multiple of kv_block=6912 is rejected at load, so pick one that is).
+        let dec = gemma4_shaped_decode_meta();
+        let mut pre = flat_prefill_meta_for_gemma4(2, 2048);
+        pre["scratchpad"]["params"]["sm_mask"] = serde_json::json!({"byte_offset": 4, "kind": "core"});
+        pre["scratchpad"]["params"]["kv_off1"] = serde_json::json!({"byte_offset": 8, "kind": "addr"});
+        pre["scratchpad"]["params"]["sm_mask1"] = serde_json::json!({"byte_offset": 12, "kind": "core"});
+        pre["scratchpad"]["kv_windows"] = serde_json::json!([
+            {"kv_param": "kv_off", "head_dim": 256, "window": 1024, "mask_param": "sm_mask"},
+            {"kv_param": "kv_off1", "head_dim": 512, "window": 13824, "mask_param": "sm_mask1"},
+        ]);
+        let (_d, _p, da, pa) = load_pair(&dec, &pre);
+        let err = da.check_prefill_pairing(&pa).unwrap_err().to_string();
+        assert!(err.contains("head_dim=512"), "{err}");
+        assert!(err.contains("capacity=6912") && err.contains("declares capacity=13824"), "{err}");
+    }
+
+    /// Same flat, non-narrowing decode shape as
+    /// `a_non_circular_multi_geometry_pair_still_passes_when_prefill_says_nothing`, so the pairing
+    /// this pins fails (or passes) on `kv_dtype` alone, not on the KV-geometry checks above it.
+    fn flat_gemma4_decode_meta() -> serde_json::Value {
+        let mut dec = gemma4_shaped_decode_meta();
+        dec["scratchpad"]["kv_windows"] = serde_json::json!([
+            {"kv_param": "kv_off", "head_dim": 256, "window": 6912, "mask_param": "sm_mask"},
+            {"kv_param": "kv_off1", "head_dim": 512, "window": 6912, "mask_param": "sm_mask1"},
+        ]);
+        dec
+    }
+
+    #[test]
+    fn a_kv_dtype_mismatch_is_refused() {
+        let mut dec = flat_gemma4_decode_meta();
+        dec["weight_quant"] = serde_json::json!({"plan": {"kv": "bfp16"}});
+        let pre = flat_prefill_meta_for_gemma4(2, 2);
+        let (_d, _p, da, pa) = load_pair(&dec, &pre);
+        let err = da.check_prefill_pairing(&pa).unwrap_err().to_string();
+        assert!(err.contains("kv_dtype"), "{err}");
+        assert!(err.contains("bfp16") && err.contains("bf16"), "must name both values: {err}");
+    }
+
+    #[test]
+    fn an_undeclared_kv_dtype_pairs_with_bf16() {
+        let mut dec = flat_gemma4_decode_meta();
+        dec["weight_quant"] = serde_json::json!({"plan": {"kv": "bf16"}});
+        let pre = flat_prefill_meta_for_gemma4(2, 2);
+        let (_d, _p, da, pa) = load_pair(&dec, &pre);
+        assert_eq!(pa.kv_dtype, "bf16", "silent prefill defaults to bf16");
+        da.check_prefill_pairing(&pa).expect("decode bf16 pairs with a silent (bf16-default) prefill");
     }
 
     #[test]
