@@ -529,8 +529,7 @@ impl NpuDecodeStep {
         // only `sync_input()` is, mirroring `asr::whisper_decoder::FusedDecoder`'s resident path).
         arena.sync_to_device().map_err(|e| EngineError::Load(format!("sync weights to device: {e}")))?;
 
-        let elf = std::fs::read(artifact.elf_path())
-            .map_err(|e| EngineError::Load(format!("read {}: {e}", artifact.elf_path().display())))?;
+        let elf = artifact.read_elf_bytes()?;
         // Content identity of the literal bytes this instance is about to run -- NOT a
         // reproducibility check (a full-ELF hash is not stable rebuild-to-rebuild, bootgen leaks
         // heap into it; see aiecc-full-elf-md5-is-not-an-identity-check). The point here is only
@@ -583,8 +582,7 @@ impl NpuDecodeStep {
         }
         buckets.push(Bucket { window: artifact.max_seq, artifact: artifact.clone(), res });
         for a in bucket_arts {
-            let elf = std::fs::read(a.elf_path())
-                .map_err(|e| EngineError::Load(format!("read {}: {e}", a.elf_path().display())))?;
+            let elf = a.read_elf_bytes()?;
             let r = dev
                 .open_elf_resident(&elf, Some(&a.kernel_name))
                 .map_err(|e| EngineError::Load(format!("open_elf_resident (bucket S={}): {e}", a.max_seq)))?;

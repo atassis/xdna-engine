@@ -369,8 +369,7 @@ impl NpuPrefill {
         let mask_write =
             artifact.mask_widths.clone().map(|mw| (*artifact.loc(&mw.buffer), mw));
         let mask_ring = artifact.mask_ring.clone().map(|mr| (*artifact.loc(&mr.buffer), mr));
-        let elf = std::fs::read(artifact.elf_path())
-            .map_err(|e| EngineError::Load(format!("read {}: {e}", artifact.elf_path().display())))?;
+        let elf = artifact.read_elf_bytes()?;
         let primary = dev.open_elf_resident(&elf, Some(&artifact.kernel_name)).map_err(|e| {
             EngineError::Load(format!("open_elf_resident (prefill): {e}"))
         })?;

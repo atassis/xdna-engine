@@ -1355,6 +1355,14 @@ impl LlmArtifact {
         self.decode_dir.join(&self.elf_name)
     }
 
+    /// The control-code bytes to hand `open_elf_resident`. Reads `elf_path()` when present;
+    /// otherwise reads `<elf_path>.zst` and decompresses it in memory. Either way the caller gets
+    /// the same uncompressed bytes it would have gotten before compression existed -- callers hash
+    /// this return value for `artifact_hash`, so that hash is unaffected by which form is on disk.
+    pub fn read_elf_bytes(&self) -> Result<Vec<u8>, EngineError> {
+        read_elf_bytes(&self.elf_path())
+    }
+
     /// The bf16 `[vocab, d_model]` blob the host embedding gather reads. `W_head` itself unless
     /// the lm-head was quantised; then the generator emits a bf16 sidecar and names it here.
     /// Older artifacts have no such field, so they resolve to `W_head` exactly as before.
@@ -1779,6 +1787,22 @@ impl LlmArtifact {
             missing.join(", ")
         )))
     }
+}
+
+/// Read a control-code ELF, transparently decompressing `<path>.zst` when `path` itself is
+/// absent. Both forms may exist (the build keeps the plain `.elf` unless `ELF_ZST_ONLY=1`); the
+/// plain file wins so a partial/corrupt `.zst` never shadows a good `.elf`.
+pub fn read_elf_bytes(path: &Path) -> Result<Vec<u8>, EngineError> {
+    if path.is_file() {
+        return fs::read(path).map_err(|e| EngineError::Load(format!("read {}: {e}", path.display())));
+    }
+    let mut zst_path = path.as_os_str().to_owned();
+    zst_path.push(".zst");
+    let zst_path = PathBuf::from(zst_path);
+    let compressed = fs::read(&zst_path)
+        .map_err(|e| EngineError::Load(format!("read {} (and {} absent): {e}", zst_path.display(), path.display())))?;
+    zstd::decode_all(compressed.as_slice())
+        .map_err(|e| EngineError::Load(format!("zstd-decompress {}: {e}", zst_path.display())))
 }
 
 #[cfg(test)]
@@ -3276,5 +3300,58 @@ mod tests {
         pre["dims"]["segments"] = serde_json::json!([{"layers": [0, 1], "kernel": "seg1"}]);
         let err = load_causal_prefill(&pre).unwrap_err().to_string();
         assert!(err.contains("never names this artifact's own primary kernel"), "{err}");
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(bytes);
+        h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// `read_elf_bytes` must hand back the plain file untouched when it exists.
+    #[test]
+    fn read_elf_bytes_prefers_the_plain_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let elf = dir.path().join("decode.elf");
+        fs::write(&elf, b"not really an ELF, just content").unwrap();
+        // A stale/corrupt sibling .zst must never be preferred over a present plain file.
+        fs::write(dir.path().join("decode.elf.zst"), b"garbage").unwrap();
+        assert_eq!(read_elf_bytes(&elf).unwrap(), b"not really an ELF, just content");
+    }
+
+    /// `<name>.elf.zst` alone (no `<name>.elf`, `ELF_ZST_ONLY=1` shape) must decompress to
+    /// byte-identical content, and the sha256 over those bytes -- what `artifact_hash` hashes --
+    /// must match the sha256 of the original uncompressed bytes.
+    #[test]
+    fn read_elf_bytes_decompresses_zst_only_byte_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let elf = dir.path().join("decode.elf");
+        // A real ELF from a served artifact when this dev box has one, else a synthetic stand-in
+        // (repeated content so zstd actually shrinks it, like a real control-code stream does).
+        let original = fs::read("/mnt/data/xdna/artifacts/gemma3-270m/decode_p8c684/decode.elf")
+            .unwrap_or_else(|_| b"\x7fELF-fixture-".repeat(4096));
+        let mut zst = std::io::Cursor::new(Vec::new());
+        {
+            let mut enc = zstd::Encoder::new(&mut zst, 3).unwrap();
+            enc.write_all(&original).unwrap();
+            enc.finish().unwrap();
+        }
+        fs::write(dir.path().join("decode.elf.zst"), zst.into_inner()).unwrap();
+        assert!(!elf.exists());
+
+        let decompressed = read_elf_bytes(&elf).unwrap();
+        assert_eq!(decompressed.len(), original.len());
+        assert_eq!(decompressed, original);
+        assert_eq!(sha256_hex(&decompressed), sha256_hex(&original));
+    }
+
+    /// Neither form present is a load error naming both paths, not a panic or a silent empty read.
+    #[test]
+    fn read_elf_bytes_missing_both_fails_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        let elf = dir.path().join("decode.elf");
+        let err = read_elf_bytes(&elf).unwrap_err().to_string();
+        assert!(err.contains("decode.elf"), "{err}");
     }
 }

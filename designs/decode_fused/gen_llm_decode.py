@@ -41,6 +41,7 @@ import ml_dtypes
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from buffer_blob import write_blob  # noqa: E402
+from elf_zst import write_elf  # noqa: E402
 from llm_decode_spec import (SPECS, C_TILE_GRANULE, L1_BYTES, L1_RESERVE,  # noqa: E402,F401
                              gemv_fits, gemv_tile_output, k_chunks_for, operator_rejects)
 
@@ -4030,7 +4031,7 @@ def main():
     if embed_blob != "W_head":
         # Host-only, deliberately not in `wnames`: see the tied-embedding note at its build site.
         write_blob(os.path.join(bdir, f"{embed_blob}.bin"), weight_bytes(host_embed))
-    open(os.path.join(a.out, "decode.elf"), "wb").write(elf)
+    elf_prov = write_elf(os.path.join(a.out, "decode.elf"), elf)
 
     meta = {
         "spec": sp.name, "elf": "decode.elf", "kernel_name": "main:sequence",
@@ -4189,6 +4190,7 @@ def main():
         print("[build] WARNING: could not record generator provenance in meta.json "
               "(no git checkout resolvable) -- staleness against designs/decode_fused HEAD will "
               "be invisible to any future check", file=sys.stderr)
+    meta.update(elf_prov)
     json.dump(meta, open(os.path.join(a.out, "meta.json"), "w"), indent=2)
     print(f"\nwrote {NL}-layer {sp.name} decode ELF ({len(elf)}B, scratch {scr/1e6:.1f}MB) to {a.out}")
 

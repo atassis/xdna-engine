@@ -26,6 +26,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
 thiserror = "1"
+# Loads `<name>.elf.zst` when the plain ELF is absent on disk (llm/artifact.rs); decompression is
+# never on the served hot path -- it happens once at load, before bind_resident.
+zstd = "0.13"
 toml = "0.8"
 tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
 # `preserve_order` here too, and for the same reason: minijinja's own ValueMap is a BTreeMap
