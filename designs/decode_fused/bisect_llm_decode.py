@@ -23,6 +23,7 @@ import ml_dtypes
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import newstack_compat  # noqa: F401,E402
 from gen_llm_decode import build_graph, isolate_build_dir, COLS  # noqa: E402
+from decode_flash_ref import flash_slot_writes  # noqa: E402
 from llm_decode_spec import k_chunks_for  # noqa: E402
 
 BF16 = ml_dtypes.bfloat16
@@ -131,6 +132,8 @@ def main():
             with c.get_buffer(ang_name).overwrite() as _buf:
                 _buf[:] = identity_rope_row(_buf.size)
     params.write("sm_mask", 1)
+    for _fn, _fv in flash_slot_writes(md.get("flash_slots") or [], 0):  # see decode_flash_ref.flash_slot_writes
+        params.write(_fn, _fv)
     params.sync()
     c()
     print("[bisect] dispatch complete\n")

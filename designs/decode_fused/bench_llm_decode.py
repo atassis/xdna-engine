@@ -57,6 +57,7 @@ import ml_dtypes
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import newstack_compat  # noqa: F401,E402 -- MUST precede iron imports (new-mlir-aie port shim)
 from gen_llm_decode import build_graph, report_artifact_freshness, load_weight_buffer, isolate_build_dir  # noqa: E402
+from decode_flash_ref import flash_slot_writes  # noqa: E402
 from iron.common.kv_layout import KVLayout  # noqa: E402
 
 BF16 = ml_dtypes.bfloat16
@@ -170,6 +171,7 @@ def main():
     # differ, which gemma4-12b's do -- global is hkv=1/hd=512 against sliding 8/256.
     geoms = [(nm, KVLayout(Hkv=khv, S=cap, HD=hd, T=blk), cap, mn)
              for nm, hd, cap, mn, blk, khv in geom_slots]
+    flash_slots = md.get("flash_slots") or []
     out = c.get_buffer("logits")
 
     # ---- instrumentation: wrap THIS instance's methods, no tracked file touched ----
@@ -216,6 +218,8 @@ def main():
         for _slot, _kvl, _ww, _mask in geoms:
             params.write(_slot, int(_kvl.kv_off(pos % _ww)))
             params.write(_mask, min(pos + 1, _ww))
+        for _fn, _fv in flash_slot_writes(flash_slots, pos):  # see decode_flash_ref.flash_slot_writes
+            params.write(_fn, _fv)
         # The attended length, when the build declared a runtime window. Timing this graph with
         # attn_window UNWRITTEN would not merely be inaccurate -- the core bounds both KV-chunk
         # loops on it, so it would time a garbage window. Raw value, no shift: ParameterScratchpad

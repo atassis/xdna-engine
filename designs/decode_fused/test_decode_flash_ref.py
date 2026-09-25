@@ -7,7 +7,8 @@
 import numpy as np
 import pytest
 
-from decode_flash_ref import blocks_per_column, decode_flash_attention, last_block_index, merge
+from decode_flash_ref import (blocks_per_column, decode_flash_attention, flash_slot_writes,
+                              last_block_index, merge)
 from flash_attn_ref import full_attention
 
 HQ, HD, CAP = 16, 512, 4096
@@ -77,3 +78,30 @@ def test_columns_without_a_live_block_fold_as_no_ops():
     got = decode_flash_attention(q, k, v, 100)       # blocks 0,1 live; columns 2..7 empty
     ref = full_attention(q, k[:100], v[:100], np.ones((HQ, 100), bool), 1.0)
     assert np.isfinite(got).all() and rel_l2(got, ref) < 2e-2
+
+
+def _slots(block=64, columns=8, capacity=CAP):
+    return [{"len_param": "gf_len0", "loop_param": "gf_loop0",
+             "block": block, "columns": columns, "capacity": capacity}]
+
+
+def test_flash_slot_writes_empty_list():
+    assert flash_slot_writes([], 0) == []
+
+
+def test_flash_slot_writes_pos_0():
+    assert flash_slot_writes(_slots(), 0) == [("gf_len0", 0), ("gf_loop0", 1)]
+
+
+def test_flash_slot_writes_pos_512():
+    assert flash_slot_writes(_slots(block=64, columns=8), 512) == [("gf_len0", 1), ("gf_loop0", 2)]
+
+
+def test_flash_slot_writes_last_position_in_capacity():
+    nb = CAP // 512
+    assert flash_slot_writes(_slots(), CAP - 1) == [("gf_len0", nb - 1), ("gf_loop0", nb)]
+
+
+def test_flash_slot_writes_past_capacity_raises():
+    with pytest.raises(ValueError):
+        flash_slot_writes(_slots(), CAP)

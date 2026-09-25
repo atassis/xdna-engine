@@ -66,3 +66,20 @@ def merge(parts):
 
 def decode_flash_attention(q, k, v, n_live, block=64, columns=8):
     return merge([column_partial(q, k, v, n_live, c, block, columns) for c in range(columns)])
+
+
+def flash_slot_writes(flash_slots, pos):
+    """(name, value) scratchpad writes for position `pos` of every AttnGlobalFlash geometry: len =
+    nb - 1, loop = nb (ParameterScratchpad.write shifts the core-kind loop slot itself). Raises
+    ValueError if `pos` needs more live positions than the geometry's capacity holds.
+    """
+    writes = []
+    for d in flash_slots:
+        nb = blocks_per_column(pos + 1, d["block"], d["columns"])
+        if nb * d["block"] * d["columns"] > d["capacity"]:
+            raise ValueError(
+                f"attn_global_flash: pos {pos} needs {nb * d['block'] * d['columns']} live "
+                f"positions, past capacity {d['capacity']}")
+        writes.append((d["len_param"], nb - 1))
+        writes.append((d["loop_param"], nb))
+    return writes
