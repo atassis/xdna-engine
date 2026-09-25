@@ -267,8 +267,8 @@ pub struct NpuDecodeStep {
     artifact: LlmArtifact,
     arena: Rc<FusedArena>,
     /// Ascending by `window`, NEVER empty: index 0 is the narrowest bucket, the last is the widest
-    /// and is therefore the context this instance can hold. A scenario declaring no buckets gets
-    /// exactly one and every dispatch below is byte-for-byte what it was before bucketing.
+    /// and is therefore the context this instance can hold. One per declared `window_rungs` entry
+    /// plus the primary; an artifact declaring no rungs gets exactly one.
     buckets: Vec<Bucket>,
     embed: EmbedTable,
     /// Each declared RoPE input buffer with the base its rows are computed from, resolved at load.
@@ -423,28 +423,7 @@ impl NpuDecodeStep {
         Self::build(dev, decode_dir, Some(prefill_dir))
     }
 
-    /// Same, plus narrower-window buckets over the same KV allocation. Each is checked against
-    /// the primary with [`LlmArtifact::check_shared_layout_agrees`] before it is bound, so a
-    /// bucket generated against a different allocation fails loud instead of corrupting weights.
-    pub fn with_buckets(
-        dev: &Rc<Device>,
-        decode_dir: &Path,
-        prefill_dir: Option<&Path>,
-        bucket_dirs: &[std::path::PathBuf],
-    ) -> Result<Self, EngineError> {
-        Self::build_with(dev, decode_dir, prefill_dir, bucket_dirs)
-    }
-
     fn build(dev: &Rc<Device>, decode_dir: &Path, prefill_dir: Option<&Path>) -> Result<Self, EngineError> {
-        Self::build_with(dev, decode_dir, prefill_dir, &[])
-    }
-
-    fn build_with(
-        dev: &Rc<Device>,
-        decode_dir: &Path,
-        prefill_dir: Option<&Path>,
-        bucket_dirs: &[std::path::PathBuf],
-    ) -> Result<Self, EngineError> {
         let artifact = LlmArtifact::load(decode_dir)?;
         // Mirrors this exact loop's writes below (`x_loc`, `rope_loc`) -- an artifact declaring a
         // third per-token input buffer would otherwise leave it unwritten every token, silently.
@@ -464,26 +443,11 @@ impl NpuDecodeStep {
             p.check_per_token_writes(&p.per_dispatch_writes())?;
         }
 
-        // Window buckets, checked exactly as the prefill half is: they share the arena, so a
-        // disagreement on any offset would let one ELF overwrite another's weights or KV cache.
-        let mut bucket_arts: Vec<LlmArtifact> = Vec::new();
-        for dir in bucket_dirs {
-            let a = LlmArtifact::load(dir)?;
-            artifact.check_shared_layout_agrees(&a)?;
-            a.check_per_token_writes(&a.per_dispatch_writes())?;
-            bucket_arts.push(a);
-        }
-
-        // One arena for every ELF, sized to the largest of each of the three. A buffer is addressed
-        // by offset within its arena, so a larger arena is transparent to the smaller graph -- which
-        // is what lets a narrow bucket, whose own scratch is smaller, run in the widest one's arena.
-        let max3 = |f: fn(&LlmArtifact) -> usize| {
-            f(&artifact)
-                .max(pre_art.as_ref().map_or(0, f))
-                .max(bucket_arts.iter().map(f).max().unwrap_or(0))
-        };
+        // One arena for both ELFs, sized to the larger of the two. A buffer is addressed by offset
+        // within its arena, so a larger arena is transparent to the smaller graph.
+        let max2 = |f: fn(&LlmArtifact) -> usize| f(&artifact).max(pre_art.as_ref().map_or(0, f));
         let arena = Rc::new(
-            FusedArena::new(dev, max3(|a| a.input_size), max3(|a| a.output_size), max3(|a| a.scratch_size))
+            FusedArena::new(dev, max2(|a| a.input_size), max2(|a| a.output_size), max2(|a| a.scratch_size))
                 .map_err(|e| EngineError::Load(format!("alloc fused arenas: {e}")))?,
         );
 
@@ -559,9 +523,7 @@ impl NpuDecodeStep {
             ..provenance_extras(&artifact.decode_dir)
         };
 
-        
-
-        // The primary is itself a bucket -- the widest one unless a declared dir names a wider.
+        // The primary is itself a bucket -- the only one unless the artifact declares rungs.
         let mut buckets = vec![];
         // Rungs FIRST, while `res` is still owned here: each is another named control code in the
         // SAME ELF on the SAME registered hw_context, so a rung costs neither a context nor an
@@ -581,20 +543,8 @@ impl NpuDecodeStep {
             buckets.push(Bucket { window: *window, artifact: artifact.clone(), res: r });
         }
         buckets.push(Bucket { window: artifact.max_seq, artifact: artifact.clone(), res });
-        for a in bucket_arts {
-            let elf = a.read_elf_bytes()?;
-            let r = dev
-                .open_elf_resident(&elf, Some(&a.kernel_name))
-                .map_err(|e| EngineError::Load(format!("open_elf_resident (bucket S={}): {e}", a.max_seq)))?;
-            arena
-                .bind_resident(&r)
-                .map_err(|e| EngineError::Load(format!("bind bucket S={} to the shared arena: {e}", a.max_seq)))?;
-            buckets.push(Bucket { window: a.max_seq, artifact: a, res: r });
-        }
         buckets.sort_by_key(|b| b.window);
         buckets.dedup_by_key(|b| b.window);
-
-        
 
         Ok(NpuDecodeStep {
             artifact, arena, buckets, embed, rope_writes, prefill, provenance,
@@ -604,8 +554,7 @@ impl NpuDecodeStep {
 
     /// `(window, kernel name)` for every bucket, ascending by window. The kernel name is what
     /// proves a rung is a distinct control code rather than the default under another label:
-    /// rungs read `main:<variant>` while a bucket-artifact ladder reads `main:sequence` for all of
-    /// them, because those are separate ELFs.
+    /// each rung reads `main:<variant>`.
     pub fn bucket_kernels(&self) -> Vec<(usize, String)> {
         self.buckets.iter().map(|b| (b.window, b.res.kernel_name().to_string())).collect()
     }
