@@ -25,11 +25,22 @@ kind = "generate"
 #     scripts/build_prefill.sh 32 256 4096 artifacts/qwen3.5-4b/prefill_m256f_s4096
 name = "qwen3.5-4b"
 
+# REBUILT 2026-09-25 (`decode_s4096_gdrl_p8c684`, prefill `prefill_m256f_s4096_p8c684`) at
+#   toolchain pin 8c684a6e9438 (the flash-attention repin), same recipe, now built with
+#   IRON=wt-iron-integ (the iron/qwen35-deltanet branch merged into integration-stack). Decode:
+#   sequence_name/scratch_size/layout/ELF size fully identical, no `xf`. Prefill: layout/scratch_size
+#   /ELF size fully identical too; pairing PASS (491 shared buffers). No JevBench harness or
+#   token-parity oracle is checked into this repo, so gated on device with `npu-dev
+#   prefill-token-gate` (real batched-M=256 + decode path, not just verify_llm_decode.py): a 19-token
+#   prompt through the batched arm, coherent and factually correct continuation
+#   ("...capital of Italy is Rome. ...Spain is Madrid. ...United Kingdom is London..."),
+#   byte-identical generated ids across two device runs. Weaker than a token-parity gate -- no
+#   reference comparison -- flagged as such.
 [artifacts]
-decode = "artifacts/qwen3.5-4b/decode_s4096_gdrl"
-weights = "artifacts/qwen3.5-4b/decode_s4096_gdrl/buffers"
+decode = "artifacts/qwen3.5-4b/decode_s4096_gdrl_p8c684"
+weights = "artifacts/qwen3.5-4b/decode_s4096_gdrl_p8c684/buffers"
 tokenizer_dir = "artifacts/qwen3.5-4b/tokenizer"
-prefill = "artifacts/qwen3.5-4b/prefill_m256f_s4096"
+prefill = "artifacts/qwen3.5-4b/prefill_m256f_s4096_p8c684"
 
 [generation]
 max_tokens = 1024

@@ -8,7 +8,12 @@ name = "gemma3-270m"
 #   decode     scripts/build_llm_decode.sh gemma3-270m   (fused 18-layer ELF + meta.json)
 #   weights    scripts/dump_llm_weights.py --spec gemma3-270m --out artifacts/gemma3-270m/weights
 #   tokenizer  the unsloth/gemma-3-270m-it HF snapshot dir
+#
+# REBUILT 2026-09-25 (`decode_p8c684`) at toolchain pin 8c684a6e9438 (the flash-attention repin):
+#   same recipe, sequence_name and scratch_size identical, layout identical but for one added `xf`
+#   entry (a pre-existing buffer newly named, not a graph change -- see 44d127a). L=18 oracle
+#   parity 8/8 against tests/refs/gemma3-270m/bf16_oracle.json.
 [artifacts]
-decode = "artifacts/gemma3-270m/decode"
+decode = "artifacts/gemma3-270m/decode_p8c684"
 weights = "artifacts/gemma3-270m/weights"
 tokenizer_dir = "artifacts/gemma3-270m/tokenizer"
