@@ -779,28 +779,10 @@ FUSE_ATTN_BLOCK = os.environ.get("FUSE_ATTN_BLOCK", "0") == "1"
 # with FUSE_ATTN_BLOCK per geometry: a geometry FUSE_ATTN_BLOCK already covers keeps that arm.
 # Default OFF: device-free only so far.
 FUSE_ATTN_WEIGHTLESS = os.environ.get("FUSE_ATTN_WEIGHTLESS", "0") == "1"
-# gemma4-weightless-attention-block variant A_g: positions split across the columns instead of
-# one kv head per core (there is only one kv head globally, so there is nothing else to split
-# by). Composes with FUSE_ATTN_WEIGHTLESS -- the two govern DISJOINT geometries (this one only the
-# GLOBAL one, hkv==sp.global_n_kv_heads) and never both cover the same geometry. Replaces the
-# scores GEMV, softmax and context step; the per-head norm, RoPE, v-norm and the K/V StridedCopy
-# append stay exactly as they are today (attn_global_dp/design.py's module docstring says why).
-# Default OFF: device-free only so far.
-FUSE_ATTN_GLOBAL_SPLIT = os.environ.get("FUSE_ATTN_GLOBAL_SPLIT", "0") == "1"
-# head_groups>1 trades L1 for bytes: process Hq/head_groups heads at a time, re-reading this
-# column's whole K/V slice once per group. 1 (default) fits at Gemma-4's shape with room to spare
-# (measured: 63952-64976 B of 65536 depending on GLOBAL_SPLIT_WEIGHT_DEPTH); kept as an escape
-# hatch, not because 1 needed it here.
-GLOBAL_SPLIT_HEAD_GROUPS = int(os.environ.get("GLOBAL_SPLIT_HEAD_GROUPS", "1"))
-GLOBAL_SPLIT_WEIGHT_DEPTH = int(os.environ.get("GLOBAL_SPLIT_WEIGHT_DEPTH", "2"))
-# attn_global_dp variant AttnGlobalFlash: the same GLOBAL-geometry scope as FUSE_ATTN_GLOBAL_SPLIT
-# (see its own comment above), one design instead of worker+merge, K/V length set per token by a
-# scratchpad parameter instead of baked into the build. Mutually exclusive with
-# FUSE_ATTN_GLOBAL_SPLIT -- both claim the same geometry and only one design can own it.
+# attn_global_dp variant AttnGlobalFlash: covers the GLOBAL geometry (hd==sp.global_head_dim,
+# hkv==sp.global_n_kv_heads), K/V length set per token by a scratchpad parameter instead of baked
+# into the build. Default OFF: device-free only so far.
 FUSE_ATTN_GLOBAL_FLASH = os.environ.get("FUSE_ATTN_GLOBAL_FLASH", "0") == "1"
-if FUSE_ATTN_GLOBAL_FLASH and FUSE_ATTN_GLOBAL_SPLIT:
-    raise SystemExit("FUSE_ATTN_GLOBAL_FLASH and FUSE_ATTN_GLOBAL_SPLIT both claim the GLOBAL "
-                      "geometry; set only one.")
 GLOBAL_FLASH_HPC = int(os.environ.get("GLOBAL_FLASH_HPC", "16"))
 # Thread decode_layer_dp's window_parameter through: the AIE core reads its attention window from
 # a per-dispatch ScratchpadParameter ("attn_window", int32) instead of baking N_KV_CHUNKS into the
@@ -888,8 +870,7 @@ def load_weight_buffer(buf, arr):
 
 
 
-# MODULE level (not a build_graph closure) so the test file can call it directly. Same scope as
-# build_graph's _attn_global_why -- see its comment for why those two clauses and not others.
+# MODULE level (not a build_graph closure) so the test file can call it directly.
 def _attn_global_flash_why(sp, g):
     hd, hkv, has_v = g
     is_global_geom = hd == sp.global_head_dim and hkv == sp.global_n_kv_heads
@@ -908,7 +889,7 @@ def flash_name_token(fused, hpc):
 
 def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tmv_declined=(),
                   tmv_chunked=(), attn_block_geoms=(), attn_weightless_geoms=(),
-                  attn_global_geoms=(), attn_global_flash_geoms=(), ff_chunks=1,
+                  attn_global_flash_geoms=(), ff_chunks=1,
                   weight_families=0, pointwise_widths=0,
                   scores_blocks=(), mlp_dp_active=False, mlp_o_active=False):
     """Name the fused sequence after everything that changes its graph, not just the model.
@@ -1034,17 +1015,8 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tm
     # exclusive per attn_weightless_why).
     if attn_weightless_geoms:
         parts.append("aw" + "".join(f"_{h}" for h in sorted(attn_weightless_geoms)))
-    # attn_global_dp -- same reasoning, its sibling arm for the GLOBAL geometry. "ags" cannot
-    # collide with "ab"/"aw": the three cover disjoint geometries by construction.
-    if attn_global_geoms:
-        parts.append("ags" + "".join(f"_{h}" for h in sorted(attn_global_geoms)))
-        if GLOBAL_SPLIT_HEAD_GROUPS != 1:
-            parts.append(f"hg{GLOBAL_SPLIT_HEAD_GROUPS}")
-        if GLOBAL_SPLIT_WEIGHT_DEPTH != 2:
-            parts.append(f"gwd{GLOBAL_SPLIT_WEIGHT_DEPTH}")
-    # attn_global_dp (AttnGlobalFlash) -- same reasoning, the sibling arm for the GLOBAL geometry
-    # that FUSE_ATTN_GLOBAL_FLASH builds instead of "ags". Never both non-empty: the module-level
-    # SystemExit above refuses FUSE_ATTN_GLOBAL_FLASH and FUSE_ATTN_GLOBAL_SPLIT set together.
+    # attn_global_dp (AttnGlobalFlash) -- same reasoning, its sibling arm for the GLOBAL geometry.
+    # Cannot collide with "ab"/"aw": the three cover disjoint geometries by construction.
     if attn_global_flash_geoms:
         parts.append(flash_name_token(attn_global_flash_geoms, GLOBAL_FLASH_HPC))
     # The window override changes the graph (rpc, the KV ring, every sliding design's max_seq),
@@ -2110,32 +2082,13 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     attn_weightless_why = {g: _attn_weightless_why(g) for g in geoms}
     _attn_weightless_fused = tuple(sorted(g[0] for g in geoms if attn_weightless_why[g] is None))
 
-    # attn_global_dp (A_g): the GLOBAL geometry only (identified the same way attn_ops does --
-    # matching spec.global_head_dim/global_n_kv_heads, not an explicit per-geometry flag). None of
-    # attn_weightless_why's clauses apply (no Hkv==COLS rule -- A_g's whole point is that Hkv=1
-    # does NOT equal COLS; no SCALE_IN_QNORM/GROUPED_K/TMV_CTX opinion, since A_g computes scores
-    # and context itself and never constructs op_scale/op_rep_k/op_ctx for a geometry it covers).
-    #
-    # NOT qkv_shape_why[g] -- that predicate is qkv_dp_reason's, i.e. qkv_head_dp/attn_block_dp's
-    # OWN rule ("cur/n_in ride an HD-wide misc channel, so d_model must be a whole number of
-    # head_dim"), read off THEIR __post_init__ (K014: ask the operator, don't restate its rule).
-    # A_g has no misc-broadcast D-wide channel at all -- it never touches `cur`/`n_in` -- so that
-    # rule does not apply to it. The real precondition is just FUSE_QKV_GEMV itself, which is what
-    # makes `ref_q` (a slice of the concatenated qkv buffer) exist for the runlist to pass in.
-    def _attn_global_why(g):
-        hd, hkv, has_v = g
-        is_global_geom = hd == sp.global_head_dim and hkv == sp.global_n_kv_heads
-        return ("FUSE_ATTN_GLOBAL_SPLIT=0" if not FUSE_ATTN_GLOBAL_SPLIT else
-                f"not the global geometry (global is head_dim={sp.global_head_dim}, "
-                f"kv_heads={sp.global_n_kv_heads})" if not is_global_geom else
-                "needs FUSE_QKV_GEMV=1 for the concatenated qkv buffer ref_q slices"
-                if not FUSE_QKV_GEMV else
-                None)
-
-    attn_global_why = {g: _attn_global_why(g) for g in geoms}
-    _attn_global_fused = tuple(sorted(g[0] for g in geoms if attn_global_why[g] is None))
-    # AttnGlobalFlash: module-level _attn_global_flash_why (see its own comment) is the ONE
-    # predicate; this dict is the only place it is evaluated per geometry.
+    # attn_global_dp (AttnGlobalFlash): the GLOBAL geometry only (identified the same way attn_ops
+    # does -- matching spec.global_head_dim/global_n_kv_heads, not an explicit per-geometry flag).
+    # None of attn_weightless_why's clauses apply (no Hkv==COLS rule -- its whole point is that
+    # Hkv=1 does NOT equal COLS; no SCALE_IN_QNORM/GROUPED_K/TMV_CTX opinion, since it computes
+    # scores and context itself and never constructs op_scale/op_rep_k/op_ctx for a geometry it
+    # covers). Module-level _attn_global_flash_why (see its own comment) is the ONE predicate;
+    # this dict is the only place it is evaluated per geometry.
     attn_global_flash_why = {g: _attn_global_flash_why(sp, g) for g in geoms}
     _attn_global_flash_fused = tuple(sorted((g for g in geoms if attn_global_flash_why[g] is None),
                                              key=lambda g: g[0]))
@@ -2221,10 +2174,6 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         why = attn_weightless_why[g]
         tag = "" if len(geoms) == 1 else f" [head_dim={g[0]}, kv_heads={g[1]}]"
         print(f"[gen] fused arm attn_block_dp_weightless{tag}: {'OFF -- ' + why if why else 'on'}")
-    for g in geoms:
-        why = attn_global_why[g]
-        tag = "" if len(geoms) == 1 else f" [head_dim={g[0]}, kv_heads={g[1]}]"
-        print(f"[gen] fused arm attn_global_dp{tag}: {'OFF -- ' + why if why else 'on'}")
     for g in geoms:
         why = attn_global_flash_why[g]
         tag = "" if len(geoms) == 1 else f" [head_dim={g[0]}, kv_heads={g[1]}]"
@@ -2330,6 +2279,10 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # purely on (hd, hkv, has_v)) always stays at the build's max_seq; a declared
         # sliding_window narrows every OTHER geometry only under SLIDING_KV_CIRCULAR.
         is_global_geom = hd == sp.global_head_dim and hkv == sp.global_n_kv_heads
+        # AttnGlobalFlash already covers this geometry: the unfused scores/softmax/context chain
+        # below (op_rep_k/v, op_scores, op_trv, op_ctx) would never reach the runlist for it, so
+        # constructing that chain only forces SOFTMAX_SEGMENT/TMatVec L1 chunking on dead ops.
+        is_flash_geom = attn_global_flash_why[(hd, hkv, has_v)] is None
         w = (S if (is_global_geom or not SLIDING_KV_CIRCULAR or sp.sliding_window is None)
              else sp.sliding_window)
         # EXPERIMENT KNOB, 2026-09-18, not a shipped default. attn_block_dp pads each quantized
@@ -2399,34 +2352,56 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # The K cache's own block size for the SCORES GEMV. `T_g` (the V/physical one) is what
         # kv_layout, the host's kv_off and the prefill pairing all describe and it is unchanged;
         # this is a re-TAPING of the same bytes, not a relayout -- append_layouts_coincide below
-        # is what holds that true rather than this comment.
-        T_k = scores_block_size(hd, hkv, w, KVA_g, scores_nb, scores_bg, T_g)
-        if T_k != T_g:
-            if not append_layouts_coincide(hkv, hd, w, T_k, T_g):
-                raise NotImplementedError(
-                    f"scores K block T={T_k} and V block T={T_g} at (head_dim={hd}, "
-                    f"n_kv_heads={hkv}) address the SAME (head, position) differently, and both "
-                    f"appends share one `kv_off` slot and one host write. Needs a second kv_off "
-                    f"scratchpad slot (gen_llm_decode's kv_slots, meta.json's kv_windows and "
-                    f"npu_decode.rs's per-geometry write) before a split can be built here -- or "
-                    f"SCORES_KV_BLOCK=0 to keep this geometry flat.")
-            for _op_name, _why in (("op_attn_block", attn_block_why[(hd, hkv, has_v)]),
-                                   ("op_qkv_dp", qkv_dp_why[(hd, hkv, has_v)])):
-                if _why is None:
+        # is what holds that true rather than this comment. Skipped for a flash-covered geometry:
+        # AttnGlobalFlash never builds op_scores, so blocking its K cache has no consumer.
+        T_k = T_g
+        if not is_flash_geom:
+            T_k = scores_block_size(hd, hkv, w, KVA_g, scores_nb, scores_bg, T_g)
+            if T_k != T_g:
+                if not append_layouts_coincide(hkv, hd, w, T_k, T_g):
                     raise NotImplementedError(
-                        f"scores K block T={T_k} differs from the V block T={T_g}, but {_op_name} "
-                        f"appends BOTH caches itself through one `kv_block_size` and cannot "
-                        f"express two. Set SCORES_KV_BLOCK=0, or give that operator a per-cache "
-                        f"block size.")
-            print(f"[gen] scores K cache BLOCKED at head_dim={hd}: T={T_k} (V cache stays flat "
-                  f"at {T_g}, same bytes) -- A deliveries per invocation {scores_bg} -> 1")
-            _scores_blocks.append((hd, T_k))
+                        f"scores K block T={T_k} and V block T={T_g} at (head_dim={hd}, "
+                        f"n_kv_heads={hkv}) address the SAME (head, position) differently, and both "
+                        f"appends share one `kv_off` slot and one host write. Needs a second kv_off "
+                        f"scratchpad slot (gen_llm_decode's kv_slots, meta.json's kv_windows and "
+                        f"npu_decode.rs's per-geometry write) before a split can be built here -- or "
+                        f"SCORES_KV_BLOCK=0 to keep this geometry flat.")
+                for _op_name, _why in (("op_attn_block", attn_block_why[(hd, hkv, has_v)]),
+                                       ("op_qkv_dp", qkv_dp_why[(hd, hkv, has_v)])):
+                    if _why is None:
+                        raise NotImplementedError(
+                            f"scores K block T={T_k} differs from the V block T={T_g}, but {_op_name} "
+                            f"appends BOTH caches itself through one `kv_block_size` and cannot "
+                            f"express two. Set SCORES_KV_BLOCK=0, or give that operator a per-cache "
+                            f"block size.")
+                print(f"[gen] scores K cache BLOCKED at head_dim={hd}: T={T_k} (V cache stays flat "
+                      f"at {T_g}, same bytes) -- A deliveries per invocation {scores_bg} -> 1")
+                _scores_blocks.append((hd, T_k))
+        # mask_slot is a NAME every geometry needs (AttnGlobalFlash's mask_parameter reads it too),
+        # so it is assigned unconditionally; the Softmax/ElementwiseMul OBJECTS behind it are not
+        # -- building them for a window touched only by flash-covered geometries is what forces
+        # SOFTMAX_SEGMENT chunking on an op the runlist never reaches. Built lazily the first time
+        # a non-flash geometry needs a window some earlier flash-only geometry already named.
         if w not in _win_cache:
             # First geometry at this window keeps the bare name "sm_mask" -- same convention as
             # kv_slots's bare "kv_off", and for the same reason (baked into the design, host's
             # pre-list fallback reads that spelling).
             mask_slot = "sm_mask" if not mask_slots else f"sm_mask{len(mask_slots)}"
             mask_slots.append((mask_slot, w))
+            if is_flash_geom:
+                _win_cache[w] = (None, None, mask_slot)
+            else:
+                win_softmax = Softmax(rows=Hq, cols=w, num_aie_columns=sp.softmax_cols(COLS),
+                                      num_channels=1, rtp_vector_size=w,
+                                      vector_size_parameter=mask_slot,
+                                      segment=softmax_segment(w), context=ctx)
+                win_scale = ElementwiseMul(size=Hq * w, tile_size=w // COLS, num_aie_columns=COLS,
+                                           context=ctx)
+                _win_cache[w] = (win_softmax, win_scale, mask_slot)
+        elif not is_flash_geom and _win_cache[w][0] is None:
+            # A later non-flash geometry sharing a window only flash geometries have touched so
+            # far: build the real ops now and update the cache in place.
+            _, _, mask_slot = _win_cache[w]
             win_softmax = Softmax(rows=Hq, cols=w, num_aie_columns=sp.softmax_cols(COLS),
                                   num_channels=1, rtp_vector_size=w,
                                   vector_size_parameter=mask_slot,
@@ -2576,55 +2551,62 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # every live consumer sizes by the CAPACITY, and a constructed-but-dead op still reaches
         # the arena's argument collection, so it wins the buffer length and the append then
         # declares 32x what the arena provides.
-        op_rep_k = (Repeat(rows=hkv, cols=w * hd, repeat=gqa, transfer_size=hd, context=ctx)
-                    if not GROUPED_K else None)
-        op_rep_v = (Repeat(rows=hkv, cols=w * hd, repeat=gqa, transfer_size=hd, context=ctx)
-                    if not (GROUPED_V or tmv_rpc.get(hd) is not None) else None)
-        # Built from the SAME (scores_nb, scores_bg, T_k) the block-size gate was answered on --
-        # see their derivation above.
-        op_scores = gemv(w, hd, ctx, num_batches=scores_nb, batch_group=scores_bg,
-                         block_size=T_k, alloc_M=None if KVA_g == w else KVA_g, **rtp_extent)
-        # num_batches=Hq, not Hq separate invocations. transpose/design.py's L3 tensors already hold
-        # "num_batches contiguous (M,N) matrices stacked along the row dimension", which is EXACTLY
-        # what vr/vt are; calling it per head issued 448 configure+run pairs per token to do 28 ops'
-        # work.
-        #
-        # It is NOT a speed fix and must not be quoted as one. Isolated on device against the same
-        # placer: -0.01 ms/token, 0.0%. Dropping 420 dispatches per token is worth nothing
-        # measurable, because these are mode selections inside ONE hardware context. Kept because it
-        # is correct, free, and 2.2 MB smaller in the ELF -- not because it is faster.
-        # 4, not COLS: Transpose splits N across columns as `N // num_columns // n`, and at N=hd=128
-        # with n=32 that is 4 tiles, so 8 columns divides to ZERO. Its __post_init__ does not catch
-        # it -- it checks M*N % (m*n*cols*channels), which 8 satisfies -- and the failure surfaces
-        # deep in taplib as "All sizes must be >= 1, but got [8, 0, 256, 32]", naming no operator
-        # and no parameter. 4 is the real ceiling at this n; raising it needs n=16.
-        # GQA broadcast as an ACCESS PATTERN instead of a materialised copy. gqa query heads attend
-        # to one kv head; with batch_group the consumer reads that head directly and the Repeat that
-        # duplicated it into DDR disappears. Opt-in per side because k and v are not the same edit
-        # (k: Repeat feeds the GEMV; v: Repeat feeds a Transpose that feeds the GEMV), so they must
-        # be gated separately to stay attributable in an A/B ladder.
-        op_trv = Transpose(M=w, N=hd, num_aie_columns=4, num_channels=1, m=256, n=32, s=8,
-                           num_batches=Hq, batch_group=gqa if GROUPED_V else 1, context=ctx)
-        # CONTEXT STEP. op_trv exists only because gemv reduces ALONG a row: it wants [hd][S] and
-        # the cache is [S][hd], so the whole cache is rearranged every token -- 16.777 MB/layer
-        # measured, at 0% compute. TMatVec reduces DOWN the rows instead and reads `vc` as it is
-        # stored, so the transpose has nothing left to do. One kv head per column
-        # (n_matrices == cols == hkv), so each column streams its own head ONCE and applies both
-        # query heads' softmax rows out of L1 -- the stride-0 group re-read goes too.
-        # rows_per_chunk=64 puts the L1 A tile at 16 KB double-buffered.
-        # The verdict and its rows_per_chunk come from `tmv_rpc`, derived once above -- not
-        # recomputed here. A second copy of the L1 model is exactly how the two would drift.
-        _tmv = tmv_rpc.get(hd)
-        uses_tmv = _tmv is not None
-        if uses_tmv:
-            rpc, mc = _tmv
-            op_ctx = TMatVec(M=hd, K=w, num_aie_columns=hkv, num_batches=Hq, batch_group=gqa,
-                                 alloc_K=None if KVA_g == w else KVA_g, block_size=T_g,
-                             rows_per_chunk=rpc, m_chunk=mc, context=ctx, **rtp_extent)
-        else:
-            # The fallback reduces along K, and GEMV's runtime extent is its M. Left at the
-            # build-time window: narrowing it needs TMV_CTX, which this geometry declined.
-            op_ctx = gemv(hd, w, ctx, num_batches=Hq)
+        # The whole unfused chain below (op_rep_k/v, op_scores, op_trv, op_ctx) is dead weight for
+        # a flash-covered geometry -- AttnGlobalFlash replaces it and the runlist never routes any
+        # buffer through these. Skip constructing them; their constraints (TMatVec's L1 budget,
+        # SOFTMAX_SEGMENT chunking) have nothing to gate for an op nobody dispatches.
+        op_rep_k = op_rep_v = op_scores = op_trv = op_ctx = None
+        uses_tmv = False
+        if not is_flash_geom:
+            op_rep_k = (Repeat(rows=hkv, cols=w * hd, repeat=gqa, transfer_size=hd, context=ctx)
+                        if not GROUPED_K else None)
+            op_rep_v = (Repeat(rows=hkv, cols=w * hd, repeat=gqa, transfer_size=hd, context=ctx)
+                        if not (GROUPED_V or tmv_rpc.get(hd) is not None) else None)
+            # Built from the SAME (scores_nb, scores_bg, T_k) the block-size gate was answered on --
+            # see their derivation above.
+            op_scores = gemv(w, hd, ctx, num_batches=scores_nb, batch_group=scores_bg,
+                             block_size=T_k, alloc_M=None if KVA_g == w else KVA_g, **rtp_extent)
+            # num_batches=Hq, not Hq separate invocations. transpose/design.py's L3 tensors already hold
+            # "num_batches contiguous (M,N) matrices stacked along the row dimension", which is EXACTLY
+            # what vr/vt are; calling it per head issued 448 configure+run pairs per token to do 28 ops'
+            # work.
+            #
+            # It is NOT a speed fix and must not be quoted as one. Isolated on device against the same
+            # placer: -0.01 ms/token, 0.0%. Dropping 420 dispatches per token is worth nothing
+            # measurable, because these are mode selections inside ONE hardware context. Kept because it
+            # is correct, free, and 2.2 MB smaller in the ELF -- not because it is faster.
+            # 4, not COLS: Transpose splits N across columns as `N // num_columns // n`, and at N=hd=128
+            # with n=32 that is 4 tiles, so 8 columns divides to ZERO. Its __post_init__ does not catch
+            # it -- it checks M*N % (m*n*cols*channels), which 8 satisfies -- and the failure surfaces
+            # deep in taplib as "All sizes must be >= 1, but got [8, 0, 256, 32]", naming no operator
+            # and no parameter. 4 is the real ceiling at this n; raising it needs n=16.
+            # GQA broadcast as an ACCESS PATTERN instead of a materialised copy. gqa query heads attend
+            # to one kv head; with batch_group the consumer reads that head directly and the Repeat that
+            # duplicated it into DDR disappears. Opt-in per side because k and v are not the same edit
+            # (k: Repeat feeds the GEMV; v: Repeat feeds a Transpose that feeds the GEMV), so they must
+            # be gated separately to stay attributable in an A/B ladder.
+            op_trv = Transpose(M=w, N=hd, num_aie_columns=4, num_channels=1, m=256, n=32, s=8,
+                               num_batches=Hq, batch_group=gqa if GROUPED_V else 1, context=ctx)
+            # CONTEXT STEP. op_trv exists only because gemv reduces ALONG a row: it wants [hd][S] and
+            # the cache is [S][hd], so the whole cache is rearranged every token -- 16.777 MB/layer
+            # measured, at 0% compute. TMatVec reduces DOWN the rows instead and reads `vc` as it is
+            # stored, so the transpose has nothing left to do. One kv head per column
+            # (n_matrices == cols == hkv), so each column streams its own head ONCE and applies both
+            # query heads' softmax rows out of L1 -- the stride-0 group re-read goes too.
+            # rows_per_chunk=64 puts the L1 A tile at 16 KB double-buffered.
+            # The verdict and its rows_per_chunk come from `tmv_rpc`, derived once above -- not
+            # recomputed here. A second copy of the L1 model is exactly how the two would drift.
+            _tmv = tmv_rpc.get(hd)
+            uses_tmv = _tmv is not None
+            if uses_tmv:
+                rpc, mc = _tmv
+                op_ctx = TMatVec(M=hd, K=w, num_aie_columns=hkv, num_batches=Hq, batch_group=gqa,
+                                     alloc_K=None if KVA_g == w else KVA_g, block_size=T_g,
+                                 rows_per_chunk=rpc, m_chunk=mc, context=ctx, **rtp_extent)
+            else:
+                # The fallback reduces along K, and GEMV's runtime extent is its M. Left at the
+                # build-time window: narrowing it needs TMV_CTX, which this geometry declined.
+                op_ctx = gemv(hd, w, ctx, num_batches=Hq)
         # attn_block_dp AS A WHOLE, for this geometry alone -- one memoized object per (hd, hkv,
         # has_v), same trap as every other op above: a fresh object per LAYER would defeat
         # unique_designs' id()-keyed collapse and build one configure per layer instead of one per
@@ -2651,22 +2633,6 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 kv_offset_parameter=slot, mask_parameter=mask_slot,
                 kv_alloc=None if KVA_g == w else KVA_g, kv_block_size=None if T_g == w else T_g,
                 v_norm=True, weightless=True)
-        # attn_global_dp (A_g): the position-split global block. Flat cache only (T_g==KVA_g) --
-        # design.py's own module docstring names this as a scope narrowing, not a bug.
-        op_attn_global_worker = op_attn_global_merge = None
-        if attn_global_why[(hd, hkv, has_v)] is None:
-            if T_g != KVA_g:
-                raise NotImplementedError(
-                    f"attn_global_dp only supports a flat KV cache (T=={KVA_g}); this geometry "
-                    f"is blocked at T={T_g}. Set FUSE_ATTN_GLOBAL_SPLIT=0 for it, or extend "
-                    f"attn_global_dp/design.py for blocked capacity."
-                )
-            from iron.operators.attn_global_dp.op import AttnGlobalWorker, AttnGlobalMerge
-            op_attn_global_worker = AttnGlobalWorker(
-                HD=hd, Hq=Hq, S=w, num_aie_columns=COLS, head_groups=GLOBAL_SPLIT_HEAD_GROUPS,
-                weight_depth=GLOBAL_SPLIT_WEIGHT_DEPTH, mask_parameter=mask_slot, context=ctx)
-            op_attn_global_merge = AttnGlobalMerge(
-                HD=hd, Hq=Hq, num_aie_columns=COLS, context=ctx)
         # AttnGlobalFlash reads kc/vc flat, [capacity*HD]. At hkv==1 KVLayout's block_stride ==
         # head_stride (iron/common/kv_layout.py), so the blocked layout is flat's position-major
         # order for any T; hkv>1 interleaves heads per block and is out of scope, as for A_g.
@@ -2702,7 +2668,6 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             uses_tmv_ctx=uses_tmv, scores_groups=scores_groups, scores_block=T_k,
             op_softmax=op_softmax, op_scale=op_scale, mask_slot=mask_slot, window=w,
             capacity=KVA_g, kv_block=T_g, op_attn_weightless=op_attn_weightless,
-            op_attn_global_worker=op_attn_global_worker, op_attn_global_merge=op_attn_global_merge,
             op_attn_global_flash=op_attn_global_flash,
             op_attn_block=op_attn_block, circular=(w != S))
         _attn_cache[(hd, hkv, has_v)] = g
@@ -3411,10 +3376,6 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                {step[-1]: D * 2 for step in o_runlist(p, g)}),
             p + "hn": D * 2, p + "hf": D * 2,
         })
-        if g.op_attn_global_worker is not None:
-            # [column][head]-major f32 handoff between AttnGlobalWorker and AttnGlobalMerge --
-            # see attn_global_dp/design.py's module docstring for why that order, not the other.
-            bufsz[p + "gpartial"] = COLS * Hq * (g.hd + 2) * 4
         if lin:
             for k in ("kc", "vc", "sc", "sw"):
                 del bufsz[p + k]
@@ -3425,9 +3386,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         if not (g.uses_tmv_ctx or lin):
             bufsz[p + "vt"] = Hq * g.window * g.hd * 2
         if g.op_attn_global_flash is not None:
-            # attn_global_flash's runlist (below) never reads sc/sw/vt/kr/vr/gpartial -- the
+            # attn_global_flash's runlist (below) never reads sc/sw/vt/kr/vr -- the
             # scores/softmax/context chain those buffers serve is what it replaces.
-            for k in ("sc", "sw", "vt", "kr", "vr", "gpartial"):
+            for k in ("sc", "sw", "vt", "kr", "vr"):
                 bufsz.pop(p + k, None)
         # `a` is purely internal to op_mlp_dp's own fuse_o path (never an L3 buffer -- see
         # design.py) once folded; only declare it when something outside that design still reads
@@ -3537,19 +3498,10 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                         [*([] if G4_W_PROLOGUE else [(op_norm, cur, p + "n_in", p + "hn")]),
                          *proj, *vnorm, *qk, *rope,
                          (g.op_sck, ref_k, p + "kc"), (g.op_scv, ref_v, p + "vc")])
-                if g.op_attn_global_worker is not None:
-                    # A_g: the input norm, Wqkv, per-head norm/RoPE/v-norm and the K/V append
-                    # (`head`, above) stay exactly as they are -- only the scores GEMV, softmax
-                    # and context TMatVec are replaced. See attn_global_dp/design.py's module
-                    # docstring for why those three and not the rest.
-                    attn_rl = [
-                        *head,
-                        (g.op_attn_global_worker, ref_q, p + "kc", p + "vc", p + "gpartial"),
-                        (g.op_attn_global_merge, p + "gpartial", p + "cx"),
-                    ]
-                elif g.op_attn_global_flash is not None:
-                    # Same `head` as A_g above (see its comment) -- only the scores/softmax/
-                    # context chain is replaced, by one design instead of two.
+                if g.op_attn_global_flash is not None:
+                    # AttnGlobalFlash: the input norm, Wqkv, per-head norm/RoPE/v-norm and the K/V
+                    # append (`head`, above) stay exactly as they are -- only the scores/softmax/
+                    # context chain is replaced, by one design.
                     attn_rl = [*head, (g.op_attn_global_flash, ref_q, p + "kc", p + "vc", p + "cx")]
                 else:
                     attn_rl = [
@@ -3826,7 +3778,6 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         _sn = sequence_name(sp, NL, S, placer_flags, tmv_declined=_tmv_declined,
                             tmv_chunked=_tmv_chunked, attn_block_geoms=_attn_block_fused,
                             attn_weightless_geoms=_attn_weightless_fused,
-                            attn_global_geoms=_attn_global_fused,
                             attn_global_flash_geoms=_attn_global_flash_fused,
                             decode_layer_active=op_decode_layer is not None, T=T,
                             ff_chunks=ff_chunks, weight_families=len(weight_families),
