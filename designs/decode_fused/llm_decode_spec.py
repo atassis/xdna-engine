@@ -37,6 +37,12 @@ GEMM_AIE_ROWS = 4            # hardcoded n_aie_rows in iron/operators/gemm/desig
 GEMM_FIFO_DEPTH = 2          # design.py: fifo_depth = 2 for A, B, and (unless prio_accuracy) C
 GEMM_WORKER_STACK = 0xD00    # design.py passes stack_size=0xD00 to every GEMM Worker
 GEMM_COLS = (1, 2, 4, 8)     # design.py's own --n-aie-cols domain; npu2 is a 4x8 array
+#: A b_col_maj B[Nout,K] streamed in steps of tile_n*cols rows hits one BD whose row stride is
+#: tile_n*cols*K; the BD descriptor's stride field caps that. gemm_shape_rejection's `bd_stride`
+#: rule only fires when a caller opts in with `check_bd_stride=True` -- a blocked or quantized B
+#: read (gen_llm_prefill.py's `blocking`/`site` kwargs) uses a different addressing pattern this
+#: formula does not describe, so the check is per-CALL, not a property of the shape alone.
+BD_STRIDE_MAX = 1 << 20
 L1_BYTES = 65536             # getLocalMemorySize(), AIE2/AIE2P core tile
 MEMTILE_BYTES = 0x80000      # getMemTileSize(), AIETargetModel.h -- 512 KB per column
 
@@ -102,27 +108,42 @@ def gemm_memtile_bytes(tile_m: int, tile_k: int, tile_n: int, cols: int, *,
     return a_l2 + b_l2 + c_l2
 
 
-def largest_valid_tile_n(Nout: int, cols: int, bfp16: bool = True) -> int | None:
+def _bd_stride_ok(d: int, cols: int, Nout: int, K: int | None, b_col_maj: bool) -> bool:
+    """`d*cols*K` (the BD row stride for a b_col_maj B streamed in tile_n*cols chunks) fits
+    BD_STRIDE_MAX -- moot when the whole of Nout is one chunk (`d*cols >= Nout`), and only ever
+    a b_col_maj concern (see BD_STRIDE_MAX's own comment)."""
+    if not (b_col_maj and K):
+        return True
+    return d * cols >= Nout or d * cols * K <= BD_STRIDE_MAX
+
+
+def largest_valid_tile_n(Nout: int, cols: int, bfp16: bool = True, *,
+                         K: int | None = None, b_col_maj: bool = False) -> int | None:
     """Largest tile_n satisfying `Nout % (tile_n*cols) == 0` and mm.cc's `tile_n % (2*t) == 0`.
 
     Used only to print a working suggestion in a raised error, never to silently pick one.
+    `K`/`b_col_maj` additionally honour the BD stride rule (see `_bd_stride_ok`) when the caller
+    passes them; omitted, this is the divisibility rule alone, as before.
     """
     if Nout % cols:
         return None
     step = 2 * gemm_mac_dims(bfp16)[2]
     per_col = Nout // cols
-    return max((d for d in range(step, per_col + 1, step) if per_col % d == 0), default=None)
+    return max((d for d in range(step, per_col + 1, step)
+                if per_col % d == 0 and _bd_stride_ok(d, cols, Nout, K, b_col_maj)),
+               default=None)
 
 
 def largest_fitting_tile_n(Nout: int, cols: int, tile_m: int, tile_k: int, *,
                            bfp16: bool = True, prio_accuracy: bool = False,
-                           check_memtile: bool = True) -> int | None:
+                           check_memtile: bool = True, K: int | None = None,
+                           b_col_maj: bool = False) -> int | None:
     """Largest tile_n clearing every rule `gemm_shape_rejection` applies, the capacity ones included.
 
     `largest_valid_tile_n` answers the N-divisibility rule alone, so it returns the widest tile --
     which is the one most likely to overrun L1. At Gemma-4's `Nout=3840, cols=8` that is 480, whose
     footprint is 265472B against a 64KB budget. A tile_n printed as a fix has to survive the checks
-    that run after the one it resolves.
+    that run after the one it resolves. `K`/`b_col_maj`: see `_bd_stride_ok`.
     """
     if Nout % cols:
         return None
@@ -132,7 +153,8 @@ def largest_fitting_tile_n(Nout: int, cols: int, tile_m: int, tile_k: int, *,
                 if per_col % d == 0
                 and gemm_l1_bytes(tile_m, tile_k, d, prio_accuracy=prio_accuracy) <= L1_BYTES
                 and (not check_memtile
-                     or gemm_memtile_bytes(tile_m, tile_k, d, cols) <= MEMTILE_BYTES)),
+                     or gemm_memtile_bytes(tile_m, tile_k, d, cols) <= MEMTILE_BYTES)
+                and _bd_stride_ok(d, cols, Nout, K, b_col_maj)),
                default=None)
 
 
@@ -184,21 +206,37 @@ def gemm_batch_tile_rejection(batch: int, tile_m: int, tile_k: int, tile_n: int,
 
 def gemm_shape_rejection(K: int, Nout: int, tile_m: int, tile_k: int, tile_n: int, cols: int, *,
                          bfp16: bool = True, prio_accuracy: bool = False,
-                         check_memtile: bool = True) -> TilingRejection | None:
-    """The per-projection rules: K/N divisibility, then the two capacity budgets."""
+                         check_memtile: bool = True, b_col_maj: bool | None = None,
+                         check_bd_stride: bool = False) -> TilingRejection | None:
+    """The per-projection rules: K/N divisibility, the BD-stride rule, then the two capacity budgets.
+
+    `check_bd_stride` is opt-in (see BD_STRIDE_MAX): the caller must know its own B is streamed
+    b_col_maj and contiguous (no `blocking`, no quantized `weight_dtype`) before this rule applies.
+    """
     if K % tile_k:
         return TilingRejection("K", f"K={K} not divisible by tile_k={tile_k} "
                                     f"(op.py: K % tile_k == 0)")
     min_N = tile_n * cols
     if Nout % min_N:
         fix = largest_fitting_tile_n(Nout, cols, tile_m, tile_k, bfp16=bfp16,
-                                     prio_accuracy=prio_accuracy, check_memtile=check_memtile)
+                                     prio_accuracy=prio_accuracy, check_memtile=check_memtile,
+                                     K=K, b_col_maj=bool(b_col_maj) and check_bd_stride)
         hint = (f"; tile_n={fix} would satisfy it" if fix
                 else f"; no tile_n multiple of {2 * gemm_mac_dims(bfp16)[2]} both divides "
                      f"Nout={Nout} at cols={cols} and fits L1/MemTile at "
                      f"tile_m={tile_m}, tile_k={tile_k}")
         return TilingRejection("N", f"Nout={Nout} not divisible by tile_n({tile_n})*cols({cols})"
                                     f"={min_N} (op.py: N % (tile_n*num_aie_columns) == 0){hint}")
+    if b_col_maj and check_bd_stride and Nout > min_N and min_N * K > BD_STRIDE_MAX:
+        fix = largest_fitting_tile_n(Nout, cols, tile_m, tile_k, bfp16=bfp16,
+                                     prio_accuracy=prio_accuracy, check_memtile=check_memtile,
+                                     K=K, b_col_maj=True)
+        hint = f"; tile_n={fix} would satisfy it" if fix else "; no tile_n clears it at this K/cols"
+        return TilingRejection("bd_stride", f"tile_n({tile_n})*cols({cols})*K={min_N * K} "
+                                            f"exceeds the BD stride range {BD_STRIDE_MAX} "
+                                            f"(aiecc's BD descriptor stride field; op.py has no "
+                                            f"rule for it, aiecc refuses the BD only at the "
+                                            f"end){hint}")
     l1 = gemm_l1_bytes(tile_m, tile_k, tile_n, prio_accuracy=prio_accuracy)
     if l1 > L1_BYTES:
         return TilingRejection("l1", f"L1 footprint {l1}B exceeds {L1_BYTES} (64KB, "
@@ -219,11 +257,13 @@ def gemm_shape_rejection(K: int, Nout: int, tile_m: int, tile_k: int, tile_n: in
 
 def gemm_tiling_rejection(M: int, K: int, N: int, tile_m: int, tile_k: int, tile_n: int,
                           cols: int, *, bfp16: bool = True, prio_accuracy: bool = False,
-                          check_memtile: bool = True) -> TilingRejection | None:
+                          check_memtile: bool = True, b_col_maj: bool | None = None,
+                          check_bd_stride: bool = False) -> TilingRejection | None:
     """One verdict for one (shape, tiling) candidate. `None` means legal."""
     rej = gemm_batch_tile_rejection(M, tile_m, tile_k, tile_n, cols, bfp16=bfp16)
     return rej or gemm_shape_rejection(K, N, tile_m, tile_k, tile_n, cols, bfp16=bfp16,
-                                       prio_accuracy=prio_accuracy, check_memtile=check_memtile)
+                                       prio_accuracy=prio_accuracy, check_memtile=check_memtile,
+                                       b_col_maj=b_col_maj, check_bd_stride=check_bd_stride)
 
 
 def gemm_tile_grid(*, bfp16: bool = True, tile_ms=None, tile_ks=None, tile_ns=None,

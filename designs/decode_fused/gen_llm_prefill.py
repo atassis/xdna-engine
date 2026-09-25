@@ -116,7 +116,7 @@ import numpy as np
 import ml_dtypes
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from llm_decode_spec import SPECS  # noqa: E402
+from llm_decode_spec import SPECS, BD_STRIDE_MAX  # noqa: E402
 from gemm_tile_registry import registry  # noqa: E402
 import pack_cache  # noqa: E402
 from prefill_ref import (f32, gate_block, layer_stack, npy_weights,  # noqa: E402
@@ -194,8 +194,6 @@ COLS = int(os.environ.get("PREFILL_COLS", "8"))
 XFER_ELEMS = int(os.environ.get("PREFILL_XFER_ELEMS", "16384"))
 # Per delta-rule call, the real tokens it steps: an int32 in each call's dk-wide bf16 slot.
 GDR_COUNT = "gdr_count"
-# aie.dma_bd's stride range, [1:1048576] elements: a 20-bit field of the shim BD.
-BD_STRIDE_MAX = 1 << 20
 # The causal mask, as a buffer name. One int32 per softmax row, host-written per chunk.
 SM_WIDTHS = "sm_widths"
 # Batch prefill past a sliding-window's circular KV ring. Default 0: byte-identical MLIR to
@@ -426,6 +424,33 @@ def pack_quant_weights(quant_pack, bdir, quant_plan):
     cache_note = f" (cache: {hits} hit, {misses} miss)" if use_cache else ""
     print(f"[gen] packed {len(quant_pack)} quantized weight buffer(s) into {bdir} "
           f"(sites: {sorted({s for s in quant_plan})}){cache_note}")
+
+
+def dq_group_for_length(n: int, rows: int, K: int):
+    """`n` decode-arena BYTES holding `rows` rows of width `K`: `None` for bf16, else the int4
+    group size (32/64/128) -- shared by `dq_group` (the actual GEMM operand read) and this file's
+    own tests, so there is exactly one place this arithmetic lives.
+
+    `n` may cover MORE than `rows` rows: `fuse_o` zero-pads Wo to a whole `TSI_O`-tile boundary
+    past D for `swiglu_mlp_dp`'s own tiling (gen_llm_decode.py's `elif key == "Wo" and fuse_o:`
+    site owns `_wo_rows_padded`'s exact arithmetic; this does not re-derive it -- K007's "one
+    place", not a second copy). The single source of truth for how many rows decode actually
+    wrote is decode's own recorded length `n` -- the same trade `check_weight`'s golden check
+    makes (it slices `a[:ref.nbytes]` off whatever the arena holds rather than asserting its
+    exact size). So: `n` must be a WHOLE number of `rows`-width rows (never a partial row -- that
+    is the loud-fail case) and hold AT LEAST `rows` of them; `weight_rows` reads only the first
+    `rows`, so any padded tail rows (decode zero-fills them) are never read as output rows.
+    """
+    bf16_stride = K * 2
+    if n % bf16_stride == 0 and n // bf16_stride >= rows:
+        return None
+    hits = [g for g in (32, 64, 128)
+            if n % row_stride_bytes(K, g, "int4") == 0
+            and n // row_stride_bytes(K, g, "int4") >= rows]
+    if len(hits) != 1:
+        raise ValueError(f"{n} B is neither a whole-row bf16 buffer nor one int4 group size "
+                         f"holding at least [{rows}, {K}] (matches: {hits})")
+    return hits[0]
 
 
 def decode_arena_plan(meta_path):
@@ -676,8 +701,15 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         bf16. A quantized weight is packed fresh (see weight_gemm/qkv_operand below), never
         decode's aliased arena slab, so `blocking` never applies to one.
         """
+        qkw = quant_kwargs(site)
+        # A bf16 [N, K] B walks N in steps of tile_n*cols rows, one BD stride of that many rows;
+        # this is the plain contiguous case (op.py has no rule for it, aiecc refuses the BD only
+        # at the end) -- `blocking` and a quantized `site` both address B differently, so the
+        # registry only owes this GEMM the stride rule when neither applies (K007: the rule now
+        # lives with the shape, not after it).
+        contiguous = b_col_maj and not qkw and not blocking
         ch = reg.lookup(M, K, Nout, emulate=emulate, prio_accuracy=prio_acc,
-                        b_col_maj=b_col_maj, label=label)
+                        b_col_maj=b_col_maj, label=label, check_bd_stride=contiguous)
         # The spec-shaped check as well as the registry's own: it names the SPEC and the op, which
         # is the message a shape error should carry, and it costs nothing.
         sp.check_prefill_projections(M, ((label, K, Nout),), tile_m=ch.tile_m, tile_k=ch.tile_k,
@@ -686,14 +718,11 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         tiles[label] = {"tile": [ch.tile_m, ch.tile_k, ch.tile_n], "cols": ch.cols,
                         "source": ch.source, "K": K, "N": Nout,
                         "measured": ch.measured}
-        qkw = quant_kwargs(site)
-        # A bf16 [N, K] B walks N in steps of tile_n*cols rows, one BD stride of that many rows;
-        # gemm_tiling_rejection has no stride rule, and aiecc refuses the BD only at the end.
         step = ch.tile_n * ch.cols
-        if b_col_maj and not qkw and not blocking and Nout > step and step * K > BD_STRIDE_MAX:
-            raise ValueError(f"GEMM {label} M={M} K={K} N={Nout}: tile_n({ch.tile_n})*cols({ch.cols})"
-                             f"*K = {step * K} exceeds the BD stride range {BD_STRIDE_MAX}; pick "
-                             f"tile_n*cols <= {BD_STRIDE_MAX // K}")
+        assert not (contiguous and Nout > step and step * K > BD_STRIDE_MAX), (
+            f"GEMM {label} M={M} K={K} N={Nout}: tile_n({ch.tile_n})*cols({ch.cols})*K="
+            f"{step * K} exceeds the BD stride range {BD_STRIDE_MAX} -- the registry lookup "
+            f"above was asked check_bd_stride=True and should never have returned this tiling")
         blk = dict(b_block_rows=blocking[0], b_block_stride=blocking[1]) \
             if (blocking and not qkw) else {}
         blk.update(extra or {})
@@ -1172,16 +1201,14 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     wdq_elems = [0]
 
     def dq_group(buf, rows, K):
+        """`buf`'s wire format for `rows` rows of width `K`, or `ValueError` naming `buf`."""
         n = dec_sizes.get(buf)
         if n is None:
             raise ValueError(f"{buf}: not in the decode arena")
-        if n == rows * K * 2:
-            return None
-        hits = [g for g in (32, 64, 128) if n == rows * row_stride_bytes(K, g, "int4")]
-        if len(hits) != 1:
-            raise ValueError(f"{buf}: {n} B is neither bf16 nor one int4 group size for "
-                             f"[{rows}, {K}] (matches: {hits})")
-        return hits[0]
+        try:
+            return dq_group_for_length(n, rows, K)
+        except ValueError as e:
+            raise ValueError(f"{buf}: {e}") from None
 
     def weight_rows(buf, total_rows, row0, nrows, K, out_stride=None, out_col=0):
         """(runlist entries, operand) for rows [row0, row0+nrows) of decode's [total_rows, K]

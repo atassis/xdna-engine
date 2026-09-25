@@ -150,12 +150,18 @@ class Registry:
     # ---- the lookup that must not guess ----
     def lookup(self, M: int, K: int, N: int, *, dtype: str = "bf16>bf16", emulate: bool = True,
                prio_accuracy: bool = False, b_col_maj: bool | None = None,
-               label: str | None = None) -> TileChoice:
+               label: str | None = None, check_bd_stride: bool = False) -> TileChoice:
         """The winning tile for this shape, or `UnsweptGemmShape`.
 
         `label` is the op's name in the graph ("scores", "down", ...). It is used for the error
         message and as an override handle; it is NOT part of the key, because two ops with the
         same shape have the same answer.
+
+        `check_bd_stride`: opt in when THIS call streams B b_col_maj and contiguous (no
+        `blocking`, no quantized weight) -- see BD_STRIDE_MAX. Off by default because the same
+        registry key is shared with quantized/blocked callers of the same shape, whose B
+        addressing this rule does not describe (gemma4-12b's `down`/`gate_up` are recorded this
+        way and are only ever built quantized).
         """
         key = key_of(M, K, N, dtype=dtype, emulate=emulate, prio_accuracy=prio_accuracy)
         ent = self.entries.get(key)
@@ -185,7 +191,8 @@ class Registry:
                             measured=merged.get("measured"), label=label)
 
         rej = gemm_tiling_rejection(M, K, N, choice.tile_m, choice.tile_k, choice.tile_n,
-                                    choice.cols, bfp16=emulate, prio_accuracy=prio_accuracy)
+                                    choice.cols, bfp16=emulate, prio_accuracy=prio_accuracy,
+                                    b_col_maj=choice.b_col_maj, check_bd_stride=check_bd_stride)
         if rej is not None:
             raise IllegalRegistryEntry(
                 f"{key}{'' if not label else ' (' + label + ')'}: the recorded tiling "
@@ -221,11 +228,12 @@ class Registry:
     def record(self, M: int, K: int, N: int, tile_m: int, tile_k: int, tile_n: int, cols: int, *,
                dtype: str = "bf16>bf16", emulate: bool = True, prio_accuracy: bool = False,
                source: str = "sweep", b_col_maj: bool | None = None, measured: dict | None = None,
-               labels=None, candidates=None) -> str:
+               labels=None, candidates=None, check_bd_stride: bool = False) -> str:
         if source not in SOURCES:
             raise ValueError(f"source={source!r} not one of {SOURCES}")
         rej = gemm_tiling_rejection(M, K, N, tile_m, tile_k, tile_n, cols, bfp16=emulate,
-                                    prio_accuracy=prio_accuracy)
+                                    prio_accuracy=prio_accuracy, b_col_maj=b_col_maj,
+                                    check_bd_stride=check_bd_stride)
         if rej is not None:
             raise IllegalRegistryEntry(f"refusing to record an illegal tiling: {rej.detail}")
         key = key_of(M, K, N, dtype=dtype, emulate=emulate, prio_accuracy=prio_accuracy)

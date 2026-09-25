@@ -18,8 +18,8 @@ from gemm_tile_registry import (
     IllegalRegistryEntry, Registry, UnsweptGemmShape, key_of, DEFAULT_REGISTRY,
 )
 from llm_decode_spec import (
-    QWEN3_0_6B, gemm_l1_bytes, gemm_memtile_bytes, gemm_tile_census, gemm_tile_grid,
-    gemm_tiling_rejection, L1_BYTES, MEMTILE_BYTES,
+    BD_STRIDE_MAX, QWEN3_0_6B, gemm_l1_bytes, gemm_memtile_bytes, gemm_tile_census,
+    gemm_tile_grid, gemm_tiling_rejection, L1_BYTES, MEMTILE_BYTES,
 )
 
 # The seven GEMMs gen_llm_prefill.py builds for qwen3-0.6b at M=256, S=2048.
@@ -72,6 +72,16 @@ class TestRegistry:
         assert gemm_tiling_rejection(256, 1024, 1536, 64, 64, 64, 8) is None
         with pytest.raises(UnsweptGemmShape):
             reg.lookup(256, 1024, 1536)
+
+    def test_down_never_returns_a_tiling_that_overruns_the_bd_stride(self, reg):
+        """qwen3-0.6b's down (M=256, K=3072, N=1024) is b_col_maj and, at the module-constant
+        64x64x64@8, its tile_n*cols*K = 1572864 overruns BD_STRIDE_MAX = 1048576 --
+        `gen_llm_prefill.py build_prefill.sh 28 256 4096` failed on exactly this before a single
+        aiecc run. A caller that streams B contiguously (`check_bd_stride=True`, what
+        `gemm_for` passes when it is neither `blocking` nor quantized) must never get such a
+        tiling back."""
+        ch = reg.lookup(256, 3072, 1024, b_col_maj=True, label="down", check_bd_stride=True)
+        assert ch.tile_n * ch.cols * 3072 <= BD_STRIDE_MAX
 
     def test_orientation_mismatch_raises(self, reg):
         """ctx is recorded b_col_maj=False; B's dims_to_stream differs, so the measurement does
