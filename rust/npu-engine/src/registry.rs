@@ -71,20 +71,9 @@ pub fn try_build(cfg_path: &Path, root: &Path) -> Result<Scenario, EngineError> 
             // (the default) is byte-for-byte the per-token rail.
             let prefill_dir =
                 (!cfg.artifacts.prefill.is_empty()).then(|| root.join(&cfg.artifacts.prefill));
-            // `decode_buckets` names narrower-window buckets over the same KV allocation. They
-            // share the arena and the weight upload with `decode`, so the cost is hardware
-            // contexts, not memory. Empty is the single-bucket rail, byte for byte.
-            let buckets: Vec<std::path::PathBuf> =
-                cfg.artifacts.decode_buckets.iter().map(|d| root.join(d)).collect();
-            let decode = if prefill_dir.is_none() && buckets.is_empty() {
-                crate::llm::NpuDecodeStep::new(&dev, &decode_dir)?
-            } else {
-                crate::llm::NpuDecodeStep::with_buckets(
-                    &dev,
-                    &decode_dir,
-                    prefill_dir.as_deref(),
-                    &buckets,
-                )?
+            let decode = match prefill_dir {
+                None => crate::llm::NpuDecodeStep::new(&dev, &decode_dir)?,
+                Some(p) => crate::llm::NpuDecodeStep::with_prefill(&dev, &decode_dir, &p)?,
             };
             Scenario::Generate(Box::new(crate::llm::LlmGenerator::new(model_cfg, decode)
                 .with_scenario_defaults(cfg.generation.to_defaults())))
