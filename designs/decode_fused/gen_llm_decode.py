@@ -784,6 +784,9 @@ FUSE_ATTN_WEIGHTLESS = os.environ.get("FUSE_ATTN_WEIGHTLESS", "0") == "1"
 # into the build. Default OFF: device-free only so far.
 FUSE_ATTN_GLOBAL_FLASH = os.environ.get("FUSE_ATTN_GLOBAL_FLASH", "0") == "1"
 GLOBAL_FLASH_HPC = int(os.environ.get("GLOBAL_FLASH_HPC", "16"))
+# AttnGlobalFlash's Step 2 (flash-multirow design section 2): K/V fifo elements carry this many
+# rows instead of 1, amortising per-call overhead. Only hpc=4 has the L1 for it (op.py asserts).
+GLOBAL_FLASH_RPE = int(os.environ.get("GLOBAL_FLASH_RPE", "1"))
 # Thread decode_layer_dp's window_parameter through: the AIE core reads its attention window from
 # a per-dispatch ScratchpadParameter ("attn_window", int32) instead of baking N_KV_CHUNKS into the
 # build. Only takes effect when decode_layer_dp itself is eligible (decode_layer_why is None below)
@@ -882,9 +885,11 @@ def _attn_global_flash_why(sp, g):
             None)
 
 
-def flash_name_token(fused, hpc):
-    """Name suffix for the geometries AttnGlobalFlash claims -- see sequence_name's docstring."""
-    return "".join(f"_agf_{hd}_hpc{hpc}" for hd, _, _ in fused)
+def flash_name_token(fused, hpc, rpe=1):
+    """Name suffix for the geometries AttnGlobalFlash claims -- see sequence_name's docstring.
+    `rpe` (rows_per_element, Step 2) only appears when it changes the graph from today's default."""
+    rpe_suffix = f"_rpe{rpe}" if rpe != 1 else ""
+    return "".join(f"_agf_{hd}_hpc{hpc}{rpe_suffix}" for hd, _, _ in fused)
 
 
 def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tmv_declined=(),
@@ -1018,7 +1023,7 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tm
     # attn_global_dp (AttnGlobalFlash) -- same reasoning, its sibling arm for the GLOBAL geometry.
     # Cannot collide with "ab"/"aw": the three cover disjoint geometries by construction.
     if attn_global_flash_geoms:
-        parts.append(flash_name_token(attn_global_flash_geoms, GLOBAL_FLASH_HPC))
+        parts.append(flash_name_token(attn_global_flash_geoms, GLOBAL_FLASH_HPC, GLOBAL_FLASH_RPE))
     # The window override changes the graph (rpc, the KV ring, every sliding design's max_seq),
     # so it has to reach the name or two arms share one cached artifact -- this function's own
     # docstring is about exactly that failure. Experiment knob; absent on every shipped arm.
@@ -2648,6 +2653,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             gi = len(flash_slots)
             op_attn_global_flash = AttnGlobalFlash(
                 HD=hd, Hq=Hq, capacity=KVA_g, heads_per_core=GLOBAL_FLASH_HPC,
+                rows_per_element=GLOBAL_FLASH_RPE,
                 mask_parameter=mask_slot, len_parameter=f"gf_len{gi}",
                 loop_parameter=f"gf_loop{gi}", context=ctx)
             flash_slots.append({
