@@ -33,6 +33,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import newstack_compat  # noqa: F401,E402
 from gen_llm_decode import (build_graph, report_artifact_freshness, load_weight_buffer,  # noqa: E402
                             isolate_build_dir, PRECISION_PLAN)
+from decode_flash_ref import flash_slot_writes  # noqa: E402
 from redispatch_check import assert_redispatch_identical  # noqa: E402
 from iron.common.kv_layout import KVLayout  # noqa: E402
 
@@ -365,6 +366,8 @@ def main():
                                sp.rope_partial_rotary).reshape(-1)
         params.write("kv_off", 0)
         params.write("sm_mask", 1)
+        for name, v in flash_slot_writes(stack[0]["sg"].get("flash_slots") or [], 0):  # see decode_flash_ref.flash_slot_writes
+            params.write(name, v)
         if window_granule is not None:
             # No manual << 2 here: params.write() already resolves attn_window's "core" kind from
             # params.txt and pre-shifts internally, exactly as it does for sm_mask above -- adding
@@ -457,6 +460,9 @@ def main():
                 _kvl = KVLayout(Hkv=sp.n_kv_heads, S=slot_w, HD=slot_hd, T=min(T, slot_w))
                 _sp_.write(slot_name, int(_kvl.kv_off(pos % slot_w)))
                 _sp_.write(slot_mask, min(pos + 1, slot_w))
+            # see decode_flash_ref.flash_slot_writes
+            for _fn, _fv in flash_slot_writes(_st["sg"].get("flash_slots") or [], pos):
+                _sp_.write(_fn, _fv)
             if window_granule is not None:
                 # params.write() pre-shifts "core"-kind params by name, so the raw length is
                 # correct here. Clamp to this build's S: window_len can round past the window the

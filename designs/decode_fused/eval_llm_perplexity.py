@@ -37,6 +37,7 @@ import newstack_compat  # noqa: F401,E402
 from verify_llm_decode import window_len, rope_row  # noqa: E402 -- one owner for each
 from gen_llm_decode import (build_graph, report_artifact_freshness,  # noqa: E402
                             load_weight_buffer, isolate_build_dir)
+from decode_flash_ref import flash_slot_writes  # noqa: E402
 from iron.common.kv_layout import KVLayout  # noqa: E402
 from llm_decode_spec import SPECS  # noqa: E402
 
@@ -151,6 +152,7 @@ def main():
     # Per-geometry capacity/block/kv-heads -- see bench_llm_decode.py's note.
     geoms = [(nm, KVLayout(Hkv=khv, S=cap, HD=hd, T=blk), cap, mn)
              for nm, hd, cap, mn, blk, khv in geom_slots]
+    flash_slots = md.get("flash_slots") or []
 
     nll, t0, top1_hits, n_sat = [], time.perf_counter(), 0, 0
     for pos in range(n):
@@ -171,6 +173,8 @@ def main():
         for _slot, _kvl, _ww, _mask in geoms:
             params.write(_slot, int(_kvl.kv_off(pos % _ww)))
             params.write(_mask, min(pos + 1, _ww))
+        for _fn, _fv in flash_slot_writes(flash_slots, pos):  # see decode_flash_ref.flash_slot_writes
+            params.write(_fn, _fv)
         if window_granule is not None:
             # A dynamic-window build reads its attended length from this parameter every dispatch.
             # Omitting it does NOT fail -- the core reads whatever the scratchpad happens to hold,

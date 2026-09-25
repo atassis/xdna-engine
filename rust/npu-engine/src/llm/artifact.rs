@@ -38,6 +38,23 @@ pub struct ScratchpadParam {
     pub core: bool,
 }
 
+/// One `attn_global_flash` geometry (`meta.json`'s `scratchpad.flash_blocks` entry): the K/V BDs
+/// grow by `nb - 1` blocks past their one-block build size, where `nb` is the live positions'
+/// block count dealt round-robin over `columns` workers -- see
+/// `crate::llm::npu_decode::flash_blocks_per_column`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FlashBlocks {
+    /// Written raw as `nb - 1` ("addr" kind).
+    pub len: ScratchpadParam,
+    /// Written as `nb`, "core" kind -- shifted `<< 2` like `sm_mask`/`attn_window` above.
+    pub looped: ScratchpadParam,
+    pub block: usize,
+    pub columns: usize,
+    /// The K/V BD's allocated extent in positions; `nb * block * columns` past this is a
+    /// build-time bug, not a position to clamp -- see the write site.
+    pub capacity: usize,
+}
+
 /// The causal mask of a batched-prefill artifact, which is a per-row WIDTH VECTOR and not a
 /// triangle: the scores buffer is `[q_heads*M, S]`, so row `r = h*M + i` is token `i` under head
 /// `h`, and it may attend `base + i + 1` positions -- the same count under every head. Softmax
@@ -235,6 +252,9 @@ pub struct LlmArtifact {
     /// exactly when `attn_window` is: a scratchpad pointer with no granule has no unit to round
     /// against, and a granule with no pointer has nothing to write it to.
     pub window_granule: Option<usize>,
+    /// `meta.json`'s `scratchpad.flash_blocks`, one entry per `attn_global_flash` geometry.
+    /// Empty on every artifact today -- the generator that emits this key is a later task.
+    pub flash_blocks: Vec<FlashBlocks>,
     /// `meta.json`'s `window_rungs`: the NAMED control codes this one ELF carries besides
     /// `main:sequence`, each a decode-layer design at a narrower attention window over the SAME KV
     /// capacity and the SAME arena, as `(kernel subname, window)` sorted ascending by window.
@@ -322,6 +342,9 @@ pub struct LlmArtifact {
     /// against (`gen_llm_decode.py`, added 2026-09-05). `None` on any artifact built before this
     /// field existed. See [`LlmArtifact::load`]'s freshness check below.
     pub toolchain_hash: Option<String>,
+    /// `meta.json`'s `weight_quant.plan.kv` -- the KV cache element type. Defaults to `"bf16"`
+    /// when absent, see [`LlmArtifact::load`].
+    pub kv_dtype: String,
     /// `meta.json`'s `dims.prefill_break_even_tokens` -- the measured prompt-length crossover
     /// above which one batched dispatch (a fixed cost, independent of how many of its `dims.M`
     /// rows are real tokens) beats priming per-token. A property of the ARTIFACT, not a Rust
@@ -431,6 +454,16 @@ impl LlmArtifact {
             .and_then(|t| t.get("hash"))
             .and_then(|v| v.as_str())
             .map(str::to_string);
+        // `weight_quant.plan.kv`: the KV cache element type. Absent (every artifact predating
+        // this field, and any half silent about quantization) defaults to "bf16" -- the format
+        // every un-quantized KV buffer is written in today.
+        let kv_dtype = meta
+            .get("weight_quant")
+            .and_then(|w| w.get("plan"))
+            .and_then(|p| p.get("kv"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("bf16")
+            .to_string();
 
         let mut layout = HashMap::new();
         let layout_obj = meta
@@ -788,6 +821,61 @@ impl LlmArtifact {
                  other computes an attended length against an undefined unit"
             )));
         }
+
+        // `scratchpad.flash_blocks`: [{"len_param", "loop_param", "block", "columns",
+        // "capacity"}, ...], one entry per `attn_global_flash` geometry. Absent on every artifact
+        // today -- the generator that emits this key is a later task -- so this degrades to empty.
+        let flash_blocks = match sp.get("flash_blocks").and_then(|v| v.as_array()) {
+            Some(list) if !list.is_empty() => {
+                let mut out = Vec::with_capacity(list.len());
+                for e in list {
+                    let len_nm = e.get("len_param").and_then(|v| v.as_str()).ok_or_else(|| {
+                        ctx("scratchpad.flash_blocks entry missing string `len_param`".to_string())
+                    })?;
+                    let loop_nm = e.get("loop_param").and_then(|v| v.as_str()).ok_or_else(|| {
+                        ctx("scratchpad.flash_blocks entry missing string `loop_param`".to_string())
+                    })?;
+                    let block = e.get("block").and_then(|v| v.as_u64()).ok_or_else(|| {
+                        ctx(format!("scratchpad.flash_blocks entry `{len_nm}` missing numeric `block`"))
+                    })? as usize;
+                    let columns = e.get("columns").and_then(|v| v.as_u64()).ok_or_else(|| {
+                        ctx(format!("scratchpad.flash_blocks entry `{len_nm}` missing numeric `columns`"))
+                    })? as usize;
+                    let capacity = e.get("capacity").and_then(|v| v.as_u64()).ok_or_else(|| {
+                        ctx(format!("scratchpad.flash_blocks entry `{len_nm}` missing numeric `capacity`"))
+                    })? as usize;
+                    if block == 0 || columns == 0 {
+                        return Err(ctx(format!(
+                            "scratchpad.flash_blocks entry `{len_nm}`: block={block} columns={columns} \
+                             must both be positive"
+                        )));
+                    }
+                    if capacity % (block * columns) != 0 {
+                        return Err(ctx(format!(
+                            "scratchpad.flash_blocks entry `{len_nm}`: capacity={capacity} is not a \
+                             whole number of block={block} * columns={columns} rounds"
+                        )));
+                    }
+                    let len = read_param(len_nm)?;
+                    if len.core {
+                        return Err(ctx(format!(
+                            "scratchpad.flash_blocks entry `{len_nm}`: len_param is \"core\" kind, \
+                             want \"addr\" -- it is written raw as nb - 1"
+                        )));
+                    }
+                    let looped = read_param(loop_nm)?;
+                    if !looped.core {
+                        return Err(ctx(format!(
+                            "scratchpad.flash_blocks entry `{loop_nm}`: loop_param is \"addr\" kind, \
+                             want \"core\" -- it needs the UPDATE_REG shift"
+                        )));
+                    }
+                    out.push(FlashBlocks { len, looped, block, columns, capacity });
+                }
+                out
+            }
+            _ => Vec::new(),
+        };
 
         // Rungs are validated here rather than trusted, because a bad one is a plausible wrong
         // answer and never an error: a rung claiming a window it was not built at would attend
@@ -1185,6 +1273,7 @@ impl LlmArtifact {
             sm_mask,
             attn_window,
             window_granule,
+            flash_blocks,
             window_rungs,
             mask_widths,
             mask_ring,
@@ -1204,6 +1293,7 @@ impl LlmArtifact {
             rope_partial_rotary,
             logit_softcap,
             toolchain_hash,
+            kv_dtype,
             prefill_break_even_tokens,
             segments,
         })
@@ -1612,6 +1702,14 @@ impl LlmArtifact {
                 prefill.rope_theta_global, prefill.rope_theta_local
             )));
         }
+        // The KV cache element type -- both default to "bf16", so this also catches a decode
+        // quantized to a narrower KV format paired with a silent (bf16-assuming) prefill.
+        if self.kv_dtype != prefill.kv_dtype {
+            return Err(EngineError::Load(format!(
+                "prefill/decode disagree on kv_dtype: decode {}, prefill {}",
+                self.kv_dtype, prefill.kv_dtype
+            )));
+        }
         if prefill.embed_scale.is_some() && self.embed_scale != prefill.embed_scale {
             return Err(EngineError::Load(format!(
                 "prefill/decode disagree on host_protocol.embed_scale: decode {:?}, prefill {:?}",
@@ -1867,6 +1965,52 @@ mod tests {
         assert_eq!(art.kv_windows[0].1, art.head_dim);
         assert_eq!(art.kv_windows[0].2, art.max_seq, "capacity == S when not narrowed");
         assert_eq!(art.kv_windows[0].3, art.sm_mask.unwrap());
+    }
+
+    #[test]
+    fn flash_blocks_absent_yields_empty_vec() {
+        let dir = tempfile::tempdir().unwrap();
+        write_meta(dir.path(), &base_meta(8, 4, serde_json::json!({})));
+        let art = LlmArtifact::load(dir.path()).expect("no flash_blocks must still load");
+        assert!(art.flash_blocks.is_empty());
+    }
+
+    #[test]
+    fn flash_blocks_parses_len_and_loop_params() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = base_meta(8, 4, serde_json::json!({}));
+        meta["scratchpad"]["params"]["gf_len0"] = serde_json::json!({"byte_offset": 8, "kind": "addr"});
+        meta["scratchpad"]["params"]["gf_loop0"] = serde_json::json!({"byte_offset": 12, "kind": "core"});
+        meta["scratchpad"]["flash_blocks"] = serde_json::json!([
+            {"len_param": "gf_len0", "loop_param": "gf_loop0", "block": 64, "columns": 8, "capacity": 262144},
+        ]);
+        write_meta(dir.path(), &meta);
+        let art = LlmArtifact::load(dir.path()).expect("well-formed flash_blocks must load");
+        assert_eq!(art.flash_blocks.len(), 1);
+        assert_eq!(art.flash_blocks[0].len.byte_offset, 8);
+        assert!(!art.flash_blocks[0].len.core);
+        assert_eq!(art.flash_blocks[0].looped.byte_offset, 12);
+        assert!(art.flash_blocks[0].looped.core);
+        assert_eq!(art.flash_blocks[0].block, 64);
+        assert_eq!(art.flash_blocks[0].columns, 8);
+        assert_eq!(art.flash_blocks[0].capacity, 262144);
+    }
+
+    /// `len_param` must be "addr" kind -- it is written raw as `nb - 1`. A "core" kind here would
+    /// silently shift a value the firmware never asked to be shifted.
+    #[test]
+    fn flash_blocks_rejects_core_kind_len_param() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = base_meta(8, 4, serde_json::json!({}));
+        meta["scratchpad"]["params"]["gf_len0"] = serde_json::json!({"byte_offset": 8, "kind": "core"});
+        meta["scratchpad"]["params"]["gf_loop0"] = serde_json::json!({"byte_offset": 12, "kind": "core"});
+        meta["scratchpad"]["flash_blocks"] = serde_json::json!([
+            {"len_param": "gf_len0", "loop_param": "gf_loop0", "block": 64, "columns": 8, "capacity": 262144},
+        ]);
+        write_meta(dir.path(), &meta);
+        let err = LlmArtifact::load(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("gf_len0"), "{err}");
+        assert!(err.contains("\"addr\""), "{err}");
     }
 
     /// THE failure the cross-check exists for: the generator declares two KV geometries and one
@@ -2985,6 +3129,59 @@ mod tests {
         assert!(err.contains("capacity=6912"), "{err}");
         assert!(err.contains("flat"), "must say decode does not itself narrow this geometry: {err}");
         assert!(err.contains("declares capacity=2048"), "must name prefill's disagreeing value: {err}");
+    }
+
+    #[test]
+    fn a_global_capacity_mismatch_is_refused() {
+        // Regression pin, same shape as the KV_ALLOC defect above but isolated to the global
+        // (head_dim 512) geometry alone: prefill declares a capacity double decode's allocation
+        // (13824 not a whole multiple of kv_block=6912 is rejected at load, so pick one that is).
+        let dec = gemma4_shaped_decode_meta();
+        let mut pre = flat_prefill_meta_for_gemma4(2, 2048);
+        pre["scratchpad"]["params"]["sm_mask"] = serde_json::json!({"byte_offset": 4, "kind": "core"});
+        pre["scratchpad"]["params"]["kv_off1"] = serde_json::json!({"byte_offset": 8, "kind": "addr"});
+        pre["scratchpad"]["params"]["sm_mask1"] = serde_json::json!({"byte_offset": 12, "kind": "core"});
+        pre["scratchpad"]["kv_windows"] = serde_json::json!([
+            {"kv_param": "kv_off", "head_dim": 256, "window": 1024, "mask_param": "sm_mask"},
+            {"kv_param": "kv_off1", "head_dim": 512, "window": 13824, "mask_param": "sm_mask1"},
+        ]);
+        let (_d, _p, da, pa) = load_pair(&dec, &pre);
+        let err = da.check_prefill_pairing(&pa).unwrap_err().to_string();
+        assert!(err.contains("head_dim=512"), "{err}");
+        assert!(err.contains("capacity=6912") && err.contains("declares capacity=13824"), "{err}");
+    }
+
+    /// Same flat, non-narrowing decode shape as
+    /// `a_non_circular_multi_geometry_pair_still_passes_when_prefill_says_nothing`, so the pairing
+    /// this pins fails (or passes) on `kv_dtype` alone, not on the KV-geometry checks above it.
+    fn flat_gemma4_decode_meta() -> serde_json::Value {
+        let mut dec = gemma4_shaped_decode_meta();
+        dec["scratchpad"]["kv_windows"] = serde_json::json!([
+            {"kv_param": "kv_off", "head_dim": 256, "window": 6912, "mask_param": "sm_mask"},
+            {"kv_param": "kv_off1", "head_dim": 512, "window": 6912, "mask_param": "sm_mask1"},
+        ]);
+        dec
+    }
+
+    #[test]
+    fn a_kv_dtype_mismatch_is_refused() {
+        let mut dec = flat_gemma4_decode_meta();
+        dec["weight_quant"] = serde_json::json!({"plan": {"kv": "bfp16"}});
+        let pre = flat_prefill_meta_for_gemma4(2, 2);
+        let (_d, _p, da, pa) = load_pair(&dec, &pre);
+        let err = da.check_prefill_pairing(&pa).unwrap_err().to_string();
+        assert!(err.contains("kv_dtype"), "{err}");
+        assert!(err.contains("bfp16") && err.contains("bf16"), "must name both values: {err}");
+    }
+
+    #[test]
+    fn an_undeclared_kv_dtype_pairs_with_bf16() {
+        let mut dec = flat_gemma4_decode_meta();
+        dec["weight_quant"] = serde_json::json!({"plan": {"kv": "bf16"}});
+        let pre = flat_prefill_meta_for_gemma4(2, 2);
+        let (_d, _p, da, pa) = load_pair(&dec, &pre);
+        assert_eq!(pa.kv_dtype, "bf16", "silent prefill defaults to bf16");
+        da.check_prefill_pairing(&pa).expect("decode bf16 pairs with a silent (bf16-default) prefill");
     }
 
     #[test]
