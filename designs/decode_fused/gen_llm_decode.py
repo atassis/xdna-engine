@@ -776,7 +776,6 @@ GLOBAL_SPLIT_WEIGHT_DEPTH = int(os.environ.get("GLOBAL_SPLIT_WEIGHT_DEPTH", "2")
 # (see its own comment above), one design instead of worker+merge, K/V length set per token by a
 # scratchpad parameter instead of baked into the build. Mutually exclusive with
 # FUSE_ATTN_GLOBAL_SPLIT -- both claim the same geometry and only one design can own it.
-# Default OFF: device-free only so far.
 FUSE_ATTN_GLOBAL_FLASH = os.environ.get("FUSE_ATTN_GLOBAL_FLASH", "0") == "1"
 if FUSE_ATTN_GLOBAL_FLASH and FUSE_ATTN_GLOBAL_SPLIT:
     raise SystemExit("FUSE_ATTN_GLOBAL_FLASH and FUSE_ATTN_GLOBAL_SPLIT both claim the GLOBAL "
@@ -868,11 +867,8 @@ def load_weight_buffer(buf, arr):
 
 
 
-# attn_global_dp (AttnGlobalFlash): MODULE level, not a build_graph closure, so
-# test_gen_llm_decode_global_flash.py can call it directly and build_graph's own
-# _attn_global_flash_why (below) has exactly one predicate to call, never a second copy of this
-# gate. Same scope as _attn_global_why (the GLOBAL geometry, FUSE_QKV_GEMV's concatenated `qkv`
-# buffer for ref_q) -- see that function's comment for why those two clauses and not others.
+# MODULE level (not a build_graph closure) so the test file can call it directly. Same scope as
+# build_graph's _attn_global_why -- see its comment for why those two clauses and not others.
 def _attn_global_flash_why(sp, g):
     hd, hkv, has_v = g
     is_global_geom = hd == sp.global_head_dim and hkv == sp.global_n_kv_heads
@@ -885,9 +881,7 @@ def _attn_global_flash_why(sp, g):
 
 
 def flash_name_token(fused, hpc):
-    """Name suffix for the geometries AttnGlobalFlash claims -- see sequence_name's docstring for
-    why every graph-changing knob must reach the name. `fused` is the (hd, hkv, has_v) tuples
-    _attn_global_flash_why(...) is None for, passed in rather than re-derived here."""
+    """Name suffix for the geometries AttnGlobalFlash claims -- see sequence_name's docstring."""
     return "".join(f"_agf_{hd}_hpc{hpc}" for hd, _, _ in fused)
 
 
@@ -1028,8 +1022,8 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tm
         if GLOBAL_SPLIT_WEIGHT_DEPTH != 2:
             parts.append(f"gwd{GLOBAL_SPLIT_WEIGHT_DEPTH}")
     # attn_global_dp (AttnGlobalFlash) -- same reasoning, the sibling arm for the GLOBAL geometry
-    # that FUSE_ATTN_GLOBAL_FLASH builds instead of "ags". Never both: attn_global_why and
-    # _attn_global_flash_why refuse each other's flag, so the two lists cannot both be non-empty.
+    # that FUSE_ATTN_GLOBAL_FLASH builds instead of "ags". Never both non-empty: the module-level
+    # SystemExit above refuses FUSE_ATTN_GLOBAL_FLASH and FUSE_ATTN_GLOBAL_SPLIT set together.
     if attn_global_flash_geoms:
         parts.append(flash_name_token(attn_global_flash_geoms, GLOBAL_FLASH_HPC))
     # The window override changes the graph (rpc, the KV ring, every sliding design's max_seq),
@@ -2288,9 +2282,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # geometries sharing one window (every artifact before this flag) collapse to ONE mask_slots
     # entry while kv_slots still has two.
     geom_slots = []
-    # Per-geometry AttnGlobalFlash scratchpad slots, appended when the geometry is constructed
-    # (attn_ops, below) -- same {len_param, loop_param, block, columns, capacity} shape
-    # npu_decode.rs's scratchpad.flash_blocks reads (54d7542).
+    # Per-geometry AttnGlobalFlash scratchpad slots -- shape npu_decode.rs's scratchpad.flash_blocks
+    # reads.
     flash_slots = []
     _attn_cache = {}
     # Softmax/scale keyed by WINDOW, not by the full geometry key: two geometries sharing a window
@@ -2653,13 +2646,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 weight_depth=GLOBAL_SPLIT_WEIGHT_DEPTH, mask_parameter=mask_slot, context=ctx)
             op_attn_global_merge = AttnGlobalMerge(
                 HD=hd, Hq=Hq, num_aie_columns=COLS, context=ctx)
-        # AttnGlobalFlash: reads kc/vc flat, [capacity*HD]. A_g's flat-only raise above does not
-        # apply verbatim here -- at hkv==1, KVLayout's blocked physical order (`[S/T blocks, Hkv
-        # heads, T positions, HD]`) has no per-block HEAD interleaving to reorder, so it is the
-        # same position-major element sequence as flat regardless of T (see kv_layout.py's module
-        # docstring: "T == S ... is BYTE-IDENTICAL to the historical flat layout", which for
-        # Hkv==1 generalises to every T since block_stride == head_stride here). hkv>1 genuinely
-        # interleaves heads within a block and is out of scope, same as A_g.
+        # AttnGlobalFlash reads kc/vc flat, [capacity*HD]. At hkv==1 KVLayout's block_stride ==
+        # head_stride (iron/common/kv_layout.py), so the blocked layout is flat's position-major
+        # order for any T; hkv>1 interleaves heads per block and is out of scope, as for A_g.
         op_attn_global_flash = None
         if attn_global_flash_why[(hd, hkv, has_v)] is None:
             if T_g != KVA_g and hkv != 1:
@@ -4068,10 +4057,8 @@ def main():
                                       for n, hd, cap, mn, blk, khv in md["geom_slots"]],
                        "head_dim": HD, "kv_heads": Hkv,
                        **({"window_param": "attn_window"} if dynamic_window else {}),
-                       # npu_decode.rs (54d7542) reads this per-token: len_param/loop_param get
-                       # the live block count, capacity gates a position past it. Omitted (not an
-                       # empty list) when no geometry claimed AttnGlobalFlash, so every meta.json
-                       # this flag never touches is byte-identical.
+                       # npu_decode.rs reads this per token. Omitted (not an empty list) when no
+                       # geometry claims AttnGlobalFlash, so every other meta.json is unchanged.
                        **({"flash_blocks": [{k: v for k, v in d.items() if k != "head_dim"}
                                             for d in md["flash_slots"]]}
                           if md["flash_slots"] else {})},
