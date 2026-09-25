@@ -772,6 +772,16 @@ FUSE_ATTN_GLOBAL_SPLIT = os.environ.get("FUSE_ATTN_GLOBAL_SPLIT", "0") == "1"
 # hatch, not because 1 needed it here.
 GLOBAL_SPLIT_HEAD_GROUPS = int(os.environ.get("GLOBAL_SPLIT_HEAD_GROUPS", "1"))
 GLOBAL_SPLIT_WEIGHT_DEPTH = int(os.environ.get("GLOBAL_SPLIT_WEIGHT_DEPTH", "2"))
+# attn_global_dp variant AttnGlobalFlash: the same GLOBAL-geometry scope as FUSE_ATTN_GLOBAL_SPLIT
+# (see its own comment above), one design instead of worker+merge, K/V length set per token by a
+# scratchpad parameter instead of baked into the build. Mutually exclusive with
+# FUSE_ATTN_GLOBAL_SPLIT -- both claim the same geometry and only one design can own it.
+# Default OFF: device-free only so far.
+FUSE_ATTN_GLOBAL_FLASH = os.environ.get("FUSE_ATTN_GLOBAL_FLASH", "0") == "1"
+if FUSE_ATTN_GLOBAL_FLASH and FUSE_ATTN_GLOBAL_SPLIT:
+    raise SystemExit("FUSE_ATTN_GLOBAL_FLASH and FUSE_ATTN_GLOBAL_SPLIT both claim the GLOBAL "
+                      "geometry; set only one.")
+GLOBAL_FLASH_HPC = int(os.environ.get("GLOBAL_FLASH_HPC", "16"))
 # Thread decode_layer_dp's window_parameter through: the AIE core reads its attention window from
 # a per-dispatch ScratchpadParameter ("attn_window", int32) instead of baking N_KV_CHUNKS into the
 # build. Only takes effect when decode_layer_dp itself is eligible (decode_layer_why is None below)
@@ -858,9 +868,33 @@ def load_weight_buffer(buf, arr):
 
 
 
+# attn_global_dp (AttnGlobalFlash): MODULE level, not a build_graph closure, so
+# test_gen_llm_decode_global_flash.py can call it directly and build_graph's own
+# _attn_global_flash_why (below) has exactly one predicate to call, never a second copy of this
+# gate. Same scope as _attn_global_why (the GLOBAL geometry, FUSE_QKV_GEMV's concatenated `qkv`
+# buffer for ref_q) -- see that function's comment for why those two clauses and not others.
+def _attn_global_flash_why(sp, g):
+    hd, hkv, has_v = g
+    is_global_geom = hd == sp.global_head_dim and hkv == sp.global_n_kv_heads
+    return ("FUSE_ATTN_GLOBAL_FLASH=0" if not FUSE_ATTN_GLOBAL_FLASH else
+            f"not the global geometry (global is head_dim={sp.global_head_dim}, "
+            f"kv_heads={sp.global_n_kv_heads})" if not is_global_geom else
+            "needs FUSE_QKV_GEMV=1 for the concatenated qkv buffer ref_q slices"
+            if not FUSE_QKV_GEMV else
+            None)
+
+
+def flash_name_token(fused, hpc):
+    """Name suffix for the geometries AttnGlobalFlash claims -- see sequence_name's docstring for
+    why every graph-changing knob must reach the name. `fused` is the (hd, hkv, has_v) tuples
+    _attn_global_flash_why(...) is None for, passed in rather than re-derived here."""
+    return "".join(f"_agf_{hd}_hpc{hpc}" for hd, _, _ in fused)
+
+
 def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tmv_declined=(),
                   tmv_chunked=(), attn_block_geoms=(), attn_weightless_geoms=(),
-                  attn_global_geoms=(), ff_chunks=1, weight_families=0, pointwise_widths=0,
+                  attn_global_geoms=(), attn_global_flash_geoms=(), ff_chunks=1,
+                  weight_families=0, pointwise_widths=0,
                   scores_blocks=(), mlp_dp_active=False, mlp_o_active=False):
     """Name the fused sequence after everything that changes its graph, not just the model.
 
@@ -993,6 +1027,11 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tm
             parts.append(f"hg{GLOBAL_SPLIT_HEAD_GROUPS}")
         if GLOBAL_SPLIT_WEIGHT_DEPTH != 2:
             parts.append(f"gwd{GLOBAL_SPLIT_WEIGHT_DEPTH}")
+    # attn_global_dp (AttnGlobalFlash) -- same reasoning, the sibling arm for the GLOBAL geometry
+    # that FUSE_ATTN_GLOBAL_FLASH builds instead of "ags". Never both: attn_global_why and
+    # _attn_global_flash_why refuse each other's flag, so the two lists cannot both be non-empty.
+    if attn_global_flash_geoms:
+        parts.append(flash_name_token(attn_global_flash_geoms, GLOBAL_FLASH_HPC))
     # The window override changes the graph (rpc, the KV ring, every sliding design's max_seq),
     # so it has to reach the name or two arms share one cached artifact -- this function's own
     # docstring is about exactly that failure. Experiment knob; absent on every shipped arm.
@@ -2080,6 +2119,11 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
 
     attn_global_why = {g: _attn_global_why(g) for g in geoms}
     _attn_global_fused = tuple(sorted(g[0] for g in geoms if attn_global_why[g] is None))
+    # AttnGlobalFlash: module-level _attn_global_flash_why (see its own comment) is the ONE
+    # predicate; this dict is the only place it is evaluated per geometry.
+    attn_global_flash_why = {g: _attn_global_flash_why(sp, g) for g in geoms}
+    _attn_global_flash_fused = tuple(sorted((g for g in geoms if attn_global_flash_why[g] is None),
+                                             key=lambda g: g[0]))
     # Filled by attn_ops (below) as each geometry is built, then handed to sequence_name -- the
     # SAME value the op was constructed with, not a re-derivation of the gate.
     _scores_blocks = []
@@ -2166,6 +2210,10 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         why = attn_global_why[g]
         tag = "" if len(geoms) == 1 else f" [head_dim={g[0]}, kv_heads={g[1]}]"
         print(f"[gen] fused arm attn_global_dp{tag}: {'OFF -- ' + why if why else 'on'}")
+    for g in geoms:
+        why = attn_global_flash_why[g]
+        tag = "" if len(geoms) == 1 else f" [head_dim={g[0]}, kv_heads={g[1]}]"
+        print(f"[gen] fused arm attn_global_flash{tag}: {'OFF -- ' + why if why else 'on'}")
     print(f"[gen] fused arm swiglu_mlp_dp: {'OFF -- ' + mlp_dp_why if mlp_dp_why else 'on'}")
     if fuse_o:
         if _spec("attn_o") != _spec("mlp"):
@@ -2240,6 +2288,10 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # geometries sharing one window (every artifact before this flag) collapse to ONE mask_slots
     # entry while kv_slots still has two.
     geom_slots = []
+    # Per-geometry AttnGlobalFlash scratchpad slots, appended when the geometry is constructed
+    # (attn_ops, below) -- same {len_param, loop_param, block, columns, capacity} shape
+    # npu_decode.rs's scratchpad.flash_blocks reads (54d7542).
+    flash_slots = []
     _attn_cache = {}
     # Softmax/scale keyed by WINDOW, not by the full geometry key: two geometries sharing a window
     # (today, always -- both at S) must share the SAME design object, exactly as the pre-existing
@@ -2601,6 +2653,35 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 weight_depth=GLOBAL_SPLIT_WEIGHT_DEPTH, mask_parameter=mask_slot, context=ctx)
             op_attn_global_merge = AttnGlobalMerge(
                 HD=hd, Hq=Hq, num_aie_columns=COLS, context=ctx)
+        # AttnGlobalFlash: reads kc/vc flat, [capacity*HD]. A_g's flat-only raise above does not
+        # apply verbatim here -- at hkv==1, KVLayout's blocked physical order (`[S/T blocks, Hkv
+        # heads, T positions, HD]`) has no per-block HEAD interleaving to reorder, so it is the
+        # same position-major element sequence as flat regardless of T (see kv_layout.py's module
+        # docstring: "T == S ... is BYTE-IDENTICAL to the historical flat layout", which for
+        # Hkv==1 generalises to every T since block_stride == head_stride here). hkv>1 genuinely
+        # interleaves heads within a block and is out of scope, same as A_g.
+        op_attn_global_flash = None
+        if attn_global_flash_why[(hd, hkv, has_v)] is None:
+            if T_g != KVA_g and hkv != 1:
+                raise NotImplementedError(
+                    f"attn_global_flash reads kc/vc as flat [capacity*HD] and this geometry's "
+                    f"blocked layout (T={T_g} < capacity={KVA_g}) only degenerates to flat at "
+                    f"Hkv==1; got Hkv={hkv}."
+                )
+            from iron.operators.attn_global_dp.op import AttnGlobalFlash
+            gi = len(flash_slots)
+            op_attn_global_flash = AttnGlobalFlash(
+                HD=hd, Hq=Hq, capacity=KVA_g, heads_per_core=GLOBAL_FLASH_HPC,
+                mask_parameter=mask_slot, len_parameter=f"gf_len{gi}",
+                loop_parameter=f"gf_loop{gi}", context=ctx)
+            flash_slots.append({
+                "head_dim": hd,  # segment filtering only (seg_flash_slots below); stripped at meta-write
+                "len_param": op_attn_global_flash.len_parameter,
+                "loop_param": op_attn_global_flash.loop_parameter,
+                "block": op_attn_global_flash.block,
+                "columns": op_attn_global_flash.num_aie_columns,
+                "capacity": KVA_g,
+            })
         g = SimpleNamespace(
             hd=hd, hkv=hkv, qd=qd, kvd=kvd, gqa=gqa, kv_slot=slot, o_chunks=o_chunks,
             op_qk_norm=op_qk_norm, op_qk_norm_b=op_qk_norm_b, qkn=_qkn, op_qkv=op_qkv, op_q=op_q,
@@ -2612,6 +2693,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             op_softmax=op_softmax, op_scale=op_scale, mask_slot=mask_slot, window=w,
             capacity=KVA_g, kv_block=T_g, op_attn_weightless=op_attn_weightless,
             op_attn_global_worker=op_attn_global_worker, op_attn_global_merge=op_attn_global_merge,
+            op_attn_global_flash=op_attn_global_flash,
             op_attn_block=op_attn_block, circular=(w != S))
         _attn_cache[(hd, hkv, has_v)] = g
         return g
@@ -3332,6 +3414,11 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             bufsz[p + "vr"] = Hq * g.window * g.hd * 2
         if not (g.uses_tmv_ctx or lin):
             bufsz[p + "vt"] = Hq * g.window * g.hd * 2
+        if g.op_attn_global_flash is not None:
+            # attn_global_flash's runlist (below) never reads sc/sw/vt/kr/vr/gpartial -- the
+            # scores/softmax/context chain those buffers serve is what it replaces.
+            for k in ("sc", "sw", "vt", "kr", "vr", "gpartial"):
+                bufsz.pop(p + k, None)
         # `a` is purely internal to op_mlp_dp's own fuse_o path (never an L3 buffer -- see
         # design.py) once folded; only declare it when something outside that design still reads
         # or writes it.
@@ -3450,6 +3537,10 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                         (g.op_attn_global_worker, ref_q, p + "kc", p + "vc", p + "gpartial"),
                         (g.op_attn_global_merge, p + "gpartial", p + "cx"),
                     ]
+                elif g.op_attn_global_flash is not None:
+                    # Same `head` as A_g above (see its comment) -- only the scores/softmax/
+                    # context chain is replaced, by one design instead of two.
+                    attn_rl = [*head, (g.op_attn_global_flash, ref_q, p + "kc", p + "vc", p + "cx")]
                 else:
                     attn_rl = [
                         *head,
@@ -3726,6 +3817,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                             tmv_chunked=_tmv_chunked, attn_block_geoms=_attn_block_fused,
                             attn_weightless_geoms=_attn_weightless_fused,
                             attn_global_geoms=_attn_global_fused,
+                            attn_global_flash_geoms=_attn_global_flash_fused,
                             decode_layer_active=op_decode_layer is not None, T=T,
                             ff_chunks=ff_chunks, weight_families=len(weight_families),
                             pointwise_widths=len(pointwise_widths),
@@ -3788,6 +3880,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         seg_hds = {sp.head_dim_for(l) for l in range(la, lb)}
         seg_kv_slots = [(n, hd) for n, hd in kv_slots if hd in seg_hds]
         seg_geom_slots = [t for t in geom_slots if t[1] in seg_hds]
+        seg_flash_slots = [d for d in flash_slots if d["head_dim"] in seg_hds]
         # Same reasoning as seg_kv_slots, one axis over: a segment whose layers are all one
         # geometry has no reason to declare the OTHER geometry's mask slot.
         seg_ws = {sp.sliding_window if (SLIDING_KV_CIRCULAR and sp.sliding_window is not None
@@ -3797,7 +3890,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         segments.append(dict(seq=seq, layers=(la, lb), inlet=seg_in, outlet=seg_out,
                              weights=seg_weights, caches=seg_caches, inputs=seg_inputs,
                              kv_slots=seg_kv_slots, mask_slots=seg_mask_slots,
-                             geom_slots=seg_geom_slots))
+                             geom_slots=seg_geom_slots, flash_slots=seg_flash_slots))
         if len(cuts) > 1:
             print(f"[gen] segment {si}: layers {la}..{lb - 1}, {seg_in} -> {seg_out}, "
                   f"{len(seg_weights)} weights, arena {seq.buffer_sizes[2] / 2**30:.3f} GiB",
@@ -3836,7 +3929,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                                     segments=segments, layer_marks=layer_marks,
                                     embed_blob=embed_blob, host_embed=host_embed,
                                     kv_slots=kv_slots, mask_slots=mask_slots,
-                                    geom_slots=geom_slots)
+                                    geom_slots=geom_slots, flash_slots=flash_slots)
 
 
 def main():
@@ -3974,7 +4067,14 @@ def main():
                                        "mask_param": mn, "kv_block": blk, "kv_heads": khv}
                                       for n, hd, cap, mn, blk, khv in md["geom_slots"]],
                        "head_dim": HD, "kv_heads": Hkv,
-                       **({"window_param": "attn_window"} if dynamic_window else {})},
+                       **({"window_param": "attn_window"} if dynamic_window else {}),
+                       # npu_decode.rs (54d7542) reads this per-token: len_param/loop_param get
+                       # the live block count, capacity gates a position past it. Omitted (not an
+                       # empty list) when no geometry claimed AttnGlobalFlash, so every meta.json
+                       # this flag never touches is byte-identical.
+                       **({"flash_blocks": [{k: v for k, v in d.items() if k != "head_dim"}
+                                            for d in md["flash_slots"]]}
+                          if md["flash_slots"] else {})},
         "dims": {"layers": NL, "d_model": D, "q_heads": Hq, "kv_heads": Hkv, "head_dim": HD,
                  "ffn": FF, "vocab": VOCAB, "S": S, "kv_block": T,
                  # Wqkv's ROW ORDER, stated because another generator reads this buffer out of the
