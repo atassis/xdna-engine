@@ -119,6 +119,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from llm_decode_spec import SPECS, BD_STRIDE_MAX  # noqa: E402
 from gemm_tile_registry import registry  # noqa: E402
 import pack_cache  # noqa: E402
+import precision  # noqa: E402 -- decode's own declarative per-site format plan; see dq_group
 from prefill_ref import (f32, gate_block, layer_stack, npy_weights,  # noqa: E402
                          rope_block as _rope_block, softmax_rows as _softmax_rows)
 
@@ -136,8 +137,8 @@ from iron.operators.gelu.op import GELU  # noqa: E402
 from iron.operators.elementwise_mul.op import ElementwiseMul  # noqa: E402
 from iron.operators.elementwise_add.op import ElementwiseAdd  # noqa: E402
 from iron.operators.strided_copy.op import StridedCopy  # noqa: E402
-from iron.common.quant import row_stride_bytes  # noqa: E402
 from iron.operators.dequant_rows.op import DequantRows  # noqa: E402
+from gen_llm_decode import _site_of, wo_rows_padded  # noqa: E402 -- single owners, not restated
 
 # Decode's ACT_POLY, mirrored: SiLU and sigmoid in f32 polynomial math instead of the SFU tanh LUT.
 # The two halves must agree, or prefill and decode compute different activations over one cache.
@@ -426,31 +427,53 @@ def pack_quant_weights(quant_pack, bdir, quant_plan):
           f"(sites: {sorted({s for s in quant_plan})}){cache_note}")
 
 
-def dq_group_for_length(n: int, rows: int, K: int):
-    """`n` decode-arena BYTES holding `rows` rows of width `K`: `None` for bf16, else the int4
-    group size (32/64/128) -- shared by `dq_group` (the actual GEMM operand read) and this file's
-    own tests, so there is exactly one place this arithmetic lives.
-
-    `n` may cover MORE than `rows` rows: `fuse_o` zero-pads Wo to a whole `TSI_O`-tile boundary
-    past D for `swiglu_mlp_dp`'s own tiling (gen_llm_decode.py's `elif key == "Wo" and fuse_o:`
-    site owns `_wo_rows_padded`'s exact arithmetic; this does not re-derive it -- K007's "one
-    place", not a second copy). The single source of truth for how many rows decode actually
-    wrote is decode's own recorded length `n` -- the same trade `check_weight`'s golden check
-    makes (it slices `a[:ref.nbytes]` off whatever the arena holds rather than asserting its
-    exact size). So: `n` must be a WHOLE number of `rows`-width rows (never a partial row -- that
-    is the loud-fail case) and hold AT LEAST `rows` of them; `weight_rows` reads only the first
-    `rows`, so any padded tail rows (decode zero-fills them) are never read as output rows.
+def plan_spec_for_site(text: str, site: str):
+    """`precision.parse_spec`, tolerant of a scale_kind spelling decode's own meta writer used
+    that `precision.py`'s build-legality vocabulary does not recognise -- e.g. gemma4-12b's
+    `weight_quant.plan` says `"int4/g32/none"`, and `precision.SCALE_KINDS["int4"]` does not have
+    a `"none"`. Byte length never depends on scale_kind (`wire_row_units`/`row_stride_bytes` take
+    dtype+group_size+scale_dtype, never scale_kind), so it is dropped here rather than refused --
+    `precision.parse_spec` still owns dtype/group parsing and picks its own default scale_kind.
     """
-    bf16_stride = K * 2
-    if n % bf16_stride == 0 and n // bf16_stride >= rows:
-        return None
-    hits = [g for g in (32, 64, 128)
-            if n % row_stride_bytes(K, g, "int4") == 0
-            and n // row_stride_bytes(K, g, "int4") >= rows]
-    if len(hits) != 1:
-        raise ValueError(f"{n} B is neither a whole-row bf16 buffer nor one int4 group size "
-                         f"holding at least [{rows}, {K}] (matches: {hits})")
-    return hits[0]
+    return precision.parse_spec("/".join(str(text).split("/")[:2]), site)
+
+
+def dq_group_for_length(n: int, rows: int, K: int, *, site: str | None = None,
+                        plan: dict | None = None, scale_dtype: str = "f32",
+                        padded_rows: int | None = None):
+    """`n` decode-arena BYTES holding `rows` rows of width `K`, for the weight at `site`
+    ("qkv"/"attn_o"/"mlp"/"head", or `None` for a buffer `precision`'s plan does not name):
+    `None` for bf16, else the int4 group size -- shared by `dq_group` (the actual GEMM operand
+    read) and this file's own tests, so there is exactly one place this arithmetic lives.
+
+    FORMAT comes from `plan[site]` (decode's own `weight_quant.plan`, `precision.parse_spec`),
+    never inferred by trying candidate group sizes against `n` -- that is exactly the bug this
+    replaced: qwen3.5-4b's `L0_Wg` is 14745600 B, the EXACT int4/g32 size for [9216, 2560] rows,
+    but 14745600 B also satisfies "int4/g64, >= 9216 rows" with 10240 rows -- an accidental fit
+    (1024 rows of unexplained slack), not evidence. A missing/bf16 `plan[site]` means plain bf16.
+
+    ROW COUNT is checked for EXACT equality, never "at least": `padded_rows` (default `rows`,
+    i.e. no pad expected) is the caller's own claim of how many rows decode actually wrote --
+    for `attn_o` under `fuse_o` that is `wo_rows_padded()` (gen_llm_decode.py), the EXACT number
+    `SwiGLUMLPDataParallel._wo_rows_padded` computes, not a bound or a guess. `weight_rows` reads
+    only the first `rows`, so the pad rows this admits are never read as output rows; `n` must
+    equal `padded_rows * stride` exactly, or this fails loud naming both numbers.
+    """
+    spec = (plan or {}).get(site) if site else None
+    if spec is None or not spec.quantized:
+        stride, group = K * 2, None
+    else:
+        stride = precision.wire_row_units(spec, K, scale_dtype)
+        group = spec.group_size
+    want_rows = rows if padded_rows is None else padded_rows
+    if want_rows < rows:
+        raise ValueError(f"padded_rows={padded_rows} is fewer than the {rows} rows [{rows}, {K}] "
+                         f"actually needs -- a bad caller, not a decode-arena mismatch")
+    want = want_rows * stride
+    if n != want:
+        raise ValueError(f"{n} B != {want} B ({want_rows} row(s) of {stride} B) for "
+                         f"[{rows}, {K}] at site={site!r} (plan={spec})")
+    return group
 
 
 def decode_arena_plan(meta_path):
@@ -1084,8 +1107,27 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     if not fuse_silu:
         bufsz["g"] = M * FF * 2
     dec_meta, dec_order, dec_sizes, dec_reserved = (None, [], {}, 0)
+    dec_plan = {}
+    dec_wo_padded_rows = None
     if dec_meta_path:
         dec_meta, dec_order, dec_sizes, dec_reserved = decode_arena_plan(dec_meta_path)
+        # decode's own declarative per-site format plan (precision.py), parsed once: the single
+        # source dq_group reads a shared-arena weight's dtype/group_size from -- see its own
+        # docstring for why this replaced guessing the format from the buffer's byte length.
+        dec_plan = {site: plan_spec_for_site(spec, site)
+                   for site, spec in dec_meta.get("weight_quant", {}).get("plan", {}).items()}
+        # attn_o's Wo is the only site fuse_o pads (gen_llm_decode.py's `elif key == "Wo" and
+        # fuse_o:`), and the exact pad depends on decode's own MLP_DP_COLS -- not recorded as a
+        # field, but decode's own `sequence_name` names both flags (doctrine: the sequence name
+        # is machine-generated from the build, so it cannot drift). `mlpo` <=> fuse_o; `mlpdp<N>`
+        # <=> N=MLP_DP_COLS, and always co-occurs with `mlpo` (fuse_o requires the mlp_dp design).
+        _seq = dec_meta.get("sequence_name", "")
+        if re.search(r"(?:^|_)mlpo(?:_|$)", _seq):
+            _m = re.search(r"mlpdp(\d+)", _seq)
+            if not _m:
+                raise ValueError(f"{dec_meta_path}: sequence_name names fuse_o (mlpo) but has "
+                                 f"no mlpdp<N> to recover MLP_DP_COLS from: {_seq!r}")
+            dec_wo_padded_rows = wo_rows_padded(D, QD, int(_m.group(1)))
         # Scratch for a K-split weight (weight_gemm below), added ONLY when the shared arena
         # actually holds one -- every shipped uniform-geometry spec never does, and this keeps
         # their arena byte-identical to before weight_gemm existed. Both down and o produce a
@@ -1135,7 +1177,7 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         row0, n = {"q": (0, geom.qd), "k": (geom.qd, geom.kvd),
                    "v": (geom.qd + geom.kvd, geom.kvd)}[role]
         total = geom.qd + (2 if geom.has_v else 1) * geom.kvd
-        pre, w = weight_rows(f"{p}Wqkv", total, row0, n, D)
+        pre, w = weight_rows(f"{p}Wqkv", total, row0, n, D, site="qkv")
         return pre + [(op, "h", w, out)]
 
     def qkv_operand(p, role, geom, layer):
@@ -1200,20 +1242,27 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     _dq_cache = {}
     wdq_elems = [0]
 
-    def dq_group(buf, rows, K):
-        """`buf`'s wire format for `rows` rows of width `K`, or `ValueError` naming `buf`."""
+    def dq_group(buf, rows, K, site=None):
+        """`buf`'s wire format for `rows` rows of width `K`, or `ValueError` naming `buf`.
+
+        `site` is the tensor's plan site ("qkv"/"attn_o"/"mlp"/"head") -- the caller's own,
+        because a chunked buffer name (`L0_Wdk0`) carries no suffix `_site_of` recognises; `None`
+        defaults to plain bf16 (dq_group_for_length's own default when a site has no plan entry).
+        `attn_o` is the one site that may be padded (`dec_wo_padded_rows`, computed once above).
+        """
         n = dec_sizes.get(buf)
         if n is None:
             raise ValueError(f"{buf}: not in the decode arena")
+        padded = dec_wo_padded_rows if site == "attn_o" else None
         try:
-            return dq_group_for_length(n, rows, K)
+            return dq_group_for_length(n, rows, K, site=site, plan=dec_plan, padded_rows=padded)
         except ValueError as e:
             raise ValueError(f"{buf}: {e}") from None
 
-    def weight_rows(buf, total_rows, row0, nrows, K, out_stride=None, out_col=0):
+    def weight_rows(buf, total_rows, row0, nrows, K, out_stride=None, out_col=0, site=None):
         """(runlist entries, operand) for rows [row0, row0+nrows) of decode's [total_rows, K]
         weight `buf`: its bf16 slice as is, or a DequantRows of the int4 rows into `wdq`."""
-        g = dq_group(buf, total_rows, K)
+        g = dq_group(buf, total_rows, K, site=site)
         if g is None:
             return [], f"{buf}[{row0 * K * 2}:{(row0 + nrows) * K * 2}]"
         key = (nrows, K, g, out_stride, out_col)
@@ -1259,6 +1308,10 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         folds each chunk the same way the decode-arena branch above does.
         """
         plain = p + base_name
+        # `_site_of` speaks decode's `precision.py` vocabulary ("attn_o", not this function's own
+        # `site="o"`) -- the shared-arena dq_group() branches below need THAT site, to read the
+        # SAME weight_quant.plan decode built the buffer against.
+        dec_site = _site_of(base_name)
         if site in quant_plan:
             dtype, group, scale_dtype, src_dir = quant_plan[site]
             prefix = f"{sp.weight_prefix}layers.{layer}."
@@ -1330,7 +1383,7 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         elif not dec_meta_path:
             return [(plain_op, a_buf, f"{plain}[0:{K * Nout * 2}]", out_buf)]
         elif plain in dec_sizes:
-            pre, w = weight_rows(plain, Nout, 0, Nout, K)
+            pre, w = weight_rows(plain, Nout, 0, Nout, K, site=dec_site)
             return pre + [(plain_op, a_buf, w, out_buf)]
         else:
             n = 0
@@ -1342,12 +1395,12 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
             if K % n:
                 raise ValueError(f"{plain}: K={K} not divisible by its own {n} decode-arena chunks")
             chunk_k = K // n
-            if dq_group(f"{plain}k0", Nout, chunk_k) is not None:
+            if dq_group(f"{plain}k0", Nout, chunk_k, site=dec_site) is not None:
                 # int4 chunks land side by side in one [Nout, K] matrix: one full-K GEMM, no fold.
                 pre = []
                 for i in range(n):
                     pre += weight_rows(f"{plain}k{i}", Nout, 0, Nout, chunk_k, out_stride=K,
-                                       out_col=i * chunk_k)[0]
+                                       out_col=i * chunk_k, site=dec_site)[0]
                 return pre + [(plain_op, a_buf, f"wdq[0:{Nout * K * 2}]", out_buf)]
             if n > 1:
                 # kacc/kpart/kpart2 are pre-sized D-wide, above, for the only two roles the shared
@@ -1482,14 +1535,17 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         el = lambda buf, lo, n: f"{buf}[{lo * 2}:{(lo + n) * 2}]"
         rows = el("cwp", HIST, M * LCH)
         rl_ = [(op_hist, el(p + "cw", 0, HIST), el("cwp", 0, HIST))]
-        pre, w = weight_rows(p + "Wlqkv", LCH, 0, LCH, D)
+        # Wlqkv/Wlzab aren't in `_SITE_OF_SUFFIX` (that map is keyed on the ordinary-attention
+        # suffixes); gen_llm_decode.py packs both at `_pack(..., "qkv")` (in_proj_qkv/z/a/b), so
+        # "qkv" is the correct plan site here too, not a guess.
+        pre, w = weight_rows(p + "Wlqkv", LCH, 0, LCH, D, site="qkv")
         rl_ += pre + [(op_lqkv, "h", w, rows),
                       (op_hist_out, "cwp", el(p + "cw", 0, HIST)),
                       (op_conv, "cwp", p + "cvw", "cwp"),
                       (op_mix_act, rows, rows)]
-        pre, w = weight_rows(p + "Wlzab", LZAB, 0, LVD, D)
+        pre, w = weight_rows(p + "Wlzab", LZAB, 0, LVD, D, site="qkv")
         rl_ += pre + [(op_lz, "h", w, "lz")]
-        pre, w = weight_rows(p + "Wlzab", LZAB, LVD, LAB, D)
+        pre, w = weight_rows(p + "Wlzab", LZAB, LVD, LAB, D, site="qkv")
         rl_ += pre + [(op_lab, "h", w, "lab")]
         for c in range(M // GDR_T):
             rl_.append((op_gdr, el("lab", c * GDR_T * LAB, GDR_T * LAB), p + "gdp",
@@ -1531,7 +1587,7 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
             rl += ([(op_norm, src, w_nin, "h")] + qkv_rl(p, "q", g, l, qb)
                    + qkv_rl(p, "k", g, l, kb) + (qkv_rl(p, "v", g, l, vb) if g.has_v else []))
             if sp.attn_output_gate:
-                pre, w = weight_rows(p + "Wgate", g.qd, 0, g.qd, D)
+                pre, w = weight_rows(p + "Wgate", g.qd, 0, g.qd, D, site="qkv")
                 rl += pre + [(g.op_gq, "h", w, "gt"), (op_gate_act, "gt", "gt")]
             if sp.v_norm and not g.has_v:
                 # attention_k_eq_v: no v_proj at all. v_norm reads the RAW k projection -- before

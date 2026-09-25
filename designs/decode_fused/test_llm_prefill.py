@@ -191,45 +191,119 @@ def test_operand_bounds_rejects_an_s_wide_read_of_a_narrowed_kv_slab():
     assert "L0_kc" in str(e.value) and "7208960" in str(e.value)
 
 
-class TestDqGroupForLength:
-    """`fuse_o` (decode default since 2026-09-08) zero-pads Wo past D to a whole `TSI_O=3`-row
-    tile boundary (`swiglu_mlp_dp`'s own tiling), and D=1024 (qwen3-0.6b) is not a multiple of 3
-    -- decode's arena then holds 1026 rows, not 1024, and `dq_group` used to demand an exact
-    `rows*K*2` byte count, so `build_prefill.sh 28 256 4096` failed on `L0_Wo` before a single
-    aiecc run. D=3840 (gemma4-12b) IS a multiple of 3, so it never hit this."""
+precision = pytest.importorskip("precision")
+gld = pytest.importorskip("gen_llm_decode")
 
-    def test_a_fuse_o_padded_bf16_wo_is_still_read_as_bf16(self):
+
+class TestDqGroupForLength:
+    """FORMAT comes from decode's own `weight_quant.plan[site]`, never inferred from the byte
+    length -- `dq_group_for_length` used to try every int4 group size and accept any that fit
+    `n` "at least" `rows` rows, which is exactly how qwen3.5-4b's `L0_Wg` broke: 14745600 B is
+    the EXACT int4/g32 size for [9216, 2560] rows, but also satisfies "int4/g64, >= 9216 rows"
+    with 10240 rows (1024 unexplained extra) -- an accidental fit the old ambiguity check
+    resolved wrong.
+
+    ROW COUNT is exact too, no ">=" left anywhere: `padded_rows` (default `rows`, i.e. no pad) is
+    the caller's own claim, and `n` must equal `padded_rows * stride` exactly or this raises.
+    `dq_group` (the closure, not this pure function) is what supplies a non-default `padded_rows`
+    -- `wo_rows_padded()` (gen_llm_decode.py) for `attn_o` under `fuse_o`, `None` everywhere else
+    -- so this class fixes the numbers by hand rather than exercising that wiring."""
+
+    MLP_G32 = {"mlp": precision.parse_spec("int4/g32/clip", "mlp")}
+    MLP_G64 = {"mlp": precision.parse_spec("int4/g64/clip", "mlp")}
+
+    def test_the_qwen35_wg_ambiguity_resolves_to_the_plans_own_group(self):
+        """The regression this replaced: reading the format off `n` alone matched BOTH g32 (the
+        real one) and g64 (an accidental 1024-row-of-slack fit); reading it off the plan matches
+        only the one decode actually built."""
+        n, rows, K = 14745600, 9216, 2560
+        assert iron_gen.dq_group_for_length(n, rows, K, site="mlp", plan=self.MLP_G32) == 32
+
+    def test_the_same_length_at_the_wrong_plan_site_raises(self):
+        """g64's row stride (1440 B) DOES divide 14745600 -- 10240 rows, 1024 more than the 9216
+        needed. That accidental fit is exactly the old bug; without an explicit `padded_rows` the
+        extra is simply not `rows`, so it fails instead of silently passing."""
+        n, rows, K = 14745600, 9216, 2560
+        with pytest.raises(ValueError, match="9216, 2560"):
+            iron_gen.dq_group_for_length(n, rows, K, site="mlp", plan=self.MLP_G64)
+
+    def test_the_exact_fuse_o_pad_is_accepted(self):
+        """qwen3-0.6b's own shape: `wo_rows_padded(1024, 2048, 4) == 1026` (see
+        test_wo_rows_padded.py). The EXACT padded count, passed explicitly, is what `dq_group`
+        itself would compute -- this class only fixes the number by hand."""
         D, K = 1024, 2048
-        assert D % 3 != 0
-        padded_rows = -(-D // 3) * 3          # decode's own TSI_O ceiling, reproduced ONLY to
-        assert padded_rows == 1026            # build the fixture, not inside the function under test
+        padded_rows = gld.wo_rows_padded(D, 2048, 4)
+        assert padded_rows == 1026
         n = padded_rows * K * 2
-        assert iron_gen.dq_group_for_length(n, D, K) is None
+        assert iron_gen.dq_group_for_length(n, D, K, site="attn_o", padded_rows=padded_rows) is None
+
+    def test_one_row_more_than_the_exact_pad_is_rejected(self):
+        """No slack past the exact number: this is the ">=" tolerance the old code had, and it is
+        gone -- one row over the true pad is a real mismatch now, not a plausible pad."""
+        D, K = 1024, 2048
+        padded_rows = gld.wo_rows_padded(D, 2048, 4)
+        n = (padded_rows + 1) * K * 2
+        with pytest.raises(ValueError, match="1024, 2048"):
+            iron_gen.dq_group_for_length(n, D, K, site="attn_o", padded_rows=padded_rows)
 
     def test_an_unpadded_bf16_wo_is_unaffected(self):
         D, K = 1024, 2048
-        assert iron_gen.dq_group_for_length(D * K * 2, D, K) is None
+        assert iron_gen.dq_group_for_length(D * K * 2, D, K, site="attn_o") is None
 
     def test_a_multiple_of_3_d_needs_no_pad_to_pass(self):
-        D, K = 3840, 8192           # gemma4-12b's own o-projection shape
+        """gemma4-12b's own o-projection shape -- unchanged by this fix: bf16, no plan entry, no
+        pad needed or tolerated."""
+        D, K = 3840, 8192
         assert D % 3 == 0
-        assert iron_gen.dq_group_for_length(D * K * 2, D, K) is None
+        assert iron_gen.dq_group_for_length(D * K * 2, D, K, site="attn_o") is None
 
     def test_a_short_buffer_still_raises(self):
         """The loud-fail half of K007: fewer bytes than D rows need is a real defect, not padding."""
         D, K = 1024, 2048
         with pytest.raises(ValueError, match="1024, 2048"):
-            iron_gen.dq_group_for_length(D * K * 2 - 2, D, K)
+            iron_gen.dq_group_for_length(D * K * 2 - 2, D, K, site="attn_o")
 
     def test_a_partial_row_still_raises(self):
         """More bytes than D rows need, but not a whole number of rows -- padding is whole rows,
         never a fraction of one."""
         D, K = 1024, 2048
         with pytest.raises(ValueError, match="1024, 2048"):
-            iron_gen.dq_group_for_length(D * K * 2 + 1, D, K)
+            iron_gen.dq_group_for_length(D * K * 2 + 1, D, K, site="attn_o")
 
-    def test_an_int4_group_still_resolves_with_padding(self):
-        from iron.common.quant import row_stride_bytes
+    def test_an_int4_group_still_resolves_with_the_exact_pad(self):
         D, K, g = 1024, 2048, 64
-        stride = row_stride_bytes(K, g, "int4")
-        assert iron_gen.dq_group_for_length((D + 2) * stride, D, K) == g
+        spec = precision.parse_spec(f"int4/g{g}/clip", "attn_o")
+        stride = precision.wire_row_units(spec, K)
+        padded_rows = gld.wo_rows_padded(D, 2048, 4)
+        assert iron_gen.dq_group_for_length(padded_rows * stride, D, K, site="attn_o",
+                                            plan={"attn_o": spec},
+                                            padded_rows=padded_rows) == g
+
+    def test_a_pad_outside_attn_o_is_not_tolerated(self):
+        """`dq_group_for_length` itself does not know which site is allowed slack -- that policy
+        lives in `dq_group`, which never passes a non-`rows` `padded_rows` for anything but
+        `attn_o`. Simulated here by simply not passing one: extra rows are then just a mismatch,
+        the same as they would be for `mlp`/`qkv`/`head` in the real generator."""
+        D, K = 1024, 2048
+        with pytest.raises(ValueError, match="1024, 2048"):
+            iron_gen.dq_group_for_length((D + 2) * K * 2, D, K, site="mlp")
+
+
+class TestPlanSpecForSite:
+    """gemma4-12b's own `weight_quant.plan` says `"int4/g32/none"` -- `"none"` is not one of
+    `precision.SCALE_KINDS["int4"]`, so `precision.parse_spec` alone refuses it (P008). Byte
+    length never reads scale_kind, so `plan_spec_for_site` drops it rather than failing the
+    whole build over a decode-meta spelling this module's own legality check does not accept."""
+
+    def test_a_scale_kind_the_precision_module_rejects_still_parses(self):
+        spec = iron_gen.plan_spec_for_site("int4/g32/none", "attn_o")
+        assert (spec.dtype, spec.group_size) == ("int4", 32)
+
+    def test_dtype_and_group_size_are_preserved(self):
+        """scale_kind is dropped unconditionally (byte length never reads it, see the class
+        docstring) -- dtype and group_size, the two that do, are exactly what was asked for."""
+        spec = iron_gen.plan_spec_for_site("int4/g32/clip", "mlp")
+        assert (spec.dtype, spec.group_size) == ("int4", 32)
+
+    def test_bf16_is_unaffected(self):
+        assert iron_gen.plan_spec_for_site("bf16", "kv").dtype == "bf16"
