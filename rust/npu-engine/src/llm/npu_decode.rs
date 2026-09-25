@@ -217,6 +217,12 @@ fn window_len(pos: usize, granule: usize) -> usize {
     need.div_ceil(granule) * granule
 }
 
+/// Blocks every column streams for position `pos` of a global flash-attention design: the live
+/// positions `pos + 1` in `block`-row blocks, dealt round-robin to `columns` workers.
+fn flash_blocks_per_column(pos: usize, block: usize, columns: usize) -> usize {
+    (pos + 1).div_ceil(block).div_ceil(columns)
+}
+
 /// The mask writes one decode step needs from `LlmArtifact::kv_windows`, one entry per DISTINCT
 /// mask slot -- a slot shared by two geometries (every model before SLIDING_KV_CIRCULAR narrows
 /// one geometry away from the others) is written once, not once per geometry sharing it. Mirrors
@@ -882,6 +888,29 @@ impl DecodeStep for NpuDecodeStep {
                 .map_err(|e| EngineError::Device(format!("write sm_mask scratchpad: {e}")))?;
         }
 
+        // `attn_global_flash`: each geometry's K/V BDs grow by `nb - 1` blocks past their
+        // one-block build size, `nb` dealt round-robin over `columns` workers. Refusing past
+        // `capacity` rather than clamping -- see `flash_blocks_per_column`'s own doc for why a
+        // short attend is a plausible wrong token, not a smaller bug.
+        for fb in &bucket.artifact.flash_blocks {
+            let nb = flash_blocks_per_column(pos, fb.block, fb.columns);
+            if nb * fb.block * fb.columns > fb.capacity {
+                return Err(EngineError::Device(format!(
+                    "attn_global_flash: pos {pos} needs {} live positions, past capacity {}",
+                    nb * fb.block * fb.columns, fb.capacity
+                )));
+            }
+            let len_val = (nb - 1) as u32;
+            bucket.res
+                .write_scratchpad(fb.len.byte_offset, &len_val.to_le_bytes())
+                .map_err(|e| EngineError::Device(format!("write flash len scratchpad: {e}")))?;
+            // "core"-kind UPDATE_REG convention -- see `sm_mask` above.
+            let loop_val = (nb as u32) << 2;
+            bucket.res
+                .write_scratchpad(fb.looped.byte_offset, &loop_val.to_le_bytes())
+                .map_err(|e| EngineError::Device(format!("write flash loop scratchpad: {e}")))?;
+        }
+
         // Opt-in: `attn_window` is absent on every artifact today (the window is still baked
         // into which bucket ELF is selected above), so this block is dead weight until a
         // dynamic-window artifact ships one -- and the dispatch path is UNCHANGED for every
@@ -928,6 +957,7 @@ impl DecodeStep for NpuDecodeStep {
 #[cfg(test)]
 mod tests {
     use super::bucket_index;
+    use super::flash_blocks_per_column;
     use super::mask_writes;
     use super::window_len;
     use crate::llm::artifact::ScratchpadParam;
@@ -971,6 +1001,13 @@ mod tests {
             mask_writes(&kv_windows, 2000),
             vec![(sliding_mask, 1024), (global_mask, 2001)]
         );
+    }
+
+    #[test]
+    fn flash_blocks_per_column_matches_the_model() {
+        for (pos, want) in [(0usize, 1usize), (63, 1), (64, 1), (511, 1), (512, 2), (262143, 512)] {
+            assert_eq!(flash_blocks_per_column(pos, 64, 8), want, "pos {pos}");
+        }
     }
 
     /// Boundaries only, at two granules so a fixed-128 coincidence can't hide an off-by-one:

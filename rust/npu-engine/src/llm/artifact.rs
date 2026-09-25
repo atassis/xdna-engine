@@ -38,6 +38,23 @@ pub struct ScratchpadParam {
     pub core: bool,
 }
 
+/// One `attn_global_flash` geometry (`meta.json`'s `scratchpad.flash_blocks` entry): the K/V BDs
+/// grow by `nb - 1` blocks past their one-block build size, where `nb` is the live positions'
+/// block count dealt round-robin over `columns` workers -- see
+/// `crate::llm::npu_decode::flash_blocks_per_column`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FlashBlocks {
+    /// Written raw as `nb - 1` ("addr" kind).
+    pub len: ScratchpadParam,
+    /// Written as `nb`, "core" kind -- shifted `<< 2` like `sm_mask`/`attn_window` above.
+    pub looped: ScratchpadParam,
+    pub block: usize,
+    pub columns: usize,
+    /// The K/V BD's allocated extent in positions; `nb * block * columns` past this is a
+    /// build-time bug, not a position to clamp -- see the write site.
+    pub capacity: usize,
+}
+
 /// The causal mask of a batched-prefill artifact, which is a per-row WIDTH VECTOR and not a
 /// triangle: the scores buffer is `[q_heads*M, S]`, so row `r = h*M + i` is token `i` under head
 /// `h`, and it may attend `base + i + 1` positions -- the same count under every head. Softmax
@@ -235,6 +252,9 @@ pub struct LlmArtifact {
     /// exactly when `attn_window` is: a scratchpad pointer with no granule has no unit to round
     /// against, and a granule with no pointer has nothing to write it to.
     pub window_granule: Option<usize>,
+    /// `meta.json`'s `scratchpad.flash_blocks`, one entry per `attn_global_flash` geometry.
+    /// Empty on every artifact today -- the generator that emits this key is a later task.
+    pub flash_blocks: Vec<FlashBlocks>,
     /// `meta.json`'s `window_rungs`: the NAMED control codes this one ELF carries besides
     /// `main:sequence`, each a decode-layer design at a narrower attention window over the SAME KV
     /// capacity and the SAME arena, as `(kernel subname, window)` sorted ascending by window.
@@ -789,6 +809,61 @@ impl LlmArtifact {
             )));
         }
 
+        // `scratchpad.flash_blocks`: [{"len_param", "loop_param", "block", "columns",
+        // "capacity"}, ...], one entry per `attn_global_flash` geometry. Absent on every artifact
+        // today -- the generator that emits this key is a later task -- so this degrades to empty.
+        let flash_blocks = match sp.get("flash_blocks").and_then(|v| v.as_array()) {
+            Some(list) if !list.is_empty() => {
+                let mut out = Vec::with_capacity(list.len());
+                for e in list {
+                    let len_nm = e.get("len_param").and_then(|v| v.as_str()).ok_or_else(|| {
+                        ctx("scratchpad.flash_blocks entry missing string `len_param`".to_string())
+                    })?;
+                    let loop_nm = e.get("loop_param").and_then(|v| v.as_str()).ok_or_else(|| {
+                        ctx("scratchpad.flash_blocks entry missing string `loop_param`".to_string())
+                    })?;
+                    let block = e.get("block").and_then(|v| v.as_u64()).ok_or_else(|| {
+                        ctx(format!("scratchpad.flash_blocks entry `{len_nm}` missing numeric `block`"))
+                    })? as usize;
+                    let columns = e.get("columns").and_then(|v| v.as_u64()).ok_or_else(|| {
+                        ctx(format!("scratchpad.flash_blocks entry `{len_nm}` missing numeric `columns`"))
+                    })? as usize;
+                    let capacity = e.get("capacity").and_then(|v| v.as_u64()).ok_or_else(|| {
+                        ctx(format!("scratchpad.flash_blocks entry `{len_nm}` missing numeric `capacity`"))
+                    })? as usize;
+                    if block == 0 || columns == 0 {
+                        return Err(ctx(format!(
+                            "scratchpad.flash_blocks entry `{len_nm}`: block={block} columns={columns} \
+                             must both be positive"
+                        )));
+                    }
+                    if capacity % (block * columns) != 0 {
+                        return Err(ctx(format!(
+                            "scratchpad.flash_blocks entry `{len_nm}`: capacity={capacity} is not a \
+                             whole number of block={block} * columns={columns} rounds"
+                        )));
+                    }
+                    let len = read_param(len_nm)?;
+                    if len.core {
+                        return Err(ctx(format!(
+                            "scratchpad.flash_blocks entry `{len_nm}`: len_param is \"core\" kind, \
+                             want \"addr\" -- it is written raw as nb - 1"
+                        )));
+                    }
+                    let looped = read_param(loop_nm)?;
+                    if !looped.core {
+                        return Err(ctx(format!(
+                            "scratchpad.flash_blocks entry `{loop_nm}`: loop_param is \"addr\" kind, \
+                             want \"core\" -- it needs the UPDATE_REG shift"
+                        )));
+                    }
+                    out.push(FlashBlocks { len, looped, block, columns, capacity });
+                }
+                out
+            }
+            _ => Vec::new(),
+        };
+
         // Rungs are validated here rather than trusted, because a bad one is a plausible wrong
         // answer and never an error: a rung claiming a window it was not built at would attend
         // short and return a believable token. A rung wider than `S` is refused for the same
@@ -1185,6 +1260,7 @@ impl LlmArtifact {
             sm_mask,
             attn_window,
             window_granule,
+            flash_blocks,
             window_rungs,
             mask_widths,
             mask_ring,
@@ -1867,6 +1943,52 @@ mod tests {
         assert_eq!(art.kv_windows[0].1, art.head_dim);
         assert_eq!(art.kv_windows[0].2, art.max_seq, "capacity == S when not narrowed");
         assert_eq!(art.kv_windows[0].3, art.sm_mask.unwrap());
+    }
+
+    #[test]
+    fn flash_blocks_absent_yields_empty_vec() {
+        let dir = tempfile::tempdir().unwrap();
+        write_meta(dir.path(), &base_meta(8, 4, serde_json::json!({})));
+        let art = LlmArtifact::load(dir.path()).expect("no flash_blocks must still load");
+        assert!(art.flash_blocks.is_empty());
+    }
+
+    #[test]
+    fn flash_blocks_parses_len_and_loop_params() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = base_meta(8, 4, serde_json::json!({}));
+        meta["scratchpad"]["params"]["gf_len0"] = serde_json::json!({"byte_offset": 8, "kind": "addr"});
+        meta["scratchpad"]["params"]["gf_loop0"] = serde_json::json!({"byte_offset": 12, "kind": "core"});
+        meta["scratchpad"]["flash_blocks"] = serde_json::json!([
+            {"len_param": "gf_len0", "loop_param": "gf_loop0", "block": 64, "columns": 8, "capacity": 262144},
+        ]);
+        write_meta(dir.path(), &meta);
+        let art = LlmArtifact::load(dir.path()).expect("well-formed flash_blocks must load");
+        assert_eq!(art.flash_blocks.len(), 1);
+        assert_eq!(art.flash_blocks[0].len.byte_offset, 8);
+        assert!(!art.flash_blocks[0].len.core);
+        assert_eq!(art.flash_blocks[0].looped.byte_offset, 12);
+        assert!(art.flash_blocks[0].looped.core);
+        assert_eq!(art.flash_blocks[0].block, 64);
+        assert_eq!(art.flash_blocks[0].columns, 8);
+        assert_eq!(art.flash_blocks[0].capacity, 262144);
+    }
+
+    /// `len_param` must be "addr" kind -- it is written raw as `nb - 1`. A "core" kind here would
+    /// silently shift a value the firmware never asked to be shifted.
+    #[test]
+    fn flash_blocks_rejects_core_kind_len_param() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = base_meta(8, 4, serde_json::json!({}));
+        meta["scratchpad"]["params"]["gf_len0"] = serde_json::json!({"byte_offset": 8, "kind": "core"});
+        meta["scratchpad"]["params"]["gf_loop0"] = serde_json::json!({"byte_offset": 12, "kind": "core"});
+        meta["scratchpad"]["flash_blocks"] = serde_json::json!([
+            {"len_param": "gf_len0", "loop_param": "gf_loop0", "block": 64, "columns": 8, "capacity": 262144},
+        ]);
+        write_meta(dir.path(), &meta);
+        let err = LlmArtifact::load(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("gf_len0"), "{err}");
+        assert!(err.contains("\"addr\""), "{err}");
     }
 
     /// THE failure the cross-check exists for: the generator declares two KV geometries and one
