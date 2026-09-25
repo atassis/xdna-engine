@@ -382,8 +382,49 @@ name = "gemma4-12b"
 #               against the previous default (179/384 steps).
 #   Rollback: point decode= and prefill= back at `..._mvq2` / `..._lsb` and reinstall.
 #
+# DEFAULT SINCE 2026-09-25: `decode_gf_ka262144_l48_hpc4_main`, a fused GLOBAL FLASH ATTENTION
+#   decode. This is a CAPABILITY change, not just a speed one: S=262144 replaces the 6912 ceiling
+#   above, so the global geometry's cost tracks n_past instead of the fixed capacity -- the
+#   plan's `decode-global-flash-attention` epic. hpc4 (4 heads/core, 32 workers) beats the first
+#   hpc16 (16 heads/core, 8 workers) cut, so it ships instead.
+#   build  GQA_GROUPED_K=1 GQA_GROUPED_V=1 FUSE_QKV_DP=0 SPLIT_LM_HEAD=0 SLIDING_KV_CIRCULAR=1 \
+#            MERGE_WEIGHT_GEMVS=1 POINTWISE_MODES=1 COLLAPSE_MERGED_CONFIGURES=1 \
+#            FUSE_ATTN_WEIGHTLESS=1 GEMV_B_SINGLE=1 KV_ALLOC=262144 BUCKET_SCRATCH_ORDER=1 \
+#            FUSE_ATTN_GLOBAL_FLASH=1 GLOBAL_FLASH_HPC=4 DECODE_PLACER_FLAGS="" \
+#            WEIGHTS=$PWD/artifacts/gemma4-12b/weights_int4g32sbf16_planar_qat_rg \
+#            GEN_EXTRA='--max-seq 262144' IRON=$WS/wt-iron-integ \
+#            bash scripts/build_llm_decode.sh gemma4-12b 48 $A/decode_gf_ka262144_l48_hpc4_main
+#   NO smseg1024/ATTN_RUNTIME_EXTENT in this recipe -- the flash op does not read either
+#   (no window_param in meta), so they were dropped from the hpc16 ladder recipe rather than
+#   carried forward unused. DECODE_PLACER_FLAGS="" is load-bearing: the default
+#   `--cores-per-col 1` leaves 8 of 32 compute tiles placeable at hpc4's 32-worker layout.
+#   REPRODUCED 2026-09-25 from merged main (ca4eb1d) + IRON integration-stack b70840f:
+#   sequence_name, scratch_size (11340398592 B) and all layout entries byte-identical to the
+#   gated build; ELF size identical (22329472 B), md5 differs (bootgen headers only).
+#     latency   itl_ms.p50, 4131-token prompt, 200 tokens, A-B-A-B (hpc4/hpc16/hpc4/hpc16),
+#               warm, power mode unpinned: hpc4 218.6/219.7 vs hpc16 225.6/221.6 (hpc16 already
+#               beats the S=6912 default's 229.66/229.65 by ~10 ms). hpc4's first rep carries a
+#               339 ms p95 tail from the model swap; its second rep is tight.
+#     slope     positions 1..131072, 48 layers: 216.31 + 0.000736 * n_past ms, residuals under
+#               0.3 ms -- 0.74 us/position, 3.5x flatter than hpc16's 2.573 us/position measured
+#               the same day. 219 ms at 4k, 240 ms at 32k, 313 ms at 128k (against hpc16's 225 /
+#               298 / 550). Still 1.23x the spec's 0.6 us/position bar, so this is not the end
+#               state -- see attn-global-flash-per-row-call-overhead.
+#     quality   teacher-forced cross-entropy, 4 fresh sequences x 96 steps, paired against the
+#               S=6912 default: median delta 0.0000 over 384 steps, 194/384 wins -- a coin flip,
+#               CE-neutral. Two greedy passes at 48 layers: 223 x 262144 logits bit-identical.
+#     context   through the service (side instance, main lacked flash_blocks support at the
+#               time): coherent summaries at 3,984 and 10,599 prompt tokens (past the old
+#               9355/10282 NaN wall), decode 221.2 / 242.5 ms/token. Closes
+#               gemma4-256k-decode-nan-past-9355 as superseded.
+#   Rollback: point decode= back at
+#            `decode_s6912_l48_are_wgm_pwm_rr_mvq2_aw_bsingle_main` and prefill= back at
+#            `prefill_m64_s6912_l48_seg4_ring_lsb_awbs_main` (both still on disk), delete the
+#            `..._ladder` sibling scenario reference from engine.toml if it was re-added, and
+#            reinstall.
+#
 [artifacts]
-decode = "artifacts/gemma4-12b/decode_s6912_l48_are_wgm_pwm_rr_mvq2_aw_bsingle_main"
+decode = "artifacts/gemma4-12b/decode_gf_ka262144_l48_hpc4_main"
 #
 # DEFAULT SINCE 2026-09-18: `prefill_m64_s6912_l48_seg4_ring`, the same recipe plus
 # PREFILL_SLIDING_RING=1, which batches prefill past the 1024 sliding-window capacity.
@@ -434,7 +475,29 @@ decode = "artifacts/gemma4-12b/decode_s6912_l48_are_wgm_pwm_rr_mvq2_aw_bsingle_m
 #   identical to the gated build, ELF differs in 21 bytes. Same A-B-A-B as the decode entry:
 #   38.48/38.16 -> 37.37/37.01 ms per prompt token, -2.9%. tier2P on the gated build matches the
 #   previous pair cell for cell (11/14 on both).
-prefill = "artifacts/gemma4-12b/prefill_m64_s6912_l48_seg4_ring_lsb_awbs_main"
+#
+# DEFAULT SINCE 2026-09-25: `prefill_m64_w8192_gf_ka262144_l48_seg4_ring_awbs_nolsb_main`, paired
+#   with the flash decode above -- moves together, see that entry for the capability/quality/
+#   latency evidence. M=64, window 8192 (a prompt past the window finishes stepwise; window is a
+#   BUILD choice here, not a context ceiling -- the paired decode's KV_ALLOC=262144 is the ceiling).
+#   build  KV_ALLOC=262144 SOFTMAX_SEGMENT=1024 PREFILL_SLIDING_RING=1 PREFILL_SEGMENTS=4 \
+#            PREFILL_MERGE_KCHUNKS=1 SPEC=gemma4-12b NO_GOLDEN=1 WEIGHTS=/nonexistent \
+#            QUANT_WEIGHTS=$A/weights_int4g32qat_hf MERGE_WEIGHT_GEMVS=1 POINTWISE_MODES=1 \
+#            COLLAPSE_MERGED_CONFIGURES=1 \
+#            DECODE_META=$A/decode_gf_ka262144_l48_hpc4_main/meta.json \
+#            bash scripts/build_prefill.sh 48 64 8192 $A/prefill_m64_w8192_gf_ka262144_l48_seg4_ring_awbs_nolsb_main
+#   SOFTMAX_SEGMENT=1024 IS LOAD-BEARING here though the paired decode does not read it (the flash
+#   op has no window_param): unset, the global geometry's unchunked softmax at S=8192 needs a
+#   16384-byte buffer per side and does not fit an L1 bank alongside its neighbours -- 'aie.tile'
+#   op allocated buffers exceeded available memory, off by a handful of bytes. Hit this rebuilding
+#   from main 2026-09-25 and confirmed the cause by reading softmax_segment()'s own docstring.
+#   REPRODUCED 2026-09-25 from merged main: 676 shared scratch buffers against the flash decode
+#   (check_prefill_arena_pairing.py PASS), ELF size identical (114398176 B) to the gated build,
+#   md5 differs (bootgen headers only). No independent A/B run at this recipe; see the paired
+#   decode entry above for the itl/slope/quality numbers this pair carries.
+#   Rollback: point `prefill =` back at `prefill_m64_s6912_l48_seg4_ring_lsb_awbs_main` (still on
+#   disk) alongside the decode rollback above, and reinstall.
+prefill = "artifacts/gemma4-12b/prefill_m64_w8192_gf_ka262144_l48_seg4_ring_awbs_nolsb_main"
 weights = "artifacts/gemma4-12b/weights_int4g32sbf16_planar_qat_rg"
 tokenizer_dir = "artifacts/gemma4-12b/tokenizer"
 
