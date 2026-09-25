@@ -27,7 +27,7 @@ use npu_xrt::{Device, ElfResident, FusedArena};
 use sha2::{Digest, Sha256};
 
 use crate::api::EngineError;
-use crate::llm::artifact::{BufLoc, EmbedScale, LlmArtifact, RopeWrite, ScratchpadParam};
+use crate::llm::artifact::{BufLoc, EmbedScale, FlashBlocks, LlmArtifact, RopeWrite, ScratchpadParam};
 use crate::llm::generator::{CacheState, DecodeStep, RecurrentSnapshot};
 use crate::llm::multimodal::{self, MediaEmbeds};
 use crate::llm::npu_prefill::NpuPrefill;
@@ -221,6 +221,22 @@ fn window_len(pos: usize, granule: usize) -> usize {
 /// positions `pos + 1` in `block`-row blocks, dealt round-robin to `columns` workers.
 fn flash_blocks_per_column(pos: usize, block: usize, columns: usize) -> usize {
     (pos + 1).div_ceil(block).div_ceil(columns)
+}
+
+/// The two scratchpad values one `attn_global_flash` geometry needs for `pos`: `len` raw as
+/// `nb - 1` and `looped` shifted for the "core"-kind UPDATE_REG convention (see `sm_mask` at the
+/// call site). Refuses rather than clamping past `fb.capacity` -- see `window_len`'s own doc for
+/// why a short attend is a plausible wrong token, not a smaller bug.
+fn flash_writes(pos: usize, fb: &FlashBlocks) -> Result<(u32, u32), EngineError> {
+    let nb = flash_blocks_per_column(pos, fb.block, fb.columns);
+    if nb * fb.block * fb.columns > fb.capacity {
+        return Err(EngineError::Device(format!(
+            "attn_global_flash: pos {pos} needs {} live positions, past capacity {}",
+            nb * fb.block * fb.columns,
+            fb.capacity
+        )));
+    }
+    Ok(((nb - 1) as u32, (nb as u32) << 2))
 }
 
 /// The mask writes one decode step needs from `LlmArtifact::kv_windows`, one entry per DISTINCT
@@ -889,23 +905,12 @@ impl DecodeStep for NpuDecodeStep {
         }
 
         // `attn_global_flash`: each geometry's K/V BDs grow by `nb - 1` blocks past their
-        // one-block build size, `nb` dealt round-robin over `columns` workers. Refusing past
-        // `capacity` rather than clamping -- see `flash_blocks_per_column`'s own doc for why a
-        // short attend is a plausible wrong token, not a smaller bug.
+        // one-block build size, `nb` dealt round-robin over `columns` workers.
         for fb in &bucket.artifact.flash_blocks {
-            let nb = flash_blocks_per_column(pos, fb.block, fb.columns);
-            if nb * fb.block * fb.columns > fb.capacity {
-                return Err(EngineError::Device(format!(
-                    "attn_global_flash: pos {pos} needs {} live positions, past capacity {}",
-                    nb * fb.block * fb.columns, fb.capacity
-                )));
-            }
-            let len_val = (nb - 1) as u32;
+            let (len_val, loop_val) = flash_writes(pos, fb)?;
             bucket.res
                 .write_scratchpad(fb.len.byte_offset, &len_val.to_le_bytes())
                 .map_err(|e| EngineError::Device(format!("write flash len scratchpad: {e}")))?;
-            // "core"-kind UPDATE_REG convention -- see `sm_mask` above.
-            let loop_val = (nb as u32) << 2;
             bucket.res
                 .write_scratchpad(fb.looped.byte_offset, &loop_val.to_le_bytes())
                 .map_err(|e| EngineError::Device(format!("write flash loop scratchpad: {e}")))?;
@@ -958,9 +963,10 @@ impl DecodeStep for NpuDecodeStep {
 mod tests {
     use super::bucket_index;
     use super::flash_blocks_per_column;
+    use super::flash_writes;
     use super::mask_writes;
     use super::window_len;
-    use crate::llm::artifact::ScratchpadParam;
+    use crate::llm::artifact::{FlashBlocks, ScratchpadParam};
 
     fn param(byte_offset: usize) -> ScratchpadParam {
         ScratchpadParam { byte_offset, core: false }
@@ -1008,6 +1014,28 @@ mod tests {
         for (pos, want) in [(0usize, 1usize), (63, 1), (64, 1), (511, 1), (512, 2), (262143, 512)] {
             assert_eq!(flash_blocks_per_column(pos, 64, 8), want, "pos {pos}");
         }
+    }
+
+    fn flash_geom(capacity: usize) -> FlashBlocks {
+        FlashBlocks {
+            len: param(8),
+            looped: ScratchpadParam { byte_offset: 12, core: true },
+            block: 64,
+            columns: 8,
+            capacity,
+        }
+    }
+
+    /// Same boundary the capacity-reject branch guards: one round below `capacity` still writes,
+    /// the round that would cross it is refused rather than attending short (a plausible wrong
+    /// token -- see `window_len`'s doc).
+    #[test]
+    fn flash_writes_matches_the_model_and_rejects_past_capacity() {
+        let fb = flash_geom(2560); // block(64) * columns(8) * 5 rounds
+        assert_eq!(flash_writes(0, &fb).unwrap(), (0, 4));
+        assert_eq!(flash_writes(512, &fb).unwrap(), (1, 8));
+        assert_eq!(flash_writes(2559, &fb).unwrap(), (4, 20), "last position inside capacity");
+        assert!(flash_writes(2560, &fb).is_err(), "one past capacity must refuse, not clamp");
     }
 
     /// Boundaries only, at two granules so a fixed-128 coincidence can't hide an off-by-one:
