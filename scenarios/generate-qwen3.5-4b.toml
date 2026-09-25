@@ -36,11 +36,18 @@ name = "qwen3.5-4b"
 #   ("...capital of Italy is Rome. ...Spain is Madrid. ...United Kingdom is London..."),
 #   byte-identical generated ids across two device runs. Weaker than a token-parity gate -- no
 #   reference comparison -- flagged as such.
+# REBUILT 2026-09-26 (`decode_s4096_gdrl_p6924def`, prefill `prefill_m256f_s4096_p6924def`) at
+#   toolchain pin MLIR_AIE_FORK_COMMIT 6924def86b7 (the elide-pm + packet-channel-sharing repin),
+#   AIECC_ELIDE_IDENTICAL_PM=1: same recipe, IRON=wt-iron-integ (b6b0945). Pairing PASS (491 shared
+#   scratch buffers, matching the prior pair's count exactly). No token-parity oracle checked into
+#   this repo (see above); gated with a smoke prompt ("The capital of France is" -> "Paris."),
+#   byte-identical generated ids across two runs. Rollback: point decode=/weights=/prefill= back at
+#   the _p8c684 set and reinstall.
 [artifacts]
-decode = "artifacts/qwen3.5-4b/decode_s4096_gdrl_p8c684"
-weights = "artifacts/qwen3.5-4b/decode_s4096_gdrl_p8c684/buffers"
+decode = "artifacts/qwen3.5-4b/decode_s4096_gdrl_p6924def"
+weights = "artifacts/qwen3.5-4b/decode_s4096_gdrl_p6924def/buffers"
 tokenizer_dir = "artifacts/qwen3.5-4b/tokenizer"
-prefill = "artifacts/qwen3.5-4b/prefill_m256f_s4096_p8c684"
+prefill = "artifacts/qwen3.5-4b/prefill_m256f_s4096_p6924def"
 
 [generation]
 max_tokens = 1024

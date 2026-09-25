@@ -423,8 +423,21 @@ name = "gemma4-12b"
 #            `..._ladder` sibling scenario reference from engine.toml if it was re-added, and
 #            reinstall.
 #
+# DEFAULT SINCE 2026-09-26 (toolchain repin to MLIR_AIE_FORK_COMMIT 6924def86b7):
+#   `decode_gf_ka262144_l48_hpc4_rpe8_elidepm_p6924def`, the same recipe plus GLOBAL_FLASH_RPE=8
+#   (attn-global-flash-multirow-mmul Step 2/3/4: 8-row fifo elements, cuts the decode slope
+#   0.737 -> 0.34-0.36 us/position, device A-B-A-B 8/8 B<A, greedy tokens bit-identical) and built
+#   with AIECC_ELIDE_IDENTICAL_PM=1 (elides value-identical program-memory writes; -3.7 MB control
+#   code/token, L6 logits byte-identical, device A/B mean -4.4 ms/token). sequence_name drops
+#   sckt_512x256 per the Task 19 cleanup already on main. L=6 exact-oracle parity 8/8 against
+#   tests/refs/gemma4-12b/qat_int4g32_oracle_l6.json; scratch_size byte-identical to the prior
+#   served artifact (11340398592 B); paired with the prefill below, arena pairing PASS (676 shared
+#   scratch buffers, matching the prior served pair's count exactly).
+#   Rollback: point decode= back at `decode_gf_ka262144_l48_hpc4_main` and prefill= back at
+#   `prefill_m64_w8192_gf_ka262144_l48_seg4_ring_awbs_nolsb_main` (both kept on disk), then
+#   reinstall.
 [artifacts]
-decode = "artifacts/gemma4-12b/decode_gf_ka262144_l48_hpc4_main"
+decode = "artifacts/gemma4-12b/decode_gf_ka262144_l48_hpc4_rpe8_elidepm_p6924def"
 #
 # DEFAULT SINCE 2026-09-18: `prefill_m64_s6912_l48_seg4_ring`, the same recipe plus
 # PREFILL_SLIDING_RING=1, which batches prefill past the 1024 sliding-window capacity.
@@ -497,7 +510,14 @@ decode = "artifacts/gemma4-12b/decode_gf_ka262144_l48_hpc4_main"
 #   decode entry above for the itl/slope/quality numbers this pair carries.
 #   Rollback: point `prefill =` back at `prefill_m64_s6912_l48_seg4_ring_lsb_awbs_main` (still on
 #   disk) alongside the decode rollback above, and reinstall.
-prefill = "artifacts/gemma4-12b/prefill_m64_w8192_gf_ka262144_l48_seg4_ring_awbs_nolsb_main"
+#
+# DEFAULT SINCE 2026-09-26 (toolchain repin, pairs with the rpe8/elide-pm decode above):
+#   `prefill_m64_w8192_gf_ka262144_l48_seg4_ring_awbs_nolsb_rpe8_p6924def`, same recipe re-pointed
+#   at DECODE_META=$A/decode_gf_ka262144_l48_hpc4_rpe8_elidepm_p6924def/meta.json. Arena pairing
+#   PASS (676 shared scratch buffers, matching the prior pair's count exactly).
+#   Rollback: point `prefill =` back at `prefill_m64_w8192_gf_ka262144_l48_seg4_ring_awbs_nolsb_main`
+#   alongside the decode rollback above, and reinstall.
+prefill = "artifacts/gemma4-12b/prefill_m64_w8192_gf_ka262144_l48_seg4_ring_awbs_nolsb_rpe8_p6924def"
 weights = "artifacts/gemma4-12b/weights_int4g32sbf16_planar_qat_rg"
 tokenizer_dir = "artifacts/gemma4-12b/tokenizer"
 

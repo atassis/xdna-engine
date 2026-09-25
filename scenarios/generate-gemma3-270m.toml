@@ -13,7 +13,12 @@ name = "gemma3-270m"
 #   same recipe, sequence_name and scratch_size identical, layout identical but for one added `xf`
 #   entry (a pre-existing buffer newly named, not a graph change -- see 44d127a). L=18 oracle
 #   parity 8/8 against tests/refs/gemma3-270m/bf16_oracle.json.
+#
+# REBUILT 2026-09-26 (`decode_p6924def`) at toolchain pin MLIR_AIE_FORK_COMMIT 6924def86b7 (the
+#   elide-pm + packet-channel-sharing repin), AIECC_ELIDE_IDENTICAL_PM=1: same recipe, L=18 oracle
+#   parity 8/8 against tests/refs/gemma3-270m/bf16_oracle.json. Rollback: point decode= back at
+#   `decode_p8c684` and reinstall.
 [artifacts]
-decode = "artifacts/gemma3-270m/decode_p8c684"
+decode = "artifacts/gemma3-270m/decode_p6924def"
 weights = "artifacts/gemma3-270m/weights"
 tokenizer_dir = "artifacts/gemma3-270m/tokenizer"

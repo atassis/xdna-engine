@@ -30,7 +30,13 @@ name = "qwen3-0.6b"
 #   gemma3-270m scenario's note, same class). Prefill's `down` GEMM tiling moved (tile_n 64->32, a
 #   registry fix for the b_col_maj BD-stride cap; ELF +14,336 B) -- pairing PASS (255 shared
 #   buffers), gate_llm.sh --tier2-prefill PASS 14/14 (7 prompt lengths x pertok/batched).
-decode = "artifacts/qwen3-0.6b/decode_p8c684"
+# REBUILT 2026-09-26 (`decode_p6924def`, prefill `prefill_p6924def`) at toolchain pin
+#   MLIR_AIE_FORK_COMMIT 6924def86b7 (the elide-pm + packet-channel-sharing repin),
+#   AIECC_ELIDE_IDENTICAL_PM=1: same recipe (WINDOW_RUNGS=256,512,1024,2048 KV_BLOCK_T=128
+#   GEN_EXTRA='--max-seq 4096'), IRON=wt-iron-integ (b6b0945). Pairing PASS (255 shared scratch
+#   buffers). gate_llm.sh --tier2-prefill PASS 14/14 (7 prompt lengths x pertok/batched arms).
+#   Rollback: point decode=/prefill= back at the _p8c684 pair and reinstall.
+decode = "artifacts/qwen3-0.6b/decode_p6924def"
 # Batched prefill, S=4096 to pair with the rung ladder's own window (scripts/build_prefill.sh 28
 # 256 4096; the pair is checked at load, so a mismatch refuses to bind rather than mis-binding).
 # Closes the gap the ladder's own result note named: stepwise priming runs 27.6-28.5 ms/prompt-token
@@ -56,7 +62,7 @@ decode = "artifacts/qwen3-0.6b/decode_p8c684"
 # rollback net; deleted 2026-09-13 along with dynwindow4096/fusedbuckets/decode/prefill (S2048),
 # all confirmed superseded and unwired from engine.toml -- see log/2026-09-11-the-rung-ladder-is-
 # the-only-qwen3-model-now.
-prefill = "artifacts/qwen3-0.6b/prefill_p8c684"
+prefill = "artifacts/qwen3-0.6b/prefill_p6924def"
 weights = "artifacts/qwen3-0.6b/weights"
 tokenizer_dir = "artifacts/qwen3-0.6b/tokenizer"
 
