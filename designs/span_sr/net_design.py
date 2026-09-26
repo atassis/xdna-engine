@@ -80,6 +80,7 @@ def _flags(kind, incs):
 def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet"):
     """NP: span_int.Span.net_params(). Returns an iron.jit callable (x, wts, y): x from
     net_layout.conv1_rows (as int8), wts from net_layout.weights_blob, y gets `upto`'s rows."""
+    assert w % 16 == 0, "conv3x3_u8.cc needs width % 16 == 0 (and the x copy, whole 64-byte vectors)"
     gen = Path(gen)
     gen.mkdir(parents=True, exist_ok=True)
     g = _golden()
@@ -99,11 +100,13 @@ def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet"):
         shim = _shim(gen / f"{sym}.cc", sym, kind[n], NP[n], w)
         spec[n] = (sym, shim, incs)
         texts += [shim.read_text()] + [Path(i).read_text() for i in incs]
+    groups = NL.weight_groups(names)
+    skip_depths = {s: NL.skip_depth(s) for s in sorted(skips)}
     digest = hashlib.sha256("".join(texts).encode() + repr(
-        (w, h, upto, sorted(stacks.items()), sorted(depth.items()))).encode()).hexdigest()[:12]
+        (w, h, upto, sorted(stacks.items()), sorted(depth.items()), groups, skip_depths,
+         MAIN_DEPTH, PROD_DEPTH)).encode()).hexdigest()[:12]
     base = _aie_api_include() + [f"-DSPAN_NET_DIGEST={digest}"]
     plen = {n: NP[n]["blob"].size for n in names}
-    groups = NL.weight_groups(names)
     wtotal = sum(plen.values())
     x_row, y_row = lay["conv_1"].in_bytes, lay[names[-1]].out_bytes
 
@@ -170,12 +173,14 @@ def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet"):
         f_in = ObjectFifo(ty(x_row), name="x_in", depth=MAIN_DEPTH)
         out, f_cat = {}, None
         if joined:
+            # a join's inputs and output share one MemTile pool, sized by the output fifo, so
+            # it must hold the deepest skip
             f_cat = ObjectFifo(ty(lay["conv_cat"].in_bytes), name="cat_in",
-                               depth=max(NL.skip_depth(s) for s in skips))
+                               depth=max(skip_depths.values()))
             subs = f_cat.prod().join(
                 [o * NL.half(w) for _, o in NL.CAT_SOURCES],
                 obj_types=[ty(lay[s].out_bytes) for s, _ in NL.CAT_SOURCES],
-                depths=[NL.skip_depth(s) for s, _ in NL.CAT_SOURCES],
+                depths=[skip_depths[s] for s, _ in NL.CAT_SOURCES],
                 names=[f"{s}_skip" for s, _ in NL.CAT_SOURCES])
             out.update({s: f for (s, _), f in zip(NL.CAT_SOURCES, subs)})
         for n in names:
