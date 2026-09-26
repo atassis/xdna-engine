@@ -450,3 +450,82 @@ def test_int8_kc_amplifies_under_a_non_uniform_near_zero_gain(tmp_path):
     assert max(rel_l2s) > 0.10, (
         "expected the non-uniform near-zero-gain case to exceed the 0.10 bound the real-weight "
         "test relies on -- if it doesn't, that bound is not actually detecting this failure mode")
+
+
+# ------------------------------------------------------------------------------------------------
+# rope_impl="poly" (Task 2 of the kv_skip_v plan): the device forms V by inverting K's RoPE
+# rotation on-chip, and the chosen scheme is the int_phase polynomial (measure_rope_poly.py) --
+# not host float64 cos/sin. `rope_impl` swaps that in ONLY for recompute_from_kc's inverse-rotation
+# call (see gate_llm_reference.run_numpy's docstring); forward Q/K RoPE stays exact, matching the
+# device (which always uses the host LUT there). Two tests: the tiny fixture's small positions
+# cannot exercise the large-p regime the poly's error bound was measured against, so that regime
+# gets its own unit test of phase_cs() directly, at Gemma-4's real geometries and p up to 262144.
+# ------------------------------------------------------------------------------------------------
+def test_int_phase_matches_exact_cos_sin_at_gemma4_geometries_and_large_positions():
+    """Unit-level check of the chosen on-chip scheme itself (measure_rope_poly.phase_cs), at the
+    two Gemma-4-12B RoPE geometries and positions up to 262144 -- the regime
+    measure_rope_poly.py measured max|dcos|=1.908e-4, max|dsin|=1.907e-4 over. Bound is 3e-4, ~1.6x
+    that measurement (headroom for a handful of positions this test picks rather than the
+    exhaustive sweep, not a re-tuned pass) and still ~20x tighter than the 5.86e-3 bf16 gate."""
+    import measure_rope_poly as rp
+
+    BOUND = 3e-4
+    geoms = [
+        ("global", 512, 1_000_000.0, 0.25),
+        ("local", 256, 10_000.0, None),
+    ]
+    positions = np.array([0, 1, 17, 4096, 131_072, 262_144 - 1, 262_144], dtype=np.int64)
+    for label, hd, theta, partial in geoms:
+        inv = rp.rope_inv_freq(hd, theta, partial)
+        inv = inv[inv != 0.0]
+        F = rp.inv_freq_to_turns_u32(inv)
+        for p in positions:
+            pos_u64 = np.array(p, dtype=np.int64).view(np.uint64)
+            ph = (pos_u64 * F.astype(np.uint64)) & rp.U32_MASK
+            s, c = rp.phase_cs(ph)
+            ref_c, ref_s = np.cos(p * inv), np.sin(p * inv)
+            max_c, max_s = np.max(np.abs(c - ref_c)), np.max(np.abs(s - ref_s))
+            assert max_c <= BOUND and max_s <= BOUND, (
+                f"{label} geometry, p={p}: max|dcos|={max_c:.4e} max|dsin|={max_s:.4e} "
+                f"exceed {BOUND:.1e}")
+
+
+def test_kv_skip_v_int_phase_rope_matches_exact_within_bound_over_free_running_generation(tmp_path):
+    """rope_impl="poly" must reproduce rope_impl="exact"'s derived V (recompute_from_kc) and the
+    resulting greedy tokens, over several free-running steps -- exercising the wiring (only the
+    inverse-rotation call is swapped; forward Q/K rope stays exact) rather than the large-position
+    error itself (this fixture's positions are ~0..7 -- see the unit test above for that)."""
+    import gate_llm_reference as glr
+
+    sp = _tiny_attention_k_eq_v_spec(qk_norm=True)
+    _write_tiny_weights(str(tmp_path), sp)
+    prompt_ids, n_tokens, k = [0, 1], 6, 2
+
+    cap_exact, cap_poly = {}, {}
+    gen_exact, _, margins_exact = glr.run_numpy(sp, str(tmp_path), prompt_ids, n_tokens, k,
+                                                v_mode="recompute_from_kc", rope_impl="exact",
+                                                capture_derived_v=cap_exact)
+    gen_poly, _, margins_poly = glr.run_numpy(sp, str(tmp_path), prompt_ids, n_tokens, k,
+                                              v_mode="recompute_from_kc", rope_impl="poly",
+                                              capture_derived_v=cap_poly)
+
+    assert cap_exact.keys() == cap_poly.keys()
+    positions = sorted(cap_exact[0].keys())
+    assert len(positions) >= len(prompt_ids) + 2, "fixture must exercise >1 free-running step"
+
+    rel_l2s = [_rel_l2(cap_poly[l][p], cap_exact[l][p]) for l in cap_exact for p in cap_exact[l]]
+    worst, mean = max(rel_l2s), sum(rel_l2s) / len(rel_l2s)
+    print(f"[rope-poly] derived-V rel-L2 over {len(rel_l2s)} (layer, position) points: "
+         f"max={worst:.2e} mean={mean:.2e}")
+
+    # At this fixture's positions (<=7) int_phase's phase error is ~1e-8 rad (see the module
+    # docstring's p*2**-33-turns bound) -- orders below bf16 noise. 1e-3 is a real bound, not a
+    # rubber stamp: it is far tighter than the 0.10 int8 bound above and would catch the wiring
+    # bug this test is actually for (poly leaking into forward Q/K rope, or the sign flipping on
+    # the -pos inversion) at this fixture's scale, not just a coincidental pass.
+    assert worst < 1e-3, (
+        f"rope_impl='poly' moved derived V by {worst:.4f} rel-L2 at these small positions -- "
+        f"report this, do not loosen the bound to hide it")
+    assert gen_poly == gen_exact, (
+        f"rope_impl='poly' flips a greedy token over free-running generation: "
+        f"exact={gen_exact} poly={gen_poly} (margins exact={margins_exact} poly={margins_poly})")

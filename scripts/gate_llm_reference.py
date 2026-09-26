@@ -72,7 +72,7 @@ def topk(logits, k):
 # numpy backend: float32 arithmetic on the bf16 weights the device holds.
 # ------------------------------------------------------------------------------------------------
 def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k, v_mode="store_at_write",
-             kv_dtype="bf16", capture_derived_v=None):
+             kv_dtype="bf16", capture_derived_v=None, rope_impl="exact"):
     """`v_mode` governs WHEN attention_k_eq_v's gainless RMSNorm on V runs, not what it computes:
 
       store_at_write     today's behaviour -- V is derived from the raw k projection and cached
@@ -104,14 +104,25 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k, v_mode="store_at_write",
     with the RoPE-inversion V derivation for every position at every layer where
     v_mode="recompute_from_kc" is active -- for measuring how much kv_dtype="int8" moves V,
     independent of how far that moves the eventual token.
+
+    `rope_impl` ("exact" default, or "poly") governs ONLY the RoPE-INVERSION call inside
+    recompute_from_kc's V derivation (`rope_for(l, kc_l[..., pos], -pos)`, the 4 call sites below
+    guarded by `derive_v_from_kc`) -- never forward Q/K RoPE, which the real device always applies
+    from the host's float64->bf16 cos/sin LUT. This mirrors the actual kernel split: forward RoPE
+    stays the existing LUT, only kv_skip_v's on-chip inverse rotation is a candidate for an
+    on-chip poly (see scripts/measure_rope_poly.py, scheme "int_phase" -- chosen scheme, reused
+    here as the reference oracle for that mechanism).
     """
     import ml_dtypes
+    import measure_rope_poly as rp
     BF16 = ml_dtypes.bfloat16
     if v_mode not in ("store_at_write", "recompute_at_read", "recompute_from_kc"):
         raise ValueError(f"v_mode must be 'store_at_write', 'recompute_at_read' or "
                          f"'recompute_from_kc', got {v_mode!r}")
     if kv_dtype not in ("bf16", "int8"):
         raise ValueError(f"kv_dtype must be 'bf16' or 'int8', got {kv_dtype!r}")
+    if rope_impl not in ("exact", "poly"):
+        raise ValueError(f"rope_impl must be 'exact' or 'poly', got {rope_impl!r}")
 
     def quant_dequant_kc(rows):
         """rows: [M, head_dim] float32, one row per (kv_head, position). Round-trips through the
@@ -184,30 +195,42 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k, v_mode="store_at_write",
             return x / (1.0 + np.exp(-np.clip(x, -60, 60)))
         return 0.5 * x * (1.0 + np.tanh(0.7978845608 * (x + 0.044715 * x ** 3)))
 
-    def rope(v, pos, hd, theta, partial):
+    def rope(v, pos, hd, theta, partial, poly=False):
         """`partial` zeroes the inverse frequency past `int(partial*hd//2)` pairs -- a zero
         frequency is the identity rotation -- matching gen_llm_prefill.rope_table's "proportional"
-        rule exactly (same derivation, one position instead of a row per chunk)."""
+        rule exactly (same derivation, one position instead of a row per chunk).
+
+        `poly=True` replaces exact float64 cos/sin with the chosen on-chip scheme (int_phase,
+        measure_rope_poly.py): F = round(inv/2pi * 2**32) per component, phase = (pos*F) mod
+        2**32 via 64-bit reinterpretation of `pos` (correct for the negative `pos` an inversion
+        call passes -- two's-complement wraparound mod 2**32 gives the same residue as `-pos`
+        wrapped, which is what an on-chip accumulator would produce)."""
         inv = 1.0 / (theta ** (np.arange(0, hd, 2, dtype=np.float64)[:hd // 2] / hd))
         if partial is not None:
             inv[int(partial * hd // 2):] = 0.0
-        c, s = np.cos(pos * inv).astype(np.float32), np.sin(pos * inv).astype(np.float32)
+        if poly:
+            F = rp.inv_freq_to_turns_u32(inv)
+            pos_u64 = np.array(pos, dtype=np.int64).view(np.uint64)
+            ph = (pos_u64 * F.astype(np.uint64)) & rp.U32_MASK
+            s, c = rp.phase_cs(ph)
+        else:
+            c, s = np.cos(pos * inv).astype(np.float32), np.sin(pos * inv).astype(np.float32)
         v = v.reshape(-1, hd)
         x1, x2 = v[:, :hd // 2], v[:, hd // 2:]
         return np.concatenate([x1 * c - x2 * s, x2 * c + x1 * s], -1).reshape(-1)
 
-    def rope_for(l, v, pos):
+    def rope_for(l, v, pos, poly=False):
         """Dual-theta: the global geometry rotates its OWN head_dim (which may differ from the
         sliding one -- 512 vs 256 on Gemma-4) and, on Gemma-4, only a fraction of it; the sliding
         geometry always rotates its full head_dim at the local theta. Single-theta specs get
         rope_theta_global everywhere and no partial rotary, matching gen_llm_prefill's non-dual arm."""
         hd = sp.head_dim_for(l)
         if not dual_rope:
-            return rope(v, pos, hd, sp.rope_theta_global, None)
+            return rope(v, pos, hd, sp.rope_theta_global, None, poly=poly)
         g = sp.is_global(l)
         theta = sp.rope_theta_global if g else sp.rope_theta_local
         partial = sp.rope_partial_rotary if g else None
-        return rope(v, pos, hd, theta, partial)
+        return rope(v, pos, hd, theta, partial, poly=poly)
 
     def rope_batch(v, positions, hd, theta, partial):
         """Batched form of rope(): `v` is (P, n_heads*hd), `positions` is (P,) absolute positions
@@ -277,6 +300,7 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k, v_mode="store_at_write",
         window = None if (sp.sliding_window is None or is_glob) else sp.sliding_window
         derive_v_at_read = sp.v_norm and not has_v and v_mode == "recompute_at_read"
         derive_v_from_kc = sp.v_norm and not has_v and v_mode == "recompute_from_kc"
+        use_poly = rope_impl == "poly"
 
         h = rms(xi, w["n_in"])
         q, k_ = mm(w["Wq"], h), mm(w["Wk"], h)
@@ -308,7 +332,7 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k, v_mode="store_at_write",
         if derive_v_from_kc and capture_derived_v is not None:
             g = norm_gain(w["n_kn"]) if sp.qk_norm else 1.0
             capture_derived_v.setdefault(l, {})[pos] = np.stack(
-                [rms(rope_for(l, kc_l[kvi, pos], -pos) / g) for kvi in range(kvh)])
+                [rms(rope_for(l, kc_l[kvi, pos], -pos, poly=use_poly) / g) for kvi in range(kvh)])
         qh = q.reshape(sp.n_q_heads, hd)
         ctx = np.empty((sp.n_q_heads, hd), np.float32)
         lo = 0 if window is None else max(0, pos - window + 1)
@@ -320,7 +344,7 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k, v_mode="store_at_write",
                 v_win = np.stack([rms(vr_l[kvi, p]) for p in range(lo, pos + 1)])
             elif derive_v_from_kc:
                 g = norm_gain(w["n_kn"]) if sp.qk_norm else 1.0
-                v_win = np.stack([rms(rope_for(l, kc_l[kvi, p], -p) / g)
+                v_win = np.stack([rms(rope_for(l, kc_l[kvi, p], -p, poly=use_poly) / g)
                                   for p in range(lo, pos + 1)])
             else:
                 v_win = vc_l[kvi, lo:pos + 1]
@@ -353,6 +377,7 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k, v_mode="store_at_write",
         window = None if (sp.sliding_window is None or is_glob) else sp.sliding_window
         derive_v_at_read = sp.v_norm and not has_v and v_mode == "recompute_at_read"
         derive_v_from_kc = sp.v_norm and not has_v and v_mode == "recompute_from_kc"
+        use_poly = rope_impl == "poly"
 
         H = rms(X, w["n_in"])
         Q, K = mm_batch(w["Wq"], H), mm_batch(w["Wk"], H)
@@ -384,7 +409,7 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k, v_mode="store_at_write",
             g = norm_gain(w["n_kn"]) if sp.qk_norm else 1.0
             for i, pos in enumerate(positions):
                 capture_derived_v.setdefault(l, {})[pos] = np.stack(
-                    [rms(rope_for(l, kc_l[kvi, pos], -pos) / g) for kvi in range(kvh)])
+                    [rms(rope_for(l, kc_l[kvi, pos], -pos, poly=use_poly) / g) for kvi in range(kvh)])
         Qh = Q.reshape(P_, sp.n_q_heads, hd)
         Ctx = np.empty((P_, sp.n_q_heads, hd), np.float32)
         for i, pos in enumerate(positions):
@@ -397,7 +422,7 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k, v_mode="store_at_write",
                     v_win = np.stack([rms(vr_l[kvi, p]) for p in range(lo, pos + 1)])
                 elif derive_v_from_kc:
                     g = norm_gain(w["n_kn"]) if sp.qk_norm else 1.0
-                    v_win = np.stack([rms(rope_for(l, kc_l[kvi, p], -p) / g)
+                    v_win = np.stack([rms(rope_for(l, kc_l[kvi, p], -p, poly=use_poly) / g)
                                       for p in range(lo, pos + 1)])
                 else:
                     v_win = vc_l[kvi, lo:pos + 1]
