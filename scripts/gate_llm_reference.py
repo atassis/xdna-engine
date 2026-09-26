@@ -246,7 +246,7 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k, v_mode="store_at_write")
             # ordering exactly (op_vn runs before qn_runs/op_kn in the emitted op list).
             src = k_ if not has_v else v
             if derive_v_at_read:
-                v_raw = src  # cached raw; the RMSNorm itself runs at consumption, in the loop below
+                v_raw = src  # see v_mode docstring
             else:
                 v = np.concatenate([rms(src.reshape(kvh, hd)[i]) for i in range(kvh)])
         if sp.qk_norm:
@@ -267,8 +267,6 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k, v_mode="store_at_write")
             sc = (kc_l[kvi, lo:pos + 1] @ qh[hh]) * attn_scale
             sc = np.exp(sc - sc.max())
             if derive_v_at_read:
-                # V never cached: the identical gainless RMSNorm from above runs here instead,
-                # at the point attention actually consumes V.
                 v_win = np.stack([rms(vr_l[kvi, p]) for p in range(lo, pos + 1)])
             else:
                 v_win = vc_l[kvi, lo:pos + 1]
@@ -308,7 +306,7 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k, v_mode="store_at_write")
         if sp.v_norm:
             src = (K if not has_v else V).reshape(P_, kvh, hd)
             if derive_v_at_read:
-                V_raw = src  # cached raw; RMSNorm runs at consumption, in the per-position loop
+                V_raw = src  # see v_mode docstring
             else:
                 V = np.stack([rms(src[:, i, :]) for i in range(kvh)], axis=1).reshape(P_, kvh * hd)
         if sp.qk_norm:
