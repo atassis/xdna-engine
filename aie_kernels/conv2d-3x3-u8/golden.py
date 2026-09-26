@@ -2,11 +2,12 @@
 import numpy as np
 
 
-def conv3x3_u8_ref(x, w, b, shift, valid_lo=0, valid_hi=None):
-    """x [CIN,H,W] uint8, w [COUT,CIN,3,3] int8, b [COUT] int32 -> [COUT,H,W] uint8.
+def conv3x3_u8_ref(x, w, b, shift, valid_lo=0, valid_hi=None, signed=False):
+    """x [CIN,H,W] uint8 (int8 if signed), w [COUT,CIN,3,3] int8, b [COUT] int32
+    -> [COUT,H,W] uint8 (int8 if signed).
 
-    Zero-padded 'same' conv; (acc + 2^(shift-1)) >> shift, clamped to [0, 255];
-    columns outside [valid_lo, valid_hi) forced to zero.
+    Zero-padded 'same' conv; (acc + 2^(shift-1)) >> shift, clamped to [0, 255]
+    ([-128, 127] if signed); columns outside [valid_lo, valid_hi) forced to zero.
     """
     cin, h, wd = x.shape
     xp = np.pad(x.astype(np.int64), ((0, 0), (1, 1), (1, 1)))
@@ -15,7 +16,8 @@ def conv3x3_u8_ref(x, w, b, shift, valid_lo=0, valid_hi=None):
     acc = acc.reshape(-1, h, wd) + b.astype(np.int64)[:, None, None]
     if shift > 0:
         acc = (acc + (1 << (shift - 1))) >> shift
-    out = np.clip(acc, 0, 255).astype(np.uint8)
+    out = (np.clip(acc, -128, 127).astype(np.int8) if signed
+           else np.clip(acc, 0, 255).astype(np.uint8))
     hi = wd if valid_hi is None else valid_hi
     out[:, :, :valid_lo] = 0
     out[:, :, hi:] = 0
