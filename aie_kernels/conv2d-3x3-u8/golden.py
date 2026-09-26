@@ -72,3 +72,18 @@ def lut_inc(table, path):
     w = pack_lut(table)
     path.write_text(",\n".join(", ".join(f"0x{x:04x}" for x in w[i:i + 8]) for i in range(0, 512, 8)) + "\n")
     return path
+
+
+def rshift_round(x, s):
+    """The kernels' requant: (x + 2^(s-1)) >> s (round half up), s >= 0."""
+    x = np.asarray(x, np.int64)
+    return (x + (1 << (s - 1))) >> s if s > 0 else x
+
+
+def gate_ref(c, x, table, ga, gb, gs1, gc, gs2):
+    """conv3x3_i8_gate's tail on int8 conv output c and block input x (same shape)."""
+    c = c.astype(np.int64)
+    att = np.asarray(table, np.int64)[c + 128]
+    s = np.clip(rshift_round(c * ga + x.astype(np.int64) * gb, gs1), -128, 127)
+    p = np.clip(s * att, -32768, 32767)
+    return np.clip(rshift_round(p * gc, gs2), -128, 127).astype(np.int8)

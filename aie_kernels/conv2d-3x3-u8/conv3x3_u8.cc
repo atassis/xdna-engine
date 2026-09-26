@@ -4,6 +4,12 @@
 // and ReLU is implied. conv3x3_i8: int8 in/out, no activation.
 // conv3x3_i8_lut: as conv3x3_i8, then each int8 output q becomes table[q + 128]
 // (any pointwise activation, e.g. SiLU, is exact on an int8 input).
+// conv3x3_i8_gate: SPAN's attention block tail. With c = conv output, x = the
+// block input at the same pixel/channel (xrow, same layout as out), and
+// att = table[c + 128] (sigmoid(.) - 0.5):
+//   sum = sat8((c*ga + x*gb) >> gs1),  out = sat8((sat16(sum*att) * gc) >> gs2)
+// where >> rounds half up (the conv's own requant rounding). xrow is consumed:
+// the kernel overwrites it with the intermediate sum.
 //
 // Rows are channel-blocked and padded by one 8-pixel block of zeros on each
 // side, so the kernel never branches on the row edge:
@@ -61,23 +67,32 @@ alignas(aie::vector_decl_align) static const uint16_t kLutCd[512] = {
 };
 #endif
 
+#ifdef CONV3X3_LUT_INC
 // Applies the table in place to the 64 bytes at dst. Keys are reloaded as
 // 16-lane vectors: extracting 16-lane groups from the 64-lane register vector
 // fed fetch() wrong keys on device (probe_lut_gather_isolated.py), while
-// 16-lane loads gather exactly.
-inline void apply_lut_inplace(int8_t *dst, Look &look) {
+// 16-lane loads gather exactly. The lookup object is built here, per call: one
+// built once at the top of the gate kernel and captured by reference gathered
+// every key as 0 (probe_conv3x3_gate_stages.py).
+inline void apply_lut_inplace(int8_t *dst) {
+  const aie::lut<4, bfloat16> t(256, (const bfloat16 *)kLutAb,
+                                (const bfloat16 *)kLutCd);
+  Look look(t, 0, 128);
   for (int g = 0; g < 64; g += 16) {
     aie::vector<int8, 16> k = aie::load_v<16>(dst + g);
     aie::store_v(dst + g, aie::to_fixed<int8>(look.fetch(k), 0));
   }
 }
+#endif
 
-template <typename T, typename P, int CIN, int COUT, bool LUT = false>
+template <typename T, typename P, int CIN, int COUT, bool LUT = false,
+          bool GATE = false>
 __attribute__((noinline)) void
 conv3x3_core(const P *__restrict line0, const P *__restrict line1,
              const P *__restrict line2, const int8_t *__restrict params,
              P *__restrict out, int width, int check, int shift, int valid_lo,
-             int valid_hi) {
+             int valid_hi, const P *__restrict xrow = nullptr, int ga = 0,
+             int gb = 0, int gs1 = 0, int gc = 0, int gs2 = 0) {
   using MMUL = aie::mmul<8, 8, 8, T, int8>;
   static_assert(CIN % 8 == 0 && COUT % 16 == 0, "channel blocking");
   constexpr int ICB = CIN / 8;
@@ -88,10 +103,8 @@ conv3x3_core(const P *__restrict line0, const P *__restrict line1,
   ::aie::set_rounding(aie::rounding_mode::positive_inf);
 
   const int32_t *bias = reinterpret_cast<const int32_t *>(params + OCB * WBLK);
-#ifdef CONV3X3_LUT_INC
-  const aie::lut<4, bfloat16> lut_t(256, (const bfloat16 *)kLutAb,
-                                    (const bfloat16 *)kLutCd);
-  Look look(lut_t, 0, 128);
+#ifndef CONV3X3_LUT_INC
+  static_assert(!LUT && !GATE, "table variants need -DCONV3X3_LUT_INC=<file>");
 #endif
   const P *lines[3] = {line0, line1, line2};
   const int ky0 = (check == 0) ? 1 : 0;
@@ -101,10 +114,32 @@ conv3x3_core(const P *__restrict line0, const P *__restrict line1,
 
   // store one 8-pixel x 8-channel tile: optional table, then the column mask
   auto put = [&](P *dst, V64<T> v, int xs) {
-    if constexpr (LUT) {
+    if constexpr (GATE) {
+#ifdef CONV3X3_LUT_INC
+      // Three passes through memory; the block-input row is consumed, so pass 1
+      // parks the sum in it. A single pass (one load feeding both fetch() and
+      // the sum) has not been re-tested since the lookup-object fix above.
+      aie::store_v(dst, v);
+      P *xp = const_cast<P *>(xrow) + (dst - out);
+      for (int g = 0; g < 64; g += 16) {
+        aie::accum<acc32, 16> a = aie::mul(aie::load_v<16>(dst + g), (int8)ga);
+        a = aie::mac(a, aie::load_v<16>(xp + g), (int8)gb);
+        aie::store_v(xp + g, a.template to_vector<int8>(gs1));
+      }
+      apply_lut_inplace(dst);
+      for (int g = 0; g < 64; g += 16) {
+        aie::vector<int16, 16> p16 =
+            aie::mul(aie::load_v<16>(xp + g), aie::load_v<16>(dst + g))
+                .template to_vector<int16>(0);
+        aie::store_v(dst + g, aie::mul(p16, (int16)gc).template to_vector<int8>(gs2));
+      }
+      if (!(xs >= valid_lo && xs + 8 <= valid_hi))
+        aie::store_v(dst, mask_block(aie::load_v<64>(dst), xs, valid_lo, valid_hi));
+#endif
+    } else if constexpr (LUT) {
 #ifdef CONV3X3_LUT_INC
       aie::store_v(dst, v);
-      apply_lut_inplace(reinterpret_cast<int8_t *>(dst), look);
+      apply_lut_inplace(reinterpret_cast<int8_t *>(dst));
       if (!(xs >= valid_lo && xs + 8 <= valid_hi))
         aie::store_v(dst, mask_block(aie::load_v<64>(dst), xs, valid_lo, valid_hi));
 #endif
@@ -191,6 +226,7 @@ void conv3x3_u8(const uint8_t *line0, const uint8_t *line1, const uint8_t *line2
       line0, line1, line2, params, out, width, check, shift, valid_lo, valid_hi);
 }
 
+#ifdef CONV3X3_LUT_INC // the table variants exist only with their table
 void conv3x3_i8_lut(const int8_t *line0, const int8_t *line1,
                     const int8_t *line2, const int8_t *params, int8_t *out,
                     int32_t width, int32_t check, int32_t shift, int32_t valid_lo,
@@ -198,6 +234,17 @@ void conv3x3_i8_lut(const int8_t *line0, const int8_t *line1,
   conv3x3_core<int8, int8_t, CONV3X3_CIN, CONV3X3_COUT, true>(
       line0, line1, line2, params, out, width, check, shift, valid_lo, valid_hi);
 }
+
+void conv3x3_i8_gate(const int8_t *line0, const int8_t *line1,
+                     const int8_t *line2, const int8_t *xrow, const int8_t *params,
+                     int8_t *out, int32_t width, int32_t check, int32_t shift,
+                     int32_t valid_lo, int32_t valid_hi, int32_t ga, int32_t gb,
+                     int32_t gs1, int32_t gc, int32_t gs2) {
+  conv3x3_core<int8, int8_t, CONV3X3_CIN, CONV3X3_COUT, false, true>(
+      line0, line1, line2, params, out, width, check, shift, valid_lo, valid_hi,
+      xrow, ga, gb, gs1, gc, gs2);
+}
+#endif
 
 void conv3x3_i8(const int8_t *line0, const int8_t *line1, const int8_t *line2,
                 const int8_t *params, int8_t *out, int32_t width, int32_t check,
