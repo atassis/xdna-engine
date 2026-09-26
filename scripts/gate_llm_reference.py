@@ -71,7 +71,8 @@ def topk(logits, k):
 # ------------------------------------------------------------------------------------------------
 # numpy backend: float32 arithmetic on the bf16 weights the device holds.
 # ------------------------------------------------------------------------------------------------
-def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k, v_mode="store_at_write"):
+def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k, v_mode="store_at_write",
+             kv_dtype="bf16", capture_derived_v=None):
     """`v_mode` governs WHEN attention_k_eq_v's gainless RMSNorm on V runs, not what it computes:
 
       store_at_write     today's behaviour -- V is derived from the raw k projection and cached
@@ -88,12 +89,40 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k, v_mode="store_at_write")
 
     Only layers with no v_proj (attention_k_eq_v) are affected; a layer with a real v_proj caches
     its projected V regardless of v_mode, since there is no K it could be recomputed from.
+
+    `kv_dtype` ("bf16" default, or "int8") governs what kc itself is stored as. "int8" round-trips
+    every position's kc THROUGH the real int8 packer (iron/common/quant.py, one group per row at
+    group_size=head_dim, matching the "kv" site's own axis -- a row is one cached position) the
+    moment K is written, mimicking the device holding an int8 K cache. Every later read of that
+    position -- both the attention score and, under v_mode="recompute_from_kc", the RoPE-inversion
+    V-derivation -- then sees the quantized-and-dequantized value, not the true float one. This is
+    the composition a sibling int8-KV task never numerically validated: int8 noise flowing through
+    RoPE-inversion and a gain-divide before landing in V, a different propagation path than a
+    plain stored-int8-V read.
+
+    `capture_derived_v`, if given a dict, is filled `{layer: {position: [kv_heads, head_dim]}}`
+    with the RoPE-inversion V derivation for every position at every layer where
+    v_mode="recompute_from_kc" is active -- for measuring how much kv_dtype="int8" moves V,
+    independent of how far that moves the eventual token.
     """
     import ml_dtypes
     BF16 = ml_dtypes.bfloat16
     if v_mode not in ("store_at_write", "recompute_at_read", "recompute_from_kc"):
         raise ValueError(f"v_mode must be 'store_at_write', 'recompute_at_read' or "
                          f"'recompute_from_kc', got {v_mode!r}")
+    if kv_dtype not in ("bf16", "int8"):
+        raise ValueError(f"kv_dtype must be 'bf16' or 'int8', got {kv_dtype!r}")
+
+    def quant_dequant_kc(rows):
+        """rows: [M, head_dim] float32, one row per (kv_head, position). Round-trips through the
+        real int8 packer at one group per row -- see the kv_dtype docstring above."""
+        try:
+            from iron.common.quant import quantize_weight, dequantize_weight
+        except ModuleNotFoundError:
+            from iron.operators.gemv.quant import quantize_weight, dequantize_weight
+        M, K = rows.shape
+        packed = quantize_weight(np.ascontiguousarray(rows, dtype=np.float32), K, "int8")
+        return dequantize_weight(packed, M, K, K, "int8")
 
     # Refuse rather than approximate: an axis this reference does not know the shape of (a rope_type
     # other than the one Gemma-4 actually uses) is exactly the same-name-different-meaning trap the
@@ -268,11 +297,18 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k, v_mode="store_at_write")
                                 for i in range(sp.n_q_heads)])
             k_ = np.concatenate([rms(k_.reshape(kvh, hd)[i], w["n_kn"]) for i in range(kvh)])
         q, k_ = rope_for(l, q, pos), rope_for(l, k_, pos)
-        kc_l[:, pos, :] = k_.reshape(kvh, hd)
+        k_rows = k_.reshape(kvh, hd)
+        if kv_dtype == "int8":
+            k_rows = quant_dequant_kc(k_rows)
+        kc_l[:, pos, :] = k_rows
         if derive_v_at_read:
             vr_l[:, pos, :] = v_raw.reshape(kvh, hd)
         elif not derive_v_from_kc:
             vc_l[:, pos, :] = v.reshape(kvh, hd)
+        if derive_v_from_kc and capture_derived_v is not None:
+            g = norm_gain(w["n_kn"]) if sp.qk_norm else 1.0
+            capture_derived_v.setdefault(l, {})[pos] = np.stack(
+                [rms(rope_for(l, kc_l[kvi, pos], -pos) / g) for kvi in range(kvh)])
         qh = q.reshape(sp.n_q_heads, hd)
         ctx = np.empty((sp.n_q_heads, hd), np.float32)
         lo = 0 if window is None else max(0, pos - window + 1)
@@ -336,11 +372,19 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k, v_mode="store_at_write")
             K = np.stack([rms(Kh[:, i, :], w["n_kn"]) for i in range(kvh)],
                         axis=1).reshape(P_, kvh * hd)
         Q, K = rope_for_batch(l, Q, positions), rope_for_batch(l, K, positions)
-        kc_l[:, positions, :] = K.reshape(P_, kvh, hd).transpose(1, 0, 2)
+        K_rows = K.reshape(P_, kvh, hd)
+        if kv_dtype == "int8":
+            K_rows = quant_dequant_kc(K_rows.reshape(P_ * kvh, hd)).reshape(P_, kvh, hd)
+        kc_l[:, positions, :] = K_rows.transpose(1, 0, 2)
         if derive_v_at_read:
             vr_l[:, positions, :] = V_raw.transpose(1, 0, 2)
         elif not derive_v_from_kc:
             vc_l[:, positions, :] = V.reshape(P_, kvh, hd).transpose(1, 0, 2)
+        if derive_v_from_kc and capture_derived_v is not None:
+            g = norm_gain(w["n_kn"]) if sp.qk_norm else 1.0
+            for i, pos in enumerate(positions):
+                capture_derived_v.setdefault(l, {})[pos] = np.stack(
+                    [rms(rope_for(l, kc_l[kvi, pos], -pos) / g) for kvi in range(kvh)])
         Qh = Q.reshape(P_, sp.n_q_heads, hd)
         Ctx = np.empty((P_, sp.n_q_heads, hd), np.float32)
         for i, pos in enumerate(positions):

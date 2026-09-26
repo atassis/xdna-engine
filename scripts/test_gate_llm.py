@@ -351,3 +351,58 @@ def test_v_skip_zero_storage_recompute_matches_the_stored_raw_k_reference(tmp_pa
     assert sp.eps == 1e-6, "atol below assumes this fixture's eps; re-check if eps changes"
     np.testing.assert_allclose(margins_got, margins_ref, rtol=0, atol=1e-4)
     assert gen_got == gen_ref
+
+
+# ------------------------------------------------------------------------------------------------
+# kv_dtype="int8": does int8-quantizing kc poison the RoPE-inversion V derivation? A sibling task
+# is adding int8 K-cache quantization; nobody had numerically checked int8 -> RoPE-inversion ->
+# gain-divide -> RMSNorm -> V, a different noise path than a plain stored-int8-V read.
+# ------------------------------------------------------------------------------------------------
+def _rel_l2(a, b):
+    a, b = np.asarray(a, np.float64), np.asarray(b, np.float64)
+    return float(np.linalg.norm(a - b) / np.linalg.norm(b))
+
+
+def test_int8_kc_recompute_from_kc_matches_bf16_within_bounds_over_free_running_generation(tmp_path):
+    """kv_dtype="int8" round-trips kc through the real int8 packer (one group per row at
+    group_size=head_dim) the moment K is written, so every later RoPE-inversion V-derivation reads
+    the quantized value -- including across several FREE-RUNNING steps, where an early position's
+    quantization affects every later step's attention over it, not just its own step."""
+    import gate_llm_reference as glr
+
+    sp = _tiny_attention_k_eq_v_spec(qk_norm=True)
+    _write_tiny_weights(str(tmp_path), sp)
+    prompt_ids, n_tokens, k = [0, 1], 6, 2
+
+    cap_bf16, cap_int8 = {}, {}
+    gen_bf16, _, margins_bf16 = glr.run_numpy(sp, str(tmp_path), prompt_ids, n_tokens, k,
+                                              v_mode="recompute_from_kc", kv_dtype="bf16",
+                                              capture_derived_v=cap_bf16)
+    gen_int8, _, margins_int8 = glr.run_numpy(sp, str(tmp_path), prompt_ids, n_tokens, k,
+                                              v_mode="recompute_from_kc", kv_dtype="int8",
+                                              capture_derived_v=cap_int8)
+
+    # Every layer/position derived under the bf16 run must also have been derived under int8, over
+    # more than one free-running step -- otherwise this fixture would only be exercising the
+    # prompt prefix, not the multi-token generation the sibling task's caution is about.
+    assert cap_bf16.keys() == cap_int8.keys()
+    positions = sorted(cap_bf16[0].keys())
+    assert len(positions) >= prompt_ids.__len__() + 2, "fixture must exercise >1 free-running step"
+
+    rel_l2s = [_rel_l2(cap_int8[l][p], cap_bf16[l][p]) for l in cap_bf16 for p in cap_bf16[l]]
+    worst = max(rel_l2s)
+    print(f"[int8-kc] derived-V rel-L2 over {len(rel_l2s)} (layer, position) points: "
+         f"max={worst:.4f} mean={sum(rel_l2s) / len(rel_l2s):.4f}")
+
+    # int8/group_size=head_dim round-trips at ~0.7-0.9% rel-L2 on raw data (sibling measurement).
+    # RoPE-inversion is a rotation (norm-preserving) and RMSNorm is scale-invariant, so this
+    # composition should not amplify that floor by an order of magnitude -- allow some headroom
+    # for the tiny fixture's small head_dim (4, not Gemma-4's 512) giving coarser groups.
+    assert worst < 0.10, (
+        f"int8 kc -> RoPE-inversion -> gain-divide -> RMSNorm amplified the raw ~0.8% round-trip "
+        f"floor to {worst:.4f} rel-L2 -- report this, do not loosen the bound to hide it")
+
+    # The strongest signal this project uses: does greedy decoding still land on the same tokens.
+    assert gen_int8 == gen_bf16, (
+        f"int8 kc flips a greedy token over free-running generation: bf16={gen_bf16} "
+        f"int8={gen_int8} (margins bf16={margins_bf16} int8={margins_int8})")
