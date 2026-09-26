@@ -492,9 +492,19 @@ def test_int_phase_matches_exact_cos_sin_at_gemma4_geometries_and_large_position
 
 def test_kv_skip_v_int_phase_rope_matches_exact_within_bound_over_free_running_generation(tmp_path):
     """rope_impl="poly" must reproduce rope_impl="exact"'s derived V (recompute_from_kc) and the
-    resulting greedy tokens, over several free-running steps -- exercising the wiring (only the
-    inverse-rotation call is swapped; forward Q/K rope stays exact) rather than the large-position
-    error itself (this fixture's positions are ~0..7 -- see the unit test above for that)."""
+    resulting greedy tokens, over several free-running steps. Two independent checks:
+
+    1. STRUCTURAL (capture_forward_k): forward Q/K rope must be BIT-IDENTICAL between the two
+       runs -- proves the flag reached only the inverse-rotation call, not a numeric coincidence.
+       At this fixture's tiny positions (<=7) int_phase's own error is ~1e-8, so a rel-L2 bound
+       alone cannot tell "forward rope untouched" apart from "forward rope also uses poly, but
+       poly is accurate here too" -- confirmed by sabotage: routing poly into the forward calls
+       too still passes every rel-L2/token assertion below, and only this bit-identity check
+       catches it (see the commit message for the sabotage run).
+    2. NUMERIC (derived-V rel-L2 + greedy tokens): the inverse-rotation swap itself doesn't move
+       the answer at this fixture's scale (see the unit test above for the large-position error
+       this fixture is too small to exercise) and doesn't flip a sign on the -pos inversion.
+    """
     import gate_llm_reference as glr
 
     sp = _tiny_attention_k_eq_v_spec(qk_norm=True)
@@ -502,12 +512,22 @@ def test_kv_skip_v_int_phase_rope_matches_exact_within_bound_over_free_running_g
     prompt_ids, n_tokens, k = [0, 1], 6, 2
 
     cap_exact, cap_poly = {}, {}
+    fwd_exact, fwd_poly = {}, {}
     gen_exact, _, margins_exact = glr.run_numpy(sp, str(tmp_path), prompt_ids, n_tokens, k,
                                                 v_mode="recompute_from_kc", rope_impl="exact",
-                                                capture_derived_v=cap_exact)
+                                                capture_derived_v=cap_exact,
+                                                capture_forward_k=fwd_exact)
     gen_poly, _, margins_poly = glr.run_numpy(sp, str(tmp_path), prompt_ids, n_tokens, k,
                                               v_mode="recompute_from_kc", rope_impl="poly",
-                                              capture_derived_v=cap_poly)
+                                              capture_derived_v=cap_poly,
+                                              capture_forward_k=fwd_poly)
+
+    assert fwd_exact.keys() == fwd_poly.keys()
+    for l in fwd_exact:
+        for p in fwd_exact[l]:
+            assert np.array_equal(fwd_exact[l][p], fwd_poly[l][p]), (
+                f"layer {l} position {p}: forward-RoPE'd K differs between rope_impl='exact' and "
+                f"'poly' -- the flag is affecting forward Q/K rope, not just the inverse rotation")
 
     assert cap_exact.keys() == cap_poly.keys()
     positions = sorted(cap_exact[0].keys())
@@ -520,9 +540,8 @@ def test_kv_skip_v_int_phase_rope_matches_exact_within_bound_over_free_running_g
 
     # At this fixture's positions (<=7) int_phase's phase error is ~1e-8 rad (see the module
     # docstring's p*2**-33-turns bound) -- orders below bf16 noise. 1e-3 is a real bound, not a
-    # rubber stamp: it is far tighter than the 0.10 int8 bound above and would catch the wiring
-    # bug this test is actually for (poly leaking into forward Q/K rope, or the sign flipping on
-    # the -pos inversion) at this fixture's scale, not just a coincidental pass.
+    # rubber stamp: it would catch a sign flip on the -pos inversion at this fixture's scale (the
+    # forward-leak wiring bug is caught by the bit-identity check above, not by this one).
     assert worst < 1e-3, (
         f"rope_impl='poly' moved derived V by {worst:.4f} rel-L2 at these small positions -- "
         f"report this, do not loosen the bound to hide it")

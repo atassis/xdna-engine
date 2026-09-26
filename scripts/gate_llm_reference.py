@@ -72,7 +72,8 @@ def topk(logits, k):
 # numpy backend: float32 arithmetic on the bf16 weights the device holds.
 # ------------------------------------------------------------------------------------------------
 def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k, v_mode="store_at_write",
-             kv_dtype="bf16", capture_derived_v=None, rope_impl="exact"):
+             kv_dtype="bf16", capture_derived_v=None, rope_impl="exact",
+             capture_forward_k=None):
     """`v_mode` governs WHEN attention_k_eq_v's gainless RMSNorm on V runs, not what it computes:
 
       store_at_write     today's behaviour -- V is derived from the raw k projection and cached
@@ -112,6 +113,11 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k, v_mode="store_at_write",
     stays the existing LUT, only kv_skip_v's on-chip inverse rotation is a candidate for an
     on-chip poly (see scripts/measure_rope_poly.py, scheme "int_phase" -- chosen scheme, reused
     here as the reference oracle for that mechanism).
+
+    `capture_forward_k`, if given a dict, is filled `{layer: {position: [kv_heads, head_dim]}}`
+    with the post-forward-RoPE K row at write time (before any kv_dtype quantization) -- proof
+    that `rope_impl` left forward K untouched: this must be bit-identical between an "exact" and
+    a "poly" run.
     """
     import ml_dtypes
     import measure_rope_poly as rp
@@ -322,6 +328,8 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k, v_mode="store_at_write",
             k_ = np.concatenate([rms(k_.reshape(kvh, hd)[i], w["n_kn"]) for i in range(kvh)])
         q, k_ = rope_for(l, q, pos), rope_for(l, k_, pos)
         k_rows = k_.reshape(kvh, hd)
+        if capture_forward_k is not None:
+            capture_forward_k.setdefault(l, {})[pos] = k_rows.copy()
         if kv_dtype == "int8":
             k_rows = quant_dequant_kc(k_rows)
         kc_l[:, pos, :] = k_rows
@@ -398,6 +406,9 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k, v_mode="store_at_write",
                         axis=1).reshape(P_, kvh * hd)
         Q, K = rope_for_batch(l, Q, positions), rope_for_batch(l, K, positions)
         K_rows = K.reshape(P_, kvh, hd)
+        if capture_forward_k is not None:
+            for i, pos in enumerate(positions):
+                capture_forward_k.setdefault(l, {})[pos] = K_rows[i].copy()
         if kv_dtype == "int8":
             K_rows = quant_dequant_kc(K_rows.reshape(P_ * kvh, hd)).reshape(P_, kvh, hd)
         kc_l[:, positions, :] = K_rows.transpose(1, 0, 2)

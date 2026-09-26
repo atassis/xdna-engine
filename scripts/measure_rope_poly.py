@@ -46,7 +46,7 @@ PI_OVER_2 = np.pi / 2.0
 # plan's independent derivation (8 mantissa bits -> unit roundoff 2**-9 ~= 3.9e-3 relative at
 # magnitude ~1) gives the same order. Gate = 3x that unit roundoff, at magnitude 1 (cos/sin peak).
 BF16_ULP_AT_1 = 2.0 ** -9
-GATE_ABS = 3.0 * BF16_ULP_AT_1  # 1.172e-2
+GATE_ABS = 3.0 * BF16_ULP_AT_1  # 5.859e-3
 
 
 def rope_inv_freq(hd, theta, partial):
