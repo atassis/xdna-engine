@@ -80,14 +80,20 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k, v_mode="store_at_write")
                           projection at the point attention CONSUMES it. Ablation for the planned
                           V-slab removal from the KV cache -- must match store_at_write bit-for-bit,
                           since it is the same arithmetic relocated, not a different computation.
+      recompute_from_kc  the actual zero-storage mechanism the kernels implement: no raw-K array
+                          at all, V is derived at read time from the already-cached ROTATED kc via
+                          RoPE-inversion (calling rope_for with the negated position) and a divide
+                          by qk-norm's gain -- RMSNorm's scale invariance means this reproduces
+                          recompute_at_read's result up to eps-order, not bit-for-bit.
 
     Only layers with no v_proj (attention_k_eq_v) are affected; a layer with a real v_proj caches
     its projected V regardless of v_mode, since there is no K it could be recomputed from.
     """
     import ml_dtypes
     BF16 = ml_dtypes.bfloat16
-    if v_mode not in ("store_at_write", "recompute_at_read"):
-        raise ValueError(f"v_mode must be 'store_at_write' or 'recompute_at_read', got {v_mode!r}")
+    if v_mode not in ("store_at_write", "recompute_at_read", "recompute_from_kc"):
+        raise ValueError(f"v_mode must be 'store_at_write', 'recompute_at_read' or "
+                         f"'recompute_from_kc', got {v_mode!r}")
 
     # Refuse rather than approximate: an axis this reference does not know the shape of (a rope_type
     # other than the one Gemma-4 actually uses) is exactly the same-name-different-meaning trap the
@@ -131,11 +137,17 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k, v_mode="store_at_write")
         across every row instead of P separate GEMVs. See layer_step_batch()."""
         return X @ w_f32.T
 
+    def norm_gain(w):
+        """The checkpoint's own RMSNorm gain convention -- shared by `rms()` and by
+        `recompute_from_kc`'s RoPE-inversion, which needs this same gain to divide by, not
+        `rms()`'s output (see the module docstring's scale-invariance derivation)."""
+        return (1.0 + w) if sp.norm_gain == "one_plus_w" else w
+
     def rms(x, w=None):
         """`w=None` is the v_norm case: gainless (with_scale=False in the checkpoint, so there is no
         weight tensor to load -- multiplying by 1.0 is the operator's own definition, not a stand-in
         for a missing one)."""
-        g = 1.0 if w is None else ((1.0 + w) if sp.norm_gain == "one_plus_w" else w)
+        g = 1.0 if w is None else norm_gain(w)
         return x / np.sqrt((x * x).mean(-1, keepdims=True) + sp.eps) * g
 
     def act(x):
@@ -235,6 +247,7 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k, v_mode="store_at_write")
         grp, has_v, is_glob = sp.n_q_heads // kvh, sp.has_v_proj(l), sp.is_global(l)
         window = None if (sp.sliding_window is None or is_glob) else sp.sliding_window
         derive_v_at_read = sp.v_norm and not has_v and v_mode == "recompute_at_read"
+        derive_v_from_kc = sp.v_norm and not has_v and v_mode == "recompute_from_kc"
 
         h = rms(xi, w["n_in"])
         q, k_ = mm(w["Wq"], h), mm(w["Wk"], h)
@@ -247,8 +260,9 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k, v_mode="store_at_write")
             src = k_ if not has_v else v
             if derive_v_at_read:
                 v_raw = src  # see v_mode docstring
-            else:
+            elif not derive_v_from_kc:
                 v = np.concatenate([rms(src.reshape(kvh, hd)[i]) for i in range(kvh)])
+            # derive_v_from_kc: nothing computed at write time -- V is recovered from kc_l below.
         if sp.qk_norm:
             q = np.concatenate([rms(q.reshape(sp.n_q_heads, hd)[i], w["n_qn"])
                                 for i in range(sp.n_q_heads)])
@@ -257,7 +271,7 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k, v_mode="store_at_write")
         kc_l[:, pos, :] = k_.reshape(kvh, hd)
         if derive_v_at_read:
             vr_l[:, pos, :] = v_raw.reshape(kvh, hd)
-        else:
+        elif not derive_v_from_kc:
             vc_l[:, pos, :] = v.reshape(kvh, hd)
         qh = q.reshape(sp.n_q_heads, hd)
         ctx = np.empty((sp.n_q_heads, hd), np.float32)
@@ -268,6 +282,10 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k, v_mode="store_at_write")
             sc = np.exp(sc - sc.max())
             if derive_v_at_read:
                 v_win = np.stack([rms(vr_l[kvi, p]) for p in range(lo, pos + 1)])
+            elif derive_v_from_kc:
+                g = norm_gain(w["n_kn"]) if sp.qk_norm else 1.0
+                v_win = np.stack([rms(rope_for(l, kc_l[kvi, p], -p) / g)
+                                  for p in range(lo, pos + 1)])
             else:
                 v_win = vc_l[kvi, lo:pos + 1]
             ctx[hh] = (sc / sc.sum()) @ v_win
@@ -298,6 +316,7 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k, v_mode="store_at_write")
         grp, has_v, is_glob = sp.n_q_heads // kvh, sp.has_v_proj(l), sp.is_global(l)
         window = None if (sp.sliding_window is None or is_glob) else sp.sliding_window
         derive_v_at_read = sp.v_norm and not has_v and v_mode == "recompute_at_read"
+        derive_v_from_kc = sp.v_norm and not has_v and v_mode == "recompute_from_kc"
 
         H = rms(X, w["n_in"])
         Q, K = mm_batch(w["Wq"], H), mm_batch(w["Wk"], H)
@@ -307,7 +326,7 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k, v_mode="store_at_write")
             src = (K if not has_v else V).reshape(P_, kvh, hd)
             if derive_v_at_read:
                 V_raw = src  # see v_mode docstring
-            else:
+            elif not derive_v_from_kc:
                 V = np.stack([rms(src[:, i, :]) for i in range(kvh)], axis=1).reshape(P_, kvh * hd)
         if sp.qk_norm:
             Qh = Q.reshape(P_, sp.n_q_heads, hd)
@@ -320,7 +339,7 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k, v_mode="store_at_write")
         kc_l[:, positions, :] = K.reshape(P_, kvh, hd).transpose(1, 0, 2)
         if derive_v_at_read:
             vr_l[:, positions, :] = V_raw.transpose(1, 0, 2)
-        else:
+        elif not derive_v_from_kc:
             vc_l[:, positions, :] = V.reshape(P_, kvh, hd).transpose(1, 0, 2)
         Qh = Q.reshape(P_, sp.n_q_heads, hd)
         Ctx = np.empty((P_, sp.n_q_heads, hd), np.float32)
@@ -332,6 +351,10 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k, v_mode="store_at_write")
                 sc = np.exp(sc - sc.max())
                 if derive_v_at_read:
                     v_win = np.stack([rms(vr_l[kvi, p]) for p in range(lo, pos + 1)])
+                elif derive_v_from_kc:
+                    g = norm_gain(w["n_kn"]) if sp.qk_norm else 1.0
+                    v_win = np.stack([rms(rope_for(l, kc_l[kvi, p], -p) / g)
+                                      for p in range(lo, pos + 1)])
                 else:
                     v_win = vc_l[kvi, lo:pos + 1]
                 Ctx[i, hh] = (sc / sc.sum()) @ v_win
@@ -364,10 +387,11 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k, v_mode="store_at_write")
     # this box has 30GB RAM against a 45GB dump, so re-reading the whole model per position (the
     # position-outer form still below, for the tail) thrashes rather than merely being slow. This
     # is the batched half of "batched prefill"; the free-running tail cannot be, see below.
+    vr_arg = vr if v_mode == "recompute_at_read" else [None] * NL  # recompute_from_kc: no vr storage
     x = embed_f32[np.asarray(prompt_ids)] * scale
     positions = np.arange(P)
     for l in range(NL):
-        x = layer_step_batch(l, materialized_layer_weights(l), x, positions, kc[l], vc[l], vr[l])
+        x = layer_step_batch(l, materialized_layer_weights(l), x, positions, kc[l], vc[l], vr_arg[l])
 
     lg = mm(embed_f32, rms(x[P - 1], n_final))     # tied lm head, only the transition position
     if sp.logit_softcap is not None:
@@ -384,7 +408,7 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k, v_mode="store_at_write")
             break
         xi = embed_f32[tok] * scale
         for l in range(NL):
-            xi = layer_step(l, materialized_layer_weights(l), xi, pos, kc[l], vc[l], vr[l])
+            xi = layer_step(l, materialized_layer_weights(l), xi, pos, kc[l], vc[l], vr_arg[l])
         lg = mm(embed_f32, rms(xi, n_final))
         if sp.logit_softcap is not None:
             c = sp.logit_softcap

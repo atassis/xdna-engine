@@ -273,6 +273,23 @@ def _tiny_attention_k_eq_v_spec():
     )
 
 
+def _tiny_attention_k_eq_v_qk_norm_spec():
+    """Same shape as `_tiny_attention_k_eq_v_spec()` but with qk_norm=True -- the real Gemma-4-12B
+    axis combination (attention_k_eq_v + qk_norm both on). Needed to exercise the
+    `recompute_from_kc` gain-division step at all: with qk_norm off, kc holds RoPE(raw) with no
+    gain and no per-position scalar, so a wrong gain formula would be invisible to that fixture."""
+    from llm_decode_spec import LlmSpec
+    return LlmSpec(
+        name="tiny-k-eq-v-qkn", d_model=8, n_layers=1, n_q_heads=2, n_kv_heads=1, head_dim=4,
+        ffn=8, vocab=16, eps=1e-6, act="silu", norm_gain="w",
+        sandwich_norms=False, qk_norm=True, embed_scale="none",
+        rope_theta_global=10_000.0, rope_theta_local=None,
+        sliding_window=None, sw_pattern=None, query_pre_attn_scalar=None,
+        attn_scale_fixed=None, v_from_k_on_global=True, v_norm=True,
+        weight_prefix="model.",
+    )
+
+
 def _write_tiny_weights(weights_dir, sp):
     """Random (but deterministic) .npy weight tensors matching sp's shapes, for run_numpy() to load."""
     rng = np.random.default_rng(42)
@@ -290,6 +307,9 @@ def _write_tiny_weights(weights_dir, sp):
         save(p + "self_attn.q_proj.weight", (sp.q_dim, sp.d_model))
         save(p + "self_attn.k_proj.weight", (sp.kv_dim, sp.d_model))
         assert not sp.has_v_proj(l), "this fixture only covers the no-v_proj (attention_k_eq_v) case"
+        if sp.qk_norm:
+            save(p + "self_attn.q_norm.weight", (sp.head_dim_for(l),))
+            save(p + "self_attn.k_norm.weight", (sp.head_dim_for(l),))
         save(p + "self_attn.o_proj.weight", (sp.d_model, sp.q_dim))
         save(p + "mlp.gate_proj.weight", (sp.ffn, sp.d_model))
         save(p + "mlp.up_proj.weight", (sp.ffn, sp.d_model))
@@ -316,3 +336,23 @@ def test_v_skip_oracle_matches_stored_v_oracle_on_global_layer(tmp_path):
     for (ids_s, vals_s), (ids_r, vals_r) in zip(tops_s, tops_r):
         assert ids_s == ids_r
         np.testing.assert_array_equal(vals_s, vals_r)
+
+
+def test_v_skip_zero_storage_recompute_matches_the_stored_raw_k_reference(tmp_path):
+    """v_mode='recompute_from_kc' derives V from the already-cached ROTATED kc (no new
+    per-position array -- this is what the real kernels do), via RoPE-inversion and a divide by
+    qk-norm's gain. It must match v_mode='recompute_at_read' (which stores true raw K separately
+    and is correct by construction) within a small eps-order tolerance, not bit-exactly."""
+    import gate_llm_reference as glr
+
+    sp = _tiny_attention_k_eq_v_qk_norm_spec()
+    _write_tiny_weights(str(tmp_path), sp)
+    prompt_ids, n_tokens, k = [0, 1], 3, 2
+
+    ref = glr.run_numpy(sp, str(tmp_path), prompt_ids, n_tokens, k, v_mode="recompute_at_read")
+    got = glr.run_numpy(sp, str(tmp_path), prompt_ids, n_tokens, k, v_mode="recompute_from_kc")
+
+    gen_ref, tops_ref, margins_ref = ref
+    gen_got, tops_got, margins_got = got
+    np.testing.assert_allclose(margins_got, margins_ref, rtol=0, atol=1e-4)
+    assert gen_got == gen_ref
