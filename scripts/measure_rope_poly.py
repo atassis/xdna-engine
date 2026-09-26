@@ -5,7 +5,7 @@ table accurately enough to derive V from K by inverting K's RoPE rotation, for e
 0..262144? Pure numpy exploration -- no kernel code. Ground truth is scripts/gate_llm_reference.py's
 `rope()`, computed in float64.
 
-Finding: the polynomial itself is not the error source (degree-9 Taylor on |y|<=pi/4 is ~1e-9,
+Finding: the polynomial itself is not the error source (degree-7/8 Taylor on |y|<=pi/4 is ~1e-9,
 negligible). Two operand-precision effects dominate, and BOTH must be fixed together:
 
 1. inv_freq stored as a single fp32 has a ~2^-24 relative error; multiplied by a position up to

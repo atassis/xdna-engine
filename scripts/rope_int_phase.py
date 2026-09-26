@@ -22,7 +22,7 @@ HALF_QUADRANT = QUADRANT_WIDTH >> 1  # 2**29
 
 
 def poly_sincos(y):
-    """Degree-9/8 Taylor for sin/cos on |y|<=pi/4 -- ~1e-9 there, negligible next to int_phase's
+    """Degree-7/8 Taylor for sin/cos on |y|<=pi/4 -- ~1e-9 there, negligible next to int_phase's
     own ~1.9e-4 bound (the F quantization -- see phase_cs)."""
     y2 = y * y
     sin_y = y * (1.0 + y2 * (-1.0 / 6 + y2 * (1.0 / 120 + y2 * (-1.0 / 5040))))
