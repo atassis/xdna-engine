@@ -23,7 +23,7 @@ _spec.loader.exec_module(g)
 CIN, COUT, H, SHIFT = 64, 16, 6, 11
 
 
-def case(name, width, check, valid_lo=0, valid_hi=None, seed=0, signed=False):
+def case(name, width, check, valid_lo=0, valid_hi=None, seed=0, signed=False, lut=False):
     hi = width if valid_hi is None else valid_hi
     rng = np.random.default_rng(seed)
     adt = np.int8 if signed else np.uint8
@@ -33,6 +33,16 @@ def case(name, width, check, valid_lo=0, valid_hi=None, seed=0, signed=False):
     b = rng.integers(-(1 << 15), 1 << 15, size=(COUT,), dtype=np.int64).astype(np.int32)
     ref = g.conv3x3_u8_ref(x, w, b, SHIFT, valid_lo, hi, signed=signed)
     fn, ct = ("conv3x3_i8", "int8_t") if signed else ("conv3x3_u8", "uint8_t")
+    params = g.pack_params(w, b)
+    lut_flag = []
+    if lut:
+        # a random table: a smooth one could hide a lane permutation in the gather
+        table = rng.integers(-128, 128, size=256, dtype=np.int64)
+        ref = table[ref.astype(np.int64) + 128].astype(np.int8)
+        ref[:, :, :valid_lo] = 0
+        ref[:, :, hi:] = 0
+        fn = "conv3x3_i8_lut"
+        lut_flag = [f"-DCONV3X3_LUT_INC=\"{g.lut_inc(table, bricklib.GEN / (name + '_lut.inc'))}\""]
 
     wp = width + 2 * g.PAD
     rows = g.pack_rows(x).reshape(H, -1)
@@ -66,9 +76,10 @@ def case(name, width, check, valid_lo=0, valid_hi=None, seed=0, signed=False):
         return full[:, :, g.PAD:-g.PAD]
 
     res = bricklib.verify_streamed(
-        name, shim, sym, tiles, wp * COUT, g.pack_params(w, b), unpack, exp, gate=0.0,
+        name, shim, sym, tiles, wp * COUT, params, unpack, exp, gate=0.0,
         in_dt=adt, out_dt=adt, resident_dt=np.int8,
-        compile_flags=[f"-DCONV3X3_CIN={CIN}", f"-DCONV3X3_COUT={COUT}"])
+        compile_flags=[f"-DCONV3X3_CIN={CIN}", f"-DCONV3X3_COUT={COUT}"] + lut_flag,
+        stack_size=2048 if lut else None)  # the LUT path measures 1984 B; aiecc re-checks
     got = np.asarray(res["got"]).astype(np.int64)
     mism = int((got != exp.astype(np.int64)).sum())
     res["mismatches"] = mism
@@ -91,6 +102,8 @@ CASES = [
     ("c3s_w64_mid", 64, 1, 0, None, 1, True),
     ("c3s_w48_top", 48, 0, 0, None, 2, True),
     ("c3s_w64_mask", 64, 1, 5, 59, 3, True),
+    ("c3l_w64_mid", 64, 1, 0, None, 4, True, True),
+    ("c3l_w48_mask", 48, 1, 5, 43, 5, True, True),
 ]
 
 if __name__ == "__main__":

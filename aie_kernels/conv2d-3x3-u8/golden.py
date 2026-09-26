@@ -48,3 +48,27 @@ def pack_params(w, b):
     bias = np.repeat(b.astype(np.int32).reshape(cout // 8, 1, 8), 8, axis=1)  # ob, px, n
     return np.concatenate([np.ascontiguousarray(wb).reshape(-1).view(np.int8),
                            bias.reshape(-1).view(np.int8)])
+
+
+def pack_lut(table):
+    """256-entry integer table (index q + 128 for int8 q) -> one gather bank, 512 bf16 words.
+
+    Values are stored as bf16 (exact for integers in [-128, 127]). Placement is the measured
+    aie::lut<4, bfloat16> read pattern (see rope-lut/gen_rope_lut_tables.py): logical entry j is
+    read from slots s0 = 16*(j//16) + (j%16)//2 and s0 + 8, half j % 2, in both banks.
+    """
+    t = np.asarray(table, np.float32)
+    assert t.shape == (256,) and np.all(np.abs(t) <= 128) and np.all(t == np.round(t))
+    phys = np.zeros(512, np.float32)
+    for j, v in enumerate(t):
+        s0 = 16 * (j // 16) + (j % 16) // 2
+        for sl in (s0, s0 + 8):
+            phys[2 * sl + (j % 2)] = v
+    return (phys.view(np.uint32) >> 16).astype(np.uint16)
+
+
+def lut_inc(table, path):
+    """Write the kernel's CONV3X3_LUT_INC file (512 bf16 words, one bank) for a 256-entry table."""
+    w = pack_lut(table)
+    path.write_text(",\n".join(", ".join(f"0x{x:04x}" for x in w[i:i + 8]) for i in range(0, 512, 8)) + "\n")
+    return path
