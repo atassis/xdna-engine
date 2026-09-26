@@ -22,6 +22,16 @@ negligible). Two operand-precision effects dominate, and BOTH must be fixed toge
    reduction) still fails at 6.7e-3..7.3e-3: BOTH the operand split and the >=2-limb reduction
    are required, neither alone is sufficient.
 
+CHOSEN SCHEME: int_phase. Resident is a single uint32 per component -- F = round(inv_freq /
+(2*pi) * 2**32), a 0.32 fixed-point turn fraction -- instead of the fp32 pair above. Phase for
+position p is ph = (p * F) mod 2**32, an exact uint32 multiply: the wraparound IS the fractional
+turn, no reduction step, no accumulated rounding across positions. Error is exactly the one
+rounding of F: |dF| <= 2**-33 turns, so at p_max = 2**18 the phase error is bounded by
+p_max * 2**-33 turns * 2*pi rad/turn ~= 1.92e-4 rad -- matches the measured 1.908e-4 max|dcos| /
+1.907e-4 max|dsin| below. Passes the gate by ~30x with half the resident storage of the
+double-single scheme and no multi-limb reduction arithmetic -- the right tradeoff for an on-chip
+kernel with no fp64.
+
 Run: .venv-iron/bin/python scripts/measure_rope_poly.py
 """
 import numpy as np
@@ -197,6 +207,37 @@ SCHEMES = {
     "twoprod_codywaite3": lambda p, i: scheme_twoprod_codywaite(p, i, nlimbs=3),
 }
 
+U32_MASK = np.uint64(0xFFFFFFFF)
+
+
+def inv_freq_to_turns_u32(inv64):
+    """Chosen resident constant: inv_freq (rad/position, float64) -> uint32 0.32 fixed-point
+    turn fraction. inv_freq <= 1 (theta >= 1, exponent in [0,1)) so the turn fraction is < 1 and
+    fits without an integer part."""
+    return (np.round(np.asarray(inv64, np.float64) / TWO_PI * (2.0 ** 32)).astype(np.uint64)
+            & U32_MASK)
+
+
+def phase_cs(ph_u32):
+    """Chosen reduction: ph (uint32 turns*2**32) -> (sin, cos), float32. Quadrant + residual are
+    both exact integer ops (no reduction rounding); only the final residual->radian scale and the
+    poly are float32."""
+    t = (ph_u32.astype(np.uint64) + np.uint64(1 << 29)) & U32_MASK
+    q = (t >> np.uint64(30)).astype(np.int64)
+    r = (t & np.uint64((1 << 30) - 1)).astype(np.int64) - (1 << 29)
+    y = r.astype(np.float32) * np.float32(np.pi / 2 / 2 ** 30)
+    sin_y, cos_y = poly_sincos(y)
+    sin_r = np.select([q == 0, q == 1, q == 2, q == 3], [sin_y, cos_y, -sin_y, -cos_y])
+    cos_r = np.select([q == 0, q == 1, q == 2, q == 3], [cos_y, -sin_y, -cos_y, sin_y])
+    return sin_r.astype(np.float32), cos_r.astype(np.float32)
+
+
+def scheme_int_phase(pos_u32, F_u32):
+    """pos and F both uint32 (or safely-widenable); ph = p*F mod 2**32 is an exact fractional-turn
+    product -- no reduction step, no rounding beyond the resident F itself (see phase_cs)."""
+    ph = (pos_u32.astype(np.uint64) * F_u32.astype(np.uint64)) & U32_MASK
+    return phase_cs(ph)
+
 
 def position_samples(max_pos=262144):
     dense = np.arange(0, 2049, dtype=np.float64)
@@ -233,6 +274,12 @@ def measure(name, hd, theta, partial, max_pos=262144):
         abs_s = np.abs(sin_r.astype(np.float64) - ref_sin.astype(np.float64))
         key = f"twoprod_codywaite{nlimbs}_ds_inv/inv=fp32x2"
         results[key] = (float(abs_c.max()), float(abs_s.max()))
+
+    F_u32 = inv_freq_to_turns_u32(F)
+    sin_r, cos_r = scheme_int_phase(P.astype(np.uint64), F_u32)
+    abs_c = np.abs(cos_r.astype(np.float64) - ref_cos.astype(np.float64))
+    abs_s = np.abs(sin_r.astype(np.float64) - ref_sin.astype(np.float64))
+    results["int_phase (chosen)/inv=u32turns"] = (float(abs_c.max()), float(abs_s.max()))
     return results, inv64_nz.size
 
 
