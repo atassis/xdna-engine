@@ -3487,7 +3487,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                                 [f"{b}[{o + h * g.hd * 2}:{o + h * g.hd * 2 + rb}]"
                                  for b, o, n in ((qhb, qho, Hq), (khb, kho, g.hkv))
                                  for h in range(n)]]
-                    if g.op_v_norm is not None:
+                    if g.op_v_norm is not None and g.cache_v:
                         # Per kv head over head_dim, NOT rotated -- RoPE is a q/k-only step. Three args:
                         # this is the qk-norm design, so it takes a gain, and `ones` is what makes it
                         # gainless (see the construction site).
@@ -3499,6 +3499,11 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                         #
                         # ORDER is load-bearing in the second case and free in the first, so it is placed
                         # for the second: BEFORE the qk-norm and RoPE entries, which mutate k in place.
+                        #
+                        # `g.cache_v` (not a fresh has_v/KV_SKIP_V check): under KV_SKIP_V=1 a
+                        # has_v=False layer's V is recomputed from `kc` at read time (the oracle's
+                        # recompute_from_kc mode, Task 1.1b) -- building this norm here would compute
+                        # a value nothing downstream reads once Task 1.3's kernel-side swap lands.
                         hv = [f"{vhb}[{vho + h*g.hd*2}:{vho + (h+1)*g.hd*2}]" for h in range(g.hkv)]
                         src = ([f"{khb}[{kho + h*g.hd*2}:{kho + (h+1)*g.hd*2}]" for h in range(g.hkv)]
                                if not g.has_v else hv)
@@ -3528,7 +3533,13 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                     # AttnGlobalFlash: the input norm, Wqkv, per-head norm/RoPE/v-norm and the K/V
                     # append (`head`, above) stay exactly as they are -- only the scores/softmax/
                     # context chain is replaced, by one design.
-                    attn_rl = [*head, (g.op_attn_global_flash, ref_q, p + "kc", p + "vc", p + "cx")]
+                    #
+                    # `n_kn`/`ang`: wiring only, for a LATER IRON-side task's kernel V reconstruction
+                    # under KV_SKIP_V (V = RoPE_inverse(kc, ang) / n_kn, undoing the qk-norm gain and
+                    # RoPE already baked into `kc`). AttnGlobalFlash.get_arg_spec() still declares 4
+                    # args, not 6 -- a real build takes this path only once that op is updated.
+                    attn_rl = [*head, (g.op_attn_global_flash, ref_q, p + "n_kn", ang,
+                                        p + "kc", p + "vc", p + "cx")]
                 else:
                     attn_rl = [
                         *head,

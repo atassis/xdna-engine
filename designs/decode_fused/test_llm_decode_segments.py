@@ -17,6 +17,7 @@ Run inside the IRON env:
   PYTHONPATH=designs/decode_fused:$IRON .venv-iron/bin/python -m pytest \
       designs/decode_fused/test_llm_decode_segments.py -v
 """
+import dataclasses
 import os
 
 import pytest
@@ -150,3 +151,38 @@ def test_each_segment_declares_only_its_own_kv_slots(build, nseg):
     # Union over segments must be the whole model's slot set -- a slot owned by nobody is a KV
     # cache the host never advances, which reads as a model that stops attending to its history.
     assert every == {n for n, _, _ in md["kv_slots"]}
+
+
+def test_kv_skip_v_drops_vnorm_for_has_v_false_layer(monkeypatch):
+    """Task 1.2b: under KV_SKIP_V=1 the has_v=False layer must not build a vnorm op.
+
+    gemma3-270m's own sw_pattern=6 already makes layer 5 (of LAYERS=6) global, so
+    v_from_k_on_global=True/v_norm=True on a copy of its spec gives has_v_proj(5)==False with no
+    other dims touched -- geometry stays uniform, no extra weights needed (v_norm is gainless).
+
+    vnorm entries are the only runlist tuples whose gain arg is the literal `ones_h{hd}` (qk-norm
+    entries pass `n_qn`/`n_kn` instead) -- v_norm applies on EVERY layer (gainless RMSNorm on the
+    value path), so the has_v=True layers still build it in place; only the has_v=False layer's
+    cross (k-src, v-dst) form is dead. Buffer names are prefixed `L{layer}_`, so that literal's
+    absence among a layer's own args is exactly "this layer's vnorm was not built".
+    """
+    monkeypatch.setattr(gen, "OperatorSequence", _StubSeq)
+    monkeypatch.setattr(gen, "DECODE_SEGMENTS", 1)
+    monkeypatch.setattr(gen, "KV_SKIP_V", True)
+    vskip_spec = dataclasses.replace(
+        gen.SPECS[SPEC], name="gemma3-270m-vskip", v_from_k_on_global=True, v_norm=True)
+    monkeypatch.setitem(gen.SPECS, vskip_spec.name, vskip_spec)
+
+    sp, fused, _w, _md = gen.build_graph(vskip_spec.name, WEIGHTS, LAYERS, 2048)
+    assert not sp.has_v_proj(LAYERS - 1), "fixture no longer produces a has_v=False layer"
+
+    def layer_has_vnorm(l):
+        prefix = f"L{l}_"
+        return any(
+            isinstance(arg, str) and arg.startswith("ones_h")
+            for entry in fused.runlist
+            if any(isinstance(a, str) and a.startswith(prefix) for a in entry[1:])
+            for arg in entry[1:])
+
+    assert not layer_has_vnorm(LAYERS - 1), "vnorm construction still present under KV_SKIP_V=1"
+    assert layer_has_vnorm(0), "has_v=True layer lost its (expected, in-place) vnorm too"
