@@ -27,6 +27,7 @@ gen = pytest.importorskip("gen_llm_decode")
 
 SPEC = "gemma3-270m"
 WEIGHTS = "/mnt/data/xdna/artifacts/gemma3-270m/weights"
+WEIGHTS_G4 = "/mnt/data/xdna/artifacts/gemma4-12b/weights_int4g32qat_hf"
 LAYERS = 6
 
 pytestmark = pytest.mark.skipif(
@@ -233,5 +234,137 @@ def test_attn_global_flash_gets_a_resident_rope_f_constant_and_kv_skip_v_flag(mo
         assert rope_f not in md["cache_names"], "rope_f is a resident constant, not a cache buffer"
         assert fused.declared_sizes.get(rope_f) is None, \
             "rope_f needs no explicit bufsz: get_arg_spec's own HD entry sizes it"
+        _assert_rope_f_undoes_forward_rotation(w[rope_f], op.HD, sp.rope_theta_global, partial)
+
+
+def _assert_rope_f_undoes_forward_rotation(rope_f_bf16, hd, theta, partial):
+    """rope_f (HD/2 uint32 turns, byte-reinterpreted into an HD-element bf16 buffer) must undo the
+    SAME rotation verify_llm_decode.py's `rope_row` applies going forward (gated byte-for-byte
+    against rust/npu-engine/src/llm/npu_decode.rs::rope_row) -- checked against an INDEPENDENT
+    ground truth, measure_rope_poly.rope_inv_freq (already verified verbatim against
+    gate_llm_reference.py's rope()), not against gen.rope_f_for_geometry a second time. A prior
+    version of this check called gen.rope_f_for_geometry again as its own oracle, so a bug inside
+    it (e.g. dropping the partial-rotary zeroing line) passed silently.
+
+    BOUND is rope_int_phase's own measured accuracy (see
+    scripts/test_gate_llm.py::test_int_phase_matches_exact_cos_sin_at_gemma4_geometries_and_large_
+    positions, which gates the same scheme at the same bound); the cross-check against `rope_row`
+    itself uses measure_rope_poly.GATE_ABS, the wider bf16-rounding bound, because rope_row's own
+    output is bf16-quantized.
+    """
+    import measure_rope_poly as mrp
+    import rope_int_phase as rp
+    import verify_llm_decode as vld
+
+    BOUND = 3e-4
+    inv = mrp.rope_inv_freq(hd, theta, partial)
+    half = hd // 2
+    rotated = half if partial is None else int(partial * hd // 2)
+    F = rope_f_bf16.view(np.uint32).astype(np.uint64)
+    for pos in (0, 1, 4097, 262143):
+        turns = ((F * np.uint64(pos)) & rp.U32_MASK).astype(np.uint32)
+        s, c = rp.phase_cs(turns)
+        ref_c, ref_s = np.cos(pos * inv), np.sin(pos * inv)
+        assert np.max(np.abs(c - ref_c)) <= BOUND, \
+            f"hd={hd} pos={pos}: max|dcos|={np.max(np.abs(c - ref_c)):.4e} exceeds {BOUND:.1e}"
+        assert np.max(np.abs(s - ref_s)) <= BOUND, \
+            f"hd={hd} pos={pos}: max|dsin|={np.max(np.abs(s - ref_s)):.4e} exceeds {BOUND:.1e}"
+        assert np.all(c[rotated:] == 1.0) and np.all(s[rotated:] == 0.0), \
+            f"hd={hd} pos={pos}: lanes past the rotated width must be the exact identity rotation"
+        row = vld.rope_row(pos, hd, theta, partial).astype(np.float32)
+        assert np.max(np.abs(c - row[0::2])) <= mrp.GATE_ABS, \
+            f"hd={hd} pos={pos}: disagrees with the forward rope_row LUT past its bf16 bound"
+        assert np.max(np.abs(s - row[1::2])) <= mrp.GATE_ABS, \
+            f"hd={hd} pos={pos}: disagrees with the forward rope_row LUT past its bf16 bound"
+
+
+def test_rope_f_satisfies_the_forward_inverse_rope_contract_with_partial_rotary():
+    """Same contract as `_assert_rope_f_undoes_forward_rotation`, at a Gemma-4-12B-shaped
+    geometry (hd=512, theta=1e6, proportional, partial=0.25 -- GEMMA4_12B's own spec fields).
+    gemma3-270m's fixture above never sets rope_type_global, so it never exercises the
+    partial-rotary zeroing branch of rope_f_for_geometry; this is the test that does.
+    """
+    g4 = gen.SPECS["gemma4-12b"]
+    partial = g4.rope_partial_rotary if g4.rope_type_global == "proportional" else None
+    assert partial is not None, "fixture drift: gemma4-12b no longer sets proportional partial rotary"
+    rope_f = gen.rope_f_for_geometry(g4.global_head_dim, g4.rope_theta_global, partial)
+    _assert_rope_f_undoes_forward_rotation(rope_f, g4.global_head_dim, g4.rope_theta_global, partial)
+
+
+@pytest.mark.skipif(not os.path.isdir(WEIGHTS_G4), reason=f"no dumped weights at {WEIGHTS_G4}")
+def test_gemma4_12b_flash_geometry_builds_against_the_real_operator_sequence(monkeypatch):
+    """Every other test in this file stubs `OperatorSequence`, so a caller/operator mismatch that
+    only `calculate_buffer_layout()` (the REAL class) would catch -- a conflicting-size collision,
+    a missing runlist buffer, an arg-spec/runlist arity mismatch -- passes silently. Builds
+    gemma4-12b for real (KV_SKIP_V/FUSE_ATTN_GLOBAL_FLASH on, FUSE_QKV_DP off so the unfused head
+    carries n_kn/rope_f into AttnGlobalFlash), with the real `iron.common.sequence.OperatorSequence`
+    and only `.compile()` stubbed out (no aiecc/mlir-aie, no device).
+
+    Needs the on-chip-rope operator worktree (wt-kv-skip-v-onchip-rope) on PYTHONPATH: an IRON
+    checkout whose `AttnGlobalFlash.get_arg_spec()` still declares the old capacity-sized `ang`
+    (e.g. the default $IRON_DIR) has no `rope_f` slot at all, so skip rather than fail for a
+    reason unrelated to this repo's own wiring.
+    """
+    from iron.operators.attn_global_dp.op import AttnGlobalFlash
+
+    probe = AttnGlobalFlash(HD=8, Hq=8, capacity=64)
+    probe_spec = probe.get_arg_spec()
+    if len(probe_spec) != 6 or probe_spec[2].shape != (8,):
+        pytest.skip("this IRON checkout's AttnGlobalFlash has no rope_f arg slot "
+                    "(pre-onchip-rope get_arg_spec) -- point PYTHONPATH at "
+                    "wt-kv-skip-v-onchip-rope")
+
+    monkeypatch.setattr(gen, "KV_SKIP_V", True)
+    monkeypatch.setattr(gen, "FUSE_ATTN_GLOBAL_FLASH", True)
+    monkeypatch.setattr(gen, "FUSE_QKV_DP", False)
+    monkeypatch.setattr(gen.OperatorSequence, "compile", lambda self, dry_run=False: self)
+
+    sp, fused, w, md = gen.build_graph("gemma4-12b", WEIGHTS_G4, LAYERS, 2048)
+
+    all_flash = [e for e in fused.runlist if type(e[0]).__name__ == "AttnGlobalFlash"]
+    seen, flash_entries = set(), []
+    for e in all_flash:
+        if id(e[0]) not in seen:
+            seen.add(id(e[0]))
+            flash_entries.append(e)
+    assert any(e[0].kv_skip_v for e in flash_entries), \
+        "gemma4-12b's global/attention_k_eq_v geometry must set kv_skip_v"
+
+    subbuffer_layout, _buffer_sizes, _slice_info = fused.calculate_buffer_layout()
+
+    partial = sp.rope_partial_rotary if sp.rope_type_global == "proportional" else None
+    for op, ref_q, n_kn, rope_f, kc, vc, cx in flash_entries:
+        assert len(op.get_arg_spec()) == 6 == len(("q", n_kn, rope_f, kc, vc, cx))
+
+        buf_type, _offset, length = subbuffer_layout[rope_f]
+        assert buf_type == "scratch"
+        assert length == op.HD * 2, f"rope_f layout length {length} != HD*2 ({op.HD * 2})"
+        assert w[rope_f].shape == (op.HD,), f"rope_f weight shape {w[rope_f].shape} != (HD,)"
+
+        # Content, not just shape: a swap of n_kn/rope_f in the caller runlist tuple would leave
+        # this position holding n_kn's trained qk-norm gain (or an all-zero rope_f in its place),
+        # neither of which equals the deterministic rope_f formula -- shape alone cannot tell them
+        # apart, since qk-norm gain is head_dim-wide too.
         expected = gen.rope_f_for_geometry(op.HD, sp.rope_theta_global, partial)
         np.testing.assert_array_equal(w[rope_f].view(np.uint32), expected.view(np.uint32))
+
+
+def test_rope_f_refuses_ordinary_partial_rotary_under_kv_skip_v(monkeypatch):
+    """rope_f_for_geometry only undoes Gemma-4's PROPORTIONAL partial rotary (full head_dim
+    width, exponent over head_dim). A spec that also sets the ordinary `rope_rotary_dim` axis
+    (llm_decode_spec.py:533-536 -- first N dims rotated, split at their own half-point) under
+    kv_skip_v would silently build a rope_f that does not undo it; must refuse by name instead.
+    """
+    monkeypatch.setattr(gen, "OperatorSequence", _StubSeq)
+    monkeypatch.setattr(gen, "DECODE_SEGMENTS", 1)
+    monkeypatch.setattr(gen, "KV_SKIP_V", True)
+    monkeypatch.setattr(gen, "FUSE_ATTN_GLOBAL_FLASH", True)
+    base = gen.SPECS[SPEC]
+    bad_spec = dataclasses.replace(
+        base, name="gemma3-270m-flash-bad-rope", v_from_k_on_global=True, v_norm=True,
+        global_head_dim=base.head_dim, global_n_kv_heads=base.n_kv_heads,
+        rope_rotary_dim=base.head_dim // 2)
+    monkeypatch.setitem(gen.SPECS, bad_spec.name, bad_spec)
+
+    with pytest.raises(NotImplementedError, match="rope_rotary_dim"):
+        gen.build_graph(bad_spec.name, WEIGHTS, LAYERS, 2048)

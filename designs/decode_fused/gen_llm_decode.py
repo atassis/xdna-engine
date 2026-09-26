@@ -3370,6 +3370,12 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             # only ever claims the GLOBAL geometry (_attn_global_flash_why), so the global theta/
             # partial-rotary axes are always the right ones here regardless of layer index.
             if g.rope_f is not None and g.rope_f not in weights:
+                if g.op_attn_global_flash.kv_skip_v and sp.rope_rotary_dim is not None:
+                    raise NotImplementedError(
+                        f"kv_skip_v's on-chip inversion assumes Gemma-4's proportional partial "
+                        f"rotary (rope_partial_rotary/rope_type_global); this spec also sets "
+                        f"rope_rotary_dim={sp.rope_rotary_dim} (the ORDINARY partial-rotary axis), "
+                        f"which rope_f_for_geometry does not undo")
                 partial = (sp.rope_partial_rotary if sp.rope_type_global == "proportional"
                           else None)
                 weights[g.rope_f] = rope_f_for_geometry(g.hd, sp.rope_theta_global, partial)
