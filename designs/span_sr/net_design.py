@@ -37,18 +37,18 @@ def _call(kind, p, w, lay):
     u, s = "(const uint8_t *)", "(const int16_t *)"
     h = NL.half(w)
     return {
-        "conv1": f"conv3x3_u8i8({u}l0, {u}l1, {u}l2, p, o, {c});",
-        "silu16": f"conv3x3_i8_lut16(l0, l1, l2, p, (int16_t *)o, {c});",
-        "silu_i16": f"conv3x3_i16i8_lut({s}l0, {s}l1, {s}l2, p, o, {c});",
-        "silu_x": f"conv3x3_i8_lut(l0, l1, l2, p, o, {c});",
-        "silu": f"conv3x3_i8_lut(l0, l1, l2, p, o, {c});",
-        "gate": (f"conv3x3_i8_gate(l0, l1, l2, l1 + {lay.x_in}, p, o, {c}, {p['ga']}, "
-                 f"{p['gb']}, {p['gs1']}, {p['gc']}, {p['gs2']});"),
-        "plain": f"conv3x3_i8(l0, l1, l2, p, o, {c});",
-        "up": f"conv3x3_i8u8(l0, l1, l2, p, (uint8_t *)o, {c});",
-        "cat": (f"conv1x1_cat_i8(l0, l0 + {h}, l0 + {2 * h}, l0 + {3 * h}, p, o, {w}, "
-                f"{p['pre']}, {p['shift']}, 0, {w});"),
-    }[kind]
+        "conv1": lambda: f"conv3x3_u8i8({u}l0, {u}l1, {u}l2, p, o, {c});",
+        "silu16": lambda: f"conv3x3_i8_lut16(l0, l1, l2, p, (int16_t *)o, {c});",
+        "silu_i16": lambda: f"conv3x3_i16i8_lut({s}l0, {s}l1, {s}l2, p, o, {c});",
+        "silu_x": lambda: f"conv3x3_i8_lut(l0, l1, l2, p, o, {c});",
+        "silu": lambda: f"conv3x3_i8_lut(l0, l1, l2, p, o, {c});",
+        "gate": lambda: (f"conv3x3_i8_gate(l0, l1, l2, l1 + {lay.x_in}, p, o, {c}, {p['ga']}, "
+                         f"{p['gb']}, {p['gs1']}, {p['gc']}, {p['gs2']});"),
+        "plain": lambda: f"conv3x3_i8(l0, l1, l2, p, o, {c});",
+        "up": lambda: f"conv3x3_i8u8(l0, l1, l2, p, (uint8_t *)o, {c});",
+        "cat": lambda: (f"conv1x1_cat_i8(l0, l0 + {h}, l0 + {2 * h}, l0 + {3 * h}, p, o, {w}, "
+                        f"{p['pre']}, {p['shift']}, 0, {w});"),
+    }[kind]()
 
 
 def _shim(path, sym, kind, p, w):
