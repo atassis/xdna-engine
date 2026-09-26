@@ -387,7 +387,9 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k, v_mode="store_at_write")
     # this box has 30GB RAM against a 45GB dump, so re-reading the whole model per position (the
     # position-outer form still below, for the tail) thrashes rather than merely being slow. This
     # is the batched half of "batched prefill"; the free-running tail cannot be, see below.
-    vr_arg = vr if v_mode == "recompute_at_read" else [None] * NL  # recompute_from_kc: no vr storage
+    # vr_l is only ever touched inside derive_v_at_read-gated branches, so None is inert for
+    # both store_at_write and recompute_from_kc -- only recompute_at_read needs real storage.
+    vr_arg = vr if v_mode == "recompute_at_read" else [None] * NL
     x = embed_f32[np.asarray(prompt_ids)] * scale
     positions = np.arange(P)
     for l in range(NL):

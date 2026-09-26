@@ -256,33 +256,21 @@ def test_the_comparator_runs_as_a_command_and_reports_pass():
 # V's gainless RMSNorm from the point K is written to the point V is consumed -- same math, a
 # different WHEN. Prove the two orderings are bit-identical before anything downstream depends on it.
 # ------------------------------------------------------------------------------------------------
-def _tiny_attention_k_eq_v_spec():
+def _tiny_attention_k_eq_v_spec(qk_norm=False):
     """A one-layer, all-global spec exercising has_v_proj()==False (attention_k_eq_v): V has no
     projection of its own and must be derived from the raw k_proj output via a gainless RMSNorm --
     exactly the case the upcoming V-cache removal touches. Dims are the smallest that satisfy the
-    reshape/GQA arithmetic in run_numpy(), not gemma4-12b's real ones."""
+    reshape/GQA arithmetic in run_numpy(), not gemma4-12b's real ones.
+
+    `qk_norm=True` is the real Gemma-4-12B axis combination (attention_k_eq_v + qk_norm both on) --
+    needed to exercise `recompute_from_kc`'s gain-division step at all: with qk_norm off, kc holds
+    RoPE(raw) with no gain and no per-position scalar, so a wrong gain formula would be invisible."""
     from llm_decode_spec import LlmSpec
     return LlmSpec(
-        name="tiny-k-eq-v", d_model=8, n_layers=1, n_q_heads=2, n_kv_heads=1, head_dim=4,
+        name="tiny-k-eq-v-qkn" if qk_norm else "tiny-k-eq-v",
+        d_model=8, n_layers=1, n_q_heads=2, n_kv_heads=1, head_dim=4,
         ffn=8, vocab=16, eps=1e-6, act="silu", norm_gain="w",
-        sandwich_norms=False, qk_norm=False, embed_scale="none",
-        rope_theta_global=10_000.0, rope_theta_local=None,
-        sliding_window=None, sw_pattern=None, query_pre_attn_scalar=None,
-        attn_scale_fixed=None, v_from_k_on_global=True, v_norm=True,
-        weight_prefix="model.",
-    )
-
-
-def _tiny_attention_k_eq_v_qk_norm_spec():
-    """Same shape as `_tiny_attention_k_eq_v_spec()` but with qk_norm=True -- the real Gemma-4-12B
-    axis combination (attention_k_eq_v + qk_norm both on). Needed to exercise the
-    `recompute_from_kc` gain-division step at all: with qk_norm off, kc holds RoPE(raw) with no
-    gain and no per-position scalar, so a wrong gain formula would be invisible to that fixture."""
-    from llm_decode_spec import LlmSpec
-    return LlmSpec(
-        name="tiny-k-eq-v-qkn", d_model=8, n_layers=1, n_q_heads=2, n_kv_heads=1, head_dim=4,
-        ffn=8, vocab=16, eps=1e-6, act="silu", norm_gain="w",
-        sandwich_norms=False, qk_norm=True, embed_scale="none",
+        sandwich_norms=False, qk_norm=qk_norm, embed_scale="none",
         rope_theta_global=10_000.0, rope_theta_local=None,
         sliding_window=None, sw_pattern=None, query_pre_attn_scalar=None,
         attn_scale_fixed=None, v_from_k_on_global=True, v_norm=True,
@@ -345,7 +333,7 @@ def test_v_skip_zero_storage_recompute_matches_the_stored_raw_k_reference(tmp_pa
     and is correct by construction) within a small eps-order tolerance, not bit-exactly."""
     import gate_llm_reference as glr
 
-    sp = _tiny_attention_k_eq_v_qk_norm_spec()
+    sp = _tiny_attention_k_eq_v_spec(qk_norm=True)
     _write_tiny_weights(str(tmp_path), sp)
     prompt_ids, n_tokens, k = [0, 1], 3, 2
 
@@ -354,5 +342,12 @@ def test_v_skip_zero_storage_recompute_matches_the_stored_raw_k_reference(tmp_pa
 
     gen_ref, tops_ref, margins_ref = ref
     gen_got, tops_got, margins_got = got
+    # The two paths take eps through a different denominator (s^2*mean(raw^2) here vs
+    # mean(raw^2) directly in the true path -- see the module's derivation), so this is not
+    # bit-exact. Measured residual on this fixture is ~1e-6-1e-7 (sp.eps order); atol is 100x
+    # that ceiling, well below the ~0.87 a wrong gain formula produces (see this test's own
+    # sabotage check in the commit history) -- tight enough to catch a real defect, loose
+    # enough not to flake on eps-order noise.
+    assert sp.eps == 1e-6, "atol below assumes this fixture's eps; re-check if eps changes"
     np.testing.assert_allclose(margins_got, margins_ref, rtol=0, atol=1e-4)
     assert gen_got == gen_ref
