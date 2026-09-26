@@ -438,7 +438,8 @@ def test_int8_kc_amplifies_under_a_non_uniform_near_zero_gain(tmp_path):
     hd = sp.head_dim_for(0)
     bad_gain = np.full(hd, 0.25, dtype=np.float32)
     bad_gain[0] = 0.001
-    np.save(os.path.join(str(tmp_path), "model.layers.0.self_attn.k_norm.weight.npy"), bad_gain)
+    gain_path = f"{sp.weight_prefix}layers.0.self_attn.k_norm.weight.npy"
+    np.save(os.path.join(str(tmp_path), gain_path), bad_gain)
 
     cap_bf16, cap_int8 = {}, {}
     glr.run_numpy(sp, str(tmp_path), [0, 1], 6, 2, v_mode="recompute_from_kc", kv_dtype="bf16",
