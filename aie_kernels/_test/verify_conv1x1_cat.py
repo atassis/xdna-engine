@@ -27,7 +27,7 @@ def _load(path, name):
 g = _load(BRICK / "golden.py", "conv1x1_golden")
 rows = _load(ROWS_BRICK / "golden.py", "conv3x3_golden")
 
-NSRC, CSRC, COUT, H, SHIFT = 4, 48, 48, 4, 10
+NSRC, CSRC, COUT, H, PRE, SHIFT = 4, 48, 48, 4, 3, 14
 
 
 def case(name, width, valid_lo=0, valid_hi=None, seed=0):
@@ -37,7 +37,8 @@ def case(name, width, valid_lo=0, valid_hi=None, seed=0):
           for _ in range(NSRC)]
     w = rng.integers(-127, 128, size=(COUT, NSRC * CSRC), dtype=np.int64).astype(np.int8)
     b = rng.integers(-(1 << 15), 1 << 15, size=(COUT,), dtype=np.int64).astype(np.int32)
-    ref = g.conv1x1_cat_ref(xs, w, b, SHIFT, valid_lo, hi)
+    mult = rng.integers(64, 256, size=COUT, dtype=np.int64)
+    ref = g.conv1x1_cat_ref(xs, w, b, SHIFT, valid_lo, hi, pre_shift=PRE, mult=mult)
     wp = width + 2 * rows.PAD
     src_rows = [rows.pack_rows(a).reshape(H, -1) for a in xs]
     tiles = np.stack([np.concatenate([r[y] for r in src_rows]) for y in range(H)])
@@ -48,14 +49,14 @@ def case(name, width, valid_lo=0, valid_hi=None, seed=0):
         f'#include <stdint.h>\n#include "{BRICK / "conv1x1_cat.cc"}"\n'
         f'extern "C" void {sym}(int8_t *t, int8_t *p, int8_t *o) {{\n'
         f'  conv1x1_cat_i8(t, t + {step}, t + {2 * step}, t + {3 * step}, p, o, {width},'
-        f' {SHIFT}, {valid_lo}, {hi});\n}}\n')
+        f' {PRE}, {SHIFT}, {valid_lo}, {hi});\n}}\n')
     exp = np.stack([ref[:, y, :] for y in range(H)])
 
     def unpack(dev):
         return np.stack([rows.unpack_rows(r, COUT, 1, width)[:, 0, :] for r in dev])
 
     res = bricklib.verify_streamed(
-        name, shim, sym, tiles, wp * COUT, g.pack_params(w, b, NSRC), unpack, exp, gate=0.0,
+        name, shim, sym, tiles, wp * COUT, g.pack_params(w, b, NSRC, mult), unpack, exp, gate=0.0,
         in_dt=np.int8, out_dt=np.int8, resident_dt=np.int8,
         compile_flags=[f"-DCONV1X1_NSRC={NSRC}", f"-DCONV1X1_CSRC={CSRC}",
                        f"-DCONV1X1_COUT={COUT}"])

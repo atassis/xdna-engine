@@ -1,12 +1,13 @@
 // 1x1 convolution over the channel concatenation of NSRC int8 rows, without
-// materializing the concatenation: out = sat8((sum_s W_s x_s + bias) >> shift),
-// >> rounding half up. Each source may carry its own quantization scale; fold
+// materializing the concatenation: acc = sum_s W_s x_s + bias, then the same
+// per-channel requant as conv2d-3x3-u8:
+//   out = sat8((sat16(acc >> pre_shift) * mult[oc]) >> shift), >> rounding half up. Each source may carry its own quantization scale; fold
 // it into that source's weight slice (golden.pack_params).
 //
 //   in0..in3  source rows, each [CSRC/8][width+16][8] int8, margins zero
 //   out       [COUT/8][width+16][8] int8, margins written zero
 //   params    weights [COUT/8][NSRC][CSRC/8][8 ic][8 oc] int8,
-//             then bias [COUT/8][8 px][8 oc] int32
+//             then bias [COUT/8][8 px][8 oc] int32, mult [COUT/8][8 px][8 oc] int16
 // Output pixels outside [valid_lo, valid_hi) are written as zero.
 // width % 16 == 0, CSRC % 8 == 0, COUT % 16 == 0; unused sources may repeat a pointer
 // when NSRC < 4.
@@ -47,7 +48,7 @@ __attribute__((noinline)) void
 conv1x1_cat_core(const int8_t *__restrict in0, const int8_t *__restrict in1,
                  const int8_t *__restrict in2, const int8_t *__restrict in3,
                  const int8_t *__restrict params, int8_t *__restrict out,
-                 int width, int shift, int valid_lo, int valid_hi) {
+                 int width, int pre_shift, int shift, int valid_lo, int valid_hi) {
   using MMUL = aie::mmul<8, 8, 8, int8, int8>;
   static_assert(CSRC % 8 == 0 && COUT % 16 == 0 && NSRC >= 1 && NSRC <= 4);
   constexpr int SCB = CSRC / 8;
@@ -58,6 +59,11 @@ conv1x1_cat_core(const int8_t *__restrict in0, const int8_t *__restrict in1,
   ::aie::set_rounding(aie::rounding_mode::positive_inf);
 
   const int32_t *bias = reinterpret_cast<const int32_t *>(params + OCB * WBLK);
+  const int16_t *mult = reinterpret_cast<const int16_t *>(bias + OCB * 64);
+  auto rq = [&](MMUL &acc, const aie::vector<int16, 64> &m) {
+    aie::vector<int16, 64> v = acc.to_vector<int16>(pre_shift);
+    return aie::mul(v, m).to_vector<int8>(shift);
+  };
   const int8_t *src[4] = {in0, in1, in2, in3};
   const int plane = (width + 16) * 8;
   const aie::vector<int8, 64> zero = aie::zeros<int8, 64>();
@@ -72,6 +78,8 @@ conv1x1_cat_core(const int8_t *__restrict in0, const int8_t *__restrict in1,
     MMUL::accum_type bias0, bias1;
     bias0.from_vector(aie::load_v<64>(bias + ob * 64));
     bias1.from_vector(aie::load_v<64>(bias + (ob + 1) * 64));
+    const aie::vector<int16, 64> m0 = aie::load_v<64>(mult + ob * 64);
+    const aie::vector<int16, 64> m1 = aie::load_v<64>(mult + (ob + 1) * 64);
 
     for (int x0 = 0; x0 < width; x0 += 16) {
       MMUL a00(bias0), a01(bias0), a10(bias1), a11(bias1);
@@ -95,12 +103,10 @@ conv1x1_cat_core(const int8_t *__restrict in0, const int8_t *__restrict in1,
         }
       }
       const int c = (x0 + 8) * 8;
-      aie::store_v(o0 + c, mask_block(a00.to_vector<int8>(shift), x0, valid_lo, valid_hi));
-      aie::store_v(o0 + c + 64,
-                   mask_block(a01.to_vector<int8>(shift), x0 + 8, valid_lo, valid_hi));
-      aie::store_v(o1 + c, mask_block(a10.to_vector<int8>(shift), x0, valid_lo, valid_hi));
-      aie::store_v(o1 + c + 64,
-                   mask_block(a11.to_vector<int8>(shift), x0 + 8, valid_lo, valid_hi));
+      aie::store_v(o0 + c, mask_block(rq(a00, m0), x0, valid_lo, valid_hi));
+      aie::store_v(o0 + c + 64, mask_block(rq(a01, m0), x0 + 8, valid_lo, valid_hi));
+      aie::store_v(o1 + c, mask_block(rq(a10, m1), x0, valid_lo, valid_hi));
+      aie::store_v(o1 + c + 64, mask_block(rq(a11, m1), x0 + 8, valid_lo, valid_hi));
     }
   }
 }
@@ -111,10 +117,10 @@ extern "C" {
 
 void conv1x1_cat_i8(const int8_t *in0, const int8_t *in1, const int8_t *in2,
                     const int8_t *in3, const int8_t *params, int8_t *out,
-                    int32_t width, int32_t shift, int32_t valid_lo,
-                    int32_t valid_hi) {
+                    int32_t width, int32_t pre_shift, int32_t shift,
+                    int32_t valid_lo, int32_t valid_hi) {
   conv1x1_cat_core<CONV1X1_NSRC, CONV1X1_CSRC, CONV1X1_COUT>(
-      in0, in1, in2, in3, params, out, width, shift, valid_lo, valid_hi);
+      in0, in1, in2, in3, params, out, width, pre_shift, shift, valid_lo, valid_hi);
 }
 
 } // extern "C"

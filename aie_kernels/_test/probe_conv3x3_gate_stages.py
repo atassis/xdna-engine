@@ -22,7 +22,7 @@ wp = width + 16
 x = rng.integers(-128, 128, size=(CIN, H, width)).astype(np.int8)
 w = rng.integers(-127, 128, size=(COUT, CIN, 3, 3)).astype(np.int8)
 b = rng.integers(-(1 << 15), 1 << 15, size=(COUT,)).astype(np.int32)
-c = g.conv3x3_u8_ref(x, w, b, SH, 0, width, signed=True)
+c = g.conv3x3_u8_ref(x, w, b, 0, 0, width, signed=True, pre_shift=SH)
 xb = rng.integers(-128, 128, size=(COUT, H, width)).astype(np.int8)
 rows, xr = g.pack_rows(x).reshape(H, -1), g.pack_rows(xb).reshape(H, -1)
 tiles = np.stack([np.concatenate([rows[y - 1], rows[y], rows[y + 1], xr[y]]) for y in range(1, H - 1)])
@@ -37,9 +37,9 @@ def run(tag, table, ga=64, gb=45, gs1=6, gc=1, gs2=0, extra=(), lutonly=False):
     sh = bricklib.GEN / f"gd_{tag}_shim.cc"
     sym = f"gatedbg_{tag}"
     a0, a1, a2, a3 = 0, wp * CIN, 2 * wp * CIN, 3 * wp * CIN
-    call = (f"conv3x3_i8_lut(t + {a0}, t + {a1}, t + {a2}, p, o, {width}, 1, {SH}, 0, {width});"
+    call = (f"conv3x3_i8_lut(t + {a0}, t + {a1}, t + {a2}, p, o, {width}, 1, {SH}, 0, 0, {width});"
             if lutonly else
-            f"conv3x3_i8_gate(t + {a0}, t + {a1}, t + {a2}, t + {a3}, p, o, {width}, 1, {SH}, 0, "
+            f"conv3x3_i8_gate(t + {a0}, t + {a1}, t + {a2}, t + {a3}, p, o, {width}, 1, {SH}, 0, 0, "
             f"{width}, {ga}, {gb}, {gs1}, {gc}, {gs2});")
     sh.write_text(f'#include <stdint.h>\n#include "{v.BRICK / "conv3x3_u8.cc"}"\n'
                   f'extern "C" void {sym}(int8_t *t, int8_t *p, int8_t *o) {{ {call} }}\n')
@@ -49,7 +49,7 @@ def run(tag, table, ga=64, gb=45, gs1=6, gc=1, gs2=0, extra=(), lutonly=False):
         gate=0.0, in_dt=np.int8, out_dt=np.int8, resident_dt=np.int8,
         compile_flags=[f"-DCONV3X3_CIN={CIN}", f"-DCONV3X3_COUT={COUT}",
                        f'-DCONV3X3_LUT_INC="{inc}"', *extra],
-        stack_size=3072)
+        stack_size=3584)
     return np.asarray(r["got"]).astype(np.int64)
 
 

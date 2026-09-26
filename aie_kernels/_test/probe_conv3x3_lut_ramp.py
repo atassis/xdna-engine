@@ -15,7 +15,7 @@ def ramp_case():
     x = rng.integers(-128, 128, size=(v.CIN, H, width), dtype=np.int64).astype(np.int8)
     w = rng.integers(-127, 128, size=(v.COUT, v.CIN, 3, 3), dtype=np.int64).astype(np.int8)
     b = rng.integers(-(1 << 15), 1 << 15, size=(v.COUT,), dtype=np.int64).astype(np.int32)
-    ref = g.conv3x3_u8_ref(x, w, b, v.SHIFT, 0, width, signed=True)
+    ref = g.conv3x3_u8_ref(x, w, b, 0, 0, width, signed=True, pre_shift=v.SHIFT)
     params = g.pack_params(w, b)
     inc = g.lut_inc(np.arange(256) - 128, v.bricklib.GEN / "c3lramp_lut.inc")
     wp = width + 2 * g.PAD
@@ -26,7 +26,7 @@ def ramp_case():
     shim.write_text(
         f'#include <stdint.h>\n#include "{v.BRICK / "conv3x3_u8.cc"}"\n'
         f'extern "C" void {sym}(int8_t *t, int8_t *p, int8_t *o) {{\n'
-        f'  conv3x3_i8_lut(t, t + {wp * v.CIN}, t + {2 * wp * v.CIN}, p, o, {width}, 1, {v.SHIFT}, 0, {width});\n}}\n')
+        f'  conv3x3_i8_lut(t, t + {wp * v.CIN}, t + {2 * wp * v.CIN}, p, o, {width}, 1, {v.SHIFT}, 0, 0, {width});\n}}\n')
     res = v.bricklib.verify_streamed(
         "c3lramp", shim, sym, tiles, wp * v.COUT, params,
         lambda dev: dev, np.zeros(1), gate=0.0, in_dt=np.int8, out_dt=np.int8, resident_dt=np.int8,

@@ -1,6 +1,7 @@
 // 3x3 same-padded convolution for one output row: int8 weights x 8- or 16-bit
-// activations -> int32 accumulate, + int32 bias, rounding shift, saturate, then
-// an optional pointwise epilogue. Entry points (in -> out):
+// activations -> int32 accumulate, + int32 bias, then a per-channel requant
+//   v = sat16(acc >> pre_shift);  q = sat_out((v * mult[oc]) >> shift)
+// and an optional pointwise epilogue. Entry points (in -> out):
 //   conv3x3_u8        uint8 -> uint8; negative sums clamp to 0, so ReLU is implied
 //   conv3x3_i8        int8 -> int8
 //   conv3x3_i16i8     int16 -> int8
@@ -23,8 +24,8 @@
 //   line0/1/2  input rows y-1, y, y+1   [CIN/8][width+16][8]   margins zero
 //   out        output row y             [COUT/8][width+16][8]  margins written zero
 //   params     weights [COUT/8][3 ky][CIN/8][3 kx][8 ic][8 oc] int8,
-//              then bias [COUT/8][8 px][8 oc] int32 (repeated per pixel so it
-//              loads straight into an accumulator tile)
+//              then bias [COUT/8][8 px][8 oc] int32 and mult [COUT/8][8 px][8 oc]
+//              int16 (repeated per pixel so each loads straight into a tile)
 // Tables are per-layer model constants, compiled in: CONV3X3_LUT_INC (and
 // CONV3X3_LUT2_INC for the lo half of lut16) name files of 512 bf16 words
 // (golden.lut_inc).
@@ -129,8 +130,8 @@ template <typename TA, typename PA, typename TO, typename PO, int CIN, int COUT,
 __attribute__((noinline)) void
 conv3x3_core(const PA *__restrict line0, const PA *__restrict line1,
              const PA *__restrict line2, const int8_t *__restrict params,
-             PO *__restrict out, int width, int check, int shift, int valid_lo,
-             int valid_hi, const PO *__restrict xrow = nullptr, int ga = 0,
+             PO *__restrict out, int width, int check, int pre_shift, int shift,
+             int valid_lo, int valid_hi, const PO *__restrict xrow = nullptr, int ga = 0,
              int gb = 0, int gs1 = 0, int gc = 0, int gs2 = 0) {
   constexpr int PX = 8 / sizeof(PA); // pixels per tile
   constexpr int LANES = PX * 8;      // elements per input tile (64 bytes)
@@ -155,19 +156,25 @@ conv3x3_core(const PA *__restrict line0, const PA *__restrict line1,
   static_assert(EPI != LUT16, "lut16 needs -DCONV3X3_LUT2_INC=<file>");
 #endif
   const int32_t *bias = reinterpret_cast<const int32_t *>(params + OCB * WBLK);
+  const int16_t *mult = reinterpret_cast<const int16_t *>(bias + OCB * 64);
   const PA *lines[3] = {line0, line1, line2};
   const int ky0 = (check == 0) ? 1 : 0;
   const int ky1 = (check == 2) ? 2 : 3;
   const int plane = (width + 16) * 8; // elements per 8-channel block of a padded row
 
+  // per-channel requant of one tile to the 8-bit (or table-key) domain
+  auto rq = [&](MMUL &acc, const aie::vector<int16, LANES> &m) {
+    aie::vector<int16, LANES> v = acc.template to_vector<int16>(pre_shift);
+    return aie::mul(v, m);
+  };
   // one tile of PX pixels x 8 channels: requant, epilogue, column mask, store
-  auto put = [&](PO *dst, MMUL &acc, int xs) {
+  auto put = [&](PO *dst, MMUL &acc, const aie::vector<int16, LANES> &m, int xs) {
     if constexpr (EPI == NONE) {
-      aie::store_v(dst, mask_block(acc.template to_vector<TO>(shift), xs,
+      aie::store_v(dst, mask_block(rq(acc, m).template to_vector<TO>(shift), xs,
                                    valid_lo, valid_hi));
     } else if constexpr (EPI == LUT) {
 #ifdef CONV3X3_LUT_INC
-      aie::store_v(dst, acc.template to_vector<int8>(shift));
+      aie::store_v(dst, rq(acc, m).template to_vector<int8>(shift));
       apply_lut_inplace(reinterpret_cast<int8_t *>(dst), LANES);
       if (!(xs >= valid_lo && xs + PX <= valid_hi))
         aie::store_v(dst, mask_block(aie::load_v<LANES>(dst), xs, valid_lo,
@@ -176,7 +183,7 @@ conv3x3_core(const PA *__restrict line0, const PA *__restrict line1,
     } else if constexpr (EPI == LUT16) {
 #if defined(CONV3X3_LUT_INC) && defined(CONV3X3_LUT2_INC)
       int8_t *keys = reinterpret_cast<int8_t *>(dst) + LANES;
-      aie::store_v(keys, acc.template to_vector<int8>(shift));
+      aie::store_v(keys, rq(acc, m).template to_vector<int8>(shift));
       apply_lut16(keys, reinterpret_cast<int16_t *>(dst));
       if (!(xs >= valid_lo && xs + PX <= valid_hi))
         aie::store_v(dst, mask_block(aie::load_v<LANES>(dst), xs, valid_lo,
@@ -186,7 +193,7 @@ conv3x3_core(const PA *__restrict line0, const PA *__restrict line1,
 #ifdef CONV3X3_LUT_INC
       // Three passes through memory. A single pass (one load feeding both
       // fetch() and the sum) has not been re-tested since the lookup-object fix.
-      aie::store_v(dst, acc.template to_vector<int8>(shift));
+      aie::store_v(dst, rq(acc, m).template to_vector<int8>(shift));
       PO *xp = const_cast<PO *>(xrow) + (dst - out);
       for (int g = 0; g < LANES; g += 16) {
         aie::accum<acc32, 16> a = aie::mul(aie::load_v<16>(dst + g), (int8)ga);
@@ -219,6 +226,8 @@ conv3x3_core(const PA *__restrict line0, const PA *__restrict line1,
     typename MMUL::accum_type bias0, bias1;
     bias0.from_vector(aie::load_v<LANES>(bias + ob * 64));
     bias1.from_vector(aie::load_v<LANES>(bias + (ob + 1) * 64));
+    const aie::vector<int16, LANES> m0 = aie::load_v<LANES>(mult + ob * 64);
+    const aie::vector<int16, LANES> m1 = aie::load_v<LANES>(mult + (ob + 1) * 64);
 
     for (int x0 = 0; x0 < width; x0 += 2 * PX) {
       MMUL a00(bias0), a01(bias0), a10(bias1), a11(bias1);
@@ -261,10 +270,10 @@ conv3x3_core(const PA *__restrict line0, const PA *__restrict line1,
         }
       }
       const int c = (x0 + 8) * 8;
-      put(o0 + c, a00, x0);
-      put(o0 + c + LANES, a01, x0 + PX);
-      put(o1 + c, a10, x0);
-      put(o1 + c + LANES, a11, x0 + PX);
+      put(o0 + c, a00, m0, x0);
+      put(o0 + c + LANES, a01, m0, x0 + PX);
+      put(o1 + c, a10, m1, x0);
+      put(o1 + c + LANES, a11, m1, x0 + PX);
     }
   }
 }
@@ -279,11 +288,12 @@ conv3x3_core(const PA *__restrict line0, const PA *__restrict line1,
 #endif
 
 #define C3_ARGS                                                                \
-  line0, line1, line2, params, out, width, check, shift, valid_lo, valid_hi
+  line0, line1, line2, params, out, width, check, pre_shift, shift, valid_lo,  \
+      valid_hi
 #define C3_SIG(PA, PO)                                                         \
   const PA *line0, const PA *line1, const PA *line2, const int8_t *params,     \
-      PO *out, int32_t width, int32_t check, int32_t shift, int32_t valid_lo,  \
-      int32_t valid_hi
+      PO *out, int32_t width, int32_t check, int32_t pre_shift, int32_t shift, \
+      int32_t valid_lo, int32_t valid_hi
 
 extern "C" {
 
@@ -319,8 +329,9 @@ void conv3x3_i16i8_lut(C3_SIG(int16_t, int8_t)) {
 
 void conv3x3_i8_gate(const int8_t *line0, const int8_t *line1,
                      const int8_t *line2, const int8_t *xrow, const int8_t *params,
-                     int8_t *out, int32_t width, int32_t check, int32_t shift,
-                     int32_t valid_lo, int32_t valid_hi, int32_t ga, int32_t gb,
+                     int8_t *out, int32_t width, int32_t check, int32_t pre_shift,
+                     int32_t shift, int32_t valid_lo, int32_t valid_hi, int32_t ga,
+                     int32_t gb,
                      int32_t gs1, int32_t gc, int32_t gs2) {
   conv3x3_core<int8, int8_t, int8, int8_t, CONV3X3_CIN, CONV3X3_COUT, GATE>(
       C3_ARGS, xrow, ga, gb, gs1, gc, gs2);

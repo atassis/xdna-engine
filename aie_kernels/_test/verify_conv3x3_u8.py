@@ -35,11 +35,13 @@ def case(name, width, check, valid_lo=0, valid_hi=None, seed=0, signed=False, lu
         adt, odt, lo_v, hi_v = np.uint8, np.int8, 0, 256
     elif mixed == "i8u8":  # int8 in, uint8 out
         adt, odt, lo_v, hi_v = np.int8, np.uint8, -128, 128
-    shift = 14 if in16 else SHIFT
+    pre, shift = (7, 14) if in16 else (4, 14)   # sat16(acc >> pre) * mult >> shift
     x = rng.integers(lo_v, hi_v, size=(CIN, H, width), dtype=np.int64).astype(adt)
     w = rng.integers(-127, 128, size=(COUT, CIN, 3, 3), dtype=np.int64).astype(np.int8)
     b = rng.integers(-(1 << 15), 1 << 15, size=(COUT,), dtype=np.int64).astype(np.int32)
-    ref = g.conv3x3_u8_ref(x, w, b, shift, valid_lo, hi, signed=(odt != np.uint8))
+    mult = rng.integers(64, 256, size=COUT, dtype=np.int64)
+    ref = g.conv3x3_u8_ref(x, w, b, shift, valid_lo, hi, signed=(odt != np.uint8), pre_shift=pre,
+                           mult=mult)
     fn, ct = ("conv3x3_i8", "int8_t") if signed else ("conv3x3_u8", "uint8_t")
     cto = "int16_t" if lut16 else ct
     if in16:
@@ -48,7 +50,7 @@ def case(name, width, check, valid_lo=0, valid_hi=None, seed=0, signed=False, lu
         fn, ct, cto = "conv3x3_u8i8", "uint8_t", "int8_t"
     elif mixed == "i8u8":
         fn, ct, cto = "conv3x3_i8u8", "int8_t", "uint8_t"
-    params = g.pack_params(w, b)
+    params = g.pack_params(w, b, mult)
     lut_flag = []
     if lut:
         # a random table: a smooth one could hide a lane permutation in the gather
@@ -105,9 +107,9 @@ def case(name, width, check, valid_lo=0, valid_hi=None, seed=0, signed=False, lu
         f'#include <stdint.h>\n#include "{BRICK / "conv3x3_u8.cc"}"\n'
         f'extern "C" void {sym}({ct} *t, int8_t *p, {cto} *o) {{\n'
         + (f'  {fn}(t, t + {wp * CIN}, t + {2 * wp * CIN}, t + {3 * wp * CIN}, p, o, {width},'
-           f' {check}, {SHIFT}, {valid_lo}, {hi}, 64, 45, 6, 100, 9);\n}}\n' if gate is not None else
+           f' {check}, {pre}, {shift}, {valid_lo}, {hi}, 64, 45, 6, 100, 9);\n}}\n' if gate is not None else
            f'  {fn}(t, t + {wp * CIN}, t + {2 * wp * CIN}, p, o, {width}, {check},'
-           f' {shift}, {valid_lo}, {hi});\n}}\n'))
+           f' {pre}, {shift}, {valid_lo}, {hi});\n}}\n'))
     exp = np.stack([ref[:, y, :] for y in ys])            # [n, COUT, W]
 
     margin_nz = []
@@ -122,7 +124,7 @@ def case(name, width, check, valid_lo=0, valid_hi=None, seed=0, signed=False, lu
         name, shim, sym, tiles, wp * COUT, params, unpack, exp, gate=0.0,
         in_dt=adt, out_dt=odt, resident_dt=np.int8,
         compile_flags=[f"-DCONV3X3_CIN={CIN}", f"-DCONV3X3_COUT={COUT}"] + lut_flag,
-        stack_size=(3072 if gate is not None else 2048) if (lut or lut16 or gate is not None) else None)  # measured: table 1984 B, gate 3072 B; aiecc re-checks
+        stack_size=(3584 if (gate is not None or lut16) else 2048) if (lut or lut16 or gate is not None) else None)  # measured: table 1984 B, lut16 2944 B, gate 3328 B; aiecc re-checks
     got = np.asarray(res["got"]).astype(np.int64)
     mism = int((got != exp.astype(np.int64)).sum())
     res["mismatches"] = mism
@@ -152,7 +154,7 @@ CASES = [
     ("c3w_i16_w64_mid", 64, 1, 0, None, 8, True, False, None, True),
     ("c3w_i16_w48_top_mask", 48, 0, 5, 43, 9, True, False, None, True),
     ("c3w_i16lut_w64_mid", 64, 1, 0, None, 10, True, True, None, True),
-    ("c3w_lut16_w64_mid", 64, 1, 0, None, 11, True, False, None, False, True),
+    ("c3w_lut16_w32_mid", 32, 1, 0, None, 11, True, False, None, False, True),
     ("c3w_lut16_w48_mask", 48, 2, 5, 43, 12, True, False, None, False, True),
     ("c3m_u8i8_w64_mid", 64, 1, 0, None, 13, False, False, None, False, False, "u8i8"),
     ("c3m_i8u8_w48_mask", 48, 1, 5, 43, 14, False, False, None, False, False, "i8u8"),

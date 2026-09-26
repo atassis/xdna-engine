@@ -34,7 +34,7 @@ def build(reps):
         f'#include <stdint.h>\n#include "{BRICK / "conv3x3_u8.cc"}"\n'
         f'extern "C" void {sym}(uint8_t *t, int8_t *p, uint8_t *o) {{\n'
         f'  for (int r = 0; r < {reps}; r++)\n'
-        f'    conv3x3_u8(t, t + {(W + 16) * CIN}, t + {2 * (W + 16) * CIN}, p, o, {W}, 1, {SHIFT}, 0, {W});\n'
+        f'    conv3x3_u8(t, t + {(W + 16) * CIN}, t + {2 * (W + 16) * CIN}, p, o, {W}, 1, {SHIFT}, 0, 0, {W});\n'
         f'}}\n')
     return bricklib._build_streamed(sym, shim, ROWS, 3 * (W + 16) * CIN, (W + 16) * COUT, len(params),
                                     [f"-DCONV3X3_CIN={CIN}", f"-DCONV3X3_COUT={COUT}"],
