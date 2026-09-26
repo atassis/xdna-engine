@@ -53,12 +53,12 @@ def pack_params(w, b):
 def pack_lut(table):
     """256-entry integer table (index q + 128 for int8 q) -> one gather bank, 512 bf16 words.
 
-    Values are stored as bf16 (exact for integers in [-128, 127]). Placement is the measured
+    Values are stored as bf16 (exact for integers in [-128, 255]). Placement is the measured
     aie::lut<4, bfloat16> read pattern (see rope-lut/gen_rope_lut_tables.py): logical entry j is
     read from slots s0 = 16*(j//16) + (j%16)//2 and s0 + 8, half j % 2, in both banks.
     """
     t = np.asarray(table, np.float32)
-    assert t.shape == (256,) and np.all(np.abs(t) <= 128) and np.all(t == np.round(t))
+    assert t.shape == (256,) and np.all((t >= -128) & (t <= 255)) and np.all(t == np.round(t))
     phys = np.zeros(512, np.float32)
     for j, v in enumerate(t):
         s0 = 16 * (j // 16) + (j % 16) // 2
@@ -87,3 +87,9 @@ def gate_ref(c, x, table, ga, gb, gs1, gc, gs2):
     s = np.clip(rshift_round(c * ga + x.astype(np.int64) * gb, gs1), -128, 127)
     p = np.clip(s * att, -32768, 32767)
     return np.clip(rshift_round(p * gc, gs2), -128, 127).astype(np.int8)
+
+
+def split_lut16(table16):
+    """int16 table -> (hi, lo) byte tables with v == hi * 256 + lo, lo in [0, 255]."""
+    t = np.asarray(table16, np.int64)
+    return t >> 8, t & 255
