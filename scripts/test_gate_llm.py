@@ -395,9 +395,22 @@ def test_int8_kc_recompute_from_kc_matches_bf16_within_bounds_over_free_running_
          f"max={worst:.4f} mean={sum(rel_l2s) / len(rel_l2s):.4f}")
 
     # int8/group_size=head_dim round-trips at ~0.7-0.9% rel-L2 on raw data (sibling measurement).
-    # RoPE-inversion is a rotation (norm-preserving) and RMSNorm is scale-invariant, so this
-    # composition should not amplify that floor by an order of magnitude -- allow some headroom
-    # for the tiny fixture's small head_dim (4, not Gemma-4's 512) giving coarser groups.
+    # CORRECTED after review: "RoPE-inversion is norm-preserving + RMSNorm is scale-invariant" is
+    # NOT sufficient on its own -- the gain-divide sits between them, and dividing by a near-zero
+    # PER-CHANNEL gain would distort direction in exactly that channel, which RMSNorm's overall
+    # scale-invariance cannot undo (verified numerically: synthetic per-channel gain with
+    # min|gain|~0.05 pushes rel-L2 to ~19%, past this bound). This tiny fixture's own random
+    # k_norm.weight (seed 42) avoided that regime by luck, not by a general property of the math.
+    # What actually makes this safe: Gemma-4-12B's REAL k_norm weights are UNIFORM per layer, not
+    # per-channel-varying -- checked all 48 layers' real checkpoint tensors
+    # (/mnt/data/xdna/artifacts/gemma4-12b/weights_int4g32qat_hf/*.self_attn.k_norm.weight.npy):
+    # every layer's min/max/mean |w| agree to within ~1e-4 (global-layer min|w|=0.0605, layer 17,
+    # uniform across all 512 channels). A UNIFORM gain is an overall rescale, which RoPE-inversion
+    # and RMSNorm's scale-invariance genuinely do absorb -- confirmed by re-running this same
+    # composition with that real gain vector: max rel-L2 1.13% over 200 trials, matching this test's
+    # own measured range, not the danger-zone number above. If a future model variant's k_norm ever
+    # becomes meaningfully non-uniform, THIS reasoning (not the disproven "always safe" claim) is
+    # what must be re-checked before trusting int8 KV under kv_skip_v again.
     assert worst < 0.10, (
         f"int8 kc -> RoPE-inversion -> gain-divide -> RMSNorm amplified the raw ~0.8% round-trip "
         f"floor to {worst:.4f} rel-L2 -- report this, do not loosen the bound to hide it")
@@ -406,3 +419,33 @@ def test_int8_kc_recompute_from_kc_matches_bf16_within_bounds_over_free_running_
     assert gen_int8 == gen_bf16, (
         f"int8 kc flips a greedy token over free-running generation: bf16={gen_bf16} "
         f"int8={gen_int8} (margins bf16={margins_bf16} int8={margins_int8})")
+
+
+def test_int8_kc_amplifies_under_a_non_uniform_near_zero_gain(tmp_path):
+    """The test above passes because Gemma-4-12B's REAL k_norm weights are UNIFORM per layer
+    (verified against the real checkpoint -- see that test's comment). This test proves the 0.10
+    bound is a real detector, not dead code: a synthetic PER-CHANNEL-varying gain with one
+    near-zero channel pushes the SAME composition (int8 kc -> RoPE-inversion -> gain-divide ->
+    RMSNorm) well past the bound, confirming the danger scenario is real and would be caught if a
+    future checkpoint's k_norm ever stopped being uniform."""
+    import gate_llm_reference as glr
+
+    sp = _tiny_attention_k_eq_v_spec(qk_norm=True)
+    _write_tiny_weights(str(tmp_path), sp)
+    # Overwrite the random k_norm.weight with a deliberately non-uniform vector, one channel
+    # near zero -- the exact shape of gain that makes gain-divide direction-distorting instead of
+    # an overall rescale.
+    hd = sp.head_dim_for(0)
+    bad_gain = np.full(hd, 0.25, dtype=np.float32)
+    bad_gain[0] = 0.001
+    np.save(os.path.join(str(tmp_path), "model.layers.0.self_attn.k_norm.weight.npy"), bad_gain)
+
+    cap_bf16, cap_int8 = {}, {}
+    glr.run_numpy(sp, str(tmp_path), [0, 1], 6, 2, v_mode="recompute_from_kc", kv_dtype="bf16",
+                  capture_derived_v=cap_bf16)
+    glr.run_numpy(sp, str(tmp_path), [0, 1], 6, 2, v_mode="recompute_from_kc", kv_dtype="int8",
+                  capture_derived_v=cap_int8)
+    rel_l2s = [_rel_l2(cap_int8[l][p], cap_bf16[l][p]) for l in cap_bf16 for p in cap_bf16[l]]
+    assert max(rel_l2s) > 0.10, (
+        "expected the non-uniform near-zero-gain case to exceed the 0.10 bound the real-weight "
+        "test relies on -- if it doesn't, that bound is not actually detecting this failure mode")
