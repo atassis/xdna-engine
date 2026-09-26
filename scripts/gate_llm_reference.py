@@ -71,9 +71,23 @@ def topk(logits, k):
 # ------------------------------------------------------------------------------------------------
 # numpy backend: float32 arithmetic on the bf16 weights the device holds.
 # ------------------------------------------------------------------------------------------------
-def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k):
+def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k, v_mode="store_at_write"):
+    """`v_mode` governs WHEN attention_k_eq_v's gainless RMSNorm on V runs, not what it computes:
+
+      store_at_write     today's behaviour -- V is derived from the raw k projection and cached
+                          the moment K is written, same as every other spec's V.
+      recompute_at_read  V is never cached; the identical RMSNorm is applied to the cached raw k
+                          projection at the point attention CONSUMES it. Ablation for the planned
+                          V-slab removal from the KV cache -- must match store_at_write bit-for-bit,
+                          since it is the same arithmetic relocated, not a different computation.
+
+    Only layers with no v_proj (attention_k_eq_v) are affected; a layer with a real v_proj caches
+    its projected V regardless of v_mode, since there is no K it could be recomputed from.
+    """
     import ml_dtypes
     BF16 = ml_dtypes.bfloat16
+    if v_mode not in ("store_at_write", "recompute_at_read"):
+        raise ValueError(f"v_mode must be 'store_at_write' or 'recompute_at_read', got {v_mode!r}")
 
     # Refuse rather than approximate: an axis this reference does not know the shape of (a rope_type
     # other than the one Gemma-4 actually uses) is exactly the same-name-different-meaning trap the
@@ -213,30 +227,38 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k):
                 w[key] = cast_weight(w[key])
         return w
 
-    def layer_step(l, w, xi, pos, kc_l, vc_l):
+    def layer_step(l, w, xi, pos, kc_l, vc_l, vr_l=None):
         """Layer `l`'s attention+MLP block on residual `xi` at absolute position `pos`, against
         this layer's own KV cache slices. Same ops regardless of whether the caller is sweeping a
         batch of known positions or a single free-running one -- see the two call sites below."""
         hd, kvh = sp.head_dim_for(l), sp.n_kv_heads_for(l)
         grp, has_v, is_glob = sp.n_q_heads // kvh, sp.has_v_proj(l), sp.is_global(l)
         window = None if (sp.sliding_window is None or is_glob) else sp.sliding_window
+        derive_v_at_read = sp.v_norm and not has_v and v_mode == "recompute_at_read"
 
         h = rms(xi, w["n_in"])
         q, k_ = mm(w["Wq"], h), mm(w["Wk"], h)
         v = mm(w["Wv"], h) if has_v else None
+        v_raw = None
         if sp.v_norm:
             # attention_k_eq_v: v_norm reads the RAW k projection -- before qk-norm and RoPE,
             # which mutate q/k_ below -- and its output IS v; mirrors gen_llm_prefill.py's
             # ordering exactly (op_vn runs before qn_runs/op_kn in the emitted op list).
             src = k_ if not has_v else v
-            v = np.concatenate([rms(src.reshape(kvh, hd)[i]) for i in range(kvh)])
+            if derive_v_at_read:
+                v_raw = src  # cached raw; the RMSNorm itself runs at consumption, in the loop below
+            else:
+                v = np.concatenate([rms(src.reshape(kvh, hd)[i]) for i in range(kvh)])
         if sp.qk_norm:
             q = np.concatenate([rms(q.reshape(sp.n_q_heads, hd)[i], w["n_qn"])
                                 for i in range(sp.n_q_heads)])
             k_ = np.concatenate([rms(k_.reshape(kvh, hd)[i], w["n_kn"]) for i in range(kvh)])
         q, k_ = rope_for(l, q, pos), rope_for(l, k_, pos)
         kc_l[:, pos, :] = k_.reshape(kvh, hd)
-        vc_l[:, pos, :] = v.reshape(kvh, hd)
+        if derive_v_at_read:
+            vr_l[:, pos, :] = v_raw.reshape(kvh, hd)
+        else:
+            vc_l[:, pos, :] = v.reshape(kvh, hd)
         qh = q.reshape(sp.n_q_heads, hd)
         ctx = np.empty((sp.n_q_heads, hd), np.float32)
         lo = 0 if window is None else max(0, pos - window + 1)
@@ -244,7 +266,13 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k):
             kvi = hh // grp
             sc = (kc_l[kvi, lo:pos + 1] @ qh[hh]) * attn_scale
             sc = np.exp(sc - sc.max())
-            ctx[hh] = (sc / sc.sum()) @ vc_l[kvi, lo:pos + 1]
+            if derive_v_at_read:
+                # V never cached: the identical gainless RMSNorm from above runs here instead,
+                # at the point attention actually consumes V.
+                v_win = np.stack([rms(vr_l[kvi, p]) for p in range(lo, pos + 1)])
+            else:
+                v_win = vc_l[kvi, lo:pos + 1]
+            ctx[hh] = (sc / sc.sum()) @ v_win
         a_out = mm(w["Wo"], ctx.reshape(-1))
         if sp.sandwich_norms:
             a_out = rms(a_out, w["n_pa"])
@@ -258,7 +286,7 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k):
             xi = xi * w["ls"]
         return xi
 
-    def layer_step_batch(l, w, X, positions, kc_l, vc_l):
+    def layer_step_batch(l, w, X, positions, kc_l, vc_l, vr_l=None):
         """Batched form of layer_step(): `X` is (P, D) for a KNOWN batch of `positions`. Every
         projection and the MLP run as ONE GEMM across all P rows instead of P separate GEMVs --
         this is the actual fix for the cost mm() showed under profiling (80% of runtime, 21980
@@ -271,13 +299,18 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k):
         hd, kvh = sp.head_dim_for(l), sp.n_kv_heads_for(l)
         grp, has_v, is_glob = sp.n_q_heads // kvh, sp.has_v_proj(l), sp.is_global(l)
         window = None if (sp.sliding_window is None or is_glob) else sp.sliding_window
+        derive_v_at_read = sp.v_norm and not has_v and v_mode == "recompute_at_read"
 
         H = rms(X, w["n_in"])
         Q, K = mm_batch(w["Wq"], H), mm_batch(w["Wk"], H)
         V = mm_batch(w["Wv"], H) if has_v else None
+        V_raw = None
         if sp.v_norm:
             src = (K if not has_v else V).reshape(P_, kvh, hd)
-            V = np.stack([rms(src[:, i, :]) for i in range(kvh)], axis=1).reshape(P_, kvh * hd)
+            if derive_v_at_read:
+                V_raw = src  # cached raw; RMSNorm runs at consumption, in the per-position loop
+            else:
+                V = np.stack([rms(src[:, i, :]) for i in range(kvh)], axis=1).reshape(P_, kvh * hd)
         if sp.qk_norm:
             Qh = Q.reshape(P_, sp.n_q_heads, hd)
             Q = np.stack([rms(Qh[:, i, :], w["n_qn"]) for i in range(sp.n_q_heads)],
@@ -287,7 +320,10 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k):
                         axis=1).reshape(P_, kvh * hd)
         Q, K = rope_for_batch(l, Q, positions), rope_for_batch(l, K, positions)
         kc_l[:, positions, :] = K.reshape(P_, kvh, hd).transpose(1, 0, 2)
-        vc_l[:, positions, :] = V.reshape(P_, kvh, hd).transpose(1, 0, 2)
+        if derive_v_at_read:
+            vr_l[:, positions, :] = V_raw.transpose(1, 0, 2)
+        else:
+            vc_l[:, positions, :] = V.reshape(P_, kvh, hd).transpose(1, 0, 2)
         Qh = Q.reshape(P_, sp.n_q_heads, hd)
         Ctx = np.empty((P_, sp.n_q_heads, hd), np.float32)
         for i, pos in enumerate(positions):
@@ -296,7 +332,11 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k):
                 kvi = hh // grp
                 sc = (kc_l[kvi, lo:pos + 1] @ Qh[i, hh]) * attn_scale
                 sc = np.exp(sc - sc.max())
-                Ctx[i, hh] = (sc / sc.sum()) @ vc_l[kvi, lo:pos + 1]
+                if derive_v_at_read:
+                    v_win = np.stack([rms(vr_l[kvi, p]) for p in range(lo, pos + 1)])
+                else:
+                    v_win = vc_l[kvi, lo:pos + 1]
+                Ctx[i, hh] = (sc / sc.sum()) @ v_win
         A_out = mm_batch(w["Wo"], Ctx.reshape(P_, -1))
         if sp.sandwich_norms:
             A_out = rms(A_out, w["n_pa"])
@@ -314,6 +354,9 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k):
     S = P + n_tokens + 1
     kc = [np.zeros((sp.n_kv_heads_for(l), S, sp.head_dim_for(l)), np.float32) for l in range(NL)]
     vc = [np.zeros((sp.n_kv_heads_for(l), S, sp.head_dim_for(l)), np.float32) for l in range(NL)]
+    # Only allocated/written under v_mode="recompute_at_read": the raw (pre-qk-norm, pre-RoPE) k
+    # projection that attention_k_eq_v's V is derived from, cached in place of V itself.
+    vr = [np.zeros((sp.n_kv_heads_for(l), S, sp.head_dim_for(l)), np.float32) for l in range(NL)]
     scale = np.sqrt(D) if sp.embed_scale == "sqrt_d_model" else 1.0
     attn_scale = sp.attn_scale
 
@@ -326,7 +369,7 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k):
     x = embed_f32[np.asarray(prompt_ids)] * scale
     positions = np.arange(P)
     for l in range(NL):
-        x = layer_step_batch(l, materialized_layer_weights(l), x, positions, kc[l], vc[l])
+        x = layer_step_batch(l, materialized_layer_weights(l), x, positions, kc[l], vc[l], vr[l])
 
     lg = mm(embed_f32, rms(x[P - 1], n_final))     # tied lm head, only the transition position
     if sp.logit_softcap is not None:
@@ -343,7 +386,7 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k):
             break
         xi = embed_f32[tok] * scale
         for l in range(NL):
-            xi = layer_step(l, materialized_layer_weights(l), xi, pos, kc[l], vc[l])
+            xi = layer_step(l, materialized_layer_weights(l), xi, pos, kc[l], vc[l], vr[l])
         lg = mm(embed_f32, rms(xi, n_final))
         if sp.logit_softcap is not None:
             c = sp.logit_softcap

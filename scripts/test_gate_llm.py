@@ -249,3 +249,70 @@ def test_the_comparator_runs_as_a_command_and_reports_pass():
     r = subprocess.run([sys.executable, os.path.join(_HERE, "gate_token_set.py"),
                         "--ref", REF_PATH, "--npu", REF_PATH], capture_output=True, text=True)
     assert r.returncode == 0 and "*** PASS ***" in r.stdout
+
+
+# ------------------------------------------------------------------------------------------------
+# attention_k_eq_v ablation: the numpy oracle's v_mode axis. The upcoming V-cache removal moves
+# V's gainless RMSNorm from the point K is written to the point V is consumed -- same math, a
+# different WHEN. Prove the two orderings are bit-identical before anything downstream depends on it.
+# ------------------------------------------------------------------------------------------------
+def _tiny_attention_k_eq_v_spec():
+    """A one-layer, all-global spec exercising has_v_proj()==False (attention_k_eq_v): V has no
+    projection of its own and must be derived from the raw k_proj output via a gainless RMSNorm --
+    exactly the case the upcoming V-cache removal touches. Dims are the smallest that satisfy the
+    reshape/GQA arithmetic in run_numpy(), not gemma4-12b's real ones."""
+    from llm_decode_spec import LlmSpec
+    return LlmSpec(
+        name="tiny-k-eq-v", d_model=8, n_layers=1, n_q_heads=2, n_kv_heads=1, head_dim=4,
+        ffn=8, vocab=16, eps=1e-6, act="silu", norm_gain="w",
+        sandwich_norms=False, qk_norm=False, embed_scale="none",
+        rope_theta_global=10_000.0, rope_theta_local=None,
+        sliding_window=None, sw_pattern=None, query_pre_attn_scalar=None,
+        attn_scale_fixed=None, v_from_k_on_global=True, v_norm=True,
+        weight_prefix="model.",
+    )
+
+
+def _write_tiny_weights(weights_dir, sp):
+    """Random (but deterministic) .npy weight tensors matching sp's shapes, for run_numpy() to load."""
+    rng = np.random.default_rng(42)
+
+    def save(name, shape):
+        np.save(os.path.join(weights_dir, f"{name}.npy"),
+                rng.standard_normal(shape).astype(np.float32))
+
+    save(f"{sp.weight_prefix}embed_tokens.weight", (sp.vocab, sp.d_model))
+    save(f"{sp.weight_prefix}norm.weight", (sp.d_model,))
+    for l in range(sp.n_layers):
+        p = f"{sp.weight_prefix}layers.{l}."
+        save(p + "input_layernorm.weight", (sp.d_model,))
+        save(p + "post_attention_layernorm.weight", (sp.d_model,))
+        save(p + "self_attn.q_proj.weight", (sp.q_dim, sp.d_model))
+        save(p + "self_attn.k_proj.weight", (sp.kv_dim, sp.d_model))
+        assert not sp.has_v_proj(l), "this fixture only covers the no-v_proj (attention_k_eq_v) case"
+        save(p + "self_attn.o_proj.weight", (sp.d_model, sp.q_dim))
+        save(p + "mlp.gate_proj.weight", (sp.ffn, sp.d_model))
+        save(p + "mlp.up_proj.weight", (sp.ffn, sp.d_model))
+        save(p + "mlp.down_proj.weight", (sp.d_model, sp.ffn))
+
+
+def test_v_skip_oracle_matches_stored_v_oracle_on_global_layer(tmp_path):
+    """attention_k_eq_v: computing V's gainless RMSNorm at the point V is CONSUMED (the attention
+    weighted sum) must give the bit-identical numpy result to today's compute-once-at-K-write
+    oracle -- it's the same RMSNorm call over the same raw k projection, only relocated."""
+    import gate_llm_reference as glr
+
+    sp = _tiny_attention_k_eq_v_spec()
+    _write_tiny_weights(str(tmp_path), sp)
+    prompt_ids, n_tokens, k = [0, 1], 3, 2
+
+    stored = glr.run_numpy(sp, str(tmp_path), prompt_ids, n_tokens, k, v_mode="store_at_write")
+    recomputed = glr.run_numpy(sp, str(tmp_path), prompt_ids, n_tokens, k, v_mode="recompute_at_read")
+
+    gen_s, tops_s, margins_s = stored
+    gen_r, tops_r, margins_r = recomputed
+    assert gen_s == gen_r
+    assert margins_s == margins_r
+    for (ids_s, vals_s), (ids_r, vals_r) in zip(tops_s, tops_r):
+        assert ids_s == ids_r
+        np.testing.assert_array_equal(vals_s, vals_r)
