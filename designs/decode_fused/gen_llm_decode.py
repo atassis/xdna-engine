@@ -2686,7 +2686,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             # angle depends on position and theta, not on layer), appended on-chip at the SAME
             # `slot` kv_off already addresses this geometry's kc/vc -- the shape is (1, hd), not
             # (hkv, hd), because one angle row covers every kv head.
-            ang_table = f"ang_cache{gi}"
+            ang_table = f"ang_table{gi}"
             _ang_kvl = KVLayout(Hkv=1, S=KVA_g, HD=hd, T=T_g)
             op_scang = StridedCopy(
                 input_sizes=(1, hd), input_strides=(hd, 1), input_offset=0,
@@ -3037,9 +3037,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     op_head = gemv(VOCAB, D, ctx, **head_quant_kw, **_w_prologue("on"))
 
     weights, bufsz, cache_names, rl = {}, {}, [], []
-    # Geometries (by ang_table name) whose ang-cache append has already been placed in THIS
-    # token's runlist -- the table is per-geometry (attn_ops memoizes g), so re-appending it on
-    # every layer that shares the geometry would repeat identical work N times per token.
+    # Per-token, per-geometry dedup for ang_table's append -- see its construction site, above.
     ang_appended = set()
     recurrent_names = []   # the cache buffers a position mask cannot hide; see npu_decode.rs reset()
     if sp.v_norm:
@@ -3362,9 +3360,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 weights[p + "vc"] = np.zeros(_kvl.total_elems, BF16)
                 cache_names.append(p + "vc")
             ang = "rope_global" if sp.is_global(l) else "rope_local"
-            # Shared per GEOMETRY (attn_ops memoizes g), not per layer -- declare it the first
-            # time this geometry's ang_table is seen, or every layer sharing it would claim its
-            # own capacity*HD buffer for a value that never differs across them.
+            # Declared once per geometry -- see ang_table's construction site, above.
             if g.ang_table is not None and g.ang_table not in weights:
                 _ang_kvl = KVLayout(Hkv=1, S=g.capacity, HD=g.hd, T=g.kv_block)
                 weights[g.ang_table] = np.zeros(_ang_kvl.total_elems, BF16)
@@ -3565,12 +3561,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                     # append (`head`, above) stay exactly as they are -- only the scores/softmax/
                     # context chain is replaced, by one design.
                     #
-                    # `n_kn`/`ang_table`: consumed under kv_skip_v only (V = RoPE_inverse(kc, ang)
-                    # / n_kn, undoing the qk-norm gain and RoPE already baked into `kc`), but
-                    # get_arg_spec() declares both unconditionally, so every flash geometry passes
-                    # a real capacity-sized `ang_table`, not the single-row `ang`. The append (one
-                    # StridedCopy per DISTINCT geometry, not per layer) has to run before this op
-                    # reads the table, so it goes first.
+                    # `n_kn`/`ang_table`: see ang_table's construction site, above, for why every
+                    # flash geometry needs the append -- it must run before this op reads the table.
                     ang_step = ([(g.op_scang, ang, g.ang_table)]
                                 if g.ang_table not in ang_appended else [])
                     ang_appended.add(g.ang_table)
