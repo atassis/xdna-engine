@@ -20,6 +20,7 @@ Run inside the IRON env:
 import dataclasses
 import os
 
+import numpy as np
 import pytest
 
 gen = pytest.importorskip("gen_llm_decode")
@@ -188,10 +189,10 @@ def test_kv_skip_v_drops_vnorm_for_has_v_false_layer(monkeypatch):
     assert layer_has_vnorm(0), "has_v=True layer lost its (expected, in-place) vnorm too"
 
 
-def test_attn_global_flash_gets_a_capacity_sized_angle_table_and_kv_skip_v_flag(monkeypatch):
-    """Task 1.5: op.py's `AttnGlobalFlash.get_arg_spec` declares the `ang` argument at
-    capacity*HD, but the caller used to hand it the single-row rope_global/rope_local buffer
-    (HD wide) instead, and nothing threaded `kv_skip_v` through to the operator at all.
+def test_attn_global_flash_gets_a_resident_rope_f_constant_and_kv_skip_v_flag(monkeypatch):
+    """op.py's `AttnGlobalFlash.get_arg_spec` declares `rope_f` at HD (the on-chip inverse-RoPE
+    constant, not the old capacity-sized angle table), and `kv_skip_v` must thread through to the
+    operator.
 
     Setting global_head_dim/global_n_kv_heads to gemma3-270m's own uniform (head_dim, n_kv_heads)
     makes EVERY layer's geometry "the global one" (attn_global_flash_why's is_global_geom check),
@@ -209,7 +210,7 @@ def test_attn_global_flash_gets_a_capacity_sized_angle_table_and_kv_skip_v_flag(
         global_head_dim=base.head_dim, global_n_kv_heads=base.n_kv_heads)
     monkeypatch.setitem(gen.SPECS, flash_spec.name, flash_spec)
 
-    sp, fused, _w, md = gen.build_graph(flash_spec.name, WEIGHTS, LAYERS, 2048)
+    sp, fused, w, md = gen.build_graph(flash_spec.name, WEIGHTS, LAYERS, 2048)
     assert not sp.has_v_proj(LAYERS - 1), "fixture no longer produces a has_v=False layer"
 
     all_flash_entries = [e for e in fused.runlist if type(e[0]).__name__ == "AttnGlobalFlash"]
@@ -225,10 +226,12 @@ def test_attn_global_flash_gets_a_capacity_sized_angle_table_and_kv_skip_v_flag(
     skip_flags = sorted(e[0].kv_skip_v for e in flash_entries)
     assert skip_flags == [False, True], "only the has_v=False geometry should set kv_skip_v"
 
-    capacity = 2048  # max_seq passed to build_graph; the global geometry is unwindowed
-    for op, ref_q, n_kn, ang_buf, kc, vc, cx in flash_entries:
-        assert ang_buf not in ("rope_global", "rope_local"), \
-            "AttnGlobalFlash must not read the single-row angle buffer directly"
-        assert fused.declared_sizes[ang_buf] == capacity * op.HD * 2, \
-            f"{ang_buf} must be sized capacity*HD, matching get_arg_spec's `ang` entry"
-        assert ang_buf in md["cache_names"], "the angle table is a persistent cache, not a weight"
+    partial = sp.rope_partial_rotary if sp.rope_type_global == "proportional" else None
+    for op, ref_q, n_kn, rope_f, kc, vc, cx in flash_entries:
+        assert rope_f not in ("rope_global", "rope_local"), \
+            "AttnGlobalFlash must not read the single-row forward-RoPE angle buffer directly"
+        assert rope_f not in md["cache_names"], "rope_f is a resident constant, not a cache buffer"
+        assert fused.declared_sizes.get(rope_f) is None, \
+            "rope_f needs no explicit bufsz: get_arg_spec's own HD entry sizes it"
+        expected = gen.rope_f_for_geometry(op.HD, sp.rope_theta_global, partial)
+        np.testing.assert_array_equal(w[rope_f].view(np.uint32), expected.view(np.uint32))

@@ -40,10 +40,13 @@ import numpy as np
 import ml_dtypes
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, os.pardir,
+                                "scripts"))
 from buffer_blob import write_blob  # noqa: E402
 from elf_zst import write_elf  # noqa: E402
 from llm_decode_spec import (SPECS, C_TILE_GRANULE, L1_BYTES, L1_RESERVE,  # noqa: E402,F401
                              gemv_fits, gemv_tile_output, k_chunks_for, operator_rejects)
+from rope_int_phase import inv_freq_to_turns_u32  # noqa: E402
 
 # Dataflow switches, read ONCE at module scope. They are consumed in three different functions
 # (graph construction, the runlist, and the meta writer), and defining them next to their first
@@ -891,6 +894,20 @@ def _attn_global_flash_why(sp, g):
             "needs FUSE_QKV_GEMV=1 for the concatenated qkv buffer ref_q slices"
             if not FUSE_QKV_GEMV else
             None)
+
+
+def rope_f_for_geometry(hd, theta, partial):
+    """Resident RoPE turn-frequency constant for AttnGlobalFlash's on-chip inverse rotation
+    (kv_skip_v): the SAME inv_freq the forward RoPE uses (verify_llm_decode.py's `rope_row`,
+    rust/npu-engine/src/llm/npu_decode.rs::rope_row), converted to the uint32 0.32 turn fraction
+    `taccum_rows_kv_skip_v_bf16_f32` expects -- HD/2 values, byte-reinterpreted into an
+    HD-element bf16 buffer (get_arg_spec's declared size).
+    """
+    half = hd // 2
+    inv = 1.0 / (theta ** (np.arange(0, hd, 2, dtype=np.float64)[:half] / hd))
+    if partial is not None:
+        inv[int(partial * hd // 2):] = 0.0
+    return inv_freq_to_turns_u32(inv).astype(np.uint32).view(BF16)
 
 
 def flash_name_token(fused, hpc, rpe=1):
@@ -2653,8 +2670,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # head_stride (iron/common/kv_layout.py), so the blocked layout is flat's position-major
         # order for any T; hkv>1 interleaves heads per block and is out of scope, as for A_g.
         op_attn_global_flash = None
-        ang_table = None
-        op_scang = None
+        rope_f = None
         if attn_global_flash_why[(hd, hkv, has_v)] is None:
             if T_g != KVA_g and hkv != 1:
                 raise NotImplementedError(
@@ -2679,21 +2695,13 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 "columns": op_attn_global_flash.num_aie_columns,
                 "capacity": KVA_g,
             })
-            # get_arg_spec() declares `ang` at capacity*HD regardless of kv_skip_v (design.py's own
+            # get_arg_spec() declares `rope_f` at HD regardless of kv_skip_v (design.py's own
             # docstring: "always part of the signature ... only tapped and consumed when kv_skip_v
             # is set") -- so every flash geometry needs this buffer, not only a kv_skip_v one, or
-            # the arg spec and the runlist buffer disagree in size. One table per geometry (RoPE's
-            # angle depends on position and theta, not on layer), appended on-chip at the SAME
-            # `slot` kv_off already addresses this geometry's kc/vc -- the shape is (1, hd), not
-            # (hkv, hd), because one angle row covers every kv head.
-            ang_table = f"ang_table{gi}"
-            _ang_kvl = KVLayout(Hkv=1, S=KVA_g, HD=hd, T=T_g)
-            op_scang = StridedCopy(
-                input_sizes=(1, hd), input_strides=(hd, 1), input_offset=0,
-                output_sizes=(1, 1, hd), output_offset=0,
-                output_strides=(0, _ang_kvl.head_stride, 1),
-                input_buffer_size=hd, output_buffer_size=_ang_kvl.total_elems,
-                num_aie_channels=1, output_offset_parameter=slot, context=ctx)
+            # the arg spec and the runlist buffer disagree in size. One resident constant per
+            # geometry (RoPE's frequency depends on hd/theta, not on layer or position); the
+            # kernel derives cos/sin on chip from the row's own cache position.
+            rope_f = f"rope_f{gi}"
         g = SimpleNamespace(
             hd=hd, hkv=hkv, qd=qd, kvd=kvd, gqa=gqa, kv_slot=slot, o_chunks=o_chunks,
             op_qk_norm=op_qk_norm, op_qk_norm_b=op_qk_norm_b, qkn=_qkn, op_qkv=op_qkv, op_q=op_q,
@@ -2704,7 +2712,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             uses_tmv_ctx=uses_tmv, scores_groups=scores_groups, scores_block=T_k,
             op_softmax=op_softmax, op_scale=op_scale, mask_slot=mask_slot, window=w,
             capacity=KVA_g, kv_block=T_g, op_attn_weightless=op_attn_weightless,
-            op_attn_global_flash=op_attn_global_flash, ang_table=ang_table, op_scang=op_scang,
+            op_attn_global_flash=op_attn_global_flash, rope_f=rope_f,
             op_attn_block=op_attn_block, circular=(w != S))
         _attn_cache[(hd, hkv, has_v)] = g
         return g
@@ -3037,8 +3045,6 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     op_head = gemv(VOCAB, D, ctx, **head_quant_kw, **_w_prologue("on"))
 
     weights, bufsz, cache_names, rl = {}, {}, [], []
-    # Per-token, per-geometry dedup for ang_table's append -- see its construction site, above.
-    ang_appended = set()
     recurrent_names = []   # the cache buffers a position mask cannot hide; see npu_decode.rs reset()
     if sp.v_norm:
         # The gainless v-norm's gain, one per head_dim and shared by EVERY layer -- a true constant,
@@ -3360,12 +3366,13 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 weights[p + "vc"] = np.zeros(_kvl.total_elems, BF16)
                 cache_names.append(p + "vc")
             ang = "rope_global" if sp.is_global(l) else "rope_local"
-            # Declared once per geometry -- see ang_table's construction site, above.
-            if g.ang_table is not None and g.ang_table not in weights:
-                _ang_kvl = KVLayout(Hkv=1, S=g.capacity, HD=g.hd, T=g.kv_block)
-                weights[g.ang_table] = np.zeros(_ang_kvl.total_elems, BF16)
-                bufsz[g.ang_table] = _ang_kvl.total_elems * 2
-                cache_names.append(g.ang_table)
+            # Declared once per geometry -- see rope_f's construction site, above. AttnGlobalFlash
+            # only ever claims the GLOBAL geometry (_attn_global_flash_why), so the global theta/
+            # partial-rotary axes are always the right ones here regardless of layer index.
+            if g.rope_f is not None and g.rope_f not in weights:
+                partial = (sp.rope_partial_rotary if sp.rope_type_global == "proportional"
+                          else None)
+                weights[g.rope_f] = rope_f_for_geometry(g.hd, sp.rope_theta_global, partial)
 
             # q/k/v are byte slices of ONE `qkv` buffer in the fused arm -- op_qkv writes all three in
             # one pass, and q|k adjacency is what lets a single RoPE cover both. Declared with an
@@ -3561,13 +3568,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                     # append (`head`, above) stay exactly as they are -- only the scores/softmax/
                     # context chain is replaced, by one design.
                     #
-                    # `n_kn`/`ang_table`: see ang_table's construction site, above, for why every
-                    # flash geometry needs the append -- it must run before this op reads the table.
-                    ang_step = ([(g.op_scang, ang, g.ang_table)]
-                                if g.ang_table not in ang_appended else [])
-                    ang_appended.add(g.ang_table)
-                    attn_rl = [*head, *ang_step,
-                               (g.op_attn_global_flash, ref_q, p + "n_kn", g.ang_table,
+                    attn_rl = [*head,
+                               (g.op_attn_global_flash, ref_q, p + "n_kn", g.rope_f,
                                 p + "kc", p + "vc", p + "cx")]
                 else:
                     attn_rl = [
