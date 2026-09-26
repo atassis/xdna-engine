@@ -2511,12 +2511,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # The FIRST geometry keeps the bare name "kv_off": it is baked into the design, and the
         # host's pre-list fallback reads that spelling.
         slot = "kv_off" if not kv_slots else f"kv_off{len(kv_slots)}"
-        # KV_SKIP_V: an attention_k_eq_v geometry (sp.v_norm and not has_v -- no v_proj, V is
-        # derived from K) gets no V-cache slot under the flag; recorded here, not re-derived from
-        # `has_v` at every kv_slots reader, since `has_v` alone (pre-existing, means "no v_proj")
-        # is not the same condition as "this build writes no V cache" (default is still to cache
-        # the derived V; see KV_SKIP_V's own comment).
-        kv_slot_has_v = not (KV_SKIP_V and sp.v_norm and not has_v)
+        # Recorded here, not re-derived from `has_v` at every kv_slots reader -- see KV_SKIP_V's
+        # own comment for the condition.
+        kv_slot_has_v = has_v or not (KV_SKIP_V and sp.v_norm)
         kv_slots.append((slot, hd, kv_slot_has_v))
         # CAPACITY, not window -- the host wraps `pos % capacity` and reads the cache at
         # `kv_block`, and under KV_ALLOC a global geometry's capacity exceeds its window while a
