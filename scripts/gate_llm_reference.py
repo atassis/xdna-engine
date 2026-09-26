@@ -111,8 +111,8 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k, v_mode="store_at_write",
     guarded by `derive_v_from_kc`) -- never forward Q/K RoPE, which the real device always applies
     from the host's float64->bf16 cos/sin LUT. This mirrors the actual kernel split: forward RoPE
     stays the existing LUT, only kv_skip_v's on-chip inverse rotation is a candidate for an
-    on-chip poly (see scripts/measure_rope_poly.py, scheme "int_phase" -- chosen scheme, reused
-    here as the reference oracle for that mechanism).
+    on-chip poly (scripts/rope_int_phase.py's int_phase -- chosen scheme, see
+    scripts/measure_rope_poly.py for why; reused here as the reference oracle for that mechanism).
 
     `capture_forward_k`, if given a dict, is filled `{layer: {position: [kv_heads, head_dim]}}`
     with the post-forward-RoPE K row at write time (before any kv_dtype quantization) -- proof
@@ -120,7 +120,7 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k, v_mode="store_at_write",
     a "poly" run.
     """
     import ml_dtypes
-    import measure_rope_poly as rp
+    import rope_int_phase as rp
     BF16 = ml_dtypes.bfloat16
     if v_mode not in ("store_at_write", "recompute_at_read", "recompute_from_kc"):
         raise ValueError(f"v_mode must be 'store_at_write', 'recompute_at_read' or "
@@ -207,7 +207,7 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k, v_mode="store_at_write",
         rule exactly (same derivation, one position instead of a row per chunk).
 
         `poly=True` replaces exact float64 cos/sin with the chosen on-chip scheme (int_phase,
-        measure_rope_poly.py): F = round(inv/2pi * 2**32) per component, phase = (pos*F) mod
+        scripts/rope_int_phase.py): F = round(inv/2pi * 2**32) per component, phase = (pos*F) mod
         2**32 via 64-bit reinterpretation of `pos` (correct for the negative `pos` an inversion
         call passes -- two's-complement wraparound mod 2**32 gives the same residue as `-pos`
         wrapped, which is what an on-chip accumulator would produce)."""

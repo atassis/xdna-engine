@@ -32,13 +32,20 @@ p_max * 2**-33 turns * 2*pi rad/turn ~= 1.92e-4 rad -- matches the measured 1.90
 double-single scheme and no multi-limb reduction arithmetic -- the right tradeoff for an on-chip
 kernel with no fp64.
 
+The chosen scheme itself (inv_freq_to_turns_u32, phase_cs) lives in scripts/rope_int_phase.py, not
+here, so the production oracle (gate_llm_reference.py) never has to import this exploration
+script -- this module imports it back for scheme_int_phase below and the losing-scheme comparison.
+
 Run: .venv-iron/bin/python scripts/measure_rope_poly.py
 """
 import numpy as np
 import ml_dtypes
 
+from rope_int_phase import (  # noqa: E402 -- chosen scheme lives there; see its module docstring
+    TWO_PI, U32_MASK, poly_sincos, inv_freq_to_turns_u32, phase_cs,
+)
+
 BF16 = ml_dtypes.bfloat16
-TWO_PI = 2.0 * np.pi
 PI_OVER_2 = np.pi / 2.0
 
 # bf16 gate: this repo's own convention (scripts/gate_numeric.py) is one bf16 quantum, 2**-8, at
@@ -89,15 +96,6 @@ for _ in range(4):
     CW_LIMBS.append(lim)
     _rem -= np.float64(lim)
 CW_LIMBS = np.array(CW_LIMBS, dtype=np.float32)
-
-
-def poly_sincos(y):
-    """Degree-9/8 Taylor for sin/cos on |y|<=pi/4 -- ~1e-9 there, negligible next to the reduction
-    error this script is measuring."""
-    y2 = y * y
-    sin_y = y * (1.0 + y2 * (-1.0 / 6 + y2 * (1.0 / 120 + y2 * (-1.0 / 5040))))
-    cos_y = 1.0 + y2 * (-1.0 / 2 + y2 * (1.0 / 24 + y2 * (-1.0 / 720 + y2 * (1.0 / 40320))))
-    return sin_y.astype(np.float32), cos_y.astype(np.float32)
 
 
 def quadrant_select(k, sin_y, cos_y):
@@ -200,36 +198,16 @@ def scheme_twoprod_codywaite_ds_inv(pos_f32, inv_hi, inv_lo, nlimbs=3):
     return quadrant_select(k2, sin_y, cos_y)
 
 
+# int_phase (the chosen scheme, see rope_int_phase.py) isn't in SCHEMES: every entry there takes
+# (pos_f32, inv_f32) so measure() can sweep the same fp32/bf16 inv_freq-precision axis over all of
+# them, but int_phase's resident constant is a uint32 turn fraction, not an fp32 inv_freq -- a
+# different signature -- so measure() calls it separately, once per (geometry, position grid).
 SCHEMES = {
     "naive_fp32": scheme_naive_fp32,
     "codywaite2_fp32": lambda p, i: scheme_codywaite_fp32(p, i, nlimbs=2),
     "codywaite3_fp32": lambda p, i: scheme_codywaite_fp32(p, i, nlimbs=3),
     "twoprod_codywaite3": lambda p, i: scheme_twoprod_codywaite(p, i, nlimbs=3),
 }
-
-U32_MASK = np.uint64(0xFFFFFFFF)
-
-
-def inv_freq_to_turns_u32(inv64):
-    """Chosen resident constant: inv_freq (rad/position, float64) -> uint32 0.32 fixed-point
-    turn fraction. inv_freq <= 1 (theta >= 1, exponent in [0,1)) so the turn fraction is < 1 and
-    fits without an integer part."""
-    return (np.round(np.asarray(inv64, np.float64) / TWO_PI * (2.0 ** 32)).astype(np.uint64)
-            & U32_MASK)
-
-
-def phase_cs(ph_u32):
-    """Chosen reduction: ph (uint32 turns*2**32) -> (sin, cos), float32. Quadrant + residual are
-    both exact integer ops (no reduction rounding); only the final residual->radian scale and the
-    poly are float32."""
-    t = (ph_u32.astype(np.uint64) + np.uint64(1 << 29)) & U32_MASK
-    q = (t >> np.uint64(30)).astype(np.int64)
-    r = (t & np.uint64((1 << 30) - 1)).astype(np.int64) - (1 << 29)
-    y = r.astype(np.float32) * np.float32(np.pi / 2 / 2 ** 30)
-    sin_y, cos_y = poly_sincos(y)
-    sin_r = np.select([q == 0, q == 1, q == 2, q == 3], [sin_y, cos_y, -sin_y, -cos_y])
-    cos_r = np.select([q == 0, q == 1, q == 2, q == 3], [cos_y, -sin_y, -cos_y, sin_y])
-    return sin_r.astype(np.float32), cos_r.astype(np.float32)
 
 
 def scheme_int_phase(pos_u32, F_u32):

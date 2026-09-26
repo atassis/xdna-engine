@@ -454,20 +454,21 @@ def test_int8_kc_amplifies_under_a_non_uniform_near_zero_gain(tmp_path):
 
 # ------------------------------------------------------------------------------------------------
 # rope_impl="poly" (Task 2 of the kv_skip_v plan): the device forms V by inverting K's RoPE
-# rotation on-chip, and the chosen scheme is the int_phase polynomial (measure_rope_poly.py) --
-# not host float64 cos/sin. `rope_impl` swaps that in ONLY for recompute_from_kc's inverse-rotation
-# call (see gate_llm_reference.run_numpy's docstring); forward Q/K RoPE stays exact, matching the
+# rotation on-chip, and the chosen scheme is int_phase (scripts/rope_int_phase.py) -- not host
+# float64 cos/sin. `rope_impl` swaps that in ONLY for recompute_from_kc's inverse-rotation call
+# (see gate_llm_reference.run_numpy's docstring); forward Q/K RoPE stays exact, matching the
 # device (which always uses the host LUT there). Two tests: the tiny fixture's small positions
 # cannot exercise the large-p regime the poly's error bound was measured against, so that regime
 # gets its own unit test of phase_cs() directly, at Gemma-4's real geometries and p up to 262144.
 # ------------------------------------------------------------------------------------------------
 def test_int_phase_matches_exact_cos_sin_at_gemma4_geometries_and_large_positions():
-    """Unit-level check of the chosen on-chip scheme itself (measure_rope_poly.phase_cs), at the
+    """Unit-level check of the chosen on-chip scheme itself (rope_int_phase.phase_cs), at the
     two Gemma-4-12B RoPE geometries and positions up to 262144 -- the regime
     measure_rope_poly.py measured max|dcos|=1.908e-4, max|dsin|=1.907e-4 over. Bound is 3e-4, ~1.6x
     that measurement (headroom for a handful of positions this test picks rather than the
     exhaustive sweep, not a re-tuned pass) and still ~20x tighter than the 5.86e-3 bf16 gate."""
-    import measure_rope_poly as rp
+    import measure_rope_poly as mrp
+    import rope_int_phase as rp
 
     BOUND = 3e-4
     geoms = [
@@ -476,7 +477,7 @@ def test_int_phase_matches_exact_cos_sin_at_gemma4_geometries_and_large_position
     ]
     positions = np.array([0, 1, 17, 4096, 131_072, 262_144 - 1, 262_144], dtype=np.int64)
     for label, hd, theta, partial in geoms:
-        inv = rp.rope_inv_freq(hd, theta, partial)
+        inv = mrp.rope_inv_freq(hd, theta, partial)
         inv = inv[inv != 0.0]
         F = rp.inv_freq_to_turns_u32(inv)
         for p in positions:
