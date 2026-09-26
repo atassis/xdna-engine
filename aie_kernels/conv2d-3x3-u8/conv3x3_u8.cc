@@ -16,7 +16,7 @@
 //                     laid out like out) and att = table[c + 128]:
 //                       sum = sat8((c*ga + x*gb) >> gs1)
 //                       out = sat8((sat16(sum*att) * gc) >> gs2)
-//                     xrow is consumed: the sum is parked in it.
+//                     xrow's contents are not preserved past the call.
 // >> rounds half up, the conv's own requant rounding.
 //
 // Rows are channel-blocked and padded by one 8-pixel block of zeros on each
@@ -191,20 +191,21 @@ conv3x3_core(const PA *__restrict line0, const PA *__restrict line1,
 #endif
     } else { // GATE
 #ifdef CONV3X3_LUT_INC
-      // Three passes through memory. A single pass (one load feeding both
-      // fetch() and the sum) has not been re-tested since the lookup-object fix.
+      // One pass: each 16-lane group of c feeds both the sum and the table
+      // fetch from registers.
       aie::store_v(dst, rq(acc, m).template to_vector<int8>(shift));
+      const aie::lut<4, bfloat16> t(256, (const bfloat16 *)kLutAb,
+                                    (const bfloat16 *)kLutCd);
+      Look look(t, 0, 128);
       PO *xp = const_cast<PO *>(xrow) + (dst - out);
       for (int g = 0; g < LANES; g += 16) {
-        aie::accum<acc32, 16> a = aie::mul(aie::load_v<16>(dst + g), (int8)ga);
-        a = aie::mac(a, aie::load_v<16>(xp + g), (int8)gb);
-        aie::store_v(xp + g, a.template to_vector<int8>(gs1));
-      }
-      apply_lut_inplace(reinterpret_cast<int8_t *>(dst), LANES);
-      for (int g = 0; g < LANES; g += 16) {
-        aie::vector<int16, 16> p16 =
-            aie::mul(aie::load_v<16>(xp + g), aie::load_v<16>(dst + g))
-                .template to_vector<int16>(0);
+        aie::vector<int8, 16> c = aie::load_v<16>(dst + g);
+        aie::vector<int8, 16> x = aie::load_v<16>(xp + g);
+        aie::accum<acc32, 16> a = aie::mul(c, (int8)ga);
+        a = aie::mac(a, x, (int8)gb);
+        aie::vector<int8, 16> s = a.template to_vector<int8>(gs1);
+        aie::vector<int8, 16> att = aie::to_fixed<int8>(look.fetch(c), 0);
+        aie::vector<int16, 16> p16 = aie::mul(s, att).template to_vector<int16>(0);
         aie::store_v(dst + g,
                      aie::mul(p16, (int16)gc).template to_vector<int8>(gs2));
       }
