@@ -186,3 +186,49 @@ def test_kv_skip_v_drops_vnorm_for_has_v_false_layer(monkeypatch):
 
     assert not layer_has_vnorm(LAYERS - 1), "vnorm construction still present under KV_SKIP_V=1"
     assert layer_has_vnorm(0), "has_v=True layer lost its (expected, in-place) vnorm too"
+
+
+def test_attn_global_flash_gets_a_capacity_sized_angle_table_and_kv_skip_v_flag(monkeypatch):
+    """Task 1.5: op.py's `AttnGlobalFlash.get_arg_spec` declares the `ang` argument at
+    capacity*HD, but the caller used to hand it the single-row rope_global/rope_local buffer
+    (HD wide) instead, and nothing threaded `kv_skip_v` through to the operator at all.
+
+    Setting global_head_dim/global_n_kv_heads to gemma3-270m's own uniform (head_dim, n_kv_heads)
+    makes EVERY layer's geometry "the global one" (attn_global_flash_why's is_global_geom check),
+    so the has_v=True layers and the has_v=False layer (same v_from_k_on_global fixture as the
+    kv_skip_v vnorm test above) land in two distinct (hd, hkv, has_v) geometries and each gets its
+    own AttnGlobalFlash -- the has_v=False one is attention_k_eq_v, the arm kv_skip_v targets.
+    """
+    monkeypatch.setattr(gen, "OperatorSequence", _StubSeq)
+    monkeypatch.setattr(gen, "DECODE_SEGMENTS", 1)
+    monkeypatch.setattr(gen, "KV_SKIP_V", True)
+    monkeypatch.setattr(gen, "FUSE_ATTN_GLOBAL_FLASH", True)
+    base = gen.SPECS[SPEC]
+    flash_spec = dataclasses.replace(
+        base, name="gemma3-270m-flash", v_from_k_on_global=True, v_norm=True,
+        global_head_dim=base.head_dim, global_n_kv_heads=base.n_kv_heads)
+    monkeypatch.setitem(gen.SPECS, flash_spec.name, flash_spec)
+
+    sp, fused, _w, md = gen.build_graph(flash_spec.name, WEIGHTS, LAYERS, 2048)
+    assert not sp.has_v_proj(LAYERS - 1), "fixture no longer produces a has_v=False layer"
+
+    all_flash_entries = [e for e in fused.runlist if type(e[0]).__name__ == "AttnGlobalFlash"]
+    # attn_ops() memoizes per (hd, hkv, has_v), so every layer sharing a geometry reuses the
+    # SAME op object -- dedupe by identity to get one entry per DISTINCT geometry.
+    seen, flash_entries = set(), []
+    for e in all_flash_entries:
+        if id(e[0]) not in seen:
+            seen.add(id(e[0]))
+            flash_entries.append(e)
+    assert len(flash_entries) == 2, "expected one AttnGlobalFlash per (has_v) geometry"
+
+    skip_flags = sorted(e[0].kv_skip_v for e in flash_entries)
+    assert skip_flags == [False, True], "only the has_v=False geometry should set kv_skip_v"
+
+    capacity = 2048  # max_seq passed to build_graph; the global geometry is unwindowed
+    for op, ref_q, n_kn, ang_buf, kc, vc, cx in flash_entries:
+        assert ang_buf not in ("rope_global", "rope_local"), \
+            "AttnGlobalFlash must not read the single-row angle buffer directly"
+        assert fused.declared_sizes[ang_buf] == capacity * op.HD * 2, \
+            f"{ang_buf} must be sized capacity*HD, matching get_arg_spec's `ang` entry"
+        assert ang_buf in md["cache_names"], "the angle table is a persistent cache, not a weight"

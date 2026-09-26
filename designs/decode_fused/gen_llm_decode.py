@@ -2653,6 +2653,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # head_stride (iron/common/kv_layout.py), so the blocked layout is flat's position-major
         # order for any T; hkv>1 interleaves heads per block and is out of scope, as for A_g.
         op_attn_global_flash = None
+        ang_table = None
+        op_scang = None
         if attn_global_flash_why[(hd, hkv, has_v)] is None:
             if T_g != KVA_g and hkv != 1:
                 raise NotImplementedError(
@@ -2662,9 +2664,11 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 )
             from iron.operators.attn_global_dp.op import AttnGlobalFlash
             gi = len(flash_slots)
+            # kv_skip_v (attention_k_eq_v): V has no cache -- exactly the geometries kv_slots
+            # already marks `not kv_slot_has_v` for (KV_SKIP_V's own condition, above).
             op_attn_global_flash = AttnGlobalFlash(
                 HD=hd, Hq=Hq, capacity=KVA_g, heads_per_core=GLOBAL_FLASH_HPC,
-                rows_per_element=GLOBAL_FLASH_RPE,
+                rows_per_element=GLOBAL_FLASH_RPE, kv_skip_v=not kv_slot_has_v,
                 mask_parameter=mask_slot, len_parameter=f"gf_len{gi}",
                 loop_parameter=f"gf_loop{gi}", context=ctx)
             flash_slots.append({
@@ -2675,6 +2679,21 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 "columns": op_attn_global_flash.num_aie_columns,
                 "capacity": KVA_g,
             })
+            # get_arg_spec() declares `ang` at capacity*HD regardless of kv_skip_v (design.py's own
+            # docstring: "always part of the signature ... only tapped and consumed when kv_skip_v
+            # is set") -- so every flash geometry needs this buffer, not only a kv_skip_v one, or
+            # the arg spec and the runlist buffer disagree in size. One table per geometry (RoPE's
+            # angle depends on position and theta, not on layer), appended on-chip at the SAME
+            # `slot` kv_off already addresses this geometry's kc/vc -- the shape is (1, hd), not
+            # (hkv, hd), because one angle row covers every kv head.
+            ang_table = f"ang_cache{gi}"
+            _ang_kvl = KVLayout(Hkv=1, S=KVA_g, HD=hd, T=T_g)
+            op_scang = StridedCopy(
+                input_sizes=(1, hd), input_strides=(hd, 1), input_offset=0,
+                output_sizes=(1, 1, hd), output_offset=0,
+                output_strides=(0, _ang_kvl.head_stride, 1),
+                input_buffer_size=hd, output_buffer_size=_ang_kvl.total_elems,
+                num_aie_channels=1, output_offset_parameter=slot, context=ctx)
         g = SimpleNamespace(
             hd=hd, hkv=hkv, qd=qd, kvd=kvd, gqa=gqa, kv_slot=slot, o_chunks=o_chunks,
             op_qk_norm=op_qk_norm, op_qk_norm_b=op_qk_norm_b, qkn=_qkn, op_qkv=op_qkv, op_q=op_q,
@@ -2685,7 +2704,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             uses_tmv_ctx=uses_tmv, scores_groups=scores_groups, scores_block=T_k,
             op_softmax=op_softmax, op_scale=op_scale, mask_slot=mask_slot, window=w,
             capacity=KVA_g, kv_block=T_g, op_attn_weightless=op_attn_weightless,
-            op_attn_global_flash=op_attn_global_flash,
+            op_attn_global_flash=op_attn_global_flash, ang_table=ang_table, op_scang=op_scang,
             op_attn_block=op_attn_block, circular=(w != S))
         _attn_cache[(hd, hkv, has_v)] = g
         return g
@@ -3018,6 +3037,10 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     op_head = gemv(VOCAB, D, ctx, **head_quant_kw, **_w_prologue("on"))
 
     weights, bufsz, cache_names, rl = {}, {}, [], []
+    # Geometries (by ang_table name) whose ang-cache append has already been placed in THIS
+    # token's runlist -- the table is per-geometry (attn_ops memoizes g), so re-appending it on
+    # every layer that shares the geometry would repeat identical work N times per token.
+    ang_appended = set()
     recurrent_names = []   # the cache buffers a position mask cannot hide; see npu_decode.rs reset()
     if sp.v_norm:
         # The gainless v-norm's gain, one per head_dim and shared by EVERY layer -- a true constant,
@@ -3339,6 +3362,14 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 weights[p + "vc"] = np.zeros(_kvl.total_elems, BF16)
                 cache_names.append(p + "vc")
             ang = "rope_global" if sp.is_global(l) else "rope_local"
+            # Shared per GEOMETRY (attn_ops memoizes g), not per layer -- declare it the first
+            # time this geometry's ang_table is seen, or every layer sharing it would claim its
+            # own capacity*HD buffer for a value that never differs across them.
+            if g.ang_table is not None and g.ang_table not in weights:
+                _ang_kvl = KVLayout(Hkv=1, S=g.capacity, HD=g.hd, T=g.kv_block)
+                weights[g.ang_table] = np.zeros(_ang_kvl.total_elems, BF16)
+                bufsz[g.ang_table] = _ang_kvl.total_elems * 2
+                cache_names.append(g.ang_table)
 
             # q/k/v are byte slices of ONE `qkv` buffer in the fused arm -- op_qkv writes all three in
             # one pass, and q|k adjacency is what lets a single RoPE cover both. Declared with an
@@ -3534,12 +3565,18 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                     # append (`head`, above) stay exactly as they are -- only the scores/softmax/
                     # context chain is replaced, by one design.
                     #
-                    # `n_kn`/`ang`: wiring only, for a LATER IRON-side task's kernel V reconstruction
-                    # under KV_SKIP_V (V = RoPE_inverse(kc, ang) / n_kn, undoing the qk-norm gain and
-                    # RoPE already baked into `kc`). AttnGlobalFlash.get_arg_spec() still declares 4
-                    # args, not 6 -- a real build takes this path only once that op is updated.
-                    attn_rl = [*head, (g.op_attn_global_flash, ref_q, p + "n_kn", ang,
-                                        p + "kc", p + "vc", p + "cx")]
+                    # `n_kn`/`ang_table`: consumed under kv_skip_v only (V = RoPE_inverse(kc, ang)
+                    # / n_kn, undoing the qk-norm gain and RoPE already baked into `kc`), but
+                    # get_arg_spec() declares both unconditionally, so every flash geometry passes
+                    # a real capacity-sized `ang_table`, not the single-row `ang`. The append (one
+                    # StridedCopy per DISTINCT geometry, not per layer) has to run before this op
+                    # reads the table, so it goes first.
+                    ang_step = ([(g.op_scang, ang, g.ang_table)]
+                                if g.ang_table not in ang_appended else [])
+                    ang_appended.add(g.ang_table)
+                    attn_rl = [*head, *ang_step,
+                               (g.op_attn_global_flash, ref_q, p + "n_kn", g.ang_table,
+                                p + "kc", p + "vc", p + "cx")]
                 else:
                     attn_rl = [
                         *head,
