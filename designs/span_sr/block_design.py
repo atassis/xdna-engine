@@ -97,8 +97,10 @@ def build(width, height, P, gen, stacks=None, tag="spanblk"):
                 arg_types=[ty(in_w[core])] * 3 + [ty(plen[core]), ty(out_w[core]), np.int32],
                 compile_flags=base_flags + [f'-DCONV3X3_LUT_INC="{inc}"'])
         f_in = ObjectFifo(ty(half), name="x_in")
-        f_12 = ObjectFifo(ty(2 * half), name="c1_c2")
-        f_23 = ObjectFifo(ty(2 * half), name="c2_c3")
+        # depth 4 on both ends: between neighbouring cores the fifo lowers to shared memory with
+        # the PRODUCER's depth, and a 3-row window over 2 buffers never acquires (device hang)
+        f_12 = ObjectFifo(ty(2 * half), name="c1_c2", depth=4)
+        f_23 = ObjectFifo(ty(2 * half), name="c2_c3", depth=4)
         f_out = ObjectFifo(ty(half), name="y_out")
         f_p = {k: ObjectFifo(ty(plen[k]), name=f"p_{k}", depth=1) for k in ("c1", "c2", "c3")}
 
