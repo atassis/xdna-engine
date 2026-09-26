@@ -181,44 +181,66 @@ class Span:
         return L
 
     # ---------------- the integer program ----------------
-    def forward_int(self, rgb01):
+    def _conv(self, x, p, signed=True):
+        return c3.conv3x3_u8_ref(x, p["w"], p["b"], p["shift"], signed=signed,
+                                 pre_shift=p["pre"], mult=p["mult"])
+
+    def block_int(self, i, xb):
+        """SPAB block i on its int8 input [48,H,W] -> (int8 output, c1 SiLU output)."""
+        p1, p2, p3 = self.L[f"b{i}.c1"], self.L[f"b{i}.c2"], self.L[f"b{i}.c3"]
+        t = self._conv(xb, p1)
+        if i == 1:
+            t = p1["lut16"][t.astype(np.int64) + 128].astype(np.int16)
+        else:
+            t = p1["lut"][t.astype(np.int64) + 128].astype(np.int8)
+        c1silu = t
+        t = self._conv(t, p2)
+        t = p2["lut"][t.astype(np.int64) + 128].astype(np.int8)
+        t = self._conv(t, p3)
+        out = c3.gate_ref(t, xb, p3["lut"], p3["ga"], p3["gb"], p3["gs1"], p3["gc"], p3["gs2"])
+        return out, c1silu
+
+    def int_tensors(self, rgb01):
+        """Every integer tensor the network produces, keyed like the float recorder."""
         L, m = self.L, self.mean255
-        conv = lambda x, p, signed=True, **k: c3.conv3x3_u8_ref(
-            x, p["w"], p["b"], p["shift"], signed=signed, pre_shift=p["pre"], mult=p["mult"], **k)
+        T = {}
         x8 = np.round(rgb01 * 255).astype(np.int64)
         # the producer pads the frame with the (rounded) mean colour: emulate by padding and
         # cropping, since the brick's zero padding is torch's padding of the NORMALIZED input
         pad = np.round(m).astype(np.int64)
         xp = np.stack([np.pad(x8[c], 1, constant_values=pad[c]) for c in range(3)])
         xp = np.concatenate([xp, np.zeros((5,) + xp.shape[1:], np.int64)]).astype(np.uint8)
-        feat = conv(xp, L["conv_1"])[:, 1:-1, 1:-1]
-        xb, outs = feat, {}
+        T["conv_1"] = feat = self._conv(xp, L["conv_1"])[:, 1:-1, 1:-1]
+        xb = feat
         for i in range(1, 7):
-            p1, p2, p3 = L[f"b{i}.c1"], L[f"b{i}.c2"], L[f"b{i}.c3"]
-            t = conv(xb, p1)
-            if i == 1:
-                t = p1["lut16"][t.astype(np.int64) + 128].astype(np.int16)
-            else:
-                t = p1["lut"][t.astype(np.int64) + 128].astype(np.int8)
-            if i == 6:
-                outs["b6.c1.silu"] = t
-            t = conv(t, p2)
-            t = p2["lut"][t.astype(np.int64) + 128].astype(np.int8)
-            t = conv(t, p3)
-            xb = c3.gate_ref(t, xb, p3["lut"], p3["ga"], p3["gb"], p3["gs1"], p3["gc"], p3["gs2"])
-            if i == 1:
-                outs["b1.out"] = xb
-        c2 = conv(xb, L["conv_2"])
+            T[f"b{i}.in"] = xb
+            xb, T[f"b{i}.c1.silu"] = self.block_int(i, xb)
+            T[f"b{i}.out"] = xb
+        T["conv_2"] = self._conv(xb, L["conv_2"])
         pc = L["conv_cat"]
-        w_cat = pc["w"].reshape(48, -1)
-        cc = c1.conv1x1_cat_ref([feat, c2, outs["b1.out"], outs["b6.c1.silu"]], w_cat, pc["b"],
-                                pc["shift"], pre_shift=pc["pre"], mult=pc["mult"])
-        rgba = conv(cc, L["up"], signed=False)                     # uint8, 16 channels
+        T["conv_cat"] = c1.conv1x1_cat_ref(
+            [feat, T["conv_2"], T["b1.out"], T["b6.c1.silu"]], pc["w"].reshape(48, -1), pc["b"],
+            pc["shift"], pre_shift=pc["pre"], mult=pc["mult"])
+        T["rgba"] = self._conv(T["conv_cat"], L["up"], signed=False)
+        return T
+
+    def forward_int(self, rgb01):
+        rgba = self.int_tensors(rgb01)["rgba"]
         # channel block (i*2+j) of LR pixel (y, x) is pixel (2y+i, 2x+j), RGBA
         h, w = rgba.shape[1:]
-        img = rgba.reshape(2, 2, 4, h, w).transpose(3, 0, 4, 1, 2).reshape(2 * h, 2 * w, 4)
-        return img
+        return rgba.reshape(2, 2, 4, h, w).transpose(3, 0, 4, 1, 2).reshape(2 * h, 2 * w, 4)
 
+    def core_params(self, i):
+        """Per-core inputs for block i's three conv cores: packed params blob, table, constants."""
+        P = {}
+        for j, key in ((1, "c1"), (2, "c2"), (3, "c3")):
+            p = self.L[f"b{i}.c{j}"]
+            d = dict(blob=c3.pack_params(p["w"], p["b"], p["mult"]), pre=p["pre"],
+                     shift=p["shift"], table=p.get("lut"))
+            if j == 3:
+                d.update({k: p[k] for k in ("ga", "gb", "gs1", "gc", "gs2")})
+            P[key] = d
+        return P
 
 def _y(rgb):
     return (65.481 * rgb[0] + 128.553 * rgb[1] + 24.966 * rgb[2] + 16) / 255
