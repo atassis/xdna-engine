@@ -141,12 +141,12 @@ def test_each_segment_declares_only_its_own_kv_slots(build, nseg):
     """
     sp, _f, _w, md = build(nseg)
     segs = md["segments"]
-    every = {n for s in segs for n, _ in s["kv_slots"]}
+    every = {n for s in segs for n, _, _ in s["kv_slots"]}
     for s in segs:
         la, lb = s["layers"]
         want = {sp.head_dim_for(l) for l in range(la, lb)}
-        assert {hd for _, hd in s["kv_slots"]} == want, \
+        assert {hd for _, hd, _ in s["kv_slots"]} == want, \
             f"segment {s['seq'].name} slots do not match its layers' head_dims"
     # Union over segments must be the whole model's slot set -- a slot owned by nobody is a KV
     # cache the host never advances, which reads as a model that stops attending to its history.
-    assert every == {n for n, _ in md["kv_slots"]}
+    assert every == {n for n, _, _ in md["kv_slots"]}

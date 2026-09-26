@@ -125,7 +125,7 @@ def main():
     # offsets, and its two RoPE tables differ in width as well as theta. At pos 0 the row content
     # is the identity regardless (see identity_rope_row), so only the SET of declared buffers and
     # their widths matter here.
-    for slot_name, _ in md["kv_slots"]:
+    for slot_name, _, _ in md["kv_slots"]:
         params.write(slot_name, 0)
     for ang_name in ("rope_global", "rope_local"):
         if ang_name in md["inputs"]:

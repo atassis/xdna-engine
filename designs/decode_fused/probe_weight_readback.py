@@ -100,7 +100,7 @@ def main():
             with c.get_buffer(ang).overwrite() as buf:
                 row = np.zeros(buf.size, np.float32); row[0::2] = 1.0
                 buf[:] = np.asarray(row, BF16)
-    for slot_name, _ in md["kv_slots"]:
+    for slot_name, _, _ in md["kv_slots"]:
         c.params.write(slot_name, 0)
     c.params.write("sm_mask", 1)
     c.params.sync()
