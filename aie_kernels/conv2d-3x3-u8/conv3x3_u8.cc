@@ -4,6 +4,9 @@
 //   conv3x3_u8        uint8 -> uint8; negative sums clamp to 0, so ReLU is implied
 //   conv3x3_i8        int8 -> int8
 //   conv3x3_i16i8     int16 -> int8
+//   conv3x3_u8i8      uint8 -> int8 (e.g. a first layer on RGB, mean folded into bias)
+//   conv3x3_i8u8      int8 -> uint8 (e.g. a last layer writing pixels: the uint8
+//                     saturation is the [0, 255] clamp)
 //   conv3x3_i8_lut    int8 -> int8, then q -> table[q + 128] (e.g. SiLU)
 //   conv3x3_i16i8_lut int16 -> int8, then the same table
 //   conv3x3_i8_lut16  int8 -> int16: q -> hi[q + 128] * 256 + lo[q + 128]
@@ -290,6 +293,14 @@ void conv3x3_u8(C3_SIG(uint8_t, uint8_t)) {
 
 void conv3x3_i8(C3_SIG(int8_t, int8_t)) {
   conv3x3_core<int8, int8_t, int8, int8_t, CONV3X3_CIN, CONV3X3_COUT>(C3_ARGS);
+}
+
+void conv3x3_u8i8(C3_SIG(uint8_t, int8_t)) {
+  conv3x3_core<uint8, uint8_t, int8, int8_t, CONV3X3_CIN, CONV3X3_COUT>(C3_ARGS);
+}
+
+void conv3x3_i8u8(C3_SIG(int8_t, uint8_t)) {
+  conv3x3_core<int8, int8_t, uint8, uint8_t, CONV3X3_CIN, CONV3X3_COUT>(C3_ARGS);
 }
 
 void conv3x3_i16i8(C3_SIG(int16_t, int8_t)) {

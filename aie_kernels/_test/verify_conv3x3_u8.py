@@ -24,22 +24,30 @@ CIN, COUT, H, SHIFT = 64, 16, 6, 11
 
 
 def case(name, width, check, valid_lo=0, valid_hi=None, seed=0, signed=False, lut=False,
-         gate=None, in16=False, lut16=False):
+         gate=None, in16=False, lut16=False, mixed=None):
     CIN = 32 if in16 else globals()["CIN"]  # three int16 rows of 64 channels do not fit L1 double-buffered
     hi = width if valid_hi is None else valid_hi
     rng = np.random.default_rng(seed)
     adt = np.int16 if in16 else (np.int8 if signed else np.uint8)
     odt = np.int16 if lut16 else (np.int8 if signed else np.uint8)
     lo_v, hi_v = (-1024, 1025) if in16 else ((-128, 128) if signed else (0, 256))
+    if mixed == "u8i8":   # uint8 in, int8 out
+        adt, odt, lo_v, hi_v = np.uint8, np.int8, 0, 256
+    elif mixed == "i8u8":  # int8 in, uint8 out
+        adt, odt, lo_v, hi_v = np.int8, np.uint8, -128, 128
     shift = 14 if in16 else SHIFT
     x = rng.integers(lo_v, hi_v, size=(CIN, H, width), dtype=np.int64).astype(adt)
     w = rng.integers(-127, 128, size=(COUT, CIN, 3, 3), dtype=np.int64).astype(np.int8)
     b = rng.integers(-(1 << 15), 1 << 15, size=(COUT,), dtype=np.int64).astype(np.int32)
-    ref = g.conv3x3_u8_ref(x, w, b, shift, valid_lo, hi, signed=signed)
+    ref = g.conv3x3_u8_ref(x, w, b, shift, valid_lo, hi, signed=(odt != np.uint8))
     fn, ct = ("conv3x3_i8", "int8_t") if signed else ("conv3x3_u8", "uint8_t")
     cto = "int16_t" if lut16 else ct
     if in16:
         fn, ct, cto = "conv3x3_i16i8", "int16_t", "int8_t"
+    if mixed == "u8i8":
+        fn, ct, cto = "conv3x3_u8i8", "uint8_t", "int8_t"
+    elif mixed == "i8u8":
+        fn, ct, cto = "conv3x3_i8u8", "int8_t", "uint8_t"
     params = g.pack_params(w, b)
     lut_flag = []
     if lut:
@@ -146,6 +154,8 @@ CASES = [
     ("c3w_i16lut_w64_mid", 64, 1, 0, None, 10, True, True, None, True),
     ("c3w_lut16_w64_mid", 64, 1, 0, None, 11, True, False, None, False, True),
     ("c3w_lut16_w48_mask", 48, 2, 5, 43, 12, True, False, None, False, True),
+    ("c3m_u8i8_w64_mid", 64, 1, 0, None, 13, False, False, None, False, False, "u8i8"),
+    ("c3m_i8u8_w48_mask", 48, 1, 5, 43, 14, False, False, None, False, False, "i8u8"),
 ]
 
 if __name__ == "__main__":
