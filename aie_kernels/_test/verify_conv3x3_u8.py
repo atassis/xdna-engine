@@ -31,6 +31,7 @@ def case(name, width, check, valid_lo=0, valid_hi=None, seed=0):
     b = rng.integers(-(1 << 15), 1 << 15, size=(COUT,), dtype=np.int64).astype(np.int32)
     ref = g.conv3x3_u8_ref(x, w, b, SHIFT, valid_lo, hi)
 
+    wp = width + 2 * g.PAD
     rows = g.pack_rows(x).reshape(H, -1)
     blank = np.zeros_like(rows[0])
     if check == 0:
@@ -49,30 +50,38 @@ def case(name, width, check, valid_lo=0, valid_hi=None, seed=0):
     shim.write_text(
         f'#include <stdint.h>\n#include "{BRICK / "conv3x3_u8.cc"}"\n'
         f'extern "C" void {sym}(uint8_t *t, int8_t *p, uint8_t *o) {{\n'
-        f'  conv3x3_u8(t, t + {width * CIN}, t + {2 * width * CIN}, p, o, {width}, {check},'
+        f'  conv3x3_u8(t, t + {wp * CIN}, t + {2 * wp * CIN}, p, o, {width}, {check},'
         f' {SHIFT}, {valid_lo}, {hi});\n}}\n')
     exp = np.stack([ref[:, y, :] for y in ys])            # [n, COUT, W]
 
+    margin_nz = []
+
     def unpack(dev):
-        return np.stack([g.unpack_rows(r, COUT, 1, width)[:, 0, :] for r in dev])
+        full = np.stack([g.unpack_rows(r, COUT, 1, width, margins=True)[:, 0, :] for r in dev])
+        margin_nz.append(int(np.count_nonzero(full[:, :, :g.PAD]) +
+                             np.count_nonzero(full[:, :, -g.PAD:])))
+        return full[:, :, g.PAD:-g.PAD]
 
     res = bricklib.verify_streamed(
-        name, shim, sym, tiles, width * COUT, g.pack_params(w, b), unpack, exp, gate=0.0,
+        name, shim, sym, tiles, wp * COUT, g.pack_params(w, b), unpack, exp, gate=0.0,
         in_dt=np.uint8, out_dt=np.uint8, resident_dt=np.int8,
         compile_flags=[f"-DCONV3X3_CIN={CIN}", f"-DCONV3X3_COUT={COUT}"])
     got = np.asarray(res["got"]).astype(np.int64)
     mism = int((got != exp.astype(np.int64)).sum())
     res["mismatches"] = mism
-    res["ok"] = bool(res["ok"] and mism == 0)
-    res["status"] = "PASS" if res["ok"] else f"FAIL({mism}/{exp.size} mismatched)"
-    print(f"[{name:22s}] exact: {exp.size - mism}/{exp.size} -> {res['status']}")
+    res["margin_nonzero"] = margin_nz[-1]
+    res["ok"] = bool(res["ok"] and mism == 0 and margin_nz[-1] == 0)
+    res["status"] = "PASS" if res["ok"] else (
+        f"FAIL({mism}/{exp.size} mismatched, {margin_nz[-1]} nonzero margin bytes)")
+    print(f"[{name:22s}] exact: {exp.size - mism}/{exp.size}, margin nonzero "
+          f"{margin_nz[-1]} -> {res['status']}")
     return res
 
 
 CASES = [
     ("c3_w32_mid", 32, 1),
     ("c3_w64_mid", 64, 1),
-    ("c3_w24_mid", 24, 1),
+    ("c3_w48_mid", 48, 1),
     ("c3_w64_top", 64, 0),
     ("c3_w64_bot", 64, 2),
     ("c3_w64_mask", 64, 1, 5, 59),

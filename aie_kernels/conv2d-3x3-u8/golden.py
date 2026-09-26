@@ -22,14 +22,20 @@ def conv3x3_u8_ref(x, w, b, shift, valid_lo=0, valid_hi=None):
     return out
 
 
+PAD = 8  # zero pixels on each side of every row
+
+
 def pack_rows(x):
-    """[C,H,W] -> [H][C/8][W][8] (channel-blocked rows)."""
+    """[C,H,W] -> [H][C/8][W+16][8]: channel-blocked rows with an 8-pixel zero margin."""
     c, h, wd = x.shape
-    return np.ascontiguousarray(x.reshape(c // 8, 8, h, wd).transpose(2, 0, 3, 1))
+    xp = np.pad(x, ((0, 0), (0, 0), (PAD, PAD)))
+    return np.ascontiguousarray(xp.reshape(c // 8, 8, h, wd + 2 * PAD).transpose(2, 0, 3, 1))
 
 
-def unpack_rows(flat, c, h, wd):
-    return flat.reshape(h, c // 8, wd, 8).transpose(1, 3, 0, 2).reshape(c, h, wd)
+def unpack_rows(flat, c, h, wd, margins=False):
+    """Inverse of pack_rows; margins=True keeps the padded columns."""
+    x = flat.reshape(h, c // 8, wd + 2 * PAD, 8).transpose(1, 3, 0, 2).reshape(c, h, wd + 2 * PAD)
+    return x if margins else x[:, :, PAD:-PAD]
 
 
 def pack_params(w, b):
