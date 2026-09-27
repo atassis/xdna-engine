@@ -93,13 +93,14 @@ alignas(aie::vector_decl_align) static const uint16_t kLut2Cd[512] = {
 // (probe_lut_gather32.py, 64/64 match) -- a different path from the earlier
 // extract<16>-from-a-64-lane-REGISTER failure (probe_lut_gather_isolated.py),
 // which this does not revisit. Halves the fetch-call/load/store count versus
-// the prior 16-lane loop. The lookup object is built per call: one built once
-// at the top of the gate kernel and captured by reference gathered every key
-// as 0 (probe_conv3x3_gate_stages.py).
-inline void apply_lut_inplace(int8_t *__restrict dst, int n) {
-  const aie::lut<4, bfloat16> t(256, (const bfloat16 *)kLutAb,
-                                (const bfloat16 *)kLutCd);
-  Look look(t, 0, 128);
+// the prior 16-lane loop.
+//
+// `look` is built once per row in conv3x3_core and passed by reference.
+// always_inline: a Look reference across a real (non-inlined) call reads
+// back zero on this Peano pin (probe_lut_hoist_isolated.py; 3f11dcb's "every
+// key as 0" was this, not the by-reference capture itself).
+__attribute__((always_inline)) inline void
+apply_lut_inplace(Look &look, int8_t *__restrict dst, int n) {
   C3_LOOP_RANGE(1, 2)
   for (int g = 0; g < n; g += 32) {
     aie::vector<int8, 32> k = aie::load_v<32>(dst + g);
@@ -113,13 +114,9 @@ inline void apply_lut_inplace(int8_t *__restrict dst, int n) {
 // (see apply_lut_inplace). keys may be the second half of dst's 128 bytes:
 // group g is read before bytes [2g, 2g+64) are written, and those only ever
 // overlap keys already consumed (same ordering as the prior 16-lane version,
-// just at 32-granularity).
-inline void apply_lut16(const int8_t *keys, int16_t *dst) {
-  const aie::lut<4, bfloat16> th(256, (const bfloat16 *)kLutAb,
-                                 (const bfloat16 *)kLutCd);
-  const aie::lut<4, bfloat16> tl(256, (const bfloat16 *)kLut2Ab,
-                                 (const bfloat16 *)kLut2Cd);
-  Look hi(th, 0, 128), lo(tl, 0, 128);
+// just at 32-granularity). `hi`/`lo` hoisted the same way as apply_lut_inplace's `look`.
+__attribute__((always_inline)) inline void
+apply_lut16(Look &hi, Look &lo, const int8_t *keys, int16_t *dst) {
   C3_LOOP_RANGE(2, 2)
   for (int g = 0; g < 64; g += 32) {
     aie::vector<int8, 32> k = aie::load_v<32>(keys + g);
@@ -170,6 +167,18 @@ conv3x3_core(const PA *__restrict line0, const PA *__restrict line1,
   const int ky1 = (check == 2) ? 2 : 3;
   const int plane = (width + 16) * 8; // elements per 8-channel block of a padded row
 
+  // Once per row, not once per put()/apply_lut_* call (4-16x/row).
+#ifdef CONV3X3_LUT_INC
+  const aie::lut<4, bfloat16> lut_main_t(256, (const bfloat16 *)kLutAb,
+                                        (const bfloat16 *)kLutCd);
+  Look look_main(lut_main_t, 0, 128);
+#endif
+#if defined(CONV3X3_LUT_INC) && defined(CONV3X3_LUT2_INC)
+  const aie::lut<4, bfloat16> lut_lo_t(256, (const bfloat16 *)kLut2Ab,
+                                       (const bfloat16 *)kLut2Cd);
+  Look look_lo(lut_lo_t, 0, 128);
+#endif
+
   // per-channel requant of one tile to the 8-bit (or table-key) domain
   auto rq = [&](MMUL &acc, const aie::vector<int16, LANES> &m) {
     aie::vector<int16, LANES> v = acc.template to_vector<int16>(pre_shift);
@@ -187,7 +196,7 @@ conv3x3_core(const PA *__restrict line0, const PA *__restrict line1,
     } else if constexpr (EPI == LUT) {
 #ifdef CONV3X3_LUT_INC
       aie::store_v(dst, rq(acc, m).template to_vector<int8>(shift));
-      apply_lut_inplace(reinterpret_cast<int8_t *>(dst), LANES);
+      apply_lut_inplace(look_main, reinterpret_cast<int8_t *>(dst), LANES);
       if (!(xs >= valid_lo && xs + PX <= valid_hi))
         aie::store_v(dst, mask_block(aie::load_v<LANES>(dst), xs, valid_lo,
                                      valid_hi));
@@ -196,7 +205,7 @@ conv3x3_core(const PA *__restrict line0, const PA *__restrict line1,
 #if defined(CONV3X3_LUT_INC) && defined(CONV3X3_LUT2_INC)
       int8_t *keys = reinterpret_cast<int8_t *>(dst) + LANES;
       aie::store_v(keys, rq(acc, m).template to_vector<int8>(shift));
-      apply_lut16(keys, reinterpret_cast<int16_t *>(dst));
+      apply_lut16(look_main, look_lo, keys, reinterpret_cast<int16_t *>(dst));
       if (!(xs >= valid_lo && xs + PX <= valid_hi))
         aie::store_v(dst, mask_block(aie::load_v<LANES>(dst), xs, valid_lo,
                                      valid_hi));
@@ -207,9 +216,6 @@ conv3x3_core(const PA *__restrict line0, const PA *__restrict line1,
       // fetch from registers (fetch()'s own Vec::size()==32 path, see
       // apply_lut_inplace).
       aie::store_v(dst, rq(acc, m).template to_vector<int8>(shift));
-      const aie::lut<4, bfloat16> t(256, (const bfloat16 *)kLutAb,
-                                    (const bfloat16 *)kLutCd);
-      Look look(t, 0, 128);
       PO *__restrict xp = const_cast<PO *>(xrow) + (dst - out);
       PO *__restrict dst_r = dst;
       C3_LOOP_RANGE(2, 2)
@@ -219,7 +225,7 @@ conv3x3_core(const PA *__restrict line0, const PA *__restrict line1,
         aie::accum<acc32, 32> a = aie::mul(c, (int8)ga);
         a = aie::mac(a, x, (int8)gb);
         aie::vector<int8, 32> s = a.template to_vector<int8>(gs1);
-        aie::vector<int8, 32> att = aie::to_fixed<int8>(look.fetch(c), 0);
+        aie::vector<int8, 32> att = aie::to_fixed<int8>(look_main.fetch(c), 0);
         aie::vector<int16, 32> p16 = aie::mul(s, att).template to_vector<int16>(0);
         aie::store_v(dst_r + g,
                      aie::mul(p16, (int16)gc).template to_vector<int8>(gs2));
