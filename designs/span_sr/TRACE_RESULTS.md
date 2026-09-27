@@ -113,6 +113,74 @@ already the coordinator's fallback -- is the skip-ring/join depth (`PROD_DEPTH=2
 fixed consumer depth), which is untouched by this experiment and remains the more likely structural
 cause given b3c3's exact zero-movement result.
 
+## b1c1/b1c2 zero-slack hypothesis: REFUTED as an alternation-sum, small effect on b3c3
+
+Hypothesis: `DEPTH["b1c1"]=3` against `b1c2`'s `windowed()` 3-row acquire leaves b1c1 and b1c2
+strictly alternating with zero producer slack, so their compute times ADD and set the whole
+chain's pace. Predicted: each of b1c1/b1c2 shows substantial compute, and the two sum to
+~1300 cyc/px.
+
+Traced individually (one stage per dispatch, `trace_span_net.py --stages b1c1` /
+`--stages b1c2`, W=32, H=128; `run.sh` does not forward CLI args to the wrapped script, so these
+were dispatched by replicating its env setup directly with `--stages` passed through):
+
+| stage | compute cyc/px | gap cyc/px | LOCK_STALL % of span | compute+gap |
+|---|---|---|---|---|
+| b1c1 | 319.87 (24.04%) | 1015.80 (75.76%) | 75.78% | 1335.7 |
+| b1c2 | 322.79 (24.18%) | 1012.77 (75.28%) | 75.67% | 1335.6 |
+
+**REFUTED as stated.** b1c1's compute (319.87) + b1c2's compute (322.79) = 642.66, far below the
+~1300 cyc/px period -- they do not sum. Instead each lands INDIVIDUALLY at compute+gap ~1335.6-
+1335.7, the same signature every other traced stage shows (conv_1 1296.6, conv_cat 1304.8, b3c3
+1325.9, up 1299.7): a common ~1300-1335 cyc/px pace regardless of a stage's own compute, with
+LOCK_STALL dominant. b1c1/b1c2's LOCK_STALL (75.7-75.8%) sits between the near-idle skip/join
+stages (~96-98%) and the heaviest core b3c3 (70.3%) in roughly the order their own compute would
+predict -- consistent with the STRUCTURAL per-row-lockstep picture already in force above, not
+with a b1c1<->b1c2-specific alternation defect.
+
+**The fix, tested anyway (task instruction): raise the b1c1->b1c2 fifo depth 3->4.**
+Compile-only sweep (`design.compile()`, no device) confirms the L1 wall predicted by the module
+docstring: at W=32, `depths={"b1c1": 4}` FAILS identically to the MAIN_DEPTH+1 case
+(`b6c2_out_buff_3` needs 4608 B, same tile class -- raising b1c1's OWN fifo depth costs L1 on
+tiles far downstream because `net_design.py`'s digest/placement is network-wide, not local to
+b1c1's tile). At W=16, `depths={"b1c1": d}` compiles for d=4,5 and fails at d=6 -- same halved
+headroom pattern as MAIN_DEPTH.
+
+Ran `probe_span_net_depth_b1c1.py` (W=16, depth 3 vs 4, alternated per height, 7-trial median,
+fitted slope, same method as the MAIN_DEPTH sweep):
+
+| b1c1 depth | slope | fitted cyc/px @ 1.8 GHz (W=16) |
+|---|---|---|
+| 3 (baseline) | 25.6 us/row | 2878 |
+| 4 | 12.7 us/row | 1426 |
+
+A big apparent swing, but the per-height medians are badly non-monotonic (depth=4 at h=128 is
+SLOWER than depth=3 at h=192; depth=3's fit has a negative intercept, -1.072 ms) -- the same box-
+contention pattern already flagged for the MAIN_DEPTH wall-clock fit, not trustworthy alone.
+
+**Corroboration: re-traced `b3c3` at b1c1-depth=3 vs. 4, W=16, H=128, same process**
+(`trace_span_net_depth_b1c1.py`):
+
+| b1c1 depth | compute cyc/px | gap cyc/px | LOCK_STALL % of span | compute+gap |
+|---|---|---|---|---|
+| 3 | 415.85 (28.73%) | 976.68 (66.94%) | 70.92% | 1392.5 |
+| 4 | 416.37 (29.42%) | 955.61 (66.99%) | 70.22% | 1372.0 |
+
+**Same outcome as the MAIN_DEPTH+1 experiment: b3c3 barely moves** (compute+gap 1392.5 -> 1372.0,
+~1.5%; LOCK_STALL 70.92% -> 70.22%). The within-dispatch trace does not corroborate the wall-clock
+fit's ~2x swing -- that swing is contention noise, not a real effect of this depth bump. So the
+b1c1->b1c2 hop is not b3c3's ceiling either, matching the MAIN_DEPTH result: a small, real, LOCAL
+lever (b1c1/b1c2's own compute+gap likely drops the same ~20-50 cyc/px a depth bump gave b3c3's
+neighbours) that does not touch the whole-chain pace.
+
+**PROD_DEPTH/join, from existing traces (task item 4): not implicated beyond the general pattern.**
+conv_1 (a skip source, `PROD_DEPTH=2` producer) and conv_cat (the join) both show the SAME
+signature as every other stage -- near-zero own compute, LOCK_STALL 95.8-96.7%, compute+gap
+~1300 cyc/px -- indistinguishable from an ordinary main-path hop's stall profile. Nothing in the
+traces singles out `PROD_DEPTH=2` or the join's fixed consumer depth as a DIFFERENT kind of
+bottleneck from the structural per-row lockstep already identified; no targeted PROD_DEPTH/join-
+depth bump was run (out of scope here), so this remains open rather than ruled in or out.
+
 ## Caveat
 
 Device is shared with other concurrent lanes (gemma4 prefill gates, this session's own
