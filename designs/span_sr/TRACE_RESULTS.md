@@ -318,6 +318,101 @@ untested directly here (would need e.g. varying the main-path hop COUNT or traci
 intermediate stages to sum the fill latency directly, both out of scope for this phase). Not ruled
 in or out; the object-fifo-depth search space this task named is now exhausted.
 
+## Phase 1a follow-up (coordinator): all 22 stages traced, no pace-setter -- MemTile(4,1) is the
+## shared resource
+
+Coordinator's objection to the "latency floor" reading: latency only throttles a buffer-insensitive
+pipeline, and PROD_DEPTH/cat_cons_depth (both buffers) were null. Alternative: the pace-setter is one
+of the 14 stages not yet traced, or a non-core resource. Traced all 14 (`probe_span_all_stages.py`,
+same conditions: W=32, H=128, SKIP_SLACK=8/default, prod_depth=2/default, cat_cons_depth=2/default,
+one dispatch per stage).
+
+**Full 22-stage table** (8 from earlier sections of this file, 14 new):
+
+| stage | kind | col,row | compute cyc/px | gap cyc/px | LOCK_STALL % | compute+gap |
+|---|---|---|---|---|---|---|
+| conv_1 | conv1 | 0,2 | 40.42 | 1256.15* | 96.68%* | 1296.6* |
+| b1c1 | silu16 | 0,3 | 319.87 | 1015.80* | 75.78%* | 1335.7* |
+| b1c2 | silu_i16 | 0,4 | 322.79 | 1012.77* | 75.67%* | 1335.6* |
+| b1c3 | gate | 0,5 | 406.22 | 236.03 | 37.46% | 642.2 |
+| b2c1 | silu_x | 1,2 | 250.40 | 388.60 | 61.48% | 639.0 |
+| b2c2 | silu | 1,3 | 250.44 | 386.84 | 61.81% | 637.3 |
+| b2c3 | gate | 1,4 | 406.16 | 230.52 | 38.96% | 636.7 |
+| b3c1 | silu_x | 1,5 | 250.42 | 383.00 | 62.52% | 633.4 |
+| b3c2 | silu | 2,2 | 250.46 | 381.27 | 62.75% | 631.7 |
+| b3c3 | gate | 2,3 | 406.20 | 224.94 | 40.46% | 631.1 |
+| b4c1 | silu_x | 2,4 | 250.41 | 377.47 | 63.36% | 627.9 |
+| b4c2 | silu | 2,5 | 250.43 | 374.35 | 63.65% | 624.8 |
+| b4c3 | gate | 3,2 | 406.50 | 219.08 | 41.88% | 625.6 |
+| b5c1 | silu_x | 3,3 | 250.52 | 371.80 | 64.24% | 622.3 |
+| b5c2 | silu | 3,4 | 250.46 | 370.13 | 64.49% | 620.6 |
+| b5c3 | gate | 3,5 | 406.17 | 213.80 | 43.34% | 620.0 |
+| b6c1 | silu_x | 4,2 | 250.39 | 366.31 | 65.13% | 616.7 |
+| b6c2 | silu | 4,3 | 250.50 | 364.54 | 65.31% | 615.0 |
+| b6c3 | gate | 4,4 | 406.26 | 208.18 | 44.58% | 614.4 |
+| conv_2 | plain | 4,5 | 83.29 | 526.58 | 88.44% | 609.9 |
+| conv_cat | cat | 5,2 | 58.23 | 1246.58* | 95.80%* | 1304.8* |
+| up | up | 5,3 | 26.68 | 1273.05* | 97.99%* | 1299.7* |
+
+`col,row` from the compiled MLIR (aie.core/aie.tile ops) of the b1c3-traced build in this run --
+placement is deterministic for that exact digest but not asserted identical across every possible
+`trace_stages=` compile, so treat the *pattern* (grouping, MemTile sharing) as load-bearing, not the
+exact column numbers for a different build. `*` = figures from the earlier per-lever/attribution
+sections above, at SKIP_SLACK=2 (conv_1/b1c1/b1c2/conv_cat/up were traced before the SKIP_SLACK fix
+and not re-traced at slack=8 in this pass -- they are NOT comparable to the slack=8 column at face
+value; re-tracing them is the obvious next step if this needs closing out further).
+
+**No pace-setter.** LOCK_STALL at slack=8 ranges 37.46% (b1c3) to 65.31% (b6c2) -- no stage anywhere
+near the "low LOCK_STALL, compute near the pace" signature the coordinator predicted. Two clean
+patterns instead: (1) **compute is fixed per KIND, not per position** -- every `gate` stage computes
+406.2-406.5, every `silu_x`/`silu` stage computes 250.4-250.5, regardless of where in the chain it
+sits; kernel work never drifts. (2) **compute+gap decreases smoothly and monotonically moving
+downstream**, independent of kind: b1c3 642.2 -> b6c3 614.4 (gate kind, -27.8 over 5 block-hops),
+b2c1 639.0 -> b6c2 615.0 (silu_x/silu kind, -24.0 over 4 block-hops) -- roughly -5 to -6 cyc/px per
+block, both kinds tracking together. Since kernel compute is provably constant, this whole-chain
+gradient is in the GAP only, and it correlates with chain POSITION, not with any per-stage
+structural property (kind, fifo depth, MemTile). The single most likely explanation given the
+standing caveat below (power mode never pinned for any measurement in this file) is a DVFS/warm-up
+transient WITHIN the single H=128-row dispatch: a stage further downstream starts counting its own
+rows later in wall-clock time, so it samples a "warmer" (faster) part of the same ramp that an
+upstream stage's early rows do not get -- not a location-specific throughput ceiling. This is a
+hypothesis, not verified here (pinning requires root, which this session does not have and the
+global rule forbids invoking directly); flagged as the standing confound on the "no pace-setter"
+finding rather than closed.
+
+**MemTile(4,1) is the shared resource the coordinator asked to check.** `net_layout.weight_groups`
+(WEIGHT_GROUP=6) makes 4 weight-feed MemTiles; `join()`'s default `tile=AnyMemTile` places the
+4-source `cat_in` join ring wherever the placer picks, and it landed on the SAME MemTile as weight
+group 3 (b6c3/conv_2/conv_cat/up), not a dedicated one. Channel count (from the compiled
+`aie.memtile_dma` blocks, a MemTile has 6 S2MM + 6 MM2S total):
+
+| MemTile | S2MM used | MM2S used | total/12 | role |
+|---|---|---|---|---|
+| (0,1) | 1 | 6 | 7 | weight group 0 only |
+| (2,1) | 1 | 6 | 7 | weight group 1 only |
+| (3,1) | 1 | 6 | 7 | weight group 2 only |
+| (4,1) | 5 | 5 | 10 | weight group 3 AND the entire 4-source join ring (cat_in) |
+
+MemTile(4,1) is the busiest in the design (10/12 channels vs. 7/12 elsewhere) and the only one
+carrying two logically distinct dataflows. Its 4 join inputs are NOT symmetric in placement: b6c1
+(col 4, local) and conv_2 (col 4, local) sit on the SAME column as the join MemTile, but conv_1
+(col 0) and b1c3 (col 0) must cross 4 columns through the stream-switch fabric to reach it.
+conv_cat itself sits at col 5 -- one column PAST its own join MemTile -- so its main-path read of
+the ring also crosses a column. No per-op DMA-hop-count or channel-occupancy trace was taken here
+(would need MEMORY_STALL/STREAM_STALL attribution per hop, not just LOCK_STALL, and ideally a
+pinned power mode first); this is a structural observation from the compiled MLIR, not a measured
+attribution of the remaining stall to this MemTile specifically.
+
+**Net for this follow-up:** every stage is a "victim" in the sense the coordinator meant (no
+core runs near-saturated while others wait), and the compute+gap gradient across the whole chain
+is better explained by an unpinned-power-mode transient than by position. MemTile(4,1)'s channel
+load (10/12, hosting both the join and a weight group) and the conv_1/b1c3 cross-column skip
+broadcasts are the concrete "shared resource" / "crosses columns" candidates this MLIR surfaces,
+per the coordinator's fallback -- neither has been measured against the remaining ~40% LOCK_STALL
+directly (that would need a channel-isolating experiment: e.g. moving the join to a dedicated
+MemTile via `join(tile=...)` and re-tracing b3c3, or a power-mode-pinned re-run of this same sweep),
+and both are offered as the next things to test, not as a closed attribution.
+
 ## Caveat
 
 Device is shared with other concurrent lanes (gemma4 prefill gates, this session's own
