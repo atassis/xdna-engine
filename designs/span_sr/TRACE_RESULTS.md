@@ -1256,3 +1256,115 @@ the tooling defect this phase's own first script introduced is fixed and documen
 methodological point that motivated this phase (an earlier plateau can be masked by a since-fixed
 bottleneck) is now itself the second confirmed instance in this file, after the block-1 ping-pong
 correction to the SKIP_SLACK section above -- both were re-tested rather than assumed closed.
+
+## Phase 1i: pipeline is now compute-bound (327 cyc/px, every LOCK_STALL low) -- cut the epilogue
+## kinds. restrict/C3_LOOP_RANGE on the gather loops is NULL; fetch()'s own 32-lane path halves
+## the LUT/gate gather cost and re-converges the whole net to a ~245 cyc/px floor
+
+With the join fix (Phase 1h) the whole net runs at its slowest core's own compute, every LOCK_STALL
+low -- COMPUTE-bound, so a cycle cut in the pace-setting kinds (silu_i16, gate, silu16, silu, in
+that order by compute) shows up 1:1 in frame rate. Worktree `wt-span-phase1i`, off main 97a033d.
+Baseline (Phase 1c/1g/1h, unchanged since): b1c2 (silu_i16) 324.0, b1c3 (gate) 315.3, b1c1
+(silu16) 266.4, b2c2 (silu) 251.1 cyc/px compute; conv-only baseline (`plain`, `conv3x3_i8`, no
+epilogue, CIN=COUT=48 int8) 83.5 cyc/px, unaffected by anything below.
+
+**Lever 1 (`__restrict` + loop-range hints on the epilogue gather loops): NULL.** Per the
+optimization skill's checklist, `apply_lut_inplace`'s `dst` (single pointer, no other pointer to
+alias against within the function -- safe), the gate epilogue's local `dst_r`/`xp` (distinct
+buffers, don't alias), and matching `C3_LOOP_RANGE` hints on all three gather loops
+(`apply_lut_inplace`, `apply_lut16`, gate) were added (`apply_lut16`'s `keys`/`dst` were LEFT
+unqualified -- they deliberately alias, per the existing comment: keys can be the second half of
+dst's own 128 bytes). Full aiecc compile (`compile_check_phase1i.py`, address allocation included)
+OK; device gate 22/22 exact. Device re-trace, full net, W=32 H=128, one stage per dispatch:
+b1c1 266.48, b1c2 324.23, b1c3 315.32, b2c2 251.2 -- **bit-for-bit identical to baseline within
+trace noise (<0.3 cyc/px) at all four.** Peano was already scheduling these 2-4-iteration loops
+optimally without the hints; `parallel_lookup::fetch()` is very likely a fixed-latency op that
+dominates each iteration's critical path regardless of surrounding scheduling, so there was no
+slack for restrict/pipelining to recover. Kept anyway (correctness-neutral, matches the skill's
+documented practice, gates clean) but claims no measured win on its own.
+
+**Lever 2 (halve the gather-call count via `fetch()`'s own 32-lane path): LARGE, confirmed.**
+`aie_api/detail/aie2/parallel_lookup.hpp`'s `fetch()` supports `Vec::size() <= 32` directly: for a
+32-lane input it does two internal `extract<16>()` from a 32-lane *accumulator* built via
+`acc.from_vector()` and combines the two 16-lane table reads itself. This is a DIFFERENT code path
+from the one `probe_lut_gather_isolated.py` found broken (extracting 16-lane groups from a 64-lane
+**register** fed `fetch()` wrong keys on device) -- that probe never tried calling `fetch()` with a
+32-lane vector and letting it do its own internal extract from an accumulator, which is aie_api's
+own tested/supported surface, not an ad hoc register slice. New isolated probe
+(`probe_lut_gather32.py`, random keys, identity table): a single `load_v<32>` + one `fetch()` call
+vs. the current 2x(`load_v<16>` + `fetch()`) loop -- **64/64 bit-exact on device.**
+
+Applied to `apply_lut_inplace` (n=32 or 64 -> 1 or 2 fetch calls, was 2 or 4), `apply_lut16` (fixed
+64 -> 2 fetch-pairs, was 4; same "keys read before the aliasing dst range is written" ordering the
+existing comment already established, just at 32-lane granularity, so no new aliasing hazard), and
+the gate epilogue's inner loop (LANES=64 -> 2 groups of 32, was 4 of 16; `aie::mul`/`mac`/`to_vector`
+all instantiate cleanly at width 32, no new API surface). Full aiecc compile OK; device gate
+**22/22 exact** (`verify_span_net.py`, all 8 checkpoints, same byte counts as every prior phase).
+
+**Device re-trace, full net, W=32 H=128, one stage per dispatch, before -> after:**
+
+| stage | kind | compute before | compute after | delta | compute+gap before | compute+gap after |
+|---|---|---|---|---|---|---|
+| b1c2 | silu_i16 | 324.0 | 242.4 | -25.2% | 326.9 | 245.2 |
+| b1c3 | gate | 315.3 | 215.4 | -31.7% | 327.2 | 245.1 |
+| b1c1 | silu16 | 266.4 | 213.0 | -20.0% | 325.9 | 244.7 |
+| b2c2 | silu | 251.1 | 183.4 | -27.0% | 326.6 | 244.4 |
+
+**All four kinds converge to compute+gap 244.4-245.2 -- within 0.8 cyc/px of each other, the
+tightest common-pace convergence in this whole file, at a floor ~25% below the pre-fix ~245-327
+range.** Compute alone dropped 20-32% per kind (largest cut on `gate`, the heaviest kind, as hoped);
+each kind's own gap correspondingly widened (LOCK_STALL rose from ~2-14% pre-fix... to ~13-29%
+post-fix on the SAME stages -- expected: compute fell, so the fixed join/sync floor from Phase 1h
+is now a larger fraction of a smaller span) but compute+gap, i.e. the actual per-stage period, fell
+in lockstep with compute on every one of the four. Since `b1c2` is this file's standing whole-chain
+pace probe (present, and near the pace, in every phase since 1c), **the whole net's pace moves with
+it: ~327 -> ~245 cyc/px, ~25% faster frame rate.** `plain`/`silu_x`/conv1/join/`up` were not
+re-traced (their kernels are untouched by this phase and were already well under the old floor);
+since the new floor (~245) is set by the four kinds actually cut, and all four now sit within noise
+of each other, no other kind is expected to be the new pace-setter.
+
+**Epilogue attribution (approximate -- conv-only baselines by PA type were not separately
+isolated this phase, so this uses the single measured `plain` baseline, PA=int8, as a stand-in for
+every LUT/gate kind's conv part; `silu_i16`'s conv is PA=int16, a different MMUL shape, so its own
+epilogue share is not comparable this way):**
+
+| kind | epilogue before (~compute - 83.5) | epilogue after | cut |
+|---|---|---|---|
+| silu (LUT, int8 keys, 1 fetch/32) | 167.6 | 99.9 | -40.4% |
+| gate (LUT + sum/mul epilogue, 1 fetch/32) | 231.8 | 131.9 | -43.1% |
+| silu16 (LUT16, hi/lo double gather, 2 fetch/32) | 182.9 | 129.5 | -29.2% |
+
+`silu16` cuts less than `silu`/`gate` because its epilogue still pays TWO fetch calls per 32-lane
+group (hi/lo, `apply_lut16`) where the others pay one -- consistent with the halving being per
+fetch-call, not per byte.
+
+**Not attempted, and why (per this codebase's own "guessing does not converge" doctrine and the
+prior sessions' already-paid cost on this exact kernel):**
+- **Combining `apply_lut16`'s hi/lo tables into one gather.** bf16 has only 8 mantissa bits and
+  cannot exactly represent the full int16 output range; the split into two bf16-exact int8-range
+  halves (`hi*256+lo`) is why the design uses two tables, not an oversight. Unsafe to merge without
+  losing bit-exactness.
+- **Hoisting `apply_lut_inplace`'s per-call `aie::lut`/`Look` construction out of the epilogue
+  loop** (built once per row instead of once per `put()` call, ~4x/row for LUT, ~2x/row post-lever-2).
+  Already tried and device-refuted: `3f11dcb` built it once at `conv3x3_core`'s top and captured it
+  by reference into the `put` lambda across the whole row -- "it gathered every key as 0" on
+  device (`probe_conv3x3_gate_stages.py`). Re-attempting this without a new hypothesis for WHY the
+  by-reference capture broke (a stack-lifetime or register-allocation interaction with the
+  outlined lambda, not investigated here) would be re-litigating a paid-for dead end, not a cheap
+  experiment.
+- **silu_i16's conv MMUL shape (task item 3).** `conv3x3_core`'s `PX = 8/sizeof(PA)` correctly
+  yields `PX=4` for int16 activations, instantiating `aie::mmul<4,8,8,int16,int8>` -- the natural,
+  correctly-shaped int16xint8 multiply, not a fallback/scalar path. Its ~2x compute over the int8
+  path (same CIN/COUT) is the expected int16-vs-int8 datapath cost, not a kernel misconfiguration;
+  no fix available at this level without changing the model's own int16 activation choice at that
+  hop, out of scope for a kernel-level cycle cut.
+- **-O2 vs -Oz per kernel.** No per-kernel opt-level override exists in `net_design.py`'s compile
+  flags (`_flags`/`_flags_gate_half`); not probed this phase.
+
+**Net for this phase: the two named cheap epilogue levers (restrict/pipelining hints, gather-call
+halving) were both tried; only the second moved anything, but it moved a lot -- the whole net's
+compute-bound floor falls ~25%, gated 22/22 exact on device.** `silu_i16` (the biggest single cut
+target) and `gate` (the biggest kind) both landed inside the top target list, largest-first, as the
+task asked; the remaining ~245 cyc/px floor is now flat across all four previously-distinct kinds,
+so the next cut (if any) needs to move all four together (e.g. the still-untried lookup-hoist, or a
+MOVEMENT-layer lever) rather than target one kind alone.
