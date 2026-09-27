@@ -113,6 +113,21 @@ pub struct ChatMessage {
     pub tool_calls: Vec<ToolCall>,
     /// `role == "tool"` only. Qwen3's template ignores it; others thread it back to the call.
     pub tool_call_id: Option<String>,
+    /// Raw media bytes attached to this turn, in the order their content parts appeared
+    /// (`image_url`/`input_audio`). Empty for every turn today except one carrying multimodal
+    /// content parts -- see `npu-runtime/src/http.rs`'s `parse_content`. Consumed by
+    /// `LlmGenerator::media_for`, never by a chat template directly: the template only ever sees
+    /// the `<|image|>`/`<|audio|>` MARKER text already folded into `content`.
+    pub media: Vec<ChatMedia>,
+}
+
+/// One attached media item's raw, still-encoded bytes -- PNG/JPEG or WAV, undecoded until
+/// `gemma4_media::Gemma4Towers` runs. Kept as an enum (not bytes + a kind flag) so a caller cannot
+/// construct the nonsensical "audio bytes tagged as image" pairing.
+#[derive(Debug, Clone)]
+pub enum ChatMedia {
+    Image(Vec<u8>),
+    Audio(Vec<u8>),
 }
 
 impl ChatMessage {
@@ -127,6 +142,11 @@ impl ChatMessage {
 
     pub fn with_tool_call_id(mut self, id: impl Into<String>) -> Self {
         self.tool_call_id = Some(id.into());
+        self
+    }
+
+    pub fn with_media(mut self, media: Vec<ChatMedia>) -> Self {
+        self.media = media;
         self
     }
 }

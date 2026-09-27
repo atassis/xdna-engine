@@ -357,6 +357,25 @@ pub fn tokenize_prompt(
     Ok(enc.get_ids().to_vec())
 }
 
+/// [`tokenize_prompt`]'s `Prompt::Chat` arm, plus the media placeholder expansion
+/// (`multimodal::expand_media_placeholders`) between rendering and tokenizing. Kept separate
+/// rather than adding two always-empty slices to every `tokenize_prompt` call site (including
+/// `decide()`'s, which never carries media): a text-only render is the exact code
+/// `tokenize_prompt` already ran before multimodal existed.
+fn tokenize_chat_with_media(
+    cfg: &ModelConfig, messages: &[crate::pipeline::ChatMessage], enable_thinking: Option<bool>,
+    tools: &[serde_json::Value], image_soft_tokens: &[usize], audio_soft_tokens: &[usize],
+) -> Result<Vec<u32>, EngineError> {
+    let tmpl = cfg.chat_template.as_ref()
+        .ok_or_else(|| EngineError::Unsupported("model has no chat_template for Prompt::Chat".to_string()))?;
+    let rendered = tmpl.render_full(messages, true, enable_thinking, tools)?;
+    let expanded = crate::llm::multimodal::expand_media_placeholders(
+        &rendered, image_soft_tokens, audio_soft_tokens)?;
+    let enc = cfg.tokenizer.encode(expanded, false)
+        .map_err(|e| EngineError::Load(format!("tokenize prompt: {e}")))?;
+    Ok(enc.get_ids().to_vec())
+}
+
 /// A scripted [`DecodeStep`] for tests: replays a fixed queue of logits vectors, one per call,
 /// ignoring `token`/`pos`. Not a model -- a way to drive [`LlmGenerator`]'s loop deterministically.
 pub struct ScriptedDecodeStep {
@@ -494,11 +513,84 @@ pub struct LlmGenerator<D: DecodeStep> {
     /// state -- fluently, with no warning, and no happy-path test would see it. Every path that
     /// writes KV must update it or clear it. There is no third option.
     resident: Vec<u32>,
+    /// `[multimodal].tower_checkpoint` from the scenario, resolved to an absolute directory. `None`
+    /// means this model declares no towers -- a request carrying media is a 400
+    /// ([`Self::media_for`]), never a silent drop.
+    tower_checkpoint: Option<std::path::PathBuf>,
+    /// Loaded on first use, not at construction: a generation with no media never pays for the
+    /// ~100 MB tower weights. `RefCell` because loading happens from `&self` context inside
+    /// `media_for`, which `generate` calls before it needs `&mut self` for anything else.
+    towers: std::cell::RefCell<Option<crate::llm::gemma4_media::Gemma4Towers>>,
+}
+
+/// [`LlmGenerator::media_for`]'s result: empty (`Default`) is the whole pre-multimodal behaviour,
+/// costing this one struct's worth of stack space on a text-only request.
+#[derive(Default)]
+struct MediaForResult {
+    image_soft_tokens: Vec<usize>,
+    audio_soft_tokens: Vec<usize>,
+    attachments: Vec<crate::llm::multimodal::MediaAttachment>,
+    d_model: usize,
 }
 
 impl<D: DecodeStep> LlmGenerator<D> {
     pub fn new(cfg: ModelConfig, decode: D) -> Self {
-        LlmGenerator { cfg, decode, scenario_defaults: Default::default(), resident: Vec::new() }
+        LlmGenerator {
+            cfg, decode, scenario_defaults: Default::default(), resident: Vec::new(),
+            tower_checkpoint: None, towers: std::cell::RefCell::new(None),
+        }
+    }
+
+    /// Wire this model's vision/audio tower checkpoint (`[multimodal].tower_checkpoint`). Absent
+    /// (the default) means every request carrying media is refused -- see [`Self::media_for`].
+    pub fn with_tower_checkpoint(mut self, dir: Option<std::path::PathBuf>) -> Self {
+        self.tower_checkpoint = dir;
+        self
+    }
+
+    /// Run the vision/audio towers (if any) over every media item attached to `prompt`'s messages,
+    /// in the order they appear, and return `(image_soft_token_counts, audio_soft_token_counts,
+    /// attachments)` -- the first two size [`multimodal::expand_media_placeholders`]'s substitution
+    /// BEFORE tokenizing, the third is what [`multimodal::scatter_media_rows`] scatters AFTER.
+    ///
+    /// A model with no `tower_checkpoint` configured and a prompt with no media both return the
+    /// all-empty triple cheaply (a `Vec::is_empty()` each); a model with no towers but a prompt
+    /// that DOES carry media is a 400 naming the model, never a silent drop of the image/audio --
+    /// the same discipline `reject_unsupported` applies to any other field this surface cannot honour.
+    fn media_for(&self, prompt: &Prompt) -> Result<MediaForResult, EngineError> {
+        let Prompt::Chat(messages) = prompt else { return Ok(MediaForResult::default()) };
+        let items: Vec<&crate::pipeline::ChatMedia> = messages.iter().flat_map(|m| m.media.iter()).collect();
+        if items.is_empty() { return Ok(MediaForResult::default()); }
+
+        let Some(dir) = &self.tower_checkpoint else {
+            return Err(EngineError::Unsupported(
+                "this model has no vision/audio towers configured (no [multimodal].tower_checkpoint \
+                 in its scenario); it cannot serve image_url/input_audio content".to_string()));
+        };
+        if self.towers.borrow().is_none() {
+            *self.towers.borrow_mut() = Some(crate::llm::gemma4_media::Gemma4Towers::load(dir)?);
+        }
+        let towers_ref = self.towers.borrow();
+        let towers = towers_ref.as_ref().expect("just loaded above");
+
+        let mut out = MediaForResult { d_model: towers.d_model(), ..Default::default() };
+        for item in items {
+            match item {
+                crate::pipeline::ChatMedia::Image(bytes) => {
+                    let rows = towers.vision_forward(bytes, crate::llm::gemma4_media::DEFAULT_MAX_SOFT_TOKENS)?;
+                    out.image_soft_tokens.push(rows.len());
+                    out.attachments.push(crate::llm::multimodal::MediaAttachment {
+                        token_id: crate::llm::multimodal::IMAGE_TOKEN_ID, rows });
+                }
+                crate::pipeline::ChatMedia::Audio(bytes) => {
+                    let rows = towers.audio_forward(bytes)?;
+                    out.audio_soft_tokens.push(rows.len());
+                    out.attachments.push(crate::llm::multimodal::MediaAttachment {
+                        token_id: crate::llm::multimodal::AUDIO_TOKEN_ID, rows });
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Prime `ids` and return the logits at their last position: `generate`'s prompt phase without
@@ -768,11 +860,34 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
         }
         let mut prefill_us = t0.elapsed().as_micros() as u64;
         let t_tokenize = Instant::now();
-        let prompt_ids = tokenize_prompt(&self.cfg, prompt, params.enable_thinking, &params.tools)?;
+        // Runs the towers (if this prompt carries media) BEFORE tokenizing: the placeholder
+        // expansion below needs each image/audio's REAL soft-token count, which only the tower
+        // pipeline knows (it depends on the image's resized patch grid / the audio's sample
+        // count, not on anything the chat template can compute itself).
+        let media = self.media_for(prompt)?;
+        let prompt_ids = if media.attachments.is_empty() {
+            // Byte-identical to pre-multimodal behaviour: text-only prompts never touch
+            // `expand_media_placeholders` or the towers.
+            tokenize_prompt(&self.cfg, prompt, params.enable_thinking, &params.tools)?
+        } else {
+            let Prompt::Chat(messages) = prompt else {
+                return Err(EngineError::Unsupported("media is only supported on Prompt::Chat".to_string()));
+            };
+            tokenize_chat_with_media(&self.cfg, messages, params.enable_thinking, &params.tools,
+                                      &media.image_soft_tokens, &media.audio_soft_tokens)?
+        };
         let tokenize_us = t_tokenize.elapsed().as_micros() as u64;
         if prompt_ids.is_empty() {
             return Err(EngineError::Unsupported("prompt tokenized to zero tokens".to_string()));
         }
+        // Every generation sets (or clears) this explicitly: `DecodeStep::media` is per-generation
+        // state that otherwise survives on the backend from the PREVIOUS request (see its doc).
+        let media_embeds = if media.attachments.is_empty() {
+            crate::llm::multimodal::MediaEmbeds::default()
+        } else {
+            crate::llm::multimodal::scatter_media_rows(&prompt_ids, &media.attachments, media.d_model)?
+        };
+        self.decode.set_media(media_embeds);
         let prompt_tokens = prompt_ids.len() as u32;
         // The KV window is a HARD bound, and crossing it is silent rather than loud: `pos` becomes
         // a `kv_off` element offset into a cache holding exactly S positions, so position S lands
@@ -1802,6 +1917,37 @@ mod tests {
         assert_eq!(text, "");
         assert_eq!(reason, FinishReason::Stop);
         assert_eq!(usage.prompt_tokens, 2, "rendered prompt \"hello world \" tokenizes to 2 ids");
+    }
+
+    #[test]
+    fn media_on_a_model_with_no_tower_checkpoint_is_a_refusal_not_a_silent_drop() {
+        let cfg = build_cfg(Some("{%- for m in messages -%}{{ m.content }} {%- endfor -%}"));
+        let decode = ScriptedDecodeStep::new(vec![vec![0.0, 0.0, 0.0, 0.0, 9.0]]);
+        let mut gen = LlmGenerator::new(cfg, decode); // no .with_tower_checkpoint(...)
+        let params = GenerateParams { max_tokens: Some(5), temperature: Some(0.0), ..GenerateParams::default() };
+        let prompt = Prompt::Chat(vec![ChatMessage::new("user", "look <|image|>")
+            .with_media(vec![crate::pipeline::ChatMedia::Image(vec![0u8; 4])])]);
+        let err = gen.generate_to_string(&prompt, &params).unwrap_err();
+        assert!(format!("{err}").contains("tower_checkpoint"), "{err}");
+    }
+
+    #[test]
+    fn a_text_only_chat_prompt_never_calls_set_media() {
+        // Regression for the media wiring: a plain chat message (no `.with_media`) must take
+        // EXACTLY the pre-multimodal path -- `media_for` returns the all-empty default without
+        // touching `self.towers`, so a model with no tower_checkpoint configured still serves
+        // ordinary chat.
+        let cfg = build_cfg(Some("{%- for m in messages -%}{{ m.content }} {%- endfor -%}"));
+        let decode = ScriptedDecodeStep::new(vec![
+            vec![0.0, 0.0, 0.0, 0.0, 0.0],
+            vec![0.0, 0.0, 0.0, 0.0, 9.0],
+        ]);
+        let mut gen = LlmGenerator::new(cfg, decode);
+        let params = GenerateParams { max_tokens: Some(5), temperature: Some(0.0), ..GenerateParams::default() };
+        let prompt = Prompt::Chat(vec![ChatMessage::new("user", "hello world")]);
+        let (_, reason, usage) = gen.generate_to_string(&prompt, &params).unwrap();
+        assert_eq!(reason, FinishReason::Stop);
+        assert_eq!(usage.prompt_tokens, 2);
     }
 
     #[test]

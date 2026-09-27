@@ -10,7 +10,7 @@ pub mod decide;
 pub use api::{Engine, EngineError, Model, ModelKind};
 pub use cancel::{Cancel, CancelReason};
 pub use decide::{DecideAnswer, DecideQuestion, DecideRequest, DecideStats, Decisions, QuestionKind, QuestionStats};
-pub use pipeline::{ChatMessage, Chunk, ToolCall, DEFAULT_MAX_TOKENS, FinishReason, GenerateParams, GenerateUsage, Prompt,
+pub use pipeline::{ChatMedia, ChatMessage, Chunk, ToolCall, DEFAULT_MAX_TOKENS, FinishReason, GenerateParams, GenerateUsage, Prompt,
                    TextGenerator};
 pub use telemetry::{
     Bound, GenerationReport, NpuWake, PrefillRecord, RunConditions, StepPhases, StepRecord, Summary,

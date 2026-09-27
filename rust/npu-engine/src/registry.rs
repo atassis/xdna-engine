@@ -75,8 +75,10 @@ pub fn try_build(cfg_path: &Path, root: &Path) -> Result<Scenario, EngineError> 
                 None => crate::llm::NpuDecodeStep::new(&dev, &decode_dir)?,
                 Some(p) => crate::llm::NpuDecodeStep::with_prefill(&dev, &decode_dir, &p)?,
             };
+            let tower_checkpoint = cfg.multimodal.tower_checkpoint.as_ref().map(|p| root.join(p));
             Scenario::Generate(Box::new(crate::llm::LlmGenerator::new(model_cfg, decode)
-                .with_scenario_defaults(cfg.generation.to_defaults())))
+                .with_scenario_defaults(cfg.generation.to_defaults())
+                .with_tower_checkpoint(tower_checkpoint)))
         }
         // NO open_dev(): nothing here composes onto the device yet (see `tts::TtsPipeline`), so a
         // `tts` scenario must not take a hardware context away from a model that coexists with it.
