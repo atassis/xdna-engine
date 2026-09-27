@@ -88,3 +88,81 @@ now with one of the two blockers understood and the other (b1c1/b1c2) actually f
   the b2c3 gate split found NO measured whole-net win from a channel split at this MAIN_DEPTH (the
   skip-ring/lockstep dynamics mask a per-core compute cut) -- the same result is plausible here and
   should be measured, not assumed, before extending this split to production.
+
+## Variant B (spill long-lead skips to DDR): legal at the API/toolchain level, checked on real aiecc
+
+Spec's "After milestone 1" section: S4's join restructure (4 independent per-source rings) doesn't
+fit (5 input DMA channels on `conv_cat` against the 2-in cap; joins don't chain, see "Channel-count
+check" above). Variant B was left open ("whether an IRON join accepts shim-fed subfifos; breaks
+'never leaves L2' for two skip streams"). Checked both halves.
+
+**join() accepts a shim-fed subfifo producer -- confirmed by API, not inference.**
+`ObjectFifoHandle.join()` (`python/iron/dataflow/objectfifo.py:1110`) only wires each new
+subfifo's CONSUMER side into the link (`subfifo_cons = [s.cons(...) ...]`, `ObjectFifoLink(...)`,
+:1188-1193); the PRODUCER side is left untouched, exactly like `f_in`/`out[names[-1]]` in
+`net_design.py`. `ObjectFifo.prod()` (:327) takes `tile:` and documents it directly: "When this
+handle drives an ObjectFifo from the runtime (passed in `Runtime` `fn_args`), the shim tile its
+host-side DMA binds to." Nothing in `join()`, `ObjectFifoLink.__init__` (:1398-1441, only asserts
+src/dst counts and offset-list lengths) or `ObjectFifoLinkOp::verify()` constrains a subfifo's
+producer tile TYPE -- the join and the shim-feed are orthogonal mechanisms, and `AnyShimTile`
+(`python/iron/device/tile.py:123`) is a first-class producer tile like `AnyMemTile`/
+`AnyComputeTile`.
+
+**Delayed self-read (write row now, read it back later) is an existing Runtime primitive.**
+`python/iron/runtime/runtime.py`'s own module docstring: "it can use native `range_`/`if_` control
+flow with `fill`/`drain` verbs nested inside." Ordering a read-fill to happen only after a
+write-drain completes (rather than racing two independent shim queues) is `TaskGroup`
+(`python/iron/runtime/taskgroup.py`): `group=` on `fill()`/`drain()`, `wait=True` on the write,
+`tg.finish()` awaits it before the read issues. `IronRuntimeError`'s only constraint found here
+(`python/iron/runtime/runtime.py:151`): mixing the implicit default group with an explicit one is
+refused ("Mixing explicit task groups and the default task group is prohibited") -- once every
+fill/drain in a sequence with any explicit group is put in an explicit group, it resolves.
+
+**Compile-only proof, full aiecc pipeline, CPU-only** (`aie_kernels/_test/compile_span_spill_join.py`):
+2 producer cores -> 2 shim WRITE drains into 2 DDR spill buffers (`TaskGroup`, `wait=True`) -> 2
+shim READ fills back out of those SAME buffers into a 2-way `.join()` on one `AnyMemTile` -> 1
+consumer core -> shim drain to `y`. Ran via `./run.sh compile_span_spill_join.py`:
+```
+[span_spill_join] OK: shim-fed join subfifo + DDR write-then-read compiles clean through aiecc
+address allocation
+```
+No rejection at the API level, the MLIR verifier, or aiecc's address allocation. **7 shim-side DMA
+transfers total** (4 MM2S fills: 2 host x-in + 2 spill-read; 3 S2MM drains: 2 spill-write + 1
+y-out), auto-placed by `AnyShimTile`/`AnyMemTile` -- exact tile/channel assignment not dumped this
+session (no `--print-alloc`-equivalent run; see "Not done"). This is a minimal 2-source probe of
+the WIRING, not the real 4-source net with real row counts/LEAD; row-granular (per-`lead`-rows)
+fill/drain, as opposed to this probe's whole-buffer fill/drain matching every other `Runtime` call
+in this repo, is unbuilt and untimed -- see "Not done".
+
+**Byte/ring budget under variant B, re-derived from `net_layout.py` (not copied from W=32/48):**
+conv_1 and b1c3 (`rows_ahead` 20, 17 -> current `skip_depth` 36, 33) are the two spilled sources;
+their on-chip join depth drops to `SKIP_SLACK` alone (16, no `rows_ahead` term -- the DDR round
+trip absorbs the lead, the ring only needs handshake slack). conv_2 (`skip_depth` 17) and b6c1
+(`skip_depth` 20) are unchanged (still core -> join directly). The join is still ONE
+`.join()` call / one shared MemTile pool (variant B does not touch that constraint -- only S4 did,
+and S4 is dead), so `ring_depth = max(17, 20, 16, 16) = 20` (b6c1-dominated, not conv_1 anymore).
+
+| W | half(w) | ring bytes (`5*half(w)*20`) | vs 524,288 (dedicated MemTile) |
+|---|---|---|---|
+| 32 | 2,304 | 230,400 | 43.9% |
+| 48 | 3,072 | 307,200 | 58.6% |
+| 96 | 5,376 | 537,600 | **102.5% -- still over** |
+| 112 | 6,144 | 614,400 | **117.2% -- still over** |
+
+Closed form `ring(w) = 5*(w+16)*48*20 = 4,800*(w+16)`; solving `<=524,288` (best case: the shallow
+join alone on a dedicated MemTile, no weight-group sharing) gives **`w <= 93.2`** -- narrower than
+96, well short of 112. This is *tighter* than the spec's own W=96-112 target but *looser* than the
+b1c1/b1c2 split's own L1 ceiling (`w<=89`, spec S5-iii, ESTIMATED). So variant B does what the
+spec claims -- it demotes the ring from binding wall to non-binding (89 < 93.2) -- but it does not,
+on this arithmetic, make W=96 or W=112 compile outright; L1 (b1c1/b1c2 split) becomes the tighter
+wall again, consistent with the spec's own "W then binds on core L1 (~89 px)" line. Getting to
+96-112 needs BOTH variant B (or equivalent) AND a wider L1 fix than S5-iii, or a smaller INNER.
+
+**DDR spill channel count, and which caps it does/doesn't trip.** Each spilled source costs 2 new
+shim-side DMA transfers (1 S2MM write, 1 MM2S read) -- 4 total for conv_1+b1c3, confirmed
+compiling in the 2-source probe above. This is a DIFFERENT resource from both caps that blocked
+S4: the compute-tile 2-in/2-out cap (`conv_cat`'s own channels, untouched -- variant B keeps
+`conv_cat` at 1 input, the joined `cat_in`) and the MemTile's 6-MM2S `WEIGHT_GROUP` cap (governs
+weight-group fan-out, not skip traffic; the spill/read channels sit on a shim tile, not on the
+join's MemTile's weight-serving side). So variant B trips neither of the caps S4 tripped -- its
+binding constraint is the ring's own byte budget above, not a channel count.
