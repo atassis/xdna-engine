@@ -115,12 +115,15 @@ here required raising it).
 
 **Device gate/trace (steps 3-4): NOT YET RUN.** `probe_span_b1int8_device.py` (gates both
 b1_modes on the full 22-core net, then traces b1c2/b1c3 one stage per dispatch) was queued
-under `npu_lock.sh queue -- env NPU_WAIT_S=3600 ...` -- the device was held by another
-session and at least 3 further sessions were also queued (`m1_snap.py`, `verify_span_p2b_a.py`,
-`m1_multi.sh`), and the background shell was killed by Claude Code's own low-memory reaper
-before it ever started running (never acquired the lock). Not a code failure -- the job never
-executed. Re-run `aie_kernels/_test/probe_span_b1int8_device.py` under the lock when the box
-has room; do not flip any default until it reports 22/22 for `b1_mode=int8`.
+under the NPU lock -- the device was held by another session and at least 3 further sessions
+were also queued (`m1_snap.py`, `verify_span_p2b_a.py`, `m1_multi.sh`). First attempt: the
+background shell was killed by Claude Code's own low-memory reaper before it acquired the lock.
+Second attempt: `NPU_WAIT_S=3600 npu_lock.sh queue -- env NPU_WAIT_S=3600 ...` -- setting the
+var for `env` sets it for the COMMAND, after the lock already read its own (1800 s) default, so
+it deferred at 30 min regardless of the intended 3600. Fixed form: `NPU_WAIT_S=3600
+npu_lock.sh queue -- <cmd>` (before the lock, not after `--`). Neither attempt touched the
+device outside the lock. Re-run `aie_kernels/_test/probe_span_b1int8_device.py` under the lock
+with the fixed invocation; do not flip any default until it reports 22/22 for `b1_mode=int8`.
 
 ## Read (not a decision)
 
