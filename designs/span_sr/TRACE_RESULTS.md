@@ -931,6 +931,104 @@ acquire/release counts, a wider LUT-amortization boundary), not a cheap one, and
 on this prefix (341.2 -> 326.0 cyc/px, W=16->32, ~4.5%) but is capped by L1 at W=32 with current
 buffer depths (probe_span_w_sweep_compile.py); "more rows per call" remains open and untested.
 
+## Phase 1e: trace-only re-bisection -- CORRECTS Phase 1a/1c: the pace jump is the JOIN, not block 1
+
+**Correction to the two prior chain-length bisections in this file (Phase 1a follow-up 2 and its
+Phase 1c re-run).** Both concluded "the pace is already essentially set within block 1's first 4
+cores" from `probe_span_upto_bisect.py`'s WALL-CLOCK fitted-slope numbers (663/572 cyc/px at
+`upto=b1c3`, within a few percent of the full net). That conclusion is WRONG. Phase 1d's
+same-process TRACE of the identical `b1c3` prefix (`probe_span_w_sweep_trace.py`, W=32) measured
+**326.0-326.4 cyc/px** -- a ~45-50% disagreement with the wall-clock bisection's own number for the
+same prefix under the same conditions. Per this file's own standing caveat ("treat compute-vs-gap
+SPLITS as trustworthy, absolute cyc/px versus the untraced net-rate probe as approximate"), the
+wall-clock bisection's absolute numbers were never trustworthy; they were nonetheless read as
+attribution evidence for WHERE the pace is set, which the caveat never licensed. Re-run below with
+the trusted instrument only.
+
+**Method** (`aie_kernels/_test/trace_span_upto_bisect.py`, new): for each `SPAN_UPTO` in {b1c3,
+b2c3, b3c3, b4c3, b5c3, b6c3, conv_2, conv_cat, up}, same-process trace of `b1c2` (present at every
+prefix from b1c3 onward -- a fixed cross-prefix probe) plus the prefix's own last stage, one stage
+per dispatch, W=32, H=128. `SPAN_UPTO` below `conv_cat` builds no join at all (`net_design.build()`
+only wires `f_cat` when `"conv_cat"` is in the truncated stage list), so b1c3..conv_2 isolate the
+main chain alone; conv_cat/up add the join and the `up` tail. Power mode: `default` (UNPINNED),
+standing caveat.
+
+| upto | cores | join built? | b1c2 compute+gap | b1c2 LOCK% | last stage | last compute+gap | last LOCK% |
+|---|---|---|---|---|---|---|---|
+| b1c3 | 4 | no | 325.9 | 1.88% | b1c3 | 326.2 | 5.8% |
+| b2c3 | 7 | no | 325.9 | 1.93% | b2c3 | 326.0 | 9.67% |
+| b3c3 | 10 | no | 325.9 | 1.99% | b3c3 | 325.8 | 12.97% |
+| b4c3 | 13 | no | 325.9 | 1.92% | b4c3 | 325.6 | 16.49% |
+| b5c3 | 16 | no | 325.9 | 1.91% | b5c3 | 325.5 | 19.3% |
+| b6c3 | 19 | no | 325.9 | 2.03% | b6c3 | 325.6 | 22.06% |
+| conv_2 | 20 | no | 325.9 | 2.06% | conv_2 | 323.3 | 79.06% |
+| **conv_cat** | **21** | **YES** | **483.8** | **33.19%** | conv_cat | 481.3 | 89.47% |
+| up | 22 | yes | 483.8 | 33.22% | up | 478.7 | 94.93% |
+
+**The pace steps from ~326 to ~483.8 cyc/px in exactly one place: between `conv_2` (20 cores, no
+join) and `conv_cat` (21 cores, +join).** Every core-only prefix (4 through 20 cores) sits at
+325.5-326.2 regardless of chain length -- 16 additional main-path cores (b2c3 through conv_2) buy
+NOTHING, refuting "block 1 sets the pace" outright, not just its magnitude. Block 1 (and the whole
+main chain) is compute-dominated and near its own rate (LOCK_STALL 1.9-2.1% on the fixed b1c2 probe
+throughout); the throttle is not distributed across the chain length, it is introduced by ONE
+structural element: whatever the join adds. `b1c2`'s own LOCK_STALL rises in lockstep with the
+prefix's OWN last-stage LOCK_STALL as the prefix lengthens through the no-join range (1.88% at
+b1c3's own last stage 5.8% -> conv_2's own last stage 79.06%) -- consistent with ordinary pipeline
+fill/drain inside a fixed H=128 dispatch (per Phase 1a follow-up's correction), not with a
+per-hop throttle; b1c2's own number stays flat at ~325.9 throughout, which is the signal that
+matters here.
+
+**What the join adds, from the compiled MLIR (`aie.objectfifo @cat_in`, `aie_kernels/_test/gen`):**
+`cat_in` is built with `iterate_bds=True` and is the ONLY objectFifo in the entire 22-core network
+built that way (grep confirms one hit). Per the commit that added it (282feac, "conv_cat joins via
+iterate_bds"): the join's per-object BD lowering needs **182 MemTile BDs** against a **48-BD**
+hard limit on that MemTile; `iterate_bds` replaces that with **8 BDs** by lowering to one
+self-looping BD per (channel, segment) instead of one static BD per repeat -- a MOVEMENT-layer
+mechanism switch, not merely a bigger buffer. Every ordinary main-path hop (`windowed()`,
+`depth=main_depth=4`) and the skip-broadcast producers (`PROD_DEPTH=2`) still lower as static
+per-slot BD chains; `cat_in` is qualitatively different DMA machinery, forced by the 48-BD cap,
+not a policy choice this file's existing depth/slack knobs (MAIN_DEPTH, PROD_DEPTH, SKIP_SLACK,
+cat_cons_depth -- all previously refuted at b3c3 in Phase 1a) ever touched.
+
+**Targeted experiment: pin the join off the MemTile it shares with weight group 3.** Phase 1a's
+follow-up found `cat_in`'s default placement (`join(tile=AnyMemTile)`, unconstrained) lands on the
+SAME MemTile as weight group 3 -- 10/12 DMA channels used there vs. 7/12 on every other
+weight-feed MemTile -- and flagged this as an untested "shared resource" candidate. Added
+`net_design.build(join_tile=...)` (new param, default `None` -> `AnyMemTile`, byte-identical
+placement when omitted) so the join can be pinned to a specific `Tile`. Compile-only check
+(`aie_kernels/_test/compile_span_join_tile.py`) confirmed `Tile(1,1)` and `Tile(5,1)` (two MemTile
+columns no weight group uses) both fit L1/BD budget cleanly, same as the default.
+
+**Device: same-process trace of `conv_cat` and `b1c2`, full net (`upto=up`), W=32, H=128, one stage
+per dispatch, baseline vs. both candidate tiles** (`aie_kernels/_test/trace_span_join_tile.py`).
+Power mode: `default` (UNPINNED), standing caveat.
+
+| join tile | conv_cat compute+gap | conv_cat LOCK% | b1c2 compute+gap | b1c2 LOCK% |
+|---|---|---|---|---|
+| baseline (AnyMemTile, lands on shared (4,1)) | 481.3 | 89.39% | 483.8 | 33.21% |
+| Tile(1,1) (dedicated) | 481.4 | 89.4% | 483.9 | 33.26% |
+| Tile(5,1) (dedicated) | 484.6 | 89.41% | 483.8 | 33.25% |
+
+**NULL -- all three land within trace noise of each other (481.3-484.6, LOCK_STALL 89.4% flat).**
+Moving the join off the shared MemTile, onto a tile with no weight-group DMA traffic at all, does
+not move the pace. This refutes the specific "MemTile(4,1) channel-sharing" mechanism Phase 1a's
+follow-up flagged as the concrete "shared resource" candidate -- the join's cost is not contention
+for that MemTile's 12 DMA channels with weight group 3.
+
+**Net: the pace-jump is now localized to the join precisely (conv_2 -> conv_cat, not "block 1" and
+not "somewhere downstream"), but the MECHANISM within the join is still open.** MemTile
+channel-sharing is refuted (this experiment). The remaining, MLIR-grounded candidate this phase's
+budget did not reach is the `iterate_bds` self-looping-BD mechanism itself -- whether a
+self-looping BD carries a per-iteration reload/resync cost that a static per-slot BD chain does
+not, independent of which MemTile it sits on. Testing that needs an isolated join (few enough
+skip sources to fit the 48-BD cap WITHOUT `iterate_bds`) traced against an equivalent
+`iterate_bds`-lowered one at the same depth -- not attempted here (one experiment was this
+phase's budget); flagged as the concrete next step rather than re-guessed.
+
+**Gate: `verify_span_net.py`, default config (no `join_tile` override) -- all 8 checkpoints exact**
+(conv_1 through up, 98304/98304 or 32768/32768 per stage) -- confirms the new opt-in `join_tile=`
+parameter is behavior-preserving when omitted, as intended; no default was flipped.
+
 ## Caveat
 
 Device is shared with other concurrent lanes (gemma4 prefill gates, this session's own

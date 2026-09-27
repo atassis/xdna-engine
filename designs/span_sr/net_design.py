@@ -13,6 +13,7 @@ import numpy as np
 
 import aie.iron as iron
 from aie.iron import CompileTime, In, ObjectFifo, Out, Program, Runtime, Worker
+from aie.iron.device import AnyMemTile, Tile
 from aie.iron.controlflow import range_
 from aie.iron.kernel import ExternalFunction
 from aie.helpers.taplib import TensorAccessPattern, TensorTiler2D
@@ -135,7 +136,7 @@ def _flags(kind, incs):
 def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
          trace_stages=None, trace_config=None, coretile_events=None, egress_shim_col=1,
          main_depth=None, skip_slack=None, prod_depth=None, cat_cons_depth=None,
-         data_sizes=None, split_gate=None, skip_cons_depths=None):
+         data_sizes=None, split_gate=None, skip_cons_depths=None, join_tile=None):
     """NP: span_int.Span.net_params(). Returns an iron.jit callable (x, wts, y): x from
     net_layout.conv1_rows (as int8), wts from net_layout.weights_blob, y gets `upto`'s rows.
 
@@ -182,7 +183,12 @@ def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
     tile), at the cost of that hop alternating with its source if the source's own compute is
     small enough not to become the new ceiling -- check with a trace, do not assume. Merged over
     SKIP_CONS_DEPTHS (default {}, currently {"conv_1": 3} -- the other half of DEPTH["b1c1"]=4's
-    L1 fix)."""
+    L1 fix).
+
+    join_tile: Tile override for the join's own MemTile (default None -> AnyMemTile, the
+    unconstrained placer choice that landed on the SAME MemTile as weight group 3 -- see
+    TRACE_RESULTS.md's Phase 1a MemTile(4,1) section). Phase 1e's targeted experiment: pin the
+    join off that shared tile onto a dedicated one."""
     main_depth = MAIN_DEPTH if main_depth is None else main_depth
     skip_slack = NL.SKIP_SLACK if skip_slack is None else skip_slack
     prod_depth = PROD_DEPTH if prod_depth is None else prod_depth
@@ -239,7 +245,9 @@ def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
         (w, h, upto, sorted(stacks.items()), sorted(depth.items()), groups, skip_depths,
          main_depth, prod_depth, cat_cons_depth, sorted(data_sizes.items()),
          sorted(skip_cons_depths.items()), sorted(trace_stages), tuple(coretile_events or ()),
-         egress_shim_col, sorted(split_gate))).encode()).hexdigest()[:12]
+         egress_shim_col, sorted(split_gate),
+         (join_tile.col, join_tile.row) if join_tile is not None else None,
+         )).encode()).hexdigest()[:12]
     base = _aie_api_include() + [f"-DSPAN_NET_DIGEST={digest}"]
     plen = {cn: spec[cn][3]["blob"].size for cn in core_names}
     wtotal = sum(plen.values())
@@ -324,7 +332,8 @@ def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
                 [o * NL.half(w) for _, o in NL.CAT_SOURCES],
                 obj_types=[ty(lay[s].out_bytes) for s, _ in NL.CAT_SOURCES],
                 depths=[skip_depths[s] for s, _ in NL.CAT_SOURCES],
-                names=[f"{s}_skip" for s, _ in NL.CAT_SOURCES])
+                names=[f"{s}_skip" for s, _ in NL.CAT_SOURCES],
+                tile=join_tile if join_tile is not None else AnyMemTile)
             out.update({s: f for (s, _), f in zip(NL.CAT_SOURCES, subs)})
         for n in names:
             if n not in out:
