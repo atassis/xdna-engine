@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Token-level parity gate for the multimodal prompt JOIN (image+audio placeholder scatter into
-the text embedding sequence) -- the mechanism `rust/npu-engine/src/llm/multimodal.rs` implements
-at the engine layer (`scatter_media_rows` + the `embed_row` hook both `NpuDecodeStep::step` and
-`NpuPrefill::prime` call). This script is the HOST-ONLY, no-device numeric check that the JOIN
-CONTRACT is right; the Rust side is unit-tested against the same contract (see `multimodal.rs`'s
-`scatter_media_rows` tests), not run through this script -- there is no Python/Rust bridge here.
+"""Token-level parity gate for the multimodal prompt JOIN (image/audio/video placeholder scatter
+into the text embedding sequence) -- the mechanism `rust/npu-engine/src/llm/multimodal.rs`
+implements at the engine layer (`scatter_media_rows` + the `embed_row` hook both
+`NpuDecodeStep::step` and `NpuPrefill::prime` call). This script is the HOST-ONLY, no-device
+numeric check that the JOIN CONTRACT is right; the Rust side is unit-tested against the same
+contract (see `multimodal.rs`'s `scatter_media_rows` tests), not run through this script -- there
+is no Python/Rust bridge here.
+
+The image+audio case builds one combined prompt from `--oracle-dir`. Video is separate, host-only
+video-fill/video-underfill cases built inline (no `--oracle-dir` input needed) that exercise the
+untested surface named by `multimodal-video-frame-path-is-ungated`: the frame flatten
+(`pixel_values_videos.flatten(0, 1)`) and the per-frame `pad_to_max_patches`/drop-padded-rows path
+-- the tower math itself is the same `embed_vision` already gated by the image case.
 
 MUST run under the gemma4-oracle venv (transformers 5.17.0 + torch), same as
 gemma4_towers_oracle_gen.py: `$GEMMA4_ORACLE_VENV/bin/python scripts/gemma4_multimodal_join_gate.py`.
@@ -62,34 +69,39 @@ GATE = 1e-4  # same floor as gemma4_towers_host_ref.py's stage gate, same reason
 # sides from the same bf16-rounded checkpoint values, so no precision gap is expected here either.
 
 
-def build_ours(input_ids, image_rows, audio_rows, embed_table, d_model, token_ids):
+def build_ours(input_ids, image_rows, audio_rows, video_rows, embed_table, d_model, token_ids):
     """The Rust join's contract, in numpy: `EmbedTable::row` (text, scaled) for every position,
     OVERRIDDEN by `scatter_media_rows`'s per-position media rows (unscaled) at placeholder
     positions -- `embed_row`'s "media override, else text gather" order, run over a whole sequence
-    instead of per-token."""
+    instead of per-token. Video is scattered the same way as image/audio: `scatter_media_rows`
+    treats VIDEO_TOKEN_ID identically (see rust/npu-engine/src/llm/multimodal.rs)."""
     scale = np.sqrt(d_model).astype(np.float32)
     out = np.stack([embed_table[t] for t in input_ids]).astype(np.float32) * scale
-    img_i = iter(image_rows)
-    aud_i = iter(audio_rows)
+    iters = {token_ids["image_token_id"]: iter(image_rows),
+             token_ids["audio_token_id"]: iter(audio_rows),
+             token_ids["video_token_id"]: iter(video_rows)}
     for i, t in enumerate(input_ids):
-        if t == token_ids["image_token_id"]:
-            out[i] = next(img_i)
-        elif t == token_ids["audio_token_id"]:
-            out[i] = next(aud_i)
-    remaining_img, remaining_aud = list(img_i), list(aud_i)
-    if remaining_img or remaining_aud:
+        if t in iters:
+            out[i] = next(iters[t])
+    leftover = {tok: rest for tok, it in iters.items() if (rest := list(it))}
+    if leftover:
         raise AssertionError(
-            f"{len(remaining_img)} image / {len(remaining_aud)} audio tower rows had no placeholder "
-            "position to scatter into -- count mismatch between the prompt and the tower output"
+            f"tower row(s) had no placeholder position to scatter into -- count mismatch between "
+            f"the prompt and the tower output: {{{', '.join(f'{k}: {len(v)}' for k, v in leftover.items())}}}"
         )
     return out
 
 
 def build_oracle(input_ids_t, pixel_values, image_position_ids, input_features, input_features_mask,
-                  vis, aud, text_embed_rows, token_ids, pad_token_id, d_model):
+                  vis, aud, text_embed_rows, token_ids, pad_token_id, d_model,
+                  pixel_values_videos=None, video_position_ids=None):
     """`Gemma4UnifiedModel.forward()`'s merge block (lines ~1013-1078 of
     modeling_gemma4_unified.py), run directly against real weights and real ops -- see the module
-    docstring for why `.forward()` itself is not callable here."""
+    docstring for why `.forward()` itself is not callable here. Each media branch is guarded the
+    same way `forward()` guards it (`if pixel_values is not None`, etc.), so a prompt can carry any
+    subset. The video branch inlines `get_video_features` (lines ~1171-1179): `embed_vision` runs
+    on the frame-flattened patches (`.flatten(0, 1)`, num_videos folded into num_frames), then the
+    per-frame pad mask is flattened the same way before indexing `pooler_output`."""
     from transformers.models.gemma4_unified.modeling_gemma4_unified import (
         Gemma4UnifiedModel, Gemma4UnifiedTextScaledWordEmbedding)
     from types import SimpleNamespace
@@ -117,24 +129,131 @@ def build_oracle(input_ids_t, pixel_values, image_position_ids, input_features, 
     local_ids = llm_input_ids.clone().apply_(lambda gid: local[gid])
     inputs_embeds = embed(local_ids).float()
 
-    vision_outputs = vis(pixel_values, image_position_ids)
-    non_pad_mask = (image_position_ids != -1).all(dim=-1)
-    image_features = vision_outputs.pooler_output[non_pad_mask].to(inputs_embeds.dtype)
-    n_image_tokens = image_mask.sum()
-    image_mask_e = image_mask.unsqueeze(-1).expand_as(inputs_embeds)
-    assert inputs_embeds[image_mask_e].numel() == image_features.numel(), \
-        f"image tokens {n_image_tokens} vs features {image_features.shape[0]}"
-    inputs_embeds = inputs_embeds.masked_scatter(image_mask_e, image_features)
+    if pixel_values is not None:
+        vision_outputs = vis(pixel_values, image_position_ids)
+        non_pad_mask = (image_position_ids != -1).all(dim=-1)
+        image_features = vision_outputs.pooler_output[non_pad_mask].to(inputs_embeds.dtype)
+        n_image_tokens = image_mask.sum()
+        image_mask_e = image_mask.unsqueeze(-1).expand_as(inputs_embeds)
+        assert inputs_embeds[image_mask_e].numel() == image_features.numel(), \
+            f"image tokens {n_image_tokens} vs features {image_features.shape[0]}"
+        inputs_embeds = inputs_embeds.masked_scatter(image_mask_e, image_features)
 
-    audio_outputs = aud(inputs_embeds=input_features)
-    audio_features = audio_outputs[input_features_mask.bool()].to(inputs_embeds.dtype)
-    n_audio_tokens = audio_mask.sum()
-    audio_mask_e = audio_mask.unsqueeze(-1).expand_as(inputs_embeds)
-    assert inputs_embeds[audio_mask_e].numel() == audio_features.numel(), \
-        f"audio tokens {n_audio_tokens} vs features {audio_features.shape[0]}"
-    inputs_embeds = inputs_embeds.masked_scatter(audio_mask_e, audio_features)
+    if pixel_values_videos is not None:
+        video_outputs = vis(pixel_values_videos.flatten(0, 1), video_position_ids.flatten(0, 1))
+        non_pad_mask_v = (video_position_ids != -1).all(dim=-1)
+        video_features = video_outputs.pooler_output[non_pad_mask_v.flatten(0, 1)].to(inputs_embeds.dtype)
+        n_video_tokens = video_mask.sum()
+        video_mask_e = video_mask.unsqueeze(-1).expand_as(inputs_embeds)
+        assert inputs_embeds[video_mask_e].numel() == video_features.numel(), \
+            f"video tokens {n_video_tokens} vs features {video_features.shape[0]}"
+        inputs_embeds = inputs_embeds.masked_scatter(video_mask_e, video_features)
+
+    if input_features is not None:
+        audio_outputs = aud(inputs_embeds=input_features)
+        audio_features = audio_outputs[input_features_mask.bool()].to(inputs_embeds.dtype)
+        n_audio_tokens = audio_mask.sum()
+        audio_mask_e = audio_mask.unsqueeze(-1).expand_as(inputs_embeds)
+        assert inputs_embeds[audio_mask_e].numel() == audio_features.numel(), \
+            f"audio tokens {n_audio_tokens} vs features {audio_features.shape[0]}"
+        inputs_embeds = inputs_embeds.masked_scatter(audio_mask_e, audio_features)
 
     return inputs_embeds[0].detach().numpy()
+
+
+def gate_media_rows(input_ids, ours, oracle, media_token_ids, label):
+    """rel-L2 gate: rows whose token is in `media_token_ids` vs every other row, printed under
+    `label`. Returns (n_media_fail, per_row) so a caller can accumulate failures across several
+    prompts/cases before deciding whether to exit non-zero."""
+    is_media = np.array([t in media_token_ids for t in input_ids])
+    assert ours.shape == oracle.shape, (ours.shape, oracle.shape)
+    per_row = np.linalg.norm((ours - oracle).astype(np.float64), axis=-1) / (
+        np.linalg.norm(oracle.astype(np.float64), axis=-1) + 1e-30)
+
+    def band(mask, band_label):
+        rows = per_row[mask]
+        n_fail = int((rows > GATE).sum())
+        worst_i = int(np.arange(len(input_ids))[mask][rows.argmax()])
+        print(f"  [{label}] {band_label}: worst row {worst_i} (token {input_ids[worst_i]}) "
+              f"rel-L2={rows.max():.3e}, {mask.sum() - n_fail}/{mask.sum()} PASS (gate {GATE:.0e})")
+        return n_fail
+
+    media_fail = band(is_media, "MEDIA rows")
+    if (~is_media).any():
+        band(~is_media, "text rows (informational)")
+    return media_fail, per_row
+
+
+def video_processor():
+    """The real `Gemma4UnifiedVideoProcessor`, read for its class constants (patch_size,
+    pooling_kernel_size, `max_soft_tokens`=70/frame) instead of hand-copying them, so a processor
+    default change cannot silently desync this gate from the checkpoint's own frame budget."""
+    from transformers.models.gemma4_unified.video_processing_gemma4_unified import (
+        Gemma4UnifiedVideoProcessor)
+    return Gemma4UnifiedVideoProcessor()
+
+
+def make_test_video(n_frames, h, w, seed=20260928):
+    """Deterministic synthetic clip (gradients + blocks + a frame-shifting diagonal, same
+    reasoning as gemma4_towers_oracle_gen.py's make_test_image), varied per frame so a
+    frame/patch transposition would misplace visibly frame-specific content."""
+    frames = []
+    for i in range(n_frames):
+        rng = np.random.default_rng(seed + i)
+        yy, xx = np.mgrid[0:h, 0:w]
+        img = np.zeros((h, w, 3), dtype=np.float32)
+        img[..., 0] = 255 * (xx / w)
+        img[..., 1] = 255 * (yy / h)
+        img[..., 2] = 255 * (((xx // 48) + (yy // 48) + i) % 2)
+        blocks = rng.integers(0, 256, size=(h // 48, w // 48, 3)).astype(np.float32)
+        img += np.kron(blocks, np.ones((48, 48, 1), dtype=np.float32)) * 0.25
+        diag = 80 * np.exp(-((xx - (yy + i * 20) * (w / h)) ** 2) / (2 * 60.0 ** 2))
+        img += diag[..., None]
+        frames.append(np.clip(img, 0, 255).astype(np.uint8))
+    video = np.stack(frames)
+    return torch.from_numpy(video).permute(0, 3, 1, 2).contiguous()  # (F, 3, H, W) uint8
+
+
+def build_video_patches(vproc, h, w, n_frames):
+    """Real preprocessing ops throughout -- resize/rescale from the processor instance,
+    patchify/merge/pad from the module -- never reimplemented, same policy as
+    gemma4_towers_oracle_gen.py's image pipeline. Returns (merged_patches, merged_positions) as
+    (n_frames, max_soft_tokens, ...) numpy arrays -- num_videos=1 is folded in by the caller,
+    matching `pixel_values_videos.flatten(0, 1)` -- plus the per-frame real (pre-pad) count."""
+    from transformers.models.gemma4_unified.video_processing_gemma4_unified import (
+        convert_video_to_patches, pad_to_max_patches)
+    from transformers.models.gemma4_unified.video_processing_gemma4_unified import (
+        patches_merge as merge_video_patches)
+
+    video_u8 = make_test_video(n_frames, h, w)
+    max_patches = vproc.max_soft_tokens * vproc.pooling_kernel_size ** 2
+    resized = vproc.aspect_ratio_preserving_resize(
+        video_u8, vproc.patch_size, max_patches, vproc.pooling_kernel_size, vproc.resample)
+    rescaled = vproc.rescale_and_normalize(
+        resized, True, 1 / 255, True, vproc.image_mean, vproc.image_std)
+
+    patches = convert_video_to_patches(rescaled, vproc.patch_size)
+    ph, pw = resized.shape[-2] // vproc.patch_size, resized.shape[-1] // vproc.patch_size
+    grid = torch.meshgrid(torch.arange(pw), torch.arange(ph), indexing="xy")
+    teacher_positions = torch.stack(grid, dim=-1).reshape(patches.shape[1], 2)[None].repeat(
+        n_frames, 1, 1)
+
+    num_model_patches = patches.shape[1] // (vproc.pooling_kernel_size ** 2)
+    merged_patches, merged_positions = merge_video_patches(patches, teacher_positions, num_model_patches)
+    n_real_per_frame = merged_patches.shape[1]
+    merged_patches, merged_positions = pad_to_max_patches(
+        merged_patches, merged_positions, vproc.max_soft_tokens)
+    return merged_patches.numpy(), merged_positions.numpy().astype(np.int64), n_real_per_frame
+
+
+def rows_from_non_pad(s7, n_real_per_frame, from_end=False):
+    """Correct selection is the first `n_real_per_frame` rows of every frame
+    (`pad_to_max_patches` pads the tail) -- equivalent to boolean-masking on `position_ids != -1`
+    since the padding is contiguous. `from_end=True` is the known-bad control: the tower's own
+    zero-patch pad-tail output from the SAME frames, same shape, wrong content."""
+    n_frames, max_soft_tokens, d_model = s7.shape
+    lo = max_soft_tokens - n_real_per_frame if from_end else 0
+    return s7[:, lo:lo + n_real_per_frame, :].reshape(-1, d_model)
 
 
 def main():
@@ -199,7 +318,7 @@ def main():
         for tid in needed_ids:
             text_embed_rows[tid] = sl[tid:tid + 1][0].float().numpy()
 
-    ours = build_ours(input_ids, image_rows, audio_rows,
+    ours = build_ours(input_ids, image_rows, audio_rows, [],
                        {k: v for k, v in text_embed_rows.items()}, d_model, token_ids)
 
     # ---- oracle: real modules wired from checkpoint key names (never from_pretrained) ----
@@ -245,31 +364,10 @@ def main():
     # full f32. Confirmed, not guessed: `torch.tensor(61.9677...).bfloat16()` == 62.0 == the
     # observed ratio (1.00052) to five figures. Reported separately so it cannot hide a join defect
     # inside its own noise, and not gated, because it predates and is orthogonal to this task.
-    is_media = np.array([t in (token_ids["image_token_id"], token_ids["audio_token_id"])
-                          for t in input_ids])
-    assert ours.shape == oracle.shape, (ours.shape, oracle.shape)
-    per_row = np.linalg.norm((ours - oracle).astype(np.float64), axis=-1) / (
-        np.linalg.norm(oracle.astype(np.float64), axis=-1) + 1e-30)
-
-    def band(mask, label):
-        rows = per_row[mask]
-        n_fail = int((rows > GATE).sum())
-        worst_i = int(np.arange(len(input_ids))[mask][rows.argmax()])
-        print(f"{label}: worst row {worst_i} (token {input_ids[worst_i]}) rel-L2={rows.max():.3e}, "
-              f"{mask.sum() - n_fail}/{mask.sum()} PASS (gate {GATE:.0e})")
-        return n_fail
-
-    print(f"\nwhole-sequence rel-L2: {rel_l2(ours, oracle):.3e}")
-    media_fail = band(is_media, "MEDIA rows (the join -- gated)")
-    band(~is_media, "text rows  (pre-existing embed_scale rounding -- informational)")
-    if media_fail:
-        raise SystemExit(f"FAIL: {media_fail} media row(s) exceed gate {GATE:.0e}")
-    print("PASS: every media row matches the HF-side reference within the gate")
-    if os.environ.get("JOIN_GATE_DEBUG"):
-        for i in np.argsort(-per_row)[:12]:
-            print(f"  row {i} token {input_ids[i]} rel-L2={per_row[i]:.3e} "
-                  f"|ours|={np.linalg.norm(ours[i]):.4f} |oracle|={np.linalg.norm(oracle[i]):.4f} "
-                  f"max-abs-diff={np.abs(ours[i]-oracle[i]).max():.4e}")
+    media_fail, _ = gate_media_rows(
+        input_ids, ours, oracle, (token_ids["image_token_id"], token_ids["audio_token_id"]),
+        "image+audio")
+    total_fail = media_fail
 
     # A media row must not have taken embed_scale: an unscaled tower row is centered near the
     # tower's own output magnitude, sqrt(d_model)=62.0x smaller than what re-scaling it would give.
@@ -281,6 +379,77 @@ def main():
         ratio = np.linalg.norm(oracle[i]) / np.linalg.norm(ours[i] * np.sqrt(d_model))
         print(f"sanity: oracle row {i} norm / (ours*sqrt(d_model)) norm = {ratio:.3f} "
               f"(expect far from 1.0 -- 1.0 would mean the oracle DID scale the media row)")
+
+    # ==== VIDEO: fill and underfill the 70-soft-token-per-frame budget ====
+    #
+    # get_video_features calls the SAME embed_vision as stills (already gated above and in the
+    # 18/18 tower gate), so this exercises the untested surface only: frame flatten
+    # (`.flatten(0, 1)` folding num_frames into the vision-tower batch) and the per-frame
+    # `pad_to_max_patches`/drop-padded-rows path. Video-only prompts (no image/audio), built and
+    # gated the same way as the image+audio prompt above.
+    vproc = video_processor()
+    for label, h, w, n_frames in (
+        ("video-fill (336x480, exact 70/frame)", 336, 480, 3),
+        ("video-underfill (1104x576 -> 528x288, 66/frame)", 1104, 576, 3),
+    ):
+        merged_patches, merged_positions, n_real_per_frame = build_video_patches(
+            vproc, h, w, n_frames)
+        s7 = vision_tower_forward(merged_patches, merged_positions, vision_w)["s7_projection"]
+        non_pad_v = (merged_positions != -1).all(axis=-1)  # (n_frames, max_soft_tokens)
+        n_dropped = int((~non_pad_v).sum())
+        print(f"\n{label}: {n_real_per_frame}/{vproc.max_soft_tokens} soft tokens/frame real, "
+              f"{n_dropped} dropped (padded) across {n_frames} frames")
+
+        video_rows = rows_from_non_pad(s7, n_real_per_frame, from_end=False)
+        n_vid = len(video_rows)
+        v_filler = [60, 70]
+        input_ids_v = (
+            [v_filler[0], token_ids["boi_token_id"]] + [token_ids["video_token_id"]] * n_vid +
+            [token_ids["eoi_token_id"], v_filler[1]]
+        )
+        needed_v = sorted(set(input_ids_v) | {pad_token_id})
+        with safe_open(os.path.join(a.checkpoint_dir, "model.safetensors"), framework="pt") as f:
+            sl = f.get_slice("model.language_model.embed_tokens.weight")
+            text_embed_rows_v = {tid: sl[tid:tid + 1][0].float().numpy() for tid in needed_v}
+
+        ours_v = build_ours(input_ids_v, [], [], video_rows, text_embed_rows_v, d_model, token_ids)
+
+        input_ids_v_t = torch.tensor([input_ids_v], dtype=torch.long)
+        pv_t = torch.from_numpy(merged_patches).unsqueeze(0).to(vis.patch_dense.weight.dtype)
+        vpos_t = torch.from_numpy(merged_positions).unsqueeze(0).long()
+        oracle_v = build_oracle(input_ids_v_t, None, None, None, None, vis, aud, text_embed_rows_v,
+                                 token_ids, pad_token_id, d_model,
+                                 pixel_values_videos=pv_t, video_position_ids=vpos_t)
+
+        v_fail, _ = gate_media_rows(input_ids_v, ours_v, oracle_v, (token_ids["video_token_id"],), label)
+        total_fail += v_fail
+
+        # Known-bad control: swap the correctly-dropped rows for the tower's OWN padded-tail
+        # output at the same positions (same shape, so it clears the count check -- only the rel-L2
+        # gate can catch it). Only a real control when there IS a pad tail.
+        if n_dropped:
+            bad_rows = rows_from_non_pad(s7, n_real_per_frame, from_end=True)
+            ours_bad = build_ours(input_ids_v, [], [], bad_rows, text_embed_rows_v, d_model, token_ids)
+            bad_fail, bad_per_row = gate_media_rows(
+                input_ids_v, ours_bad, oracle_v, (token_ids["video_token_id"],),
+                f"{label} KNOWN-BAD CONTROL (padded rows instead of dropped)")
+            if bad_fail == 0:
+                raise SystemExit(
+                    f"gate did not fail on the known-bad input for {label} -- "
+                    f"worst rel-L2 {bad_per_row.max():.3e} stayed under {GATE:.0e}; the gate is vacuous")
+            print(f"  control confirmed: {bad_fail} row(s) fail as expected -- the gate is not vacuous")
+
+    if total_fail:
+        raise SystemExit(f"FAIL: {total_fail} media row(s) exceed gate {GATE:.0e} across all cases")
+    print("\nPASS: every media row (image, audio, video-fill, video-underfill) matches the "
+          "HF-side reference within the gate")
+    if os.environ.get("JOIN_GATE_DEBUG"):
+        per_row = np.linalg.norm((ours - oracle).astype(np.float64), axis=-1) / (
+            np.linalg.norm(oracle.astype(np.float64), axis=-1) + 1e-30)
+        for i in np.argsort(-per_row)[:12]:
+            print(f"  row {i} token {input_ids[i]} rel-L2={per_row[i]:.3e} "
+                  f"|ours|={np.linalg.norm(ours[i]):.4f} |oracle|={np.linalg.norm(oracle[i]):.4f} "
+                  f"max-abs-diff={np.abs(ours[i]-oracle[i]).max():.4e}")
 
 
 if __name__ == "__main__":

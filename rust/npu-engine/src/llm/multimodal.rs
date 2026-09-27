@@ -9,9 +9,10 @@
 //! Token ids are the checkpoint's own (`config.json`, NOT `meta.json` -- the decode artifact's
 //! generator has no notion of media). Contract established by reading
 //! `modeling_gemma4_unified.py` (transformers 5.17.0), not guessed, and pinned by
-//! `scripts/gemma4_multimodal_join_gate.py`'s HF-side gate (509/509 media rows, worst rel-L2
-//! 4.127e-05, against a reference wired from checkpoint key names -- never `from_pretrained`,
-//! which silently random-inits 10 of these towers' own params on this checkpoint):
+//! `scripts/gemma4_multimodal_join_gate.py`'s HF-side gate (image+audio: 509/509 media rows,
+//! worst rel-L2 4.127e-05; video fill+underfill: 408/408, worst rel-L2 6.160e-06, against a
+//! reference wired from checkpoint key names -- never `from_pretrained`, which silently
+//! random-inits 10 of these towers' own params on this checkpoint):
 //!
 //!   - a media row is the tower's OWN output verbatim -- it never takes `embed_scale`. HF scatters
 //!     `get_image_features`'s output directly over the (scaled, then discarded) placeholder
@@ -40,8 +41,10 @@ pub const IMAGE_TOKEN_ID: u32 = 258_880;
 /// `config.json`'s `audio_token_id` -- every soft token of an audio placeholder run.
 pub const AUDIO_TOKEN_ID: u32 = 258_881;
 /// `config.json`'s `video_token_id` -- every soft token of a video placeholder run. The vision
-/// tower re-run per frame (same weights, same op sequence as an image); the routing limitation
-/// above applies to it too and is not exercised by the join gate.
+/// tower re-run per frame (same weights, same op sequence as an image, frames folded into the
+/// tower's batch dimension); the routing limitation above applies to it too. Frame flatten and
+/// the per-frame `pad_to_max_patches`/drop-padded-rows path are gated by
+/// `scripts/gemma4_multimodal_join_gate.py`'s video-fill and video-underfill cases.
 pub const VIDEO_TOKEN_ID: u32 = 258_884;
 /// `config.json`'s `boi_token_id`, wrapping an image/video run. A literal TEXT token: never
 /// matched by [`scatter_media_rows`], gathered and scaled like any other.
