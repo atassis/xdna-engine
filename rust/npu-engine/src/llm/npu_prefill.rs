@@ -45,6 +45,7 @@
 use std::rc::Rc;
 
 use npu_xrt::{Device, ElfResident, FusedArena};
+use sha2::{Digest, Sha256};
 
 use crate::api::EngineError;
 use crate::llm::artifact::{BufLoc, LlmArtifact, MaskRing, MaskWidths, PrefillSegment, RopeWrite};
@@ -317,6 +318,9 @@ pub struct NpuPrefill {
     /// Where the ring mask goes, resolved once at open like `mask_write`. `None` unless the
     /// artifact was built with `PREFILL_SLIDING_RING=1` (design sec 2.2) -- the flag-off default.
     mask_ring: Option<(BufLoc, MaskRing)>,
+    /// This ELF's content hash, computed once at open the same way `NpuDecodeStep::build` computes
+    /// the decode one -- see [`ArmProvenance::prefill_artifact_hash`](crate::telemetry::ArmProvenance).
+    artifact_hash: String,
 }
 
 /// How one declared segment's resident gets opened: reuse the artifact's own primary (already
@@ -370,6 +374,13 @@ impl NpuPrefill {
             artifact.mask_widths.clone().map(|mw| (*artifact.loc(&mw.buffer), mw));
         let mask_ring = artifact.mask_ring.clone().map(|mr| (*artifact.loc(&mr.buffer), mr));
         let elf = artifact.read_elf_bytes()?;
+        // Same convention as `NpuDecodeStep::build`'s `artifact_hash`: a content identity to tell two
+        // reports apart, not a reproducibility check, so computed once here rather than per request.
+        let artifact_hash: String = {
+            let mut h = Sha256::new();
+            h.update(&elf);
+            h.finalize().iter().take(6).map(|b| format!("{b:02x}")).collect()
+        };
         let primary = dev.open_elf_resident(&elf, Some(&artifact.kernel_name)).map_err(|e| {
             EngineError::Load(format!("open_elf_resident (prefill): {e}"))
         })?;
@@ -401,11 +412,17 @@ impl NpuPrefill {
         }
 
         let batch = artifact.batch;
-        Ok(NpuPrefill { artifact, segments, batch, rope_writes, mask_write, mask_ring })
+        Ok(NpuPrefill { artifact, segments, batch, rope_writes, mask_write, mask_ring, artifact_hash })
     }
 
     pub fn batch(&self) -> usize {
         self.batch
+    }
+
+    /// This ELF's directory, hash and declared toolchain pin -- the prefill half of
+    /// [`ArmProvenance`](crate::telemetry::ArmProvenance), read by `NpuDecodeStep::build` once at load.
+    pub(crate) fn identity(&self) -> (String, String, Option<String>) {
+        (self.artifact.decode_dir.display().to_string(), self.artifact_hash.clone(), self.artifact.toolchain_hash.clone())
     }
 
     /// `self.artifact`'s measured crossover, or `None` on a pre-2026-09-11 artifact -- see
