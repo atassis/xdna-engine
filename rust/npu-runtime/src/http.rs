@@ -1483,7 +1483,7 @@ pub mod parse {
                 Some(c) if !c.is_empty() => parse_tool_calls(c).map_err(|e| format!("messages[{i}]: {e}"))?,
                 _ => Vec::new(),
             };
-            let content = parse_content(m.get("content"), !calls.is_empty())
+            let (content, media) = parse_content(m.get("content"), !calls.is_empty())
                 .map_err(|e| format!("messages[{i}]: {e}"))?;
             let mut msg = npu_engine::ChatMessage::new(role, content);
             if !calls.is_empty() {
@@ -1491,6 +1491,9 @@ pub mod parse {
             }
             if let Some(id) = m.get("tool_call_id").and_then(|c| c.as_str()) {
                 msg = msg.with_tool_call_id(id);
+            }
+            if !media.is_empty() {
+                msg = msg.with_media(media);
             }
             chat.push(msg);
         }
@@ -1573,13 +1576,14 @@ pub mod parse {
                 Some(c) if !c.is_empty() => parse_tool_calls(c).map_err(|e| format!("messages[{i}]: {e}"))?,
                 _ => Vec::new(),
             };
-            let content = parse_content(m.get("content"), !calls.is_empty())
+            let (content, media) = parse_content(m.get("content"), !calls.is_empty())
                 .map_err(|e| format!("messages[{i}]: {e}"))?;
             let mut msg = npu_engine::ChatMessage::new(role, content);
             if !calls.is_empty() { msg = msg.with_tool_calls(calls); }
             if let Some(id) = m.get("tool_call_id").and_then(|c| c.as_str()) {
                 msg = msg.with_tool_call_id(id);
             }
+            if !media.is_empty() { msg = msg.with_media(media); }
             chat.push(msg);
         }
 
@@ -1611,31 +1615,72 @@ pub mod parse {
         Ok(ParsedGenerate { model, prompt: npu_engine::Prompt::Chat(chat), params, stream, stats: false })
     }
 
-    /// A message's `content`: a plain string, or OpenAI's multi-part array form when every part is
-    /// `{"type":"text","text":...}`. Any other part type is REJECTED rather than silently dropped (the
-    /// old behaviour) -- this surface has no vision/audio input, and dropping content changes the
-    /// prompt's meaning with no trace, which is exactly what spec S6 bans.
-    fn parse_content(v: Option<&serde_json::Value>, has_tool_calls: bool) -> Result<String, String> {
+    /// A message's `content`: a plain string, or OpenAI's multi-part array form. `text` parts
+    /// flatten in place; `image_url`/`input_audio` parts decode to raw bytes (returned separately,
+    /// in appearance order) and leave a `<|image|>`/`<|audio|>` marker in the text -- the SAME
+    /// literal string the model's own chat template emits for a media item
+    /// (`gemma4_media.rs`/`multimodal.rs`'s `expand_media_placeholders` expands it downstream once
+    /// the actual soft-token count is known). Any other part type is REJECTED rather than silently
+    /// dropped -- dropping content changes the prompt's meaning with no trace, spec S6.
+    fn parse_content(v: Option<&serde_json::Value>, has_tool_calls: bool)
+        -> Result<(String, Vec<npu_engine::ChatMedia>), String> {
         match v {
             // OpenAI sends `content: null` on an assistant turn whose payload is `tool_calls`, and
             // omits it entirely on some clients. That is not missing content -- the turn's content
             // IS the call. Only a turn with no call either way is still an error.
-            Some(serde_json::Value::Null) | None if has_tool_calls => Ok(String::new()),
-            Some(serde_json::Value::String(s)) => Ok(s.clone()),
+            Some(serde_json::Value::Null) | None if has_tool_calls => Ok((String::new(), Vec::new())),
+            Some(serde_json::Value::String(s)) => Ok((s.clone(), Vec::new())),
             Some(serde_json::Value::Array(parts)) => {
                 let mut out = String::new();
+                let mut media = Vec::new();
                 for p in parts {
                     match p.get("type").and_then(|t| t.as_str()) {
                         Some("text") => out.push_str(p.get("text").and_then(|t| t.as_str()).unwrap_or("")),
+                        Some("image_url") => {
+                            let url = p.get("image_url").and_then(|i| i.get("url")).and_then(|u| u.as_str())
+                                .ok_or("\"image_url\" part missing \"image_url.url\"")?;
+                            media.push(npu_engine::ChatMedia::Image(decode_data_url(url, "image")?));
+                            out.push_str("<|image|>");
+                        }
+                        Some("input_audio") => {
+                            let ia = p.get("input_audio")
+                                .ok_or("\"input_audio\" part missing \"input_audio\"")?;
+                            let format = ia.get("format").and_then(|f| f.as_str()).unwrap_or("");
+                            if format != "wav" {
+                                return Err(format!(
+                                    "\"input_audio.format\" {format:?} is not supported (supported: \"wav\")"));
+                            }
+                            let b64 = ia.get("data").and_then(|d| d.as_str())
+                                .ok_or("\"input_audio\" part missing \"input_audio.data\"")?;
+                            let bytes = base64::Engine::decode(
+                                &base64::engine::general_purpose::STANDARD, b64)
+                                .map_err(|e| format!("\"input_audio.data\" is not valid base64: {e}"))?;
+                            media.push(npu_engine::ChatMedia::Audio(bytes));
+                            out.push_str("<|audio|>");
+                        }
                         Some(other) => return Err(format!("unsupported content part type {other:?}")),
                         None => return Err("content part missing \"type\"".into()),
                     }
                 }
-                Ok(out)
+                Ok((out, media))
             }
             Some(_) => Err("\"content\" must be a string or an array of parts".into()),
             None => Err("missing \"content\"".into()),
         }
+    }
+
+    /// `image_url.url`'s ONLY supported form is a `data:` URL -- `data:<mime>;base64,<payload>`.
+    /// A remote `http(s)://` URL is a clear 400, never a silent fetch: this server does no network
+    /// I/O to serve a generation, and fetching one would be a very different trust/latency surface
+    /// than "decode the bytes you sent me".
+    fn decode_data_url(url: &str, what: &str) -> Result<Vec<u8>, String> {
+        let payload = url.strip_prefix("data:")
+            .and_then(|rest| rest.split_once(",").map(|(_, b64)| b64))
+            .ok_or_else(|| format!(
+                "\"{what}_url.url\" must be a data: URL (data:<mime>;base64,<payload>); \
+                 remote http(s) URLs are not fetched by this server"))?;
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, payload)
+            .map_err(|e| format!("\"{what}_url.url\" payload is not valid base64: {e}"))
     }
 
     /// `/v1/completions`. The array form of `prompt` (OpenAI allows batching several prompts in one
@@ -3229,7 +3274,7 @@ pub(crate) mod generate_tests {
     }
 
     #[test]
-    fn a_multipart_content_array_of_text_parts_is_flattened_and_other_types_are_rejected() {
+    fn a_multipart_content_array_of_text_parts_is_flattened_and_unknown_types_are_rejected() {
         let (h, j, _d, p, _sent, seen) = gen_handle(ss(&["ok"]), Duration::ZERO);
         let (code, resp) = route(&post("/v1/chat/completions",
             r#"{"messages":[{"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}]}"#),
@@ -3240,9 +3285,67 @@ pub(crate) mod generate_tests {
             _ => panic!("expected Prompt::Chat"),
         }
         let (code, resp) = route(&post("/v1/chat/completions",
-            r#"{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"x"}}]}]}"#),
+            r#"{"messages":[{"role":"user","content":[{"type":"tool_result","text":"x"}]}]}"#),
             &h, &p);
         assert_eq!(code, 400, "an unsupported content part must fail loud, not drop silently: {resp}");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// `image_url`'s ONLY supported form: `image_url.url` is a `data:` URL, decoded to raw bytes
+    /// and attached as [`npu_engine::ChatMedia::Image`]; the text gets a literal `<|image|>`
+    /// marker in its place, matching what the model's own chat template would render for one
+    /// image content part. A remote `http(s)://` URL is refused, never fetched.
+    #[test]
+    fn a_data_url_image_part_decodes_to_media_and_leaves_an_image_marker() {
+        let (h, j, _d, p, _sent, seen) = gen_handle(ss(&["ok"]), Duration::ZERO);
+        let png_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [1u8, 2, 3, 4]);
+        let body = format!(
+            r#"{{"messages":[{{"role":"user","content":[{{"type":"text","text":"see: "}},
+                {{"type":"image_url","image_url":{{"url":"data:image/png;base64,{png_b64}"}}}}]}}]}}"#);
+        let (code, resp) = route(&post("/v1/chat/completions", &body), &h, &p);
+        assert_eq!(code, 200, "{resp}");
+        match seen.lock().unwrap().clone().unwrap().0 {
+            Prompt::Chat(msgs) => {
+                assert_eq!(msgs[0].content, "see: <|image|>");
+                assert_eq!(msgs[0].media.len(), 1);
+                assert!(matches!(&msgs[0].media[0], npu_engine::ChatMedia::Image(b) if b == &[1u8, 2, 3, 4]));
+            }
+            _ => panic!("expected Prompt::Chat"),
+        }
+
+        let (code, resp) = route(&post("/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/x.png"}}]}]}"#),
+            &h, &p);
+        assert_eq!(code, 400, "{resp}");
+        assert!(resp.text().contains("not fetched"), "{resp}");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// `input_audio`: only `format: "wav"` is supported; its base64 `data` decodes to
+    /// [`npu_engine::ChatMedia::Audio`] and the text gets an `<|audio|>` marker.
+    #[test]
+    fn an_input_audio_part_requires_wav_and_decodes_to_media() {
+        let (h, j, _d, p, _sent, seen) = gen_handle(ss(&["ok"]), Duration::ZERO);
+        let wav_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [9u8, 9, 9]);
+        let body = format!(
+            r#"{{"messages":[{{"role":"user","content":[
+                {{"type":"input_audio","input_audio":{{"data":"{wav_b64}","format":"wav"}}}}]}}]}}"#);
+        let (code, resp) = route(&post("/v1/chat/completions", &body), &h, &p);
+        assert_eq!(code, 200, "{resp}");
+        match seen.lock().unwrap().clone().unwrap().0 {
+            Prompt::Chat(msgs) => {
+                assert_eq!(msgs[0].content, "<|audio|>");
+                assert!(matches!(&msgs[0].media[0], npu_engine::ChatMedia::Audio(b) if b == &[9u8, 9, 9]));
+            }
+            _ => panic!("expected Prompt::Chat"),
+        }
+
+        let (code, resp) = route(&post("/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":[
+                {"type":"input_audio","input_audio":{"data":"AAAA","format":"mp3"}}]}]}"#),
+            &h, &p);
+        assert_eq!(code, 400, "{resp}");
+        assert!(resp.text().contains("wav"), "{resp}");
         h.shutdown(); j.join().unwrap();
     }
 
