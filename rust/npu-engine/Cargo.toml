@@ -46,8 +46,18 @@ npu-onnx = { path = "../npu-onnx" }
 npu-parakeet = { path = "../npu-parakeet", features = ["npu"] }
 npu-whisper = { path = "../npu-whisper", features = ["npu"] }
 npu-weights = { path = "../npu-weights" }
+# Gemma-4 multimodal host towers: PNG/JPEG decode only, no encoder/transform features needed --
+# resize is our own bicubic port (rust/npu-engine/src/llm/gemma4_media.rs), matched against the
+# HF/torchvision oracle rather than delegated to this crate.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# Gemma4Towers::load reads ONLY its 11 named tensors out of the served checkpoint's
+# model.safetensors -- which is the FULL 12B-param file (24 GB) -- via a direct mmap + selective
+# safetensors deserialize. `npu_weights::source::read_safetensors` upcasts EVERY tensor in the file
+# to f32 in one BTreeMap, ~48 GB for this checkpoint on a 30 GB box; measured to swap-thrash for
+# 60-90s per load rather than hard-fail, which is worse; see gemma4_media.rs's load().
+safetensors = "0.4"
+half = "2"
 
 [dev-dependencies]
 tempfile = "3"
-safetensors = "0.4"
 

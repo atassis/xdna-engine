@@ -6,6 +6,7 @@ pub mod chat_template;
 pub mod config;
 pub mod detokenize;
 pub mod generator;
+pub mod gemma4_media;
 pub mod kv_layout;
 pub mod multimodal;
 pub mod npu_decode;
