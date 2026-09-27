@@ -56,8 +56,12 @@ def time_one(in_h):
 
 
 if __name__ == "__main__":
-    r1 = time_one(6)
-    r2 = time_one(12)
+    # fsr1_strip_vec carries a THIRD buffer beyond the usual depth-2 in/out objectFifos: the
+    # static easu_buf intermediate (output-sized, single copy, no double-buffering). At in_h=12
+    # (out 36x48) that overflows the core's data memory the same way RCAS-alone's did (see
+    # README) -- in_h=8 is the largest crop that still fits.
+    r1 = time_one(4)
+    r2 = time_one(8)
     d_time = r2[0] - r1[0]
     d_px = r2[1] - r1[1]
     print(f"delta: {d_time*1e6:.1f}us over {d_px} extra px "

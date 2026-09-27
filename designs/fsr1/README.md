@@ -227,15 +227,36 @@ interleaved buffer directly with a strided per-channel load (no scratch copy) --
 buffers, all output-sized) leave only ~1024 output pixels' worth of room per buffer at `w=48`
 (48x21) before `aiecc` reports `'aie.tile' op basic-sequential allocation also failed` -- this is
 why `time_fsr1_rcas_vec.py`'s two probe crops (12/21 output rows) are smaller than
-`time_fsr1_vec.py`'s (18/36); the fused kernel does not hit this because its input objectFifo is
-EASU-sized, not RCAS-sized.
+`time_fsr1_vec.py`'s (18/36). The fused kernel hits a variant of the same wall: its
+`easu_buf` intermediate (output-sized, static, no double-buffering) is a THIRD buffer beyond the
+usual depth-2 in/out objectFifos, so `time_fsr1_strip_vec.py`'s max feasible crop is `in_h=8`
+(out 24x48), not the vec-EASU probe's 12.
 
-**Cycles/px, timing pending (device queue contention, 2026-09-27):** the NPU is single-tenant and
-was busy with several other agents' queued jobs (prefill, SPAN probes, a GEMM sweep) for the
-whole timing pass in this session; `time_fsr1_rcas_vec.py` and `time_fsr1_strip_vec.py` are
-written (same marginal two-crop-size method as `time_fsr1_vec.py`) and correctness-gated but the
-device numbers were not captured before this pass ended. Re-run both under `run.sh` once the
-device is free; no code change needed.
+**Cycles/px** (`time_fsr1_rcas_vec.py`/`time_fsr1_strip_vec.py`, same marginal two-crop-size
+method as `time_fsr1_vec.py`, device-measured, npu_lock-serialized against several other agents'
+concurrent jobs -- box AC-powered, `performance` power profile, canonical clock 1.8GHz per
+`decode-perop-aie-clock`):
+
+| kernel | probe crops (out rows) | marginal ns/px | cycles/px @1.8GHz |
+|---|---|---|---|
+| `fsr1_rcas_vec` (RCAS alone) | 12, 21 | 344.8 | 620.6 |
+| `fsr1_strip_vec` (EASU+RCAS fused) | 12, 24 | pending re-run (see below) | -- |
+
+**Projected, 1920x1080, RCAS alone:** 2,073,600 px x 344.8 ns/px = **~715.0 ms/frame on one
+core**; ideal 32-core scaling -> **~22.3 ms/frame**. Note this is a lower bound relative to the
+EASU-vec proxy comparison in Step 2b: RCAS alone is already ~4.7x more ns/px than EASU alone
+(1550.3 ns/px), not the ~1/5-flop-count ratio the op-count table's naive FLOP estimate suggested
+-- RCAS's same-size in->out shape gets no benefit from EASU's 9-output-per-source-quad sharing,
+and its per-pixel overhead (5 taps x 3 channels of clamp-addressed scalar loads, `load_strip`) is
+not FLOP-bound the way the count table assumed.
+
+**Combined EASU+RCAS projection is pending a re-run.** `time_fsr1_strip_vec.py`'s first attempt
+used the vec-EASU probe's crop sizes (6/12 output rows) and hit the same data-memory overflow as
+RCAS-alone's first attempt (`'.bss' will not fit in region 'data': overflowed by 20104 bytes` --
+the `easu_buf` intermediate at the larger crop); fixed to probe at 4/8 output rows instead and
+re-queued under the shared npu_lock (device was held by other agents' jobs for this whole
+session -- see the commit for the queue state). Once it lands: ns/px x 2,073,600 for 1-core
+ms/frame, /32 for ideal-core, same as the RCAS-alone projection above.
 
 ## Step 3 -- whole frame, one dispatch: NOT REACHED (two demonstrated blockers, not scope)
 
