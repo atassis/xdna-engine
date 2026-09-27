@@ -57,7 +57,7 @@ static inline fvec aprx_lo_rcp_v(fvec a) {
 }
 static inline fvec aprx_lo_rsq_v(fvec a) {
   auto bits = a.template cast_to<int32_t>();
-  auto shifted = bits >> 1u;
+  auto shifted = aie::downshift(bits, 1u);
   auto r = aie::sub((int32_t)0x5F347D74, shifted);
   return r.template cast_to<float>();
 }
@@ -87,7 +87,7 @@ static void easu_set_v(EasuAcc &a, float ppx, float ppy, int mask,
   else w = ppx * ppy;
 
   fvec dc = aie::sub(lD, lC), cb = aie::sub(lC, lB);
-  fvec lenX = aie::inv(aie::max(aie::abs(dc), aie::abs(cb)));
+  fvec lenX = aprx_lo_rcp_v(aie::max(aie::abs(dc), aie::abs(cb)));
   fvec dirX = aie::sub(lD, lB);
   a.dirx = aie::add(a.dirx, vmuls(dirX, w));
   lenX = aie::min(aie::max(vmul(aie::abs(dirX), lenX), 0.0f), 1.0f);
@@ -95,7 +95,7 @@ static void easu_set_v(EasuAcc &a, float ppx, float ppy, int mask,
   a.len = aie::add(a.len, vmuls(lenX, w));
 
   fvec ec = aie::sub(lE, lC), ca = aie::sub(lC, lA);
-  fvec lenY = aie::inv(aie::max(aie::abs(ec), aie::abs(ca)));
+  fvec lenY = aprx_lo_rcp_v(aie::max(aie::abs(ec), aie::abs(ca)));
   fvec dirY = aie::sub(lE, lA);
   a.diry = aie::add(a.diry, vmuls(dirY, w));
   lenY = aie::min(aie::max(vmul(aie::abs(dirY), lenY), 0.0f), 1.0f);
@@ -173,7 +173,7 @@ __attribute__((noinline)) static void easu_phase_row(const float *planar, int s,
 
   fvec dirR = aie::add(vmul(acc.dirx, acc.dirx), vmul(acc.diry, acc.diry));
   auto zro = aie::lt(dirR, 1.0f / 32768.0f);
-  fvec rdirR = aie::invsqrt(dirR);
+  fvec rdirR = aprx_lo_rsq_v(dirR);
   fvec ones = aie::broadcast<float, VW>(1.0f);
   rdirR = aie::select(rdirR, ones, zro);
   fvec dirx = vmul(aie::select(acc.dirx, ones, zro), rdirR);
@@ -182,11 +182,11 @@ __attribute__((noinline)) static void easu_phase_row(const float *planar, int s,
   fvec length = vmuls(acc.len, 0.5f);
   length = vmul(length, length);
   fvec mx = aie::max(aie::abs(dirx), aie::abs(diry));
-  fvec stretch = vmul(aie::add(vmul(dirx, dirx), vmul(diry, diry)), aie::inv(mx));
+  fvec stretch = vmul(aie::add(vmul(dirx, dirx), vmul(diry, diry)), aprx_lo_rcp_v(mx));
   fvec len2x = aie::add(vmul(aie::sub(stretch, 1.0f), length), 1.0f);
   fvec len2y = aie::add(vmuls(length, -0.5f), 1.0f);
   fvec lob = aie::add(vmuls(length, (1.0f / 4.0f - 0.04f - 0.5f)), 0.5f);
-  fvec clp = aie::inv(lob);
+  fvec clp = aprx_lo_rcp_v(lob);
 
   fvec min4[3], max4[3];
   fvec jc[3] = {jR, jG, jB}, gc[3] = {gR, gG, gB}, ic[3] = {iR, iG, iB}, kc[3] = {kR, kG, kB};

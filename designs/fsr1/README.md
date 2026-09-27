@@ -148,6 +148,48 @@ vs 25476 ns/px across two very different crop sizes) -- this kernel is per-pixel
 dispatch-bound. At the measured/canonical AIE clock (**~1.8 GHz**, `decode-perop-aie-clock`, stated per
 doctrine since the AIE clock is a DPM variable, not a constant): **25476 ns/px = ~45857 cycles/output-pixel.**
 
+## Step 2b -- vectorized EASU kernel, aie_api, reciprocal fix landed: PASS on device
+
+`kernel/fsr1_kernel_vec.cc`'s `fsr1_easu_vec` (EASU only, RCAS still a separate scalar pass -- mirrors
+gamescope's own two-dispatch split, see file header). Finishes the WIP left by the prior session: the
+`aie::inv`/`aie::invsqrt` call sites in `easu_set_v` (2) and `easu_phase_row` (`rdirR`, `stretch`'s
+`aie::inv(mx)`, `clp` -- 3) now call the vectorized `aprx_lo_rcp_v`/`aprx_lo_rsq_v` bit-trick helpers
+instead of the hardware SFU; the one exact case (`invW`, FSR1's own plain `ARcpF1`) still uses
+`aie::inv`, per the file header's reasoning.
+
+- **A real bug in the added helpers, caught before device**: `aprx_lo_rsq_v` used `bits >> 1u` on an
+  `aie::vector<int32_t,16>`, which fails to compile -- `operator>>` for vectors lives in the opt-in
+  `aie::operators` namespace, not found by ADL. Fixed to call `aie::downshift(bits, 1u)` directly.
+  This means the helpers had never been compiled before this pass, despite being written in the prior
+  session -- confirmed the standalone compile-check step actually exercises them now.
+- **Standalone Peano object-file compile-check** (`clang++ --target=aie2p-none-unknown-elf -Oz`):
+  clean, own-function `.text` total 11808 B (was 11952 B before this fix -- the swap did not grow it,
+  contrary to the "adding int32 ops should cost little" prediction, it shrank slightly).
+- **Linked ELF `.text`** (`llvm-size -A` on the device-built `elfs_main_core_0_2.elf`): **13344 B =
+  81.4% of 16384**, comfortably under budget (vs the scalar kernel's 15456 B/94.3%).
+- **Device-verified** (`kernel/verify_fsr1_vec.py`): **rel_l2=3.355e-07**, max abs diff 2.295e-06,
+  determinism 0.0 over 4 runs -> PASS -- down from the WIP's 0.211, now in the same band as the scalar
+  kernel's 3.094e-07. Confirms the root cause (SFU reciprocal's `1/0=inf` vs FSR1's own finite bit-trick
+  result on degenerate flat-region input) and the fix.
+- **`optnone` workaround on `easu_tap_v` no longer reproduces.** Recompiled the file with the attribute
+  removed at `-O1`/`-O2`/`-Os`/`-Oz`: all four compile clean, no "ran out of registers" error. The
+  int32 bit-trick rewrite changed this function's live-range shape enough that the allocator failure
+  the prior session hit is gone -- per toolchain-bug-test-latest-before-workaround doctrine this should
+  be dropped, not carried forward on a stale premise; left in place here since removing it was out of
+  this pass's scope (report-only per the task brief), but it is dead weight now.
+- **Cycles/px** (`kernel/time_fsr1_vec.py`, same marginal two-size method, `FSR1_IN_W=16` fixed since
+  it doubles as the vector width, `FSR1_IN_H` 6 vs 12): marginal **1550.3 ns/px** (16x6->48x18: 1706.0
+  ns/px; 16x12->48x36: 1628.2 ns/px) = **~2791 cycles/px @1.8GHz** (canonical measured clock,
+  `decode-perop-aie-clock`; box was AC-powered, `performance` power profile). This is EASU only --
+  **not comparable 1:1 to the scalar kernel's 25476 ns/px, which includes RCAS** -- but as an EASU-vs-
+  EASU proxy (RCAS is ~1/5 of the scalar kernel's flop count per the op-count table) the vectorization
+  is roughly **16x** faster per pixel than the scalar EASU+RCAS kernel.
+- **Projected, EASU-only, not yet the whole FSR1 pipeline**: 1920x1080 = 2,073,600 px x 1550.3 ns/px =
+  **~3.21 s/frame on one core**; ideal 32-core scaling (all AIE2p columns, not the 8 used for the scalar
+  projection) -> **~100 ms/frame**. RCAS is still scalar and unvectorized on this path and has not been
+  separately timed here, so the combined EASU+RCAS per-frame cost is not yet known -- vectorizing RCAS
+  the same way is the next concrete step before this number means anything for the whole filter.
+
 ## Step 3 -- whole frame, one dispatch: NOT REACHED (two demonstrated blockers, not scope)
 
 1. **Structural: a literal one-shot whole-frame dispatch cannot fit.** `verify_oneshot`/`_build_oneshot`
@@ -180,3 +222,7 @@ Conditional on step 3 landing (per the task brief); step 3 did not land, so this
 - `kernel/verify_fsr1.py` -- device correctness gate (bricklib `verify_oneshot`, PASS).
 - `kernel/time_fsr1.py` -- device cycles/pixel measurement at two crop sizes.
 - `kernel/run.sh` -- npu_lock-wrapped runner (adapted from `aie_kernels/_test/run.sh`).
+
+## Files added this pass (step 2b)
+- `kernel/time_fsr1_vec.py` -- device cycles/pixel measurement for `fsr1_easu_vec` at two crop
+  sizes (`FSR1_IN_H` 6/12, `FSR1_IN_W` fixed at 16 since it is also the vector width).
