@@ -849,6 +849,88 @@ above). Every existing call site is single-stage-per-dispatch, so behavior is un
 of them; a future 2-stage-per-dispatch caller must now pass `pid=` explicitly or gets a loud
 error instead of a wrong number.
 
+## Phase 1d: fixed-per-row-cost hypothesis -- CONFIRMED IN SHAPE, REFUTED IN MAGNITUDE; the one
+## named cheap fix is a documented device-refuted dead end
+
+Hypothesis: T_row = a + b*W (pace cyc/px = b + a/W), with a rough two-point fit from older,
+differently-configured runs guessing a ~= 4.7k cycles/row. Tested on the `SPAN_UPTO=b1c3` 4-core
+prefix (main's defaults, no depth/skip overrides), the only chain that fits L1 across more than
+one W.
+
+**W compile sweep** (`probe_span_w_sweep_compile.py`, compile-only, no device): W=16 and 32 OK;
+W=48 and 64 FAIL on tile (0,3) = b1c1 (`b1c1_out_buff`/`silu16` LUT, same class of wall this file's
+byte-budget section already derived: `half(w)` grows past the tile's remaining headroom once
+`half(w) > ~2317 B`, i.e. `w > ~32`). So only W=16/32 admit a device sweep at main's defaults --
+48/64 are out of reach without also touching DEPTH/SKIP_CONS_DEPTHS, which is a different
+experiment.
+
+**Device: same-process trace of b1c2/b1c3 (one stage per dispatch, H=128) plus a wall-clock
+fitted-slope cross-check of the whole b1c3 prefix, W=16 vs 32** (`probe_span_w_sweep_trace.py`).
+Power mode: `default` (UNPINNED), standing caveat.
+
+| W | stage | compute cyc/row | gap cyc/row | LOCK_STALL % | compute+gap/row | compute+gap cyc/px |
+|---|---|---|---|---|---|---|
+| 16 | b1c2 | 5372.3 | 86.1 | 2.44% | 5458.4 | 341.2 |
+| 16 | b1c3 | 5192.3 | 269.3 | 7.51% | 5461.6 | 341.4 |
+| 32 | b1c2 | 10344.4 | 86.1 | 1.97% | 10430.5 | 326.0 |
+| 32 | b1c3 | 10096.0 | 349.4 | 5.91% | 10445.4 | 326.4 |
+
+LOCK_STALL is tiny here (2.4-7.5%) versus the full net's 33-98% -- this prefix has no join/tail
+contention, so it is not comparable to the full-net floor, exactly as expected from using it only
+to hold L1 across widths.
+
+**Two-point fit, T_row = a + b*W** (only 2 W admit, so this is an exact solve, not a regression):
+
+| stage | compute a, b | gap a, b | compute+gap a, b |
+|---|---|---|---|
+| b1c2 | 400.2, 310.76 | 86.1, 0.00 | 486.3, 310.76 |
+| b1c3 | 288.6, 306.48 | 189.2, 5.01 | 477.8, 311.49 |
+
+Wall-clock cross-check (whole b1c3-prefix chain, fitted slope over heights [64,128,192,256], not
+per-stage): 4926.6 cyc/row at W=16, 10875.8 at W=32 -- consistent in shape (compute-dominated,
+near-linear in W) with the trace, though the 2-point a/b solve on this noisier series alone
+(a=-1023, b=372) is not trustworthy on its own, same standing box-contention caveat as every
+wall-clock fit in this file.
+
+**CONFIRMED IN SHAPE: a > 0 (there is a real, W-independent per-row cost).** **REFUTED IN
+MAGNITUDE: a ~= 400-486 cycles/row, not ~4.7k.** b (~307-311 cyc/px) lands right at the measured
+per-kind compute for `gate`/`silu_i16` (306-324 cyc/px elsewhere in this file) -- at these widths
+the pace is compute-dominated, not fixed-cost-dominated: a/W is only ~15-30 of the ~326-341 cyc/px
+total (5-9%). b1c2's gap fit is the cleanest single result in this file: b=0.00 exactly -- its gap
+is a pure W-independent constant (86.1 cycles), not a per-pixel term.
+
+**Where `a` lives: mostly INSIDE the compute bracket, not the gap.** Of the ~478-486 total,
+289-400 cycles sit inside compute (the traced kernel call itself) and only 86-189 sit in the gap
+(handshake/lock latency, consistent with LOCK_STALL being small here). So the fixed cost is a
+kernel-call overhead, not a synchronization one, on this prefix.
+
+**Disassembly (Peano `llvm-objdump` from the pinned instance, `elfs_main_core_0_4.elf`,
+`conv3x3_i16i8_lut` = b1c2's kernel):** the per-row call is `core_0_4`'s steady-state loop (`acq`
+lock, `jl #0xf20` into the shim, `rel` lock) calling the shim (`wsweeptr32b1c2_b1c2_w32`, 0x140 B)
+which brackets `event0()`/a call to `conv3x3_core<...>` (0x420, 0xb00 B)/`event1()`. The visible
+prefix of `conv3x3_core` (30+ VLIW bundles before the tile loop, register-spill prologue +
+`vbcst.8`/`vbcst.16`/`vbcst.32`/`vconv.fp32.bf16`/`vst bmll0`/`vst bmlh0`) IS per-call LUT/table
+construction -- broadcasting and converting the SiLU lookup table into vector registers and
+spilling it to the stack, every row, even though the table is a per-net constant. Order of
+magnitude matches the measured ~289-400 cycle compute-side fixed cost.
+
+**This exact hoist is a KNOWN, ALREADY-TRIED, DEVICE-REFUTED dead end, not an open opportunity.**
+`aie_kernels/conv2d-3x3-u8/conv3x3_u8.cc:92-94` documents it directly: "The lookup object is built
+per call: one built once at the top of the gate kernel and captured by reference gathered every
+key as 0 (`probe_conv3x3_gate_stages.py`)." So the one concrete source this disassembly finds for
+`a` cannot be hoisted with the current `aie::lut`/`parallel_lookup` API without reintroducing a
+device-measured correctness bug -- confirmed from source, not re-derived from scratch (per this
+file's own "search before re-deriving" standing rule).
+
+**Decision: no prototype attempted.** The task's own gate for step 4 ("if `a` is large") is not
+met -- measured `a` is ~400-486 cycles/row, two orders of magnitude under the ~4.7k the rough fit
+guessed, and the one identified mechanism for it is a documented dead end. The "process 2 output
+rows per kernel call" alternative was not attempted: it is a Worker/kernel-signature change (new
+acquire/release counts, a wider LUT-amortization boundary), not a cheap one, and the small size of
+`a` does not justify that risk here. **Implication for Phase 2:** widening W is a small, real lever
+on this prefix (341.2 -> 326.0 cyc/px, W=16->32, ~4.5%) but is capped by L1 at W=32 with current
+buffer depths (probe_span_w_sweep_compile.py); "more rows per call" remains open and untested.
+
 ## Caveat
 
 Device is shared with other concurrent lanes (gemma4 prefill gates, this session's own
