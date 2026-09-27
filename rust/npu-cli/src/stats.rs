@@ -157,6 +157,13 @@ pub fn table(r: &GenerationReport) -> String {
             p.artifact_hash.as_deref().unwrap_or("?"),
             p.toolchain_pin_hash.as_deref().unwrap_or("?")));
     }
+    if p.prefill_artifact_path.is_some() || p.prefill_artifact_hash.is_some() {
+        o.push_str(&format!(
+            "                 prefill  {} ({}) · toolchain {}\n",
+            p.prefill_artifact_path.as_deref().unwrap_or("?"),
+            p.prefill_artifact_hash.as_deref().unwrap_or("?"),
+            p.prefill_toolchain_pin_hash.as_deref().unwrap_or("?")));
+    }
 
     o.push_str(&format!(
         "  conditions     {} · power mode {} · {}\n",

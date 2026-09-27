@@ -515,11 +515,19 @@ impl NpuDecodeStep {
         let prefill = pre_art.map(|a| NpuPrefill::open(dev, a, &artifact, &arena)).transpose()?;
         let embed = EmbedTable::open(&artifact)?;
 
+        let (prefill_artifact_path, prefill_artifact_hash, prefill_toolchain_pin_hash) =
+            match prefill.as_ref().map(NpuPrefill::identity) {
+                Some((path, hash, tc)) => (Some(path), Some(hash), tc),
+                None => (None, None, None),
+            };
         let provenance = ArmProvenance {
             artifact_path: Some(artifact.decode_dir.display().to_string()),
             artifact_hash: Some(artifact_hash),
             toolchain_pin_hash: artifact.toolchain_hash.clone(),
             max_seq: Some(artifact.max_seq as u32),
+            prefill_artifact_path,
+            prefill_artifact_hash,
+            prefill_toolchain_pin_hash,
             ..provenance_extras(&artifact.decode_dir)
         };
 

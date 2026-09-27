@@ -208,6 +208,12 @@ pub fn diff_design_breakdown(before: &[DesignCost], after: &[DesignCost]) -> Vec
 /// the output saying they were different builds at all. Every field is `None`/empty until a backend
 /// supplies it (`DecodeStep::provenance`); `n_past` is the one field the generator itself fills, from
 /// the KV position this generation actually reached.
+///
+/// `artifact_*`/`toolchain_pin_hash` name the DECODE arm; `prefill_*` name the separate batched-prefill
+/// ELF when the scenario pairs one in (`NpuDecodeStep::with_prefill`), `None` on a stepwise-only run.
+/// Two identities because they are two builds: `check_shared_layout_agrees` lets them diverge in
+/// dtype/quant/fusion flags as long as the shared buffers agree, so a decode-only hash cannot stand in
+/// for the prefill half that actually primed the prompt.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArmProvenance {
     pub head_dtype: Option<String>,
@@ -223,6 +229,12 @@ pub struct ArmProvenance {
     pub artifact_path: Option<String>,
     pub artifact_hash: Option<String>,
     pub toolchain_pin_hash: Option<String>,
+    #[serde(default)]
+    pub prefill_artifact_path: Option<String>,
+    #[serde(default)]
+    pub prefill_artifact_hash: Option<String>,
+    #[serde(default)]
+    pub prefill_toolchain_pin_hash: Option<String>,
 }
 
 /// Everything one generation measured. Produced by the generation loop; the fields the loop cannot

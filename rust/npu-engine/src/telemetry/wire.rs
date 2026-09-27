@@ -108,6 +108,9 @@ fn provenance_json(p: &ArmProvenance) -> Value {
         "artifact_path": p.artifact_path,
         "artifact_hash": p.artifact_hash,
         "toolchain_pin_hash": p.toolchain_pin_hash,
+        "prefill_artifact_path": p.prefill_artifact_path,
+        "prefill_artifact_hash": p.prefill_artifact_hash,
+        "prefill_toolchain_pin_hash": p.prefill_toolchain_pin_hash,
     })
 }
 
@@ -400,6 +403,11 @@ fn parse_provenance(p: &Value) -> ArmProvenance {
         artifact_path: p["artifact_path"].as_str().map(str::to_string),
         artifact_hash: p["artifact_hash"].as_str().map(str::to_string),
         toolchain_pin_hash: p["toolchain_pin_hash"].as_str().map(str::to_string),
+        // Absent in a log written before prefill provenance existed -- `None`, same as a run with
+        // no prefill artifact at all; the two cases are indistinguishable from the log alone.
+        prefill_artifact_path: p["prefill_artifact_path"].as_str().map(str::to_string),
+        prefill_artifact_hash: p["prefill_artifact_hash"].as_str().map(str::to_string),
+        prefill_toolchain_pin_hash: p["prefill_toolchain_pin_hash"].as_str().map(str::to_string),
     }
 }
 
@@ -676,6 +684,34 @@ mod tests {
             "eval duration is one quantity in two units"
         );
         assert_eq!(o["prompt_eval_duration"].as_u64().unwrap(), s.prefill_us * 1_000);
+    }
+
+    #[test]
+    fn prefill_provenance_round_trips_and_an_old_log_without_it_still_parses() {
+        let r = GenerationReport {
+            provenance: ArmProvenance {
+                artifact_hash: Some("abc123".into()),
+                prefill_artifact_path: Some("/artifacts/gemma4-prefill".into()),
+                prefill_artifact_hash: Some("def456".into()),
+                prefill_toolchain_pin_hash: Some("tc789".into()),
+                ..ArmProvenance::default()
+            },
+            ..a_report()
+        };
+        let line = summary_line(&r, &meta(), FinishReason::Stop);
+        assert_eq!(line["x_npu"]["provenance"]["prefill_artifact_hash"], "def456");
+        let back = parse_run(&line.to_string()).unwrap().summary.unwrap();
+        assert_eq!(back.provenance.prefill_artifact_hash.as_deref(), Some("def456"));
+        assert_eq!(back.provenance.artifact_hash.as_deref(), Some("abc123"));
+
+        // A log from before this field existed carries no `prefill_*` keys at all.
+        let mut old = line.clone();
+        old["x_npu"]["provenance"].as_object_mut().unwrap().remove("prefill_artifact_path");
+        old["x_npu"]["provenance"].as_object_mut().unwrap().remove("prefill_artifact_hash");
+        old["x_npu"]["provenance"].as_object_mut().unwrap().remove("prefill_toolchain_pin_hash");
+        let back = parse_run(&old.to_string()).unwrap().summary.unwrap();
+        assert_eq!(back.provenance.prefill_artifact_hash, None);
+        assert_eq!(back.provenance.artifact_hash.as_deref(), Some("abc123"), "old fields unaffected");
     }
 
     /// A parser miss is otherwise invisible: the bytes reach the client as assistant text and
