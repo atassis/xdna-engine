@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 
 import aie.iron as iron
-from aie.iron import In, ObjectFifo, Out, Program, Runtime, Worker
+from aie.iron import CompileTime, In, ObjectFifo, Out, Program, Runtime, Worker
 from aie.iron.controlflow import range_
 from aie.iron.kernel import ExternalFunction
 from aie.helpers.taplib import TensorAccessPattern, TensorTiler2D
@@ -51,7 +51,11 @@ def _call(kind, p, w, lay):
     }[kind]()
 
 
-def _shim(path, sym, kind, p, w):
+def _shim(path, sym, kind, p, w, bracket=False):
+    """bracket=True wraps the whole call (kernel + skip forward) in event0()/event1() so a
+    traced core's per-row compute vs. gap is readable off the trace, mirroring
+    codec_block/trace_conv_dispatch.py's bracketing convention. Off by default: production
+    shims stay byte-identical."""
     lay = NL.layout(kind, w)
     fwd = ""
     if lay.x_in is not None and lay.x_out is not None:
@@ -62,8 +66,9 @@ def _shim(path, sym, kind, p, w):
     else:
         src = KDIR / "conv3x3_u8.cc"
         args = "int8_t *l0, int8_t *l1, int8_t *l2, int8_t *p, int8_t *o, int32_t check"
+    ev0, ev1 = ("  event0();\n", "  event1();\n") if bracket else ("", "")
     path.write_text(f'#include <stdint.h>\n#include "{src}"\n'
-                    f'extern "C" void {sym}({args}) {{\n  {_call(kind, p, w, lay)}\n{fwd}}}\n')
+                    f'extern "C" void {sym}({args}) {{\n{ev0}  {_call(kind, p, w, lay)}\n{fwd}{ev1}}}\n')
     return path
 
 
@@ -77,9 +82,16 @@ def _flags(kind, incs):
     return f
 
 
-def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet"):
+def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
+         trace_stages=None, trace_config=None, coretile_events=None, egress_shim_col=1):
     """NP: span_int.Span.net_params(). Returns an iron.jit callable (x, wts, y): x from
-    net_layout.conv1_rows (as int8), wts from net_layout.weights_blob, y gets `upto`'s rows."""
+    net_layout.conv1_rows (as int8), wts from net_layout.weights_blob, y gets `upto`'s rows.
+
+    trace_stages/trace_config: same two-half mechanism as bricklib._build_streamed_traced --
+    trace_config (a TraceConfig, REQUIRED if trace_stages is given) is passed to iron.jit so it
+    injects a `trace_size` compile kwarg into `design`; that call bakes Program.enable_trace on
+    exactly the Workers named in trace_stages, bracketed with event0()/event1() in their shim.
+    None (default) leaves every shim byte-identical to production."""
     assert w % 16 == 0, "conv3x3_u8.cc needs width % 16 == 0 (and the x copy, whole 64-byte vectors)"
     gen = Path(gen)
     gen.mkdir(parents=True, exist_ok=True)
@@ -92,19 +104,21 @@ def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet"):
     joined = "conv_cat" in names
     skips = {s for s, _ in NL.CAT_SOURCES} if joined else set()
 
+    trace_stages = set(trace_stages or [])
     texts = [(KDIR / "conv3x3_u8.cc").read_text(), (CAT_DIR / "conv1x1_cat.cc").read_text()]
     spec = {}
     for n in names:
         sym = f"{tag}_{n}_w{w}"
         incs = [g.lut_inc(t, gen / f"{sym}_t{i}.inc") for i, t in enumerate(NP[n].get("tables", []))]
-        shim = _shim(gen / f"{sym}.cc", sym, kind[n], NP[n], w)
+        shim = _shim(gen / f"{sym}.cc", sym, kind[n], NP[n], w, bracket=n in trace_stages)
         spec[n] = (sym, shim, incs)
         texts += [shim.read_text()] + [Path(i).read_text() for i in incs]
     groups = NL.weight_groups(names)
     skip_depths = {s: NL.skip_depth(s) for s in sorted(skips)}
     digest = hashlib.sha256("".join(texts).encode() + repr(
         (w, h, upto, sorted(stacks.items()), sorted(depth.items()), groups, skip_depths,
-         MAIN_DEPTH, PROD_DEPTH)).encode()).hexdigest()[:12]
+         MAIN_DEPTH, PROD_DEPTH, sorted(trace_stages), tuple(coretile_events or ()),
+         egress_shim_col)).encode()).hexdigest()[:12]
     base = _aie_api_include() + [f"-DSPAN_NET_DIGEST={digest}"]
     plen = {n: NP[n]["blob"].size for n in names}
     wtotal = sum(plen.values())
@@ -154,7 +168,7 @@ def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet"):
             fo.release(1)
         fp.release(1)
 
-    def design(x: In, wts: In, y: Out):
+    def design(x: In, wts: In, y: Out, *, trace_size: CompileTime[int] = 0):
         kern = {}
         for n in names:
             sym, shim, incs = spec[n]
@@ -216,7 +230,12 @@ def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet"):
 
         rt = Runtime(sequence, [ty((h + 2) * x_row), ty(wtotal), ty(h * y_row), f_in.prod(),
                                 out[names[-1]].cons()] + [wf.prod() for wf in w_fifos])
-        return Program(iron.get_current_device(), rt, workers=workers).resolve_program()
+        prog = Program(iron.get_current_device(), rt, workers=workers)
+        if trace_size:
+            traced = [workers[names.index(n)] for n in trace_stages]
+            prog.enable_trace(trace_size=trace_size, workers=traced,
+                              coretile_events=coretile_events, egress_shim_col=egress_shim_col)
+        return prog.resolve_program()
 
     design.__name__ = design.__qualname__ = f"{tag}_{digest}"
-    return iron.jit(design, use_cache=True)
+    return iron.jit(design, use_cache=True, trace_config=trace_config)
