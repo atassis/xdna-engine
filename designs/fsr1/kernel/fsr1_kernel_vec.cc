@@ -72,12 +72,15 @@ static inline fvec aprx_med_rcp_v(fvec a) {
 }
 
 // VW consecutive elements of channel `ch`, row `y` (clamped), starting at source column `x0`
-// (each lane independently clamped -- a scalar gather, not yet a SIMD one; see README).
-static fvec load_tap(const float *planar, int ch, int y, int x0) {
+// (each lane independently clamped -- a scalar gather, not yet a SIMD one; see README). Reads
+// the interleaved RGB buffer directly (stride-3 per pixel), same idiom as RCAS's load_strip --
+// no planar deinterleave scratch, which is what let the fused EASU+RCAS kernel fit data memory
+// (see README's Step 2c).
+static fvec load_tap(const float *img, int ch, int y, int x0) {
   int yc = clampi(y, 0, FSR1_IN_H - 1);
   alignas(64) float buf[VW];
-  const float *row = planar + (ch * FSR1_IN_H + yc) * FSR1_IN_W;
-  for (int i = 0; i < VW; i++) buf[i] = row[clampi(x0 + i, 0, FSR1_IN_W - 1)];
+  const float *row = img + yc * FSR1_IN_W * 3;
+  for (int i = 0; i < VW; i++) buf[i] = row[clampi(x0 + i, 0, FSR1_IN_W - 1) * 3 + ch];
   return aie::load_v<VW>(buf);
 }
 
@@ -132,36 +135,36 @@ static void easu_tap_v(fvec aC[3], fvec &aW, float tapx, float tapy, float ppx, 
 }
 
 // Computes one phase-row: real output row = 3*s + py, columns {3t+px : t=0..VW-1}.
-// `planar` is [channel][row][col], IN_H*IN_W each. Writes `out[c]` (VW lanes).
-__attribute__((noinline)) static void easu_phase_row(const float *planar, int s, int px, int py, fvec out[3]) {
+// `img` is the interleaved RGB input. Writes `out[c]` (VW lanes).
+__attribute__((noinline)) static void easu_phase_row(const float *img, int s, int px, int py, fvec out[3]) {
   float ppx = FRAC_X[px], ppy = FRAC_X[py];
   int fpy = s + OFFSET_X[py];
   int fpx0 = OFFSET_X[px];
 
-  fvec bR = load_tap(planar, 0, fpy - 1, fpx0), bG = load_tap(planar, 1, fpy - 1, fpx0),
-       bB = load_tap(planar, 2, fpy - 1, fpx0);
-  fvec cR = load_tap(planar, 0, fpy - 1, fpx0 + 1), cG = load_tap(planar, 1, fpy - 1, fpx0 + 1),
-       cB = load_tap(planar, 2, fpy - 1, fpx0 + 1);
-  fvec eR = load_tap(planar, 0, fpy, fpx0 - 1), eG = load_tap(planar, 1, fpy, fpx0 - 1),
-       eB = load_tap(planar, 2, fpy, fpx0 - 1);
-  fvec fR = load_tap(planar, 0, fpy, fpx0), fG = load_tap(planar, 1, fpy, fpx0),
-       fB = load_tap(planar, 2, fpy, fpx0);
-  fvec gR = load_tap(planar, 0, fpy, fpx0 + 1), gG = load_tap(planar, 1, fpy, fpx0 + 1),
-       gB = load_tap(planar, 2, fpy, fpx0 + 1);
-  fvec hR = load_tap(planar, 0, fpy, fpx0 + 2), hG = load_tap(planar, 1, fpy, fpx0 + 2),
-       hB = load_tap(planar, 2, fpy, fpx0 + 2);
-  fvec iR = load_tap(planar, 0, fpy + 1, fpx0 - 1), iG = load_tap(planar, 1, fpy + 1, fpx0 - 1),
-       iB = load_tap(planar, 2, fpy + 1, fpx0 - 1);
-  fvec jR = load_tap(planar, 0, fpy + 1, fpx0), jG = load_tap(planar, 1, fpy + 1, fpx0),
-       jB = load_tap(planar, 2, fpy + 1, fpx0);
-  fvec kR = load_tap(planar, 0, fpy + 1, fpx0 + 1), kG = load_tap(planar, 1, fpy + 1, fpx0 + 1),
-       kB = load_tap(planar, 2, fpy + 1, fpx0 + 1);
-  fvec lR = load_tap(planar, 0, fpy + 1, fpx0 + 2), lG = load_tap(planar, 1, fpy + 1, fpx0 + 2),
-       lB_ = load_tap(planar, 2, fpy + 1, fpx0 + 2);
-  fvec nR = load_tap(planar, 0, fpy + 2, fpx0), nG = load_tap(planar, 1, fpy + 2, fpx0),
-       nB = load_tap(planar, 2, fpy + 2, fpx0);
-  fvec oR = load_tap(planar, 0, fpy + 2, fpx0 + 1), oG = load_tap(planar, 1, fpy + 2, fpx0 + 1),
-       oB = load_tap(planar, 2, fpy + 2, fpx0 + 1);
+  fvec bR = load_tap(img, 0, fpy - 1, fpx0), bG = load_tap(img, 1, fpy - 1, fpx0),
+       bB = load_tap(img, 2, fpy - 1, fpx0);
+  fvec cR = load_tap(img, 0, fpy - 1, fpx0 + 1), cG = load_tap(img, 1, fpy - 1, fpx0 + 1),
+       cB = load_tap(img, 2, fpy - 1, fpx0 + 1);
+  fvec eR = load_tap(img, 0, fpy, fpx0 - 1), eG = load_tap(img, 1, fpy, fpx0 - 1),
+       eB = load_tap(img, 2, fpy, fpx0 - 1);
+  fvec fR = load_tap(img, 0, fpy, fpx0), fG = load_tap(img, 1, fpy, fpx0),
+       fB = load_tap(img, 2, fpy, fpx0);
+  fvec gR = load_tap(img, 0, fpy, fpx0 + 1), gG = load_tap(img, 1, fpy, fpx0 + 1),
+       gB = load_tap(img, 2, fpy, fpx0 + 1);
+  fvec hR = load_tap(img, 0, fpy, fpx0 + 2), hG = load_tap(img, 1, fpy, fpx0 + 2),
+       hB = load_tap(img, 2, fpy, fpx0 + 2);
+  fvec iR = load_tap(img, 0, fpy + 1, fpx0 - 1), iG = load_tap(img, 1, fpy + 1, fpx0 - 1),
+       iB = load_tap(img, 2, fpy + 1, fpx0 - 1);
+  fvec jR = load_tap(img, 0, fpy + 1, fpx0), jG = load_tap(img, 1, fpy + 1, fpx0),
+       jB = load_tap(img, 2, fpy + 1, fpx0);
+  fvec kR = load_tap(img, 0, fpy + 1, fpx0 + 1), kG = load_tap(img, 1, fpy + 1, fpx0 + 1),
+       kB = load_tap(img, 2, fpy + 1, fpx0 + 1);
+  fvec lR = load_tap(img, 0, fpy + 1, fpx0 + 2), lG = load_tap(img, 1, fpy + 1, fpx0 + 2),
+       lB_ = load_tap(img, 2, fpy + 1, fpx0 + 2);
+  fvec nR = load_tap(img, 0, fpy + 2, fpx0), nG = load_tap(img, 1, fpy + 2, fpx0),
+       nB = load_tap(img, 2, fpy + 2, fpx0);
+  fvec oR = load_tap(img, 0, fpy + 2, fpx0 + 1), oG = load_tap(img, 1, fpy + 2, fpx0 + 1),
+       oB = load_tap(img, 2, fpy + 2, fpx0 + 1);
 
   fvec bL = vluma(bR, bG, bB), cL = vluma(cR, cG, cB);
   fvec eL = vluma(eR, eG, eB), fL = vluma(fR, fG, fB), gL = vluma(gR, gG, gB), hL = vluma(hR, hG, hB);
@@ -226,19 +229,12 @@ __attribute__((noinline)) static void easu_phase_row(const float *planar, int s,
 // from it.
 extern "C" {
 void fsr1_easu_vec(const float *in_rgb, float *out_rgb) {
-  // Deinterleave RGB -> planar (scalar; small crop, not the bottleneck -- see README).
-  static float planar[3 * FSR1_IN_H * FSR1_IN_W];
-  for (int y = 0; y < FSR1_IN_H; y++)
-    for (int x = 0; x < FSR1_IN_W; x++)
-      for (int c = 0; c < 3; c++)
-        planar[(c * FSR1_IN_H + y) * FSR1_IN_W + x] = in_rgb[(y * FSR1_IN_W + x) * 3 + c];
-
   for (int py = 0; py < 3; py++) {
     for (int s = 0; s < FSR1_IN_H; s++) {
       int oy = 3 * s + py;
       for (int px = 0; px < 3; px++) {
         fvec out[3];
-        easu_phase_row(planar, s, px, py, out);
+        easu_phase_row(in_rgb, s, px, py, out);
         alignas(64) float lane[3][VW];
         aie::store_v(lane[0], out[0]);
         aie::store_v(lane[1], out[1]);
@@ -259,11 +255,7 @@ void fsr1_easu_vec(const float *in_rgb, float *out_rgb) {
 // clamp-per-lane addressing as EASU's load_tap.
 static const float FSR_RCAS_LIMIT = 0.25f - 1.0f / 16.0f;
 
-// Reads straight from the interleaved RGB buffer (stride-3 per pixel) -- unlike EASU's
-// load_tap, RCAS needs no planar deinterleave scratch: it is same-size in->out with only
-// row/column-neighbor taps, so there is nothing to gain from a separate layout, and skipping
-// it saves a full resident-image-sized static buffer (this is what put the deinterleaved
-// version over the core's data-memory budget, see README).
+// Reads straight from the interleaved RGB buffer, same idiom as EASU's load_tap.
 static fvec load_strip(const float *img, int ch, int y, int x0, int w, int h) {
   int yc = clampi(y, 0, h - 1);
   alignas(64) float buf[VW];
