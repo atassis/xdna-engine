@@ -85,6 +85,46 @@ sit at 244.7/231.58, within noise of every other traced kind's floor (215-231.5,
 essentially nothing at the whole-net level (231.58->231.06, -0.2%) until that shared gap floor moves
 too. Same caveat as everywhere else in this file: device shared, power mode not pinned.
 
+## Adopted as an explicit option, not yet the default (this branch, `feat/span-b1int8`)
+
+`span_int.Span(export_dir, b1_mode="int16"|"int8")` -- "int8" is variant (c) at p99.5
+(`B1_INT8_PCT`), the zero-kernel-work option; int16 stays the default and byte-identical
+(`test_span_int.py`/`test_net_layout.py` pass unmodified). Re-measured on this branch,
+same split: **int8 39.40 dB, int16 39.74 dB** (`span_int.py` main(), `SPAN_B1_MODE=int8`) --
+matches the table above exactly.
+
+`net_design.build(..., b1_int8=bool)` switches b1c1/b1c2's kind (silu16->silu_x,
+silu_i16->silu) via `net_layout.stages()`/`golden()` (STAGES/GOLDEN themselves untouched,
+so every OTHER caller is byte-identical); `DATA_SIZES={"b1c1": 4160}` (sized for silu16's
+two-table LUT) is now skipped when `b1_int8`, since silu_x's one table does not need it --
+reserving it anyway would hand back the L1 int8 is meant to free.
+
+**Per-core L1, W=32, compile-only (`design.compile()`, no device) -- before/after:**
+
+| tile | stage | int16 (before) | int8 (after) |
+|---|---|---|---|
+| (0,3) | b1c1 | stack 3584 + weight 23040 + 4x6912 out + data 4160 + skip 3x2304 = **65344/65536** (192 B free) | stack 2560 + weight 23040 + 4x4608 out + skip 3x2304, LUT auto-fits (no reservation) -- ~13 KB free |
+| (0,3) | b1c1 max fitting `depths={"b1c1": N}` | N=4 (N=5 overflows by 6720 B, `aiecc`'s own MemoryMap) | **N=6** |
+| (0,4) | b1c2 max fitting `depths={"b1c2": N}` | N=7 | **N=8** (stack 3584->2560, one more 4608 B slot) |
+
+Both breakeven depths read off `aiecc`'s own overflow error (deliberate 1-slot overrun,
+same technique TRACE_RESULTS.md's Phase 1a fit section uses), not estimated. b1c1 gains two
+more depth-slots' worth of L1 headroom, b1c2 one -- real relief for the frame-width lane's
+wall, measured at the SHIPPED defaults (`depths={"b1c1": 4}` still fits both modes; nothing
+here required raising it).
+
+**Device gate/trace (steps 3-4): NOT YET RUN.** `probe_span_b1int8_device.py` (gates both
+b1_modes on the full 22-core net, then traces b1c2/b1c3 one stage per dispatch) was queued
+under the NPU lock -- the device was held by another session and at least 3 further sessions
+were also queued (`m1_snap.py`, `verify_span_p2b_a.py`, `m1_multi.sh`). First attempt: the
+background shell was killed by Claude Code's own low-memory reaper before it acquired the lock.
+Second attempt: `NPU_WAIT_S=3600 npu_lock.sh queue -- env NPU_WAIT_S=3600 ...` -- setting the
+var for `env` sets it for the COMMAND, after the lock already read its own (1800 s) default, so
+it deferred at 30 min regardless of the intended 3600. Fixed form: `NPU_WAIT_S=3600
+npu_lock.sh queue -- <cmd>` (before the lock, not after `--`). Neither attempt touched the
+device outside the lock. Re-run `aie_kernels/_test/probe_span_b1int8_device.py` under the lock
+with the fixed invocation; do not flip any default until it reports 22/22 for `b1_mode=int8`.
+
 ## Read (not a decision)
 
 - (a), the literal "make it int8" swap the docstring is warning about: costs 1.6 dB, not the full

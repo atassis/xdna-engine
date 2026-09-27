@@ -4,7 +4,8 @@
 half, treated as the whole frame, must equal span_int on that crop exactly. Stops at the first
 stage that disagrees.
 
-Env: SPAN_EXPORT, SPAN_DEMO_DIR; optional SPAN_UPTO (comma list), SPAN_HEIGHT (default 64).
+Env: SPAN_EXPORT, SPAN_DEMO_DIR; optional SPAN_UPTO (comma list), SPAN_HEIGHT (default 64),
+SPAN_B1_MODE (int16 [default] or int8 -- INT8_BLOCK1.md's block-1 quantization option).
 """
 import os
 import sys
@@ -24,17 +25,17 @@ WIDTH = 32
 HEIGHT = int(os.environ.get("SPAN_HEIGHT", 64))
 
 
-def run(net, NP, crop, T, upto):
+def run(net, NP, crop, T, upto, b1_int8):
     names = NL.stage_names(upto)
-    design = N.build(WIDTH, HEIGHT, NP, HERE / "gen" / "span_net", upto=upto)
+    design = N.build(WIDTH, HEIGHT, NP, HERE / "gen" / "span_net", upto=upto, b1_int8=b1_int8)
     x = NL.conv1_rows(crop, net.mean255).reshape(-1).view(np.int8)
     xt = iron.tensor(x, dtype=np.int8, device="npu")
     wt = iron.tensor(NL.weights_blob(NP, names), dtype=np.int8, device="npu")
-    out_bytes = NL.layout(dict(NL.STAGES)[upto], WIDTH).out_bytes
+    out_bytes = NL.layout(NL.stages(b1_int8)[upto], WIDTH).out_bytes
     yt = iron.zeros((HEIGHT * out_bytes,), dtype=np.int8, device="npu")
     design(xt, wt, yt)
-    got = NL.unpack_out(yt.numpy(), upto, HEIGHT, WIDTH).astype(np.int64)
-    ref = T[NL.GOLDEN[upto][0]].astype(np.int64)
+    got = NL.unpack_out(yt.numpy(), upto, HEIGHT, WIDTH, b1_int8=b1_int8).astype(np.int64)
+    ref = T[NL.golden(b1_int8)[upto][0]].astype(np.int64)
     mism = int((got != ref).sum())
     print(f"span net upto {upto} ({len(names)} cores), {WIDTH}x{HEIGHT}: exact "
           f"{ref.size - mism}/{ref.size} -> {'PASS' if mism == 0 else 'FAIL'}", flush=True)
@@ -42,14 +43,16 @@ def run(net, NP, crop, T, upto):
 
 
 def main():
+    b1_mode = os.environ.get("SPAN_B1_MODE", "int16")
+    b1_int8 = b1_mode == "int8"
     cal, test = TS.load_split(os.environ["SPAN_DEMO_DIR"])
-    net = S.Span(os.environ["SPAN_EXPORT"])
+    net = S.Span(os.environ["SPAN_EXPORT"], b1_mode=b1_mode)
     net.quantize(cal)
     crop = test[:, :HEIGHT, :WIDTH]
     T = net.int_tensors(crop)
     NP = net.net_params()
     for upto in os.environ.get("SPAN_UPTO", ",".join(NL.GOLDEN)).split(","):
-        if not run(net, NP, crop, T, upto):
+        if not run(net, NP, crop, T, upto, b1_int8):
             sys.exit(1)
     sys.exit(0)
 

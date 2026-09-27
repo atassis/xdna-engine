@@ -187,7 +187,8 @@ def _flags(kind, incs):
 def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
          trace_stages=None, trace_config=None, coretile_events=None, egress_shim_col=1,
          main_depth=None, skip_slack=None, prod_depth=None, cat_cons_depth=None,
-         data_sizes=None, split_gate=None, skip_cons_depths=None, join_tile=None):
+         data_sizes=None, split_gate=None, skip_cons_depths=None, join_tile=None,
+         b1_int8=False):
     """NP: span_int.Span.net_params(). Returns an iron.jit callable (x, wts, y): x from
     net_layout.conv1_rows (as int8), wts from net_layout.weights_blob, y gets `upto`'s rows.
 
@@ -222,7 +223,10 @@ def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
     array/LUT table) reservation aiecc's own error suggests when buffer allocation leaves too
     little room for a core's LUT: "aiecc: core main_core_0_3 needs space for 4160 bytes of static
     data ... but it may fit if you reserve it explicitly." Merged over DATA_SIZES (default {},
-    currently {"b1c1": 4160} -- required for DEPTH["b1c1"]=4 to fit L1 at W=32).
+    currently {"b1c1": 4160} -- required for DEPTH["b1c1"]=4 to fit L1 at W=32 when b1c1 runs
+    silu16's two hi/lo tables). DATA_SIZES itself is skipped when b1_int8 (silu_x's one int8
+    table needs far less; a 4160 B reservation sized for the two-table int16 LUT would only take
+    back the L1 int8 is meant to free -- INT8_BLOCK1.md).
 
     split_gate: stage names (kind in SPLIT_KINDS: gate, silu16, silu_i16) to split onto two cores
     by output channel
@@ -240,12 +244,15 @@ def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
     join_tile: Tile override for the join's own MemTile (default None -> AnyMemTile, the
     unconstrained placer choice that landed on the SAME MemTile as weight group 3 -- see
     TRACE_RESULTS.md's Phase 1a MemTile(4,1) section). Phase 1e's targeted experiment: pin the
-    join off that shared tile onto a dedicated one."""
+    join off that shared tile onto a dedicated one.
+
+    b1_int8: b1c1/b1c2 run blocks 2-6's own int8 kinds (silu_x/silu) instead of silu16/silu_i16
+    (INT8_BLOCK1.md). NP must have been produced by span_int.Span(b1_mode="int8")."""
     main_depth = MAIN_DEPTH if main_depth is None else main_depth
     skip_slack = NL.SKIP_SLACK if skip_slack is None else skip_slack
     prod_depth = PROD_DEPTH if prod_depth is None else prod_depth
     cat_cons_depth = 2 if cat_cons_depth is None else cat_cons_depth
-    data_sizes = {**DATA_SIZES, **(data_sizes or {})}
+    data_sizes = {**({} if b1_int8 else DATA_SIZES), **(data_sizes or {})}
     split_gate = frozenset(split_gate or ())
     skip_cons_depths = {**SKIP_CONS_DEPTHS, **(skip_cons_depths or {})}
     assert w % 16 == 0, "conv3x3_u8.cc needs width % 16 == 0 (and the x copy, whole 64-byte vectors)"
@@ -253,7 +260,7 @@ def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
     gen.mkdir(parents=True, exist_ok=True)
     g = _golden()
     names = NL.stage_names(upto)
-    kind = dict(NL.STAGES)
+    kind = NL.stages(b1_int8)
     for n in split_gate:
         assert kind[n] in SPLIT_KINDS, f"split_gate unsupported for kind={kind[n]} ({n})"
     lay = {n: NL.layout(kind[n], w) for n in names}
@@ -299,7 +306,7 @@ def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
          main_depth, prod_depth, cat_cons_depth, sorted(data_sizes.items()),
          sorted(skip_cons_depths.items()), sorted(trace_stages), tuple(coretile_events or ()),
          egress_shim_col, sorted(split_gate),
-         (join_tile.col, join_tile.row) if join_tile is not None else None,
+         (join_tile.col, join_tile.row) if join_tile is not None else None, b1_int8,
          )).encode()).hexdigest()[:12]
     base = _aie_api_include() + [f"-DSPAN_NET_DIGEST={digest}"]
     plen = {cn: spec[cn][3]["blob"].size for cn in core_names}
