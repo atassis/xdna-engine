@@ -61,6 +61,15 @@ static inline fvec aprx_lo_rsq_v(fvec a) {
   auto r = aie::sub((int32_t)0x5F347D74, shifted);
   return r.template cast_to<float>();
 }
+// APrxMedRcpF1 -- one Newton refinement step on top of the same bit-trick seed, used by RCAS
+// for its exact-in-cpu_ref divisions (see cpu_ref.py's aprx_med_rcp / fsr1_kernel.cc's scalar
+// twin).
+static inline fvec aprx_med_rcp_v(fvec a) {
+  auto bits = a.template cast_to<int32_t>();
+  auto r = aie::sub((int32_t)0x7EF19FFF, bits);
+  fvec b = r.template cast_to<float>();
+  return vmul(b, aie::sub(2.0f, vmul(b, a)));
+}
 
 // VW consecutive elements of channel `ch`, row `y` (clamped), starting at source column `x0`
 // (each lane independently clamped -- a scalar gather, not yet a SIMD one; see README).
@@ -103,13 +112,7 @@ static void easu_set_v(EasuAcc &a, float ppx, float ppy, int mask,
   a.len = aie::add(a.len, vmuls(lenY, w));
 }
 
-// optnone: at -O1/-O2/-Os Peano's register allocator fails ("ran out of registers") on this
-// function's live-range shape (6 concurrent phase-state vectors x aggressive ILP scheduling
-// extends their live ranges past where they're actually needed -- confirmed by -O0 compiling
-// clean with the exact same code). A real toolchain-scheduling limit for this function's
-// dependency shape, not a fundamental impossibility; forcing -O0 HERE only (optnone) is the
-// workaround pending a from-scratch restructure. See README.
-__attribute__((optnone)) static void easu_tap_v(fvec aC[3], fvec &aW, float tapx, float tapy, float ppx, float ppy,
+static void easu_tap_v(fvec aC[3], fvec &aW, float tapx, float tapy, float ppx, float ppy,
                        fvec dirx, fvec diry, fvec len2x, fvec len2y, fvec lob, fvec clp,
                        const fvec c[3]) {
   float offx = tapx - ppx, offy = tapy - ppy;
@@ -218,10 +221,9 @@ __attribute__((noinline)) static void easu_phase_row(const float *planar, int s,
     out[c] = aie::min(max4[c], aie::max(min4[c], vmul(aC[c], invW)));
 }
 
-// EASU only, vectorized (RCAS is a second pass, kept scalar in a SEPARATE kernel/dispatch --
-// gamescope itself runs EASU and RCAS as two separate GPU dispatches too, so this mirrors the
-// reference pipeline rather than deviating from it; it is also what let the combined kernel fit
-// program memory -- see README's .text accounting).
+// EASU, vectorized. RCAS (below) is a second pass -- gamescope itself runs EASU and RCAS as
+// two separate GPU dispatches, so this mirrors the reference pipeline rather than deviating
+// from it.
 extern "C" {
 void fsr1_easu_vec(const float *in_rgb, float *out_rgb) {
   // Deinterleave RGB -> planar (scalar; small crop, not the bottleneck -- see README).
@@ -249,5 +251,84 @@ void fsr1_easu_vec(const float *in_rgb, float *out_rgb) {
       }
     }
   }
+}
+}
+
+// RCAS, vectorized. Same-size in->out (no upscale), so a phase table isn't needed: VW
+// consecutive output columns load directly, and the 4 cross taps are the same row/column
+// clamp-per-lane addressing as EASU's load_tap.
+static const float FSR_RCAS_LIMIT = 0.25f - 1.0f / 16.0f;
+
+// Reads straight from the interleaved RGB buffer (stride-3 per pixel) -- unlike EASU's
+// load_tap, RCAS needs no planar deinterleave scratch: it is same-size in->out with only
+// row/column-neighbor taps, so there is nothing to gain from a separate layout, and skipping
+// it saves a full resident-image-sized static buffer (this is what put the deinterleaved
+// version over the core's data-memory budget, see README).
+static fvec load_strip(const float *img, int ch, int y, int x0, int w, int h) {
+  int yc = clampi(y, 0, h - 1);
+  alignas(64) float buf[VW];
+  const float *row = img + yc * w * 3;
+  for (int i = 0; i < VW; i++) buf[i] = row[clampi(x0 + i, 0, w - 1) * 3 + ch];
+  return aie::load_v<VW>(buf);
+}
+
+static void rcas_row_v(const float *img, int w, int h, int oy, int x0, float con,
+                       fvec out[3]) {
+  fvec b[3], d[3], e[3], f[3], hh[3];
+  for (int c = 0; c < 3; c++) {
+    b[c] = load_strip(img, c, oy - 1, x0, w, h);
+    d[c] = load_strip(img, c, oy, x0 - 1, w, h);
+    e[c] = load_strip(img, c, oy, x0, w, h);
+    f[c] = load_strip(img, c, oy, x0 + 1, w, h);
+    hh[c] = load_strip(img, c, oy + 1, x0, w, h);
+  }
+
+  fvec lobe_c[3];
+  for (int c = 0; c < 3; c++) {
+    fvec mn4 = aie::min(aie::min(aie::min(b[c], d[c]), f[c]), hh[c]);
+    fvec mx4 = aie::max(aie::max(aie::max(b[c], d[c]), f[c]), hh[c]);
+    fvec hitMin = vmul(aie::min(mn4, e[c]), aie::inv(vmuls(mx4, 4.0f)));
+    fvec hitMax = vmul(aie::sub(1.0f, aie::max(mx4, e[c])),
+                       aie::inv(aie::sub(vmuls(mn4, 4.0f), 4.0f)));
+    lobe_c[c] = aie::max(vmuls(hitMin, -1.0f), hitMax);
+  }
+  fvec lobe = aie::max(aie::max(lobe_c[0], lobe_c[1]), lobe_c[2]);
+  lobe = aie::min(lobe, 0.0f);
+  lobe = aie::max(lobe, -FSR_RCAS_LIMIT);
+  lobe = vmuls(lobe, con);
+  fvec rcpL = aprx_med_rcp_v(aie::add(vmuls(lobe, 4.0f), 1.0f));
+  for (int c = 0; c < 3; c++) {
+    fvec acc = aie::add(aie::add(vmul(lobe, b[c]), vmul(lobe, d[c])),
+                        aie::add(vmul(lobe, hh[c]), vmul(lobe, f[c])));
+    out[c] = vmul(aie::add(acc, e[c]), rcpL);
+  }
+}
+
+extern "C" {
+void fsr1_rcas_vec(const float *in_rgb, float *out_rgb) {
+  const float con = 0.87055056329f; // 2^-0.2, matches cpu_ref.py's fsr_rcas_con(0.2)
+  for (int oy = 0; oy < FSR1_OUT_H; oy++) {
+    for (int cx = 0; cx < FSR1_OUT_W / VW; cx++) {
+      fvec out[3];
+      rcas_row_v(in_rgb, FSR1_OUT_W, FSR1_OUT_H, oy, cx * VW, con, out);
+      alignas(64) float lane[3][VW];
+      aie::store_v(lane[0], out[0]);
+      aie::store_v(lane[1], out[1]);
+      aie::store_v(lane[2], out[2]);
+      for (int t = 0; t < VW; t++) {
+        int ox = cx * VW + t;
+        float *dst = &out_rgb[(oy * FSR1_OUT_W + ox) * 3];
+        dst[0] = lane[0][t]; dst[1] = lane[1][t]; dst[2] = lane[2][t];
+      }
+    }
+  }
+}
+
+// Fused EASU+RCAS, one dispatch, mirroring the scalar kernel's fsr1_strip -- see README for
+// the program-memory accounting this fused form is checked against.
+void fsr1_strip_vec(const float *in_rgb, float *out_rgb) {
+  static float easu_buf[FSR1_OUT_H * FSR1_OUT_W * 3];
+  fsr1_easu_vec(in_rgb, easu_buf);
+  fsr1_rcas_vec(easu_buf, out_rgb);
 }
 }

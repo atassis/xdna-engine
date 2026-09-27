@@ -190,6 +190,53 @@ instead of the hardware SFU; the one exact case (`invW`, FSR1's own plain `ARcpF
   separately timed here, so the combined EASU+RCAS per-frame cost is not yet known -- vectorizing RCAS
   the same way is the next concrete step before this number means anything for the whole filter.
 
+## Step 2c -- vectorized RCAS, fused EASU+RCAS gated on device
+
+`fsr1_rcas_vec` (RCAS, vectorized, `kernel/fsr1_kernel_vec.cc`) and `fsr1_strip_vec` (EASU+RCAS,
+one dispatch, calls `fsr1_easu_vec` then `fsr1_rcas_vec` through an intermediate resident buffer,
+mirroring the scalar kernel's `fsr1_strip`). RCAS reuses the same bit-trick bricks as EASU
+(`aprx_med_rcp_v`, the APrxMedRcpF1 twin, added for RCAS's lobe reciprocal) and reads/writes the
+interleaved RGB buffer directly with per-lane clamp addressing (no planar deinterleave -- see
+"data-memory budget" below for why). The `optnone` on `easu_tap_v` no longer reproduces (removed);
+Peano compiles clean at -O1..-Oz with the code as it stands now.
+
+**Device-verified** (`kernel/verify_fsr1_rcas_vec.py`, `kernel/verify_fsr1_strip_vec.py`, real XRT
+run, npu_lock-serialized):
+
+| kernel | rel_l2 | max abs diff | determinism (n=4) | status |
+|---|---|---|---|---|
+| `fsr1_rcas_vec` (RCAS alone, random RGB) | 9.158e-08 | 2.384e-07 | 0.0 | PASS |
+| `fsr1_strip_vec` (EASU+RCAS fused) | 5.469e-07 | 3.278e-06 | 0.0 | PASS |
+
+Both in the same rel_l2 band as the EASU-only vec kernel's 3.355e-07 -- RCAS's own reciprocal
+(hitMin/hitMax's exact division, done via `aie::inv` per the EASU precedent for FSR1's "exact"
+cases) does not add a new error regime.
+
+**.text vs the 16KB program memory** (`llvm-size -A` on the linked per-core ELF): `fsr1_strip_vec`
+(fused) is **15808 B = 96.5% of 16384** -- it fits on ONE core, no split needed (up from
+`fsr1_easu_vec` alone's 13344 B/81.4%; RCAS's own contribution is ~2.4 KB of .text).
+`fsr1_rcas_vec` alone is 4208 B/25.7%.
+
+**Data-memory budget is the tighter constraint for RCAS, not .text.** RCAS is same-size in->out,
+so both its objectFifo buffers are output-sized (unlike EASU, whose input buffer is 9x smaller
+than its output). The first version deinterleaved into an extra `planar[]` static scratch buffer
+the same size as the image and blew the core's 64KB data memory (`'.bss' will not fit in region
+'data': overflowed by 2688 bytes` at the crop size used for the EASU-vec gate). Fix: read the
+interleaved buffer directly with a strided per-channel load (no scratch copy) -- see
+`load_strip` in `fsr1_kernel_vec.cc`. Even with that fix, RCAS-alone's two depth-2 objectFifos (4
+buffers, all output-sized) leave only ~1024 output pixels' worth of room per buffer at `w=48`
+(48x21) before `aiecc` reports `'aie.tile' op basic-sequential allocation also failed` -- this is
+why `time_fsr1_rcas_vec.py`'s two probe crops (12/21 output rows) are smaller than
+`time_fsr1_vec.py`'s (18/36); the fused kernel does not hit this because its input objectFifo is
+EASU-sized, not RCAS-sized.
+
+**Cycles/px, timing pending (device queue contention, 2026-09-27):** the NPU is single-tenant and
+was busy with several other agents' queued jobs (prefill, SPAN probes, a GEMM sweep) for the
+whole timing pass in this session; `time_fsr1_rcas_vec.py` and `time_fsr1_strip_vec.py` are
+written (same marginal two-crop-size method as `time_fsr1_vec.py`) and correctness-gated but the
+device numbers were not captured before this pass ended. Re-run both under `run.sh` once the
+device is free; no code change needed.
+
 ## Step 3 -- whole frame, one dispatch: NOT REACHED (two demonstrated blockers, not scope)
 
 1. **Structural: a literal one-shot whole-frame dispatch cannot fit.** `verify_oneshot`/`_build_oneshot`
