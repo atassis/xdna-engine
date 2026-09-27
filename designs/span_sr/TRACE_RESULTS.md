@@ -572,6 +572,98 @@ explicit gate for adopting a new default. `verify_span_net.py` was not re-run si
 `net_layout.DEPTH`/`net_design.MAIN_DEPTH` etc. are unchanged -- only the new opt-in `data_sizes=`
 diagnostic parameter (default None, byte-identical when omitted) was added to `net_design.py`.
 
+## Phase 1a follow-up 4 (coordinator): made DEPTH["b1c1"]=4 fit L1 at W=32 -- DEFAULT FLIPPED
+
+Merged `main` (bee0720, "inline the gate epilogue") into this branch first, so all timings below
+are current. That merge alone lowered the whole net's baseline pace network-wide (this session's
+own baseline trace: b1c1/b1c2/b3c3 all ~575-587 cyc/px, down from ~610-690 in pre-merge sessions --
+also visible in b1c1's own compute dropping from ~320 to ~266 cyc/px, unrelated to any lever in
+this file). Net conflict in `net_design.py` (main added `split_gate`/output-channel splitting,
+`aie_kernels/_test/BALANCE.md` epic) resolved by keeping both feature sets side by side; compile-
+and device-verified after the merge before continuing.
+
+Tried the coordinator's candidates in cost order, each measured against the compiled buffer map
+(the exact byte accounting the prior section only estimated):
+
+1. **Measured stack (tried, informative, NOT used in the final fix).** Deliberately under-sizing
+   `stacks={"silu16": 1}` and reading aiecc's own error gives b1c1's MEASURED stack requirement:
+   **1472 B** (vs. the reserved 3584 B -- 2112 B of apparent headroom). But the tile's true deficit
+   at depth=4 (with the LUT fix below applied) is *also* 2112 B, so closing it via stack ALONE
+   would need the bare measured value with ZERO margin (1472, no headroom for e.g. a future shim
+   change) -- confirmed by compiling at `stacks={"silu16": 1600}` (measured + 128 B margin): still
+   FAILS, over by exactly 128 B. Not used because lever 3 (below) closes the gap with margin to
+   spare, without touching stack at all.
+2. **Asymmetric producer/consumer depths through DMA -- not tried.** Lever 1 already gave a full
+   byte-exact accounting (`net_design.py`'s error output prints tile (0,3)'s complete MemoryMap;
+   see below) showing the b1c1<->b1c2 buffer lives ENTIRELY on b1c1's own tile (0,3), not split
+   across b1c1/b1c2 -- an adjacent-core objectFifo link is placed as one buffer array on one tile,
+   not two. b1c2's tile budget is untouched by this whole depth bump, so there is no producer/
+   consumer split to make; the shared-pool bug this lever was meant to route around does not apply
+   here (it is a JOIN pool issue, not an adjacent two-core link).
+3. **conv_1->b1c1 input depth 3 (USED).** New `net_design.build(skip_cons_depths=...)` param
+   (per-skip-source override of the hardcoded `main_depth` on that source's main-path consumer;
+   default `{}`, merged over a new `SKIP_CONS_DEPTHS` module constant, same pattern as `DEPTH`).
+   `skip_cons_depths={"conv_1": 3}` drops ONE `conv_1_skip_1_cons_buff` slot (2304 B) on tile (0,3).
+   Combined with `data_sizes={"b1c1": 4160}` (the LUT-starvation fix from the prior section) and
+   `depths={"b1c1": 4}`, **compiles at W=32 on the full net, with default `STACK["silu16"]`
+   unchanged.**
+
+**Exact byte accounting for tile (0,3), from the compiled buffer map** (forcing a deliberate small
+overflow to print it, `aie_kernels/_test/probe_span_b1c1_w32_fit.py`'s sibling checks):
+
+| item | bytes | note |
+|---|---|---|
+| stack | 3584 | STACK["silu16"], unchanged |
+| p_b1c1_cons_buff_0 | 23040 | weight sub-blob, model-fixed |
+| b1c1_out_buff_0..3 | 4 x 6912 = 27648 | DEPTH["b1c1"]=4 (was 3 x 6912 = 20736) |
+| core data sections | 4160 | LUT table, data_sizes fix |
+| conv_1_skip_1_cons_buff_0..2 | 3 x 2304 = 6912 | skip_cons_depths={"conv_1": 3} (was 4 x 2304 = 9216) |
+| **total** | **65344** | **192 B free of 65536 (64 KB)** |
+
+Without the skip_cons_depths fix (4 x 2304 = 9216), total = 67648, over by 2112 B -- matching lever
+1's stack-alone deficit exactly. With it, the deficit closes with 192 B to spare, no LUT/weight/
+stack change needed.
+
+**Full-net (upto=up) W=32 A/B, alternated per height, 4 heights, medians**
+(`aie_kernels/_test/probe_span_b1c1_w32_fit.py`). Power mode: `default` (UNPINNED).
+
+| config | fitted cyc/px (W=32) |
+|---|---|
+| baseline (depth=3) | 553 |
+| new (depth=4 + data_sizes + skip_cons_depths) | 561 |
+
+**The wall-clock fit shows no clear win (553 vs 561, within this file's usual noise band) -- do
+not read this as a null result; the same-process trace below contradicts it and is the
+instrument this file has trusted throughout.**
+
+**Same-process trace, W=32 H=128, at the new config, then re-traced at baseline for a clean
+same-instrument comparison** (`probe_span_b1c1_w32_fit.py` + `probe_span_b1c1_w32_fit_baseline.py`):
+
+| config | stage | compute cyc/px | gap cyc/px | LOCK_STALL % | compute+gap |
+|---|---|---|---|---|---|
+| baseline | b1c1 | 265.6 | 321.07 | 54.35% | 586.7 |
+| baseline | b1c2 | 322.75 | 264.29 | 45.12% | 587.0 |
+| baseline | b3c3 | 315.08 | 259.4 | 49.17% | 574.5 |
+| new | b1c1 | 266.35 | 216.47 | 44.51% | 482.8 |
+| new | b1c2 | 324.01 | 159.78 | 33.25% | 483.8 |
+| new | b3c3 | 316.26 | 167.49 | 38.98% | 483.8 |
+
+**Compute is unchanged between baseline and new (confirms the fix touches only synchronization,
+not kernel work) and the new config's three stages land within 1 cyc/px of each other (482.8-
+483.8) -- the tightest common-pace convergence in this whole file.** b3c3 (the previously-
+identified heaviest core) drops 574.5 -> 483.8 (15.8%), LOCK_STALL 49.17% -> 38.98%; b1c1 drops
+586.7 -> 482.8 (17.7%), LOCK_STALL 54.35% -> 44.51%. **This is a real, device-confirmed win on the
+full production-width net, decisively shown by the trusted instrument even though the noisier
+wall-clock A/B missed it** -- consistent with this file's standing caveat that same-dispatch trace
+splits are trustworthy where cross-dispatch wall-clock timing is not.
+
+**Gate: `verify_span_net.py` at the new default (no explicit overrides) -- 22/22 cores exact.**
+
+**DEFAULT FLIPPED.** `net_design.py`: `DEPTH["b1c1"]` 3 -> 4; new module constants
+`DATA_SIZES = {"b1c1": 4160}` and `SKIP_CONS_DEPTHS = {"conv_1": 3}`, both merged unconditionally
+(same pattern as `DEPTH`) so a caller with no overrides gets the fixed design. `data_sizes=`/
+`skip_cons_depths=` build() params still override per-call if needed.
+
 ## Caveat
 
 Device is shared with other concurrent lanes (gemma4 prefill gates, this session's own
