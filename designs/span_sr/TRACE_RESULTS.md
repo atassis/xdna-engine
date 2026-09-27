@@ -1368,3 +1368,85 @@ target) and `gate` (the biggest kind) both landed inside the top target list, la
 task asked; the remaining ~245 cyc/px floor is now flat across all four previously-distinct kinds,
 so the next cut (if any) needs to move all four together (e.g. the still-untried lookup-hoist, or a
 MOVEMENT-layer lever) rather than target one kind alone.
+
+## Phase 1j: the per-call LUT/lookup rebuild -- mechanism found (Peano miscompiles a Look passed
+## by reference across a real NOINLINE call), hoisted once/row, net floor 245 -> ~231.6 cyc/px
+
+Target: Phase 1d's disassembly-flagged per-call `aie::lut`/`parallel_lookup` rebuild in
+`conv3x3_core`'s epilogue, previously device-refuted at 3f11dcb ("gathered every key as 0").
+Worktree `wt-span-phase1j`, off main 89cdad7.
+
+**Mechanism, reproduced in isolation (`aie_kernels/_test/probe_lut_hoist_isolated.py`).** Five
+arms, same 64 keys, identity table, one kernel call: A) `Look` built fresh per group (today's
+baseline shape); B) `Look` built once, a NOINLINE free function taking `Look &` called per group
+(3f11dcb's shape); C) same as B but the callee is `__attribute__((always_inline))`; D) `Look`
+built once, a NOINLINE free function taking it BY VALUE; E) `Look` built once, a `[&]` lambda
+(ordinary call, not forced non-inline).
+
+| arm | match vs A | zeros |
+|---|---|---|
+| A base (fresh per group) | 64/64 | 1/64 |
+| B hoisted, by-ref, NOINLINE | **1/64** | **64/64** |
+| C hoisted, by-ref, ALWAYS_INLINE | 64/64 | 1/64 |
+| D hoisted, by-value, NOINLINE | 64/64 | 1/64 |
+| E hoisted, by-ref lambda | 64/64 | 1/64 |
+
+**Reproduced on purpose, and bisected to exactly one factor.** Only B fails, and it fails exactly
+like 3f11dcb (every key reads back 0). By-value across the same NOINLINE boundary (D) and
+by-reference with no real call boundary (C, always_inline) are both correct -- so this is not
+"capture by reference is broken" and not "NOINLINE is broken"; it is specifically **a C++
+reference parameter to a non-trivially-constructed local aggregate, passed across a real
+(non-inlined) AIE2P function call**, mishandled by this Peano pin. `aie::parallel_lookup`
+(`aie_api/detail/aie2/parallel_lookup.hpp`) is plain scalar state once the compile-time-constant
+`all_space_used_` path is taken (two pointers, one int, one bool -- the `idx_max_vec_`/
+`idx_min_vec_` vector members are never written in that path); the disassembly's own read of the
+prefix as "table construction into lookup registers" (`vst bmll0`/`bmlh0`) does not hold up against
+the header source either -- `bmll0`/`bmlh0` are generic 512-bit accumulator-register halves
+(`aie_api/detail/aie2/utils.hpp`'s `pin_to_reg`, used for any accumulator, not LUT-specific); most
+likely that prefix is accumulator-load spill for `bias0.from_vector()` plus ordinary NOINLINE
+prologue, not LUT construction at all. Not pursued further (correctness mechanism, not compute
+attribution, was this phase's target) -- flagged as a loose end on the disassembly's own claim.
+
+**Fix (OURS, toolchain-caused but routed around, not requiring a Peano patch): hoist per ROW, pass
+by reference only through `always_inline` callees.** `apply_lut_inplace`/`apply_lut16` now take
+`Look &`/`Look &, Look &` instead of constructing internally, and are
+`__attribute__((always_inline))` (were plain `inline`); GATE's epilogue uses the same hoisted
+`look_main` instead of building its own. `conv3x3_core` builds `look_main` (and `look_lo` for
+LUT16) ONCE per call -- once per output ROW, not once per net (the 3f11dcb-refuted hoist) and not
+once per `put()`/apply_lut_* call (4-16x/row, the actual prior cost). Guarded by the same
+`#ifdef CONV3X3_LUT_INC`/`CONV3X3_LUT2_INC` as before, so plain-kind builds (no `-DCONV3X3_LUT_INC`
+at all, `net_design.py`'s `_flags()`) never see the new locals.
+
+**Device re-trace, full net, W=32 H=128, one stage per dispatch, Phase 1i -> Phase 1j:**
+
+| stage | kind | compute (1i) | compute (1j) | delta | compute+gap (1i) | compute+gap (1j) |
+|---|---|---|---|---|---|---|
+| b1c2 | silu_i16 (LUT) | 242.4 | 228.67 | -5.7% | 245.2 | 231.58 |
+| b1c3 | gate (GATE) | 215.4 | 215.03 | ~0% | 245.1 | 231.52 |
+| b1c1 | silu16 (LUT16) | 213.0 | 213.08 | ~0% | 244.7 | 231.23 |
+| b2c2 | silu (LUT) | 183.4 | 178.81 | -2.5% | 244.4 | 231.06 |
+
+**Only the LUT kind (apply_lut_inplace: silu_i16, silu) moved; GATE and LUT16 did not, though both
+were hoisted too.** Consistent with the mechanism: `apply_lut_inplace` was a separate function
+Peano was NOT already inlining across its 4 per-row calls (a real call boundary each time, so no
+cross-call CSE of the identical construction was possible) -- forcing it `always_inline` is what let
+the now-hoisted, now-single construction actually collapse 4 down to 1. GATE's epilogue and
+`apply_lut16` were always textually inline (a lambda body / an already-`inline` function small
+enough to fold into the surrounding loop), so Peano's own LICM had already hoisted their
+loop-invariant `Look` construction across `put()`'s calls within a row before this phase touched
+anything -- this phase's explicit hoist for those two was a no-op restatement of what the optimizer
+already did, not a new lever. All four kinds re-converge to **231.06-231.58 cyc/px** (within 0.5 of
+each other, same tight-convergence signature as Phase 1i) -- **whole-net floor 245 -> ~231.6
+cyc/px, a further ~5.5% cut**, on top of Phase 1i's 327 -> 245.
+
+**`.text` per core** (`llvm-size -A`, all 22 cores from the traced builds): min 2672, max **5008**,
+well inside the 16 KB (16384 B) program-memory budget -- the hoist adds one scalar-only local per
+row, not a table copy, so program memory did not grow measurably.
+
+**Gate: `verify_span_net.py`, default config -- 22/22 cores exact** (all 8 checkpoints, same byte
+counts as every prior phase).
+
+**Not attempted:** disassembling the fixed build to confirm the accumulator-spill re-reading of the
+prefix (would settle the loose end above, not change the measured result); reporting the mechanism
+to upstream llvm-aie (this is a workaround, not a patch -- the underlying Peano reference-parameter
+bug on this pin is still live and would bite the next by-reference hoist attempted here).
