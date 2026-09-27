@@ -257,6 +257,67 @@ future MAIN_DEPTH/PROD_DEPTH work on the same pool). Re-ran `verify_span_net.py`
 default: **22/22 cores exact** (`up`, 32x64, 32768/32768 -- every stage upto it also exact),
 same as the slack=2 baseline gate.
 
+## Phase 1a: PROD_DEPTH, cat_cons_depth, and the untraced skip stages -- all NULL
+
+Task (`2026-09-27-npu-any-game-realtime.md` phase 1a): at SKIP_SLACK=8, b3c3 still shows ~40%
+LOCK_STALL, ~1.6x over its own isolated compute. Three untested suspects going in: (1) `PROD_DEPTH`
+(the four skip sources' core-side producer depth, default 2 -- their output ObjectFifo has TWO
+consumers, the next main-path core AND the join's MemTile ring, and a broadcast producer can only
+run as far ahead as its slower consumer); (2) conv_cat's own `f_cat.cons(depth=2)` read-ahead into
+the join ring; (3) the untraced skip-related stages b6c1 and conv_2.
+
+`net_design.build()` gained `prod_depth=`/`cat_cons_depth=` overrides (default None -> the prior
+hardcoded values, module byte-identical when omitted; same pattern as `main_depth=`/`skip_slack=`).
+**Compile-only sweep, W=32, skip_slack=8:** `prod_depth` fits L1 up to at least 16 (unlike
+MAIN_DEPTH, the skip-source cores are lightly loaded); `cat_cons_depth` fits at 3, fails at 4
+(conv_cat's own L1, same class of wall as the MAIN_DEPTH tiles).
+
+**Device: same-process b3c3 trace A/B, W=32, H=128, SKIP_SLACK=8 held fixed**
+(`aie_kernels/_test/probe_span_stall_levers.py`). Power mode: `default` (UNPINNED), same caveat
+as every prior measurement in this file.
+
+| lever | compute cyc/px | gap cyc/px | LOCK_STALL % of span | compute+gap |
+|---|---|---|---|---|
+| prod_depth=2 (baseline) | 406.2 | 224.94 | 40.46% | 631.1 |
+| prod_depth=8 | 406.2 | 224.94 | 40.47% | 631.1 |
+| cat_cons_depth=2 (baseline) | 406.2 | 224.94 | 40.46% | 631.1 |
+| cat_cons_depth=3 | 406.2 | 224.94 | 40.46% | 631.1 |
+| prod_depth=8 + cat_cons_depth=3 (combined) | 406.2 | 224.93 | 40.47% | 631.1 |
+
+**All three NULL -- bit-for-bit identical to the baseline within trace noise.** Neither the
+skip-source producer's own buffering nor conv_cat's read-ahead moves b3c3 at all, at any value
+either compiles. This also indirectly refutes the "throttled by its slower consumer" framing for
+PROD_DEPTH: if the main-path consumer (fixed at main_depth=4, L1-bound, already refuted as a
+b3c3 lever) were the ceiling, giving the producer more of its OWN buffer still wouldn't show up at
+b3c3 -- consistent with what was measured, but not a positive confirmation of the mechanism either.
+
+**Untraced stages, same session, defaults (prod_depth=2, cat_cons_depth=2, skip_slack=8):**
+
+| stage | role | compute cyc/px | gap cyc/px | LOCK_STALL % of span | compute+gap |
+|---|---|---|---|---|---|
+| b6c1 | skip source, mid-chain | 250.39 (34.58%) | 366.31 (50.2%) | 65.13% | 616.7 |
+| conv_2 | skip source, feeds join 1 row ahead | 83.29 (11.28%) | 526.58 (70.75%) | 88.44% | 609.9 |
+
+Both land at compute+gap ~610-617, matching b3c3's 631.1 and the earlier-traced conv_1/conv_cat/
+b1c1/b1c2/up signature (all "victims" of the same common pace, LOCK_STALL-dominated) -- no
+different behaviour from being a skip source vs. an ordinary main-path hop, and no anomaly
+localized to either stage.
+
+**Net: all three named suspects are dead ends, and the plateau already reached at SKIP_SLACK=8 is
+reproduced exactly** (631.1 cyc/px, 40.46-40.47% LOCK_STALL here vs. 631.1 cyc/px, 40.49% at
+SKIP_SLACK=25 in the earlier trace) -- SKIP_SLACK=8 is already at the same floor as 25, corroborating
+the plateau finding independently. **What the remaining stall correlates with:** every stage tried
+so far -- skip source, join, ordinary main-path hop, the heaviest core -- converges to the SAME
+~610-631 cyc/px pace regardless of its own compute or of any ObjectFifo depth knob touched (skip
+ring, MAIN_DEPTH, b1c1->b1c2, PROD_DEPTH, cat_cons_depth all refuted at b3c3 specifically). That is
+the same "structural, common-to-every-core" signature the original 3.5x attribution found, just at a
+~2x lower floor after the SKIP_SLACK fix. No object-fifo depth lever tested touches it, which argues
+the remaining ~40% is a LATENCY floor (fixed hop count/DMA round-trip through the array) rather than
+a THROUGHPUT/buffering one -- consistent with `rows_ahead(b3c3)`-style pipeline fill latency, but
+untested directly here (would need e.g. varying the main-path hop COUNT or tracing enough
+intermediate stages to sum the fill latency directly, both out of scope for this phase). Not ruled
+in or out; the object-fifo-depth search space this task named is now exhausted.
+
 ## Caveat
 
 Device is shared with other concurrent lanes (gemma4 prefill gates, this session's own

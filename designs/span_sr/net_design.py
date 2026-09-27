@@ -84,7 +84,7 @@ def _flags(kind, incs):
 
 def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
          trace_stages=None, trace_config=None, coretile_events=None, egress_shim_col=1,
-         main_depth=None, skip_slack=None):
+         main_depth=None, skip_slack=None, prod_depth=None, cat_cons_depth=None):
     """NP: span_int.Span.net_params(). Returns an iron.jit callable (x, wts, y): x from
     net_layout.conv1_rows (as int8), wts from net_layout.weights_blob, y gets `upto`'s rows.
 
@@ -103,9 +103,21 @@ def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
     skip_slack: override for net_layout.SKIP_SLACK (default None -> the module constant, 2),
     used only to size the join ring (`skip_depth(src) = rows_ahead(src) + skip_slack`) -- the
     skip-ring latency-throttle hypothesis in TRACE_RESULTS.md. Does not touch NL.SKIP_SLACK
-    itself (net_layout stays byte-identical), so the module default is unaffected."""
+    itself (net_layout stays byte-identical), so the module default is unaffected.
+
+    prod_depth: override for PROD_DEPTH (default None -> the module constant, 2), the CORE-side
+    producer depth of a skip source's output ObjectFifo (conv_1/conv_2/b1c3/b6c1). That fifo has
+    TWO consumers -- the next main-path core (depth=main_depth) and the join's MemTile ring
+    (depth=skip_depths[src]) -- and a broadcast producer can only run as far ahead as its
+    slowest consumer allows; prod_depth is the producer's own buffering against that.
+
+    cat_cons_depth: override for conv_cat's own input depth (default None -> 2), the `rowwise()`
+    worker's `f_cat.cons(depth=...)` handle that reads the join ring. Independent of skip_slack
+    (which sizes the ring itself, not conv_cat's read-ahead into it)."""
     main_depth = MAIN_DEPTH if main_depth is None else main_depth
     skip_slack = NL.SKIP_SLACK if skip_slack is None else skip_slack
+    prod_depth = PROD_DEPTH if prod_depth is None else prod_depth
+    cat_cons_depth = 2 if cat_cons_depth is None else cat_cons_depth
     assert w % 16 == 0, "conv3x3_u8.cc needs width % 16 == 0 (and the x copy, whole 64-byte vectors)"
     gen = Path(gen)
     gen.mkdir(parents=True, exist_ok=True)
@@ -131,8 +143,8 @@ def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
     skip_depths = {s: NL.rows_ahead(s) + skip_slack for s in sorted(skips)}
     digest = hashlib.sha256("".join(texts).encode() + repr(
         (w, h, upto, sorted(stacks.items()), sorted(depth.items()), groups, skip_depths,
-         main_depth, PROD_DEPTH, sorted(trace_stages), tuple(coretile_events or ()),
-         egress_shim_col)).encode()).hexdigest()[:12]
+         main_depth, prod_depth, cat_cons_depth, sorted(trace_stages),
+         tuple(coretile_events or ()), egress_shim_col)).encode()).hexdigest()[:12]
     base = _aie_api_include() + [f"-DSPAN_NET_DIGEST={digest}"]
     plen = {n: NP[n]["blob"].size for n in names}
     wtotal = sum(plen.values())
@@ -217,14 +229,14 @@ def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
         workers = []
         for i, n in enumerate(names):
             if kind[n] == "cat":
-                fi, body = f_cat.cons(depth=2), rowwise
+                fi, body = f_cat.cons(depth=cat_cons_depth), rowwise
             elif i == 0:
                 fi, body = f_in.cons(main_depth), padded
             else:
                 prev = names[i - 1]
                 fi = out[prev].cons(main_depth if prev in skips else depth[prev])
                 body = windowed
-            fo = out[n].prod(depth=PROD_DEPTH) if n in skips else out[n].prod()
+            fo = out[n].prod(depth=prod_depth) if n in skips else out[n].prod()
             workers.append(Worker(body, fn_args=[fi, p_fifo[n].cons(), fo, kern[n]],
                                   stack_size=stacks[kind[n]]))
 
