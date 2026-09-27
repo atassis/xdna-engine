@@ -103,6 +103,27 @@ def conv1_rows(rgb01, mean255):
         xp.reshape(1, 8, h + 2, w + 2 * PAD).transpose(2, 0, 3, 1)).astype(np.uint8)
 
 
+def split_gate_params(p, cin=C, cout=C, lo_channels=32):
+    """Split a gate stage's net_params() dict into two output-channel halves: golden.pack_params
+    concatenates [weights][bias][mult], each ordered by ob (8-channel block), so each section
+    slices at the same ob boundary. conv3x3_core processes ob in PAIRS (ob += 2), so each half's
+    channel count must be a multiple of 16 -- cout=48 has no even 24/24 split point, so the
+    default lo_channels=32 gives 32/16, the closest the kernel's block-pairing allows.
+    ga/gb/gs1/gc/gs2/tables/pre/shift are per-net scalars, shared by both halves as is."""
+    assert lo_channels % 16 == 0 and 0 < lo_channels < cout
+    ocb, lo_ocb = cout // 8, lo_channels // 8
+    wblk = 3 * (cin // 8) * 3 * 64
+    w_end, b_end = ocb * wblk, ocb * wblk + ocb * 256
+
+    def part(lo):
+        a, z = (0, lo_ocb) if lo else (lo_ocb, ocb)
+        blob = p["blob"]
+        return np.concatenate([blob[a * wblk:z * wblk], blob[w_end + a * 256:w_end + z * 256],
+                               blob[b_end + a * 128:b_end + z * 128]])
+
+    return {**p, "blob": part(True)}, {**p, "blob": part(False)}
+
+
 def unpack_out(y, upto, h, w):
     """Device output rows of stage `upto` -> [ch, h, w], dropping any in-band x."""
     _, ch, dt = GOLDEN[upto]
