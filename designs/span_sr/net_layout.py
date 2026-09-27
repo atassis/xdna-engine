@@ -24,8 +24,14 @@ CAT_SOURCES = [("conv_1", 0), ("conv_2", 1), ("b1c3", 2), ("b6c1", 3)]
 CAT_HALVES = 5
 
 # policy: rows of headroom past the minimum a skip must hold, so a source is not throttled by
-# its skip before the main path catches up
-SKIP_SLACK = 2
+# its skip before the main path catches up. Was 2; raised to 8 2026-09-27 (device dose-response,
+# TRACE_RESULTS.md skip-ring latency-throttle section): whole-net wall-clock fell from ~2624 to
+# ~659 cyc/px between slack=2 and slack=8, with slack=16/25 buying no further win in the same
+# run (noise-bound plateau at 660-750). A same-process trace at the two ends (slack=2 vs 25)
+# corroborates the mechanism directly: b3c3's gap fell 919.72 -> 224.92 cyc/px with compute
+# pinned at 406.2 throughout. 8 sits well under the 512 KB MemTile ring ceiling (max fitting
+# slack=25 at W=32), leaving headroom for later MAIN_DEPTH/PROD_DEPTH work.
+SKIP_SLACK = 8
 # policy: a MemTile has 6 MM2S channels, so one weight split feeds at most 6 cores
 WEIGHT_GROUP = 6
 

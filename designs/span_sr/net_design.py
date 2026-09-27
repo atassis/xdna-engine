@@ -84,7 +84,7 @@ def _flags(kind, incs):
 
 def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
          trace_stages=None, trace_config=None, coretile_events=None, egress_shim_col=1,
-         main_depth=None):
+         main_depth=None, skip_slack=None):
     """NP: span_int.Span.net_params(). Returns an iron.jit callable (x, wts, y): x from
     net_layout.conv1_rows (as int8), wts from net_layout.weights_blob, y gets `upto`'s rows.
 
@@ -98,8 +98,14 @@ def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
     holds a 3-row sliding window and releases 1/iteration, so depth=4 leaves exactly 1 free
     slot for the upstream producer -- diagnostic for the per-row lockstep hypothesis in
     TRACE_RESULTS.md. Does not touch PROD_DEPTH (skip-broadcast producer depth) or the
-    per-stage DEPTH overrides (e.g. b1c1=3), which still take precedence via `depths=`."""
+    per-stage DEPTH overrides (e.g. b1c1=3), which still take precedence via `depths=`.
+
+    skip_slack: override for net_layout.SKIP_SLACK (default None -> the module constant, 2),
+    used only to size the join ring (`skip_depth(src) = rows_ahead(src) + skip_slack`) -- the
+    skip-ring latency-throttle hypothesis in TRACE_RESULTS.md. Does not touch NL.SKIP_SLACK
+    itself (net_layout stays byte-identical), so the module default is unaffected."""
     main_depth = MAIN_DEPTH if main_depth is None else main_depth
+    skip_slack = NL.SKIP_SLACK if skip_slack is None else skip_slack
     assert w % 16 == 0, "conv3x3_u8.cc needs width % 16 == 0 (and the x copy, whole 64-byte vectors)"
     gen = Path(gen)
     gen.mkdir(parents=True, exist_ok=True)
@@ -122,7 +128,7 @@ def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
         spec[n] = (sym, shim, incs)
         texts += [shim.read_text()] + [Path(i).read_text() for i in incs]
     groups = NL.weight_groups(names)
-    skip_depths = {s: NL.skip_depth(s) for s in sorted(skips)}
+    skip_depths = {s: NL.rows_ahead(s) + skip_slack for s in sorted(skips)}
     digest = hashlib.sha256("".join(texts).encode() + repr(
         (w, h, upto, sorted(stacks.items()), sorted(depth.items()), groups, skip_depths,
          main_depth, PROD_DEPTH, sorted(trace_stages), tuple(coretile_events or ()),

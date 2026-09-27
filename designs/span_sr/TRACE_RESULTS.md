@@ -181,6 +181,82 @@ traces singles out `PROD_DEPTH=2` or the join's fixed consumer depth as a DIFFER
 bottleneck from the structural per-row lockstep already identified; no targeted PROD_DEPTH/join-
 depth bump was run (out of scope here), so this remains open rather than ruled in or out.
 
+## Skip-ring latency-throttle hypothesis: CONFIRMED, dose-response
+
+Hypothesis: `conv_1` is `rows_ahead("conv_1")=20` rows ahead of `conv_cat` on the main path, and
+the join's `f_cat` ring holds only `rows_ahead + SKIP_SLACK` rows (`net_layout.skip_depth`).
+`conv_1` cannot write row r+depth until `conv_cat` has consumed row r, and `conv_cat` consumes
+row r only after the ~20-stage main path has carried row r+20 all the way through -- a temporal
+latency L. The ring admits only ~SKIP_SLACK rows per L, so period T >= L/SKIP_SLACK(+ some other
+buffering), throttling every stage identically regardless of its own compute -- matching every
+prior trace in this file.
+
+Added `net_design.build(skip_slack=...)`, overriding `NL.skip_depth`'s slack term without
+touching `NL.SKIP_SLACK` itself (module stays byte-identical when the arg is omitted).
+
+**Step 1 -- compile-only MemTile budget, W=32.** The join's shared pool = `lay["conv_cat"].in_bytes`
+(`CAT_HALVES(5) x half(32)=2304` = **11520 B/row-slot**) x `depth(conv_1) = 20 + SKIP_SLACK`.
+512 KB / 11520 = 45.5 rows. Swept `design.compile()` (no device) at slack in
+{2,4,8,16,20,22,23,24,25,26,30}: **OK through slack=25** (depth=45, 506.2/512 KiB), **FAILS at
+slack=26** (depth=46, 517.5 KiB) -- exact arithmetic match, and unlike MAIN_DEPTH/b1c1-depth this
+lever is NOT L1-bound, so it is testable at full production width (no W=16 fallback needed).
+
+**Step 2 -- device dose-response, same session, W=32, SKIP_SLACK in {2,4,8,16,25}**
+(`aie_kernels/_test/probe_span_net_skipslack.py`, 4 heights x 5 trials, fitted slope, same
+alternated-per-height method as the MAIN_DEPTH sweep). Power mode: `default` (UNPINNED) before
+and after, same caveat as every prior measurement in this file.
+
+| SKIP_SLACK | depth(conv_1) | fitted cyc/px @ 1.8 GHz (W=32) |
+|---|---|---|
+| 2 (baseline) | 22 | 2624 |
+| 4 | 24 | 973 |
+| 8 | 28 | 659 |
+| 16 | 36 | 744 |
+| 25 (max fitting) | 45 | 703 |
+
+Sharp drop 2->4->8, then a **noise-bound plateau at ~660-750** through 16 and 25 -- 8 already
+captures effectively all of this run's available win; 16/25 do not improve on 8 (non-monotonic,
+consistent with the box-contention caveat, not a real degradation). The absolute slack=2 number
+here (2624) differs from the untraced net-rate baseline elsewhere in this file (1528) -- same
+box-contention caveat, not a regression; the SHAPE (dose-response, plateau) is what corroborates
+the hypothesis, not the absolute baseline.
+
+**Corroboration: b3c3 re-traced at slack=2 vs. 25, same process, W=32, H=128**
+(`aie_kernels/_test/trace_span_net_skipslack.py`):
+
+| SKIP_SLACK | compute cyc/px | gap cyc/px | LOCK_STALL % of span | compute+gap |
+|---|---|---|---|---|
+| 2 | 406.2 (29.51%) | 919.72 (66.31%) | 70.3% | 1325.9 |
+| 25 | 406.2 (59.14%) | 224.92 (32.49%) | 40.49% | 631.1 |
+
+**Compute is bit-for-bit identical (406.2) at both slacks -- only the gap moved.** Gap fell 76%
+(919.72 -> 224.92); LOCK_STALL fell from 70.3% to 40.49%; compute's share of the span rose from
+29.5% to 59.1% -- b3c3 is now doing more work than waiting, which no prior lever in this file
+achieved (MAIN_DEPTH+1 and b1c1-depth+1 both left b3c3 at ~70% LOCK_STALL, near-zero movement).
+The slack=25 trace total (631.1) also lands within 11% of the slack=25 wall-clock fit (703),
+cross-checking the two methods.
+
+**This is the decisive result -- rules in the skip-ring, not the main-path 1-slot windows** (those
+remain small, real, local levers per the sections above, just not the ceiling). `b3c3` still shows
+40.49% LOCK_STALL at slack=25, so the ring is not the ONLY throttle left -- MAIN_DEPTH/PROD_DEPTH
+are still live secondary levers, matching the earlier finding that they move b3c3 by ~1.5-20 cyc/px
+on their own, now stacked on top of a much smaller base.
+
+**Step 3 -- quantitative check, T ~= L/(slack+c).** Fitting the traced-b3c3 gap (919.72 at slack=2,
+224.92 at slack=25) to `gap = L/(slack+c)` gives **c ~= 5.4, L ~= 6847 cyc/px**. Only 6 of the
+~20 main-path stages between conv_1 and conv_cat have been individually traced (conv_1 40.42,
+conv_cat 58.23, b1c1 319.87, b1c2 322.79, b3c3 406.20, up 26.68 -- up and the two join/skip
+stages are not ON the timed main-path span this L covers, so the comparison is against b1c1/
+b1c2/b3c3), whose mean is ~349 cyc/px; **6847 / ~20 hops ~= 342 cyc/px**, matching that mean to
+within 2%. Consistent with the model, not an independent confirmation (too few stages traced to
+sum L directly) -- but the right order of magnitude from a completely different fit.
+
+**Change: SKIP_SLACK default raised 2 -> 8** (`net_layout.py`), chosen as the point where the
+dose-response plateaus in this run, well under the slack=25 MemTile ceiling (leaves headroom for
+future MAIN_DEPTH/PROD_DEPTH work on the same pool). Re-ran `verify_span_net.py` at the new
+default: **22/22 cores exact** (`up`, 32x64, 32768/32768 -- every stage upto it also exact),
+same as the slack=2 baseline gate.
+
 ## Caveat
 
 Device is shared with other concurrent lanes (gemma4 prefill gates, this session's own
