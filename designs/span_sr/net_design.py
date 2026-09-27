@@ -84,7 +84,8 @@ def _flags(kind, incs):
 
 def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
          trace_stages=None, trace_config=None, coretile_events=None, egress_shim_col=1,
-         main_depth=None, skip_slack=None, prod_depth=None, cat_cons_depth=None):
+         main_depth=None, skip_slack=None, prod_depth=None, cat_cons_depth=None,
+         data_sizes=None):
     """NP: span_int.Span.net_params(). Returns an iron.jit callable (x, wts, y): x from
     net_layout.conv1_rows (as int8), wts from net_layout.weights_blob, y gets `upto`'s rows.
 
@@ -113,11 +114,18 @@ def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
 
     cat_cons_depth: override for conv_cat's own input depth (default None -> 2), the `rowwise()`
     worker's `f_cat.cons(depth=...)` handle that reads the join ring. Independent of skip_slack
-    (which sizes the ring itself, not conv_cat's read-ahead into it)."""
+    (which sizes the ring itself, not conv_cat's read-ahead into it).
+
+    data_sizes: per-stage override for Worker(data_size=...), the explicit static-data (constant
+    array/LUT table) reservation aiecc's own error suggests when buffer allocation leaves too
+    little room for a core's LUT: "aiecc: core main_core_0_3 needs space for 4160 bytes of static
+    data ... but it may fit if you reserve it explicitly." Default None -> no override (aiecc's
+    automatic placement, byte-identical to before this param existed)."""
     main_depth = MAIN_DEPTH if main_depth is None else main_depth
     skip_slack = NL.SKIP_SLACK if skip_slack is None else skip_slack
     prod_depth = PROD_DEPTH if prod_depth is None else prod_depth
     cat_cons_depth = 2 if cat_cons_depth is None else cat_cons_depth
+    data_sizes = data_sizes or {}
     assert w % 16 == 0, "conv3x3_u8.cc needs width % 16 == 0 (and the x copy, whole 64-byte vectors)"
     gen = Path(gen)
     gen.mkdir(parents=True, exist_ok=True)
@@ -143,8 +151,8 @@ def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
     skip_depths = {s: NL.rows_ahead(s) + skip_slack for s in sorted(skips)}
     digest = hashlib.sha256("".join(texts).encode() + repr(
         (w, h, upto, sorted(stacks.items()), sorted(depth.items()), groups, skip_depths,
-         main_depth, prod_depth, cat_cons_depth, sorted(trace_stages),
-         tuple(coretile_events or ()), egress_shim_col)).encode()).hexdigest()[:12]
+         main_depth, prod_depth, cat_cons_depth, sorted(data_sizes.items()),
+         sorted(trace_stages), tuple(coretile_events or ()), egress_shim_col)).encode()).hexdigest()[:12]
     base = _aie_api_include() + [f"-DSPAN_NET_DIGEST={digest}"]
     plen = {n: NP[n]["blob"].size for n in names}
     wtotal = sum(plen.values())
@@ -238,7 +246,7 @@ def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
                 body = windowed
             fo = out[n].prod(depth=prod_depth) if n in skips else out[n].prod()
             workers.append(Worker(body, fn_args=[fi, p_fifo[n].cons(), fo, kern[n]],
-                                  stack_size=stacks[kind[n]]))
+                                  stack_size=stacks[kind[n]], data_size=data_sizes.get(n)))
 
         w_taps, off = [], 0
         for grp in groups:

@@ -462,6 +462,116 @@ those first 4 cores is still open -- narrowing further (e.g. upto=conv_1, upto=b
 find exactly which hop within block 1 first reaches the pace) is the natural next bisection step,
 not run here per "stop at the answer."
 
+## Phase 1a follow-up 3 (coordinator): b1c1<->b1c2 alternation-sum, RE-CONFIRMED at SKIP_SLACK=8 --
+## depth 3->4 collapses the gap, but does not fit L1 at W=32 on the full net
+
+Coordinator's re-read of the earlier REFUTED section above: that test ran at SKIP_SLACK=2, where
+the ring throttle set the pace network-wide and masked whatever the b1c1<->b1c2 link (`DEPTH =
+{"b1c1": 3}` against b1c2's 3-row `windowed()` acquire, i.e. ZERO producer slack) was doing on its
+own. Predicted compute-sum (320+323=643) already matched the chain-bisection's `upto=b1c3` pace
+(663, prior section) suspiciously well. Re-tested at SKIP_SLACK=8 (`probe_span_b1c1b1c2_retest.py`,
+`probe_span_b1c1b1c2_retest2.py`), W=32 unless noted, same-session methods throughout.
+
+**Part 1 -- bisect upto in {conv_1, b1c1, b1c2, b1c3}, fitted rate:**
+
+| upto | cores | fitted cyc/px |
+|---|---|---|
+| conv_1 | 1 | -10 (fit garbage -- too cheap, dominated by dispatch-overhead noise) |
+| b1c1 | 2 | 448 |
+| b1c2 | 3 | 647 |
+| b1c3 | 4 | 813 (this session's own re-measurement; noisier than the prior bisection's 663 for the
+same config -- see the standing box-contention caveat, not a regression) |
+
+**b1c1 alone (448) matches its own isolated compute; b1c2 jumps to 647 -- within 0.6% of the
+320+323=643 cyc/px alternation-sum prediction.** b1c3 is noisier (813) but the qualitative jump
+already lands at b1c2, exactly as predicted.
+
+**Part 2 -- same-process depth 3 vs 4 A/B, `upto=b1c3` (compile-only sweep found depth=4 fits L1
+here, unlike the full net):**
+
+| depth | fitted whole-net cyc/px |
+|---|---|
+| 3 (baseline) | 732 |
+| 4 | 437 |
+
+437 lands almost exactly on the gate-core isolated rate (~406-433). Same-process trace of b1c1 and
+b1c2 individually, W=32 H=128:
+
+| depth | stage | compute cyc/px | gap cyc/px | LOCK_STALL % | compute+gap |
+|---|---|---|---|---|---|
+| 3 | b1c1 | 319.94 | 320.95 | 49.72% | 640.9 |
+| 3 | b1c2 | 322.75 | 318.06 | 49.70% | 640.8 |
+| 4 | b1c1 | 319.52 | 85.74 | 20.89% | 405.3 |
+| 4 | b1c2 | 323.14 | 84.11 | 21.28% | 407.2 |
+
+**At depth=3 the two stages are near-perfectly symmetric: each one's own compute (~320-323) is
+almost exactly half its own compute+gap (~640.8-640.9), and gap ~= the OTHER stage's compute --
+the ping-pong signature the alternation-sum hypothesis predicts.** At depth=4, compute is
+unchanged (confirms kernel work never moved) but gap collapses 74-76% (320.95->85.74,
+318.06->84.11) and LOCK_STALL drops from ~49.7% to ~21% -- both stages land at the isolated gate
+rate. **This is the strongest confirmation in this file**: same shape (compute pinned, gap
+collapses) as the SKIP_SLACK fix, on a completely different link.
+
+Tracing depth=4 on this short chain required a second lever: adding the trace bracket to b1c1
+tipped the SAME tile over an L1 wall that non-traced depth=4 alone did not (see below) --
+`net_design.build()` gained `data_sizes=` (aiecc's own suggested fix: `Worker(data_size=...)`,
+default None -> no override, byte-identical when omitted) to reserve the LUT's static data
+explicitly; `data_sizes={"b1c1": 4160}` fixed it for this short chain.
+
+**Part 3 -- depth 3 vs 4 on the FULL NET (`upto=up`), W=16 (depth=4 does not fit L1 at W=32 on the
+full net -- see below), fitted rate:**
+
+| depth | fitted cyc/px (W=16) |
+|---|---|
+| 3 (baseline) | 781 |
+| 4 | 631 |
+
+19% lower, same direction as the short chain and the earlier corroborated levers in this file, but
+a smaller relative win than the W=32 short-chain result (40%) -- consistent with this file's other
+W=16 fallback sweeps (MAIN_DEPTH, b1c1-depth-at-slack=2) showing smaller/noisier wall-clock swings
+than their W=32/trace counterparts.
+
+**Does depth=4 fit L1 at W=32 on the full net? No, and there are TWO independent walls on the SAME
+tile (0,3) = b1c1, not one:**
+
+1. **b1c1's own static/constant data (its silu16 LUT table).** Without `data_sizes=`, aiecc's
+   automatic buffer placement leaves too little room for the LUT after growing b1c1's own output
+   buffer by one depth-4 slot: `ld.lld: error: section '.data' will not fit in region 'data':
+   overflowed by 2624 bytes` / `aiecc: core main_core_0_3 needs space for 4160 bytes of static
+   data ... but it may fit if you reserve it explicitly` -- exactly the fix `data_sizes=` now
+   applies. **Confirmed fixable**, and fixed, for the short chain.
+2. **Applying that fix on the full net does NOT close the gap -- it exposes a SECOND, independent
+   wall on the exact same tile.** With `data_sizes={"b1c1": 4160}` set, compilation proceeds
+   further (bank-aware allocation now fails only on `b6c2_out_buff_3`/`b3c2_out_buff_3`, which
+   basic-sequential allocation recovers from as warnings, not fatal) and then hits a HARD error
+   back on tile (0,3): `'aie.tile' op basic-sequential allocation failed. Core (0, 3) reserves
+   4160 bytes for its static data ..., which has to fit alongside this tile's buffers` -- the
+   specific buffer that fails to place is `conv_1_skip_1_cons_buff_2` (2304 B), the conv_1->b1c1
+   MAIN-PATH INPUT fifo's own buffer (main_depth=4, 4 x 2304 B = 9216 B total), which is exactly
+   the SAME broadcast objectfifo the PROD_DEPTH investigation named (conv_1's output has two
+   consumers: the join, and this main-path hop into b1c1).
+
+**What is on tile (0,3) and what would have to shrink** (from the compiled buffer sizes in
+`net_layout.py`/`net_design.py`, W=32): LUT/static data 4160 B (fixed, kernel constant table) +
+STACK["silu16"] 3584 B + conv_1->b1c1 input fifo 4 x 2304 B = 9216 B (main_depth=4, network-wide) +
+b1c1's OWN output fifo D x 6912 B (silu16 out_bytes=6912 B; D=3 -> 20736 B, D=4 -> 27648 B, i.e.
+raising D by 1 costs exactly +6912 B) + b1c1's weight sub-blob (model-fixed, `plen["b1c1"]`). D=3
+already compiles with `net_design.py`'s existing `DEPTH={"b1c1": 3}` override -- the module's own
+comment says this block "ha[s] no headroom at all" -- so the tile is already fully committed at
+D=3, and D=4's marginal +6912 B is what overflows it. Candidates to shrink, none free: (a) the
+LUT table itself (4160 B, narrower/fewer entries -- touches SiLU16 approximation quality, out of
+scope here); (b) `STACK["silu16"]` (3584 B, only shrinkable if aiecc's own measured-stack-size
+check confirms slack -- guessing is exactly what this codebase's hanging-numbers doctrine warns
+against); (c) the conv_1->b1c1 input fifo's depth, specifically for this one hop rather than
+`MAIN_DEPTH` network-wide (no per-hop input-depth override exists yet in `net_design.py`; would
+need a new parameter, untested here). None attempted -- flagged for a follow-up, not closed.
+
+**Decision: do NOT flip the default.** Confirmed at W=32 on the short chain (trace) and W=16 on
+the full net (fitted rate); NOT confirmed to fit L1 at W=32 on the full net, which is this file's
+explicit gate for adopting a new default. `verify_span_net.py` was not re-run since
+`net_layout.DEPTH`/`net_design.MAIN_DEPTH` etc. are unchanged -- only the new opt-in `data_sizes=`
+diagnostic parameter (default None, byte-identical when omitted) was added to `net_design.py`.
+
 ## Caveat
 
 Device is shared with other concurrent lanes (gemma4 prefill gates, this session's own
