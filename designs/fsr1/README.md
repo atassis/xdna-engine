@@ -81,8 +81,102 @@ Not yet measured: an actual `whole_array`-style device kernel to turn this table
   by the flat-image bit-exact control (any border mismatch would show as border-row error, which is 0
   in that control).
 
-## Left undone in this pass (for the next session on this task)
+## Left undone in step 1 (for a future session)
 - No real gamescope-rendered frame was used (`/mnt/data/xdna/build/gamescope-npu` was not built/run in
   this pass) -- only synthetic test images. The error table above should be re-run against real captured
   frames before treating the ~1 LSB figure as representative.
-- Step 2 (single-core AIE kernel), step 3 (whole-frame single dispatch), step 4 (C ABI) not started.
+
+## FMA-contraction check on the noisy-content gap (capped at 30 min, 2026-09-27)
+
+Hypothesis: the CPU-vs-GPU gap on noisy content (15.1% of px >2 LSB) is glslang/driver fused-multiply-add
+contraction (`a*b+c` in one rounding step) vs numpy's separate mul-then-add. Checked, not confirmed:
+
+- `glslangValidator -Od` (disables glslang's own SPIR-V optimization pass) produced a **byte-identical**
+  `easu.spv`/`rcas.spv` to the default build -- rules out glslang-level contraction as the source; there is
+  none to disable at that layer.
+- FMA contraction most plausibly happens in the NVIDIA driver's SPIR-V-to-ISA compiler, which is not
+  reachable from glslangValidator flags. Testing that would need GLSL `precise` qualifiers on the shader's
+  accumulators (`aC`, `aW`, `dir`, `len` in `ffx_fsr1.h`) forcing no reassociation/fusion, which means
+  editing the vendored header -- not done in the capped window.
+- **Result recorded, not closed**: FMA contraction remains the leading candidate mechanism for the
+  noisy-content gap, unconfirmed. The gap is a NOTE (see `error-metrics-are-notes-not-gates`), not a
+  blocker -- step 2's device gate uses the CPU reference directly, not the GPU, so this does not affect it.
+
+## Step 2 -- single-core AIE kernel, gated against cpu_ref.py: PASS on device
+
+`kernel/fsr1_kernel.cc`: full EASU+RCAS, **scalar fp32**, one resident RGB crop in L1 (no aie_api vector
+types -- see "what this costs" below). Verified twice before touching the device:
+1. Host-compiled (native gcc) against `cpu_ref.py` on an 8x8 and a 16x16 crop: **float32-ULP exact**
+   (max abs diff 2.4e-7) outside two pixels that hit RCAS's own `mn4==mx4` div-by-zero singularity.
+   Caught and fixed one real bug this way (`b_`/`c_` were reading the wrong 2x2-gather components,
+   `bczz[3],bczz[2]` instead of `bczz[0],bczz[1]` -- traced by comparing intermediate `p0..p3` gather
+   coordinates and tap values between the two implementations pixel-by-pixel, not by guessing).
+2. Compiled for aie2p with the pinned Peano (`--target=aie2p-none-unknown-elf`): clean.
+3. **Device-verified** (`kernel/verify_fsr1.py`, aie_kernels/_test's `bricklib.verify_oneshot` rail, real
+   XRT run on aie2p, npu_lock-serialized): `rel_l2=3.094e-07` (note), **run-to-run determinism 0.0 over 4
+   runs -> PASS**, max abs diff 1.222e-06 vs `cpu_ref.py` on device.
+
+**.text vs the 16KB program memory** (`llvm-size -A` on the built per-core ELF,
+`elfs_main_core_0_2.elf`): **15456 bytes = 94.3% of 16384**, at `-Oz` -- at the compiler's default `-O2`
+this kernel's own functions alone are ~18.2KB, already over budget before the IRON DMA/objectFifo runtime
+glue is added; `-Oz` was required to fit at all (own-function total ~12.2KB at `-Oz`, rest is runtime glue).
+This is itself a finding: a straight-line scalar transliteration of the reference algorithm does not fit
+AIE2p's program memory at a normal optimization level.
+
+**MAC/lane utilization: 0%.** `llvm-nm` on the compiled kernel shows only software-float library calls
+(`__mulsf3`, `__divsf3`, `__addsf3`-class helpers, `__ltsf2`/`__gtsf2`/`__gesf2`/`__nesf2` compares,
+`__floatsisf`/`__fixsfsi` conversions) -- **zero** `aie::mmul`/vector-MAC instructions anywhere in the
+build. Every arithmetic op in this kernel is a software emulation routine, not hardware MAC-array or even
+hardware scalar-FPU work. This is the expected, measured cost of writing `float`/`int` C++ directly instead
+of `aie::vector<float,N>`/`aie_api` -- a correctness-first port, exactly the "generic brick where the
+hardware has a specialized one" mistake the brick-first doctrine warns against, done here deliberately to
+get a fast, bit-exact-verified baseline before spending kernel-authoring effort on vectorization.
+
+**Cycles/output-pixel:** measured via device wall-clock (dispatch-inclusive, `kernel/time_fsr1.py`,
+`BRICK_JIT_CACHE=1` so repeat calls hit the cached xclbin, min of 15 reps per
+`method-build-run-npu-xrt-test.md`'s convention) at two crop sizes to separate the fixed dispatch cost
+from the per-pixel cost:
+
+| crop | out px | wall_min | ns/px (crop avg) |
+|---|---|---|---|
+| 8x8 -> 24x24 | 576 | 15.075 ms | 26172 |
+| 11x11 -> 33x33 | 1089 | 28.144 ms | 25844 |
+| marginal (isolates per-pixel from fixed dispatch overhead) | +513 | +13.069 ms | **25476 ns/px** |
+
+Fixed dispatch overhead is small (~0.4 ms) against a large, highly linear per-pixel cost (26172 vs 25844
+vs 25476 ns/px across two very different crop sizes) -- this kernel is per-pixel-compute-bound, not
+dispatch-bound. At the measured/canonical AIE clock (**~1.8 GHz**, `decode-perop-aie-clock`, stated per
+doctrine since the AIE clock is a DPM variable, not a constant): **25476 ns/px = ~45857 cycles/output-pixel.**
+
+## Step 3 -- whole frame, one dispatch: NOT REACHED (two demonstrated blockers, not scope)
+
+1. **Structural: a literal one-shot whole-frame dispatch cannot fit.** `verify_oneshot`/`_build_oneshot`
+   requires the WHOLE input and output resident in L1 at once (64KB/core). 640x360 input alone is 2.7MB;
+   even the smallest useful output tile at 1x is far over budget. A real whole-frame single dispatch needs
+   a STREAMING design (tiled DMA, `_build_streamed`) with overlapping row-halos for EASU's 12-tap/RCAS's
+   5-tap neighborhoods across tile boundaries -- unbuilt this pass; that halo-correct tiling is itself a
+   nontrivial kernel-engineering task, not a config flag.
+2. **Even if built, the measured per-pixel cost disqualifies it before multi-core is relevant.**
+   2,073,600 output pixels (1920x1080) x 25476 ns/px (measured, not assumed) = **~52.8 s/frame on one
+   core** -- projected by direct extrapolation from a measurement whose linearity is itself measured
+   (two crop sizes agree to within 3%), not a guess. Perfect 8-column scaling would only buy 8x -> **~6.6
+   s/frame**, still ~6.6x worse than the ~1000 ms/frame ESPCN baseline this task exists to replace, and
+   nowhere near game speed (16-33 ms/frame for 30-60 fps). 0% MAC utilization (above) is *why*: spreading
+   a software-float scalar kernel across columns is the wrong next lever.
+
+**Recommendation recorded, not executed:** vectorize with `aie_api` (`aie::vector<float,N>`/bfp16 MAC
+path) BEFORE building the multi-core streaming/halo plumbing -- building the streaming design around a
+kernel already known to be 3-4 orders of magnitude off target would be wasted engineering. This is the
+concrete next step on the task.
+
+## Step 4 -- C ABI: NOT REACHED
+
+Conditional on step 3 landing (per the task brief); step 3 did not land, so this was not started.
+
+## Files added this pass (step 2)
+- `kernel/fsr1_kernel.cc` -- the scalar EASU+RCAS kernel (fp32, compile-time `FSR1_IN_W`/`FSR1_IN_H`).
+- `kernel/host_check.c`, `host_check_easu.c` -- native-compiled pre-device correctness checks (not
+  committed as binaries; regenerate with plain `gcc`, see the file headers).
+- `kernel/verify_fsr1.py` -- device correctness gate (bricklib `verify_oneshot`, PASS).
+- `kernel/time_fsr1.py` -- device cycles/pixel measurement at two crop sizes.
+- `kernel/run.sh` -- npu_lock-wrapped runner (adapted from `aie_kernels/_test/run.sh`).

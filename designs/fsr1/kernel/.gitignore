@@ -1,0 +1,6 @@
+gen/
+*.o
+*.f32
+host_check
+host_check_easu
+host_check16
