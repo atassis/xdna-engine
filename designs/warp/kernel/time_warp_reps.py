@@ -96,7 +96,20 @@ def marginal(fn, ch, tile_w, tile_h, halo, k_lo, k_hi, label):
     print(f"[{label} C={ch}] K={k_lo}: {t_lo*1e6:.1f}us  K={k_hi}: {t_hi*1e6:.1f}us  "
           f"per-call={per_call*1e6:.2f}us over {npx}px -> {ns_px:.1f} ns/px "
           f"({ns_px*1.8:.0f} cyc/px @1.8GHz)")
-    return ns_px
+    return t_lo, t_hi, ns_px
+
+
+def linearity_check(fn, ch, tile_w, tile_h, halo, ks, label):
+    """Three K points -- confirms per-call time from the two-point marginal is actually
+    linear in K (a real per-call cost), not an artifact of picking K_lo/K_hi."""
+    pts = [(k, fn(ch, tile_w, tile_h, halo, k)[0]) for k in ks]
+    print(f"[{label} C={ch}] " + "  ".join(f"K={k}:{t*1e6:.1f}us" for k, t in pts))
+    (k0, t0), (k1, t1), (k2, t2) = pts
+    slope_01 = (t1 - t0) / (k1 - k0)
+    slope_12 = (t2 - t1) / (k2 - k1)
+    ratio = slope_12 / slope_01 if slope_01 else float("nan")
+    print(f"[{label} C={ch}] per-call slope K{k0}->{k1}: {slope_01*1e9:.2f}ns  "
+          f"K{k1}->{k2}: {slope_12*1e9:.2f}ns  ratio={ratio:.3f} (1.0 = linear)")
 
 
 if __name__ == "__main__":
@@ -105,6 +118,8 @@ if __name__ == "__main__":
     print("=== scalar control (must reproduce ~879/1499 ns/px) ===")
     for ch in (3, 4):
         marginal(time_scalar, ch, TILE_W, TILE_H, HALO, K_LO, K_HI, "scalar")
+        linearity_check(time_scalar, ch, TILE_W, TILE_H, HALO, (4, 200, 800), "scalar")
     print("=== vectorized ===")
     for ch in (3, 4):
         marginal(time_vec, ch, TILE_W, TILE_H, HALO, K_LO, K_HI, "vec")
+        linearity_check(time_vec, ch, TILE_W, TILE_H, HALO, (4, 200, 800), "vec")
