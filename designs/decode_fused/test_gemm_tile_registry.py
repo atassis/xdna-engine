@@ -50,6 +50,14 @@ class TestRegistry:
             assert ch.source == "seed", f"{label} has moved off the seed; update this test"
             assert ch.measured is None
 
+    def test_orientation_is_part_of_the_key(self, tmp_path):
+        """sc_batch and cx_batch are both 256x256x256 at M=256, in opposite orientations."""
+        r = Registry({}, path=tmp_path / "r.json", overrides={})
+        r.record(256, 256, 256, 64, 128, 32, 8, source="assumed", b_col_maj=True)
+        r.record(256, 256, 256, 64, 64, 32, 8, source="assumed", b_col_maj=False)
+        assert r.lookup(256, 256, 256, b_col_maj=True).tile_k == 128
+        assert r.lookup(256, 256, 256, b_col_maj=False).tile_k == 64
+
     def test_every_numerics_arm_is_seeded(self, reg):
         """PREFILL_BFP16 / PREFILL_ACC change the KEY, so an unseeded arm would start raising the
         moment someone runs the numerics A/B."""
@@ -83,10 +91,10 @@ class TestRegistry:
         ch = reg.lookup(256, 3072, 1024, b_col_maj=True, label="down", check_bd_stride=True)
         assert ch.tile_n * ch.cols * 3072 <= BD_STRIDE_MAX
 
-    def test_orientation_mismatch_raises(self, reg):
+    def test_other_orientation_is_unswept(self, reg):
         """ctx is recorded b_col_maj=False; B's dims_to_stream differs, so the measurement does
         not carry across the two orientations."""
-        with pytest.raises(IllegalRegistryEntry):
+        with pytest.raises(UnsweptGemmShape):
             reg.lookup(256, 2048, 128, b_col_maj=True, label="ctx")
 
     def test_an_illegal_hand_edit_is_caught_on_lookup(self, tmp_path):

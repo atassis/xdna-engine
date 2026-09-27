@@ -42,11 +42,10 @@ dims. `dtype` is `in>out` (`bf16>bf16` today). `emulate` is
 tiles are legal at all, so two arms with different `emulate` are not comparable and must not share
 an entry.
 
-`b_col_maj` is NOT part of the key -- every prefill projection reads its weight in decode's stored
-`[Nout, K]` order, and the one exception (`ctx`, which reads the V cache as `[K=S, N=HD]`) is
-already distinguished by its shape. It is RECORDED per entry anyway and `lookup()` raises if a
-caller asks with a different one, because the B streaming pattern differs between the two
-(`design.py` picks `dims_to_stream` on it) and a silently-shared measurement would be a lie.
+`b_col_maj=False` (B read as `[K, N]`, e.g. `ctx` over the V cache) adds `_brow` to the key;
+column-major, the common case, adds nothing. B's streaming pattern differs between the two
+(`design.py` picks `dims_to_stream` on it), so a measurement never carries across, and at M=256
+`sc_batch_hd256` and `cx_batch_hd256` are both 256x256x256 in opposite orientations.
 """
 import json
 import os
@@ -94,10 +93,11 @@ class TileChoice:
 
 
 def key_of(M: int, K: int, N: int, *, dtype: str = "bf16>bf16", emulate: bool = True,
-           prio_accuracy: bool = False) -> str:
+           prio_accuracy: bool = False, b_col_maj: bool | None = None) -> str:
     """The canonical registry key. Every field that changes which tile wins is in it."""
     return (f"m{M}_k{K}_n{N}_{dtype.replace('>', '2')}"
-            f"_bfp{int(bool(emulate))}_acc{int(bool(prio_accuracy))}")
+            f"_bfp{int(bool(emulate))}_acc{int(bool(prio_accuracy))}"
+            f"{'_brow' if b_col_maj is False else ''}")
 
 
 def _parse_overrides(raw: str | None) -> dict:
@@ -163,12 +163,16 @@ class Registry:
         addressing this rule does not describe (gemma4-12b's `down`/`gate_up` are recorded this
         way and are only ever built quantized).
         """
-        key = key_of(M, K, N, dtype=dtype, emulate=emulate, prio_accuracy=prio_accuracy)
+        key = key_of(M, K, N, dtype=dtype, emulate=emulate, prio_accuracy=prio_accuracy,
+                     b_col_maj=b_col_maj)
+        if b_col_maj is None and key not in self.entries:
+            key = key_of(M, K, N, dtype=dtype, emulate=emulate, prio_accuracy=prio_accuracy,
+                         b_col_maj=False)
         ent = self.entries.get(key)
         ovr = self.overrides.get(key) or (self.overrides.get(label) if label else None)
         if ent is None and ovr is None:
             raise UnsweptGemmShape(self._miss_message(key, M, K, N, dtype, emulate,
-                                                      prio_accuracy, label))
+                                                      prio_accuracy, label, b_col_maj))
         merged = dict(ent or {})
         if ovr is not None:
             unknown = set(ovr) - {"tile_m", "tile_k", "tile_n", "cols"}
@@ -208,7 +212,8 @@ class Registry:
                 f"does not carry across; sweep this shape in the orientation you build.")
         return choice
 
-    def _miss_message(self, key, M, K, N, dtype, emulate, prio_accuracy, label) -> str:
+    def _miss_message(self, key, M, K, N, dtype, emulate, prio_accuracy, label,
+                      b_col_maj=None) -> str:
         where = f" for {label}" if label else ""
         return (
             f"no GEMM tile entry{where}: M={M} K={K} N={N} dtype={dtype} "
@@ -221,7 +226,8 @@ class Registry:
             f"    bash scripts/time_gemm_tiles.sh <sweep-dir>/manifest.json    # on the device\n"
             f"or, if you deliberately want an UNMEASURED entry, say so explicitly:\n"
             f"    designs/decode_fused/sweep_gemm_tiles.py --seed {M}x{K}x{N}"
-            f" --tile 64,64,64 --cols 8 --source assumed\n"
+            f" --tile 64,64,64 --seed-cols 8 --source assumed"
+            f"{' --b-row-major' if b_col_maj is False else ''}\n"
             f"Registry: {self.path or DEFAULT_REGISTRY}")
 
     # ---- writing ----
@@ -236,7 +242,8 @@ class Registry:
                                     check_bd_stride=check_bd_stride)
         if rej is not None:
             raise IllegalRegistryEntry(f"refusing to record an illegal tiling: {rej.detail}")
-        key = key_of(M, K, N, dtype=dtype, emulate=emulate, prio_accuracy=prio_accuracy)
+        key = key_of(M, K, N, dtype=dtype, emulate=emulate, prio_accuracy=prio_accuracy,
+                     b_col_maj=b_col_maj)
         prev = self.entries.get(key)
         merged_labels = sorted(set(labels or []) | set((prev or {}).get("labels") or []))
         # Models share shapes -- (256,128,2048) is `scores` for qwen3-0.6b and s2-pro-slow-ar
