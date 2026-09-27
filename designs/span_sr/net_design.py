@@ -116,6 +116,57 @@ def _shim_gate_half(path, sym, p, w, xoff, bracket=False):
     return path
 
 
+# kinds split_gate accepts, generalizing BALANCE.md's gate-only mechanism (Phase 2 M1, spec
+# 2026-09-28-span-frame-width-design.md S5-iii) to b1c1/b1c2 (silu16/silu_i16): same conv3x3_core
+# COUT-block-pair split, same net_layout.split_gate_params blob slice (already kind-agnostic).
+SPLIT_KINDS = {"gate", "silu16", "silu_i16"}
+
+
+def _split_layout(kind, w, lo_channels):
+    """Byte split of a stage's own COUT-indexed output segment at `lo_channels`, plus the LOCAL
+    offset in the hi half's own buffer where an x-forward copy lands (None: no forward on this
+    kind). gate's own segment is out_bytes (int8, h); silu16's is the int16 SiLU result (2h,
+    x rides after at x_out=2h); silu_i16's is its int8 conv result (h, x rides after at
+    x_out=h) -- both silu kinds forward x on the hi half only, same as the unsplit x_out offset,
+    now local to hi's own (smaller) buffer."""
+    h = NL.half(w)
+    lo, hi = lo_channels, NL.C - lo_channels
+    if kind == "gate":
+        return h * lo // NL.C, h * hi // NL.C, None
+    if kind == "silu16":
+        lo_b, hi_b = 2 * h * lo // NL.C, 2 * h * hi // NL.C
+        return lo_b, hi_b + h, hi_b
+    if kind == "silu_i16":
+        lo_b, hi_b = h * lo // NL.C, h * hi // NL.C
+        return lo_b, hi_b + h, hi_b
+    raise ValueError(f"split_gate unsupported for kind={kind}")
+
+
+def _shim_split_half(path, sym, kind, p, w, xoff=None, fwd_offset=None, bracket=False):
+    """Half-COUT core for any SPLIT_KINDS member. xoff: gate's own extra x-arg offset (gate
+    only, None otherwise). fwd_offset: local offset in this half's own output buffer for the
+    x-forward copy (silu16/silu_i16's hi half only; None elsewhere). Same event0()/event1()
+    convention as _shim_gate_half."""
+    lay = NL.layout(kind, w)
+    c = f"{w}, check, {p['pre']}, {p['shift']}, 0, {w}"
+    s = "(const int16_t *)"
+    call = {
+        "silu16": lambda: f"conv3x3_i8_lut16(l0, l1, l2, p, (int16_t *)o, {c});",
+        "silu_i16": lambda: f"conv3x3_i16i8_lut({s}l0, {s}l1, {s}l2, p, o, {c});",
+        "gate": lambda: (f"conv3x3_i8_gate(l0, l1, l2, l1 + {xoff}, p, o, {c}, {p['ga']}, "
+                         f"{p['gb']}, {p['gs1']}, {p['gc']}, {p['gs2']});"),
+    }[kind]()
+    fwd = ""
+    if fwd_offset is not None:
+        fwd = (f"  for (int i = 0; i < {NL.half(w)}; i += 64)\n"
+               f"    aie::store_v(o + {fwd_offset} + i, aie::load_v<64>(l1 + {lay.x_in} + i));\n")
+    args = "int8_t *l0, int8_t *l1, int8_t *l2, int8_t *p, int8_t *o, int32_t check"
+    ev0, ev1 = ("  event0();\n", "  event1();\n") if bracket else ("", "")
+    path.write_text(f'#include <stdint.h>\n#include "{KDIR / "conv3x3_u8.cc"}"\n'
+                    f'extern "C" void {sym}({args}) {{\n{ev0}  {call}\n{fwd}{ev1}}}\n')
+    return path
+
+
 def _flags_gate_half(incs, cout):
     f = ["-DCONV3X3_CIN=48", f"-DCONV3X3_COUT={cout}"]
     for i, inc in enumerate(incs):
@@ -173,7 +224,8 @@ def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
     data ... but it may fit if you reserve it explicitly." Merged over DATA_SIZES (default {},
     currently {"b1c1": 4160} -- required for DEPTH["b1c1"]=4 to fit L1 at W=32).
 
-    split_gate: stage names (kind=gate only) to split onto two cores by output channel
+    split_gate: stage names (kind in SPLIT_KINDS: gate, silu16, silu_i16) to split onto two cores
+    by output channel
     (BALANCE.md option (a), GATE_SPLIT_LO/NL.C-GATE_SPLIT_LO channels).
 
     skip_cons_depths: per-SOURCE override (keyed by the skip source's own name, e.g. "conv_1") for
@@ -203,7 +255,7 @@ def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
     names = NL.stage_names(upto)
     kind = dict(NL.STAGES)
     for n in split_gate:
-        assert kind[n] == "gate", f"split_gate is for kind=gate stages, got {n}={kind[n]}"
+        assert kind[n] in SPLIT_KINDS, f"split_gate unsupported for kind={kind[n]} ({n})"
     lay = {n: NL.layout(kind[n], w) for n in names}
     stacks = {**STACK, **(stacks or {})}
     depth = {n: main_depth for n in names} | DEPTH | (depths or {})
@@ -216,17 +268,18 @@ def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
     for n in names:
         if n in split_gate:
             npl, nph = NL.split_gate_params(NP[n], lo_channels=GATE_SPLIT_LO)
-            lo_bytes = NL.half(w) * GATE_SPLIT_LO // NL.C
-            hi_bytes = lay[n].out_bytes - lo_bytes
+            lo_bytes, hi_bytes, fwd_off = _split_layout(kind[n], w, GATE_SPLIT_LO)
             split_bytes[n] = (lo_bytes, hi_bytes)
-            xoff = lay[n].x_in + lo_bytes
-            halves = ((f"{n}_lo", npl, lay[n].x_in, GATE_SPLIT_LO),
-                     (f"{n}_hi", nph, xoff, NL.C - GATE_SPLIT_LO))
-            for suffix, npi, xo, cout in halves:
+            is_gate = kind[n] == "gate"
+            xo_lo = lay[n].x_in if is_gate else None
+            xo_hi = (lay[n].x_in + lo_bytes) if is_gate else None
+            halves = ((f"{n}_lo", npl, xo_lo, None, GATE_SPLIT_LO),
+                     (f"{n}_hi", nph, xo_hi, fwd_off, NL.C - GATE_SPLIT_LO))
+            for suffix, npi, xo, fo, cout in halves:
                 sym = f"{tag}_{suffix}_w{w}"
                 incs = [g.lut_inc(t, gen / f"{sym}_t{i}.inc") for i, t in enumerate(npi.get("tables", []))]
-                shim = _shim_gate_half(gen / f"{sym}.cc", sym, npi, w, xo,
-                                       bracket=suffix in trace_stages)
+                shim = _shim_split_half(gen / f"{sym}.cc", sym, kind[n], npi, w, xoff=xo,
+                                        fwd_offset=fo, bracket=suffix in trace_stages)
                 spec[suffix] = (sym, shim, incs, npi)
                 texts += [shim.read_text()] + [Path(i).read_text() for i in incs]
                 core_names.append(suffix)
