@@ -1036,3 +1036,52 @@ Device is shared with other concurrent lanes (gemma4 prefill gates, this session
 multiple `npu_lock.sh` defer/retry cycles. No control for box thermal/DPM drift across dispatches
 (power mode not queried per `npu_power_mode.py`); treat compute-vs-gap SPLITS (same-dispatch ratios)
 as trustworthy, absolute cyc/px versus the untraced net-rate probe as approximate.
+
+## Phase 1f: trace-confirm the iterate_bds mechanism itself -- REFUTED, join tax is NOT iterate_bds
+
+Phase 1e's open item: the join step (+157.9 cyc/px, conv_2->conv_cat) is confirmed structural and
+NOT MemTile(4,1) channel sharing (join_tile experiment, null), leaving the `iterate_bds`
+self-looping-BD mechanism itself (vs. a static per-slot BD chain) as the one untested candidate.
+`bench_iterate_bds.py`'s wall-clock A/B is this file's OWN flagged-unreliable instrument on this
+box (single-source cases flipped sign) -- re-tested here with the trusted same-process TRACE
+instrument instead.
+
+Method: `aie_kernels/_test/trace_iterate_bds.py`, new. Same isolated-join shape as
+`bench_iterate_bds.py` (NSRC producers -> one MemTile join pool -> 1 consumer, SPAN's own join
+row size 2304 B), but the consumer's per-row touch is routed through a tiny ExternalFunction
+kernel (`touch.cc`: `o[0]=l0[0]` bracketed by `event0()`/`event1()`) so it can carry a hardware
+trace -- pure-Python IRON worker bodies have no event0()/event1() binding (only ExternalFunction
+kernel bodies do, same as net_design.py's `_shim(bracket=True)` convention). Traced the consumer
+core only, NSRC=4, depth in {4, 8}, ON/OFF alternated per repeat (3 repeats), W=32-equivalent
+row=2304B, H=128. Power mode: `default` (UNPINNED), standing caveat.
+
+Compile-only check first (`compile_trace_iterate_bds.py`, no device): depth=4 compiles both ways;
+depth=8 compiles ON only (OFF needs 64 BDs > 48-BD cap, `'aie.memtile_dma' op has more than 48
+blocks` -- confirms the cap arithmetic from the original commit, not just at NSRC=4/depth=22).
+
+| nsrc | row | depth | iterate_bds | compute+gap cyc/row (median, n=3) | stall_union % of span |
+|---|---|---|---|---|---|
+| 4 | 2304B | 4 | ON | 1144.2 | 97.15-97.18% |
+| 4 | 2304B | 4 | OFF | 1144.0 | 97.15-97.18% |
+| 4 | 2304B | 8 | ON | 1144.0 | 97.15-97.16% |
+| 4 | 2304B | 8 | OFF | compile FAILS (48-BD cap, expected) | -- |
+
+**REFUTED -- ON and OFF land within 0.2 cyc/row of each other at depth=4 (both ~1144.0-1144.2,
+run-to-run noise here is ~3 cyc/row), and depth=8 ON matches depth=4 ON exactly (1144.0 vs
+1144.2/1144.0).** A real ~158 cyc/px tax (33% of SPAN's ~484 cyc/px join-step floor) would be
+~35x this run's noise floor and would show up unmistakably; it does not. The self-looping-BD
+lowering itself carries no measurable per-row cost over the static per-slot BD chain, at NSRC=4,
+either depth tested, isolated from SPAN's own MemTile placement, weight-group sharing, and
+kernel compute.
+
+**Net: the join's `iterate_bds` MECHANISM is now also refuted, on top of MemTile channel sharing
+(Phase 1e).** Both concrete candidates this file named for the join-step tax are dead ends. The
+tax is real and localized (Phase 1e's bisection is not in question -- conv_2->conv_cat is still
+where the whole-net pace jumps ~326->483.8 cyc/px) but its MECHANISM remains open: it is
+something about the join's shape in situ (4 real producer cores each running SPAN's own kernel
+work and objectFifo topology, not this isolated microbench's trivial producers) that this
+isolated harness does not reproduce, or something outside the MemTile-DMA layer entirely (e.g.
+stream-switch routing/arbitration across the 4 real producer cores' distinct source tiles, which
+this microbench's producers do not share with SPAN's real skip-source placement). **No fork fix
+is warranted**: the task's premise (iterate_bds itself carries a per-row tax) does not hold under
+the trusted instrument, so there is nothing in the MemTile objectFifo lowering to change.
