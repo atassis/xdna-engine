@@ -25,9 +25,23 @@ CAT_DIR = KDIR.parent / "conv2d-1x1-cat"
 # stack reservation per kind; aiecc measures each core and fails naming the bytes it needs
 STACK = {"conv1": 2048, "silu16": 3584, "silu_i16": 3584, "silu_x": 2560, "silu": 2560,
          "gate": 3584, "plain": 2048, "cat": 2048, "up": 2048, "gate_half": 3584}
-# objectFIFO depth of a stage's output (both ends, see the shared-pool trap). b1c1's rows are
-# three halves wide: four of them do not fit in L1 beside its weights and its input window.
-DEPTH = {"b1c1": 3}
+# objectFIFO depth of a stage's output (both ends, see the shared-pool trap). Was 3 (zero producer
+# slack against b1c2's 3-row window forced b1c1/b1c2 to alternate, computes summed: TRACE_RESULTS.md
+# "b1c1<->b1c2 alternation-sum, RE-CONFIRMED"); raised to 4 2026-09-27, device-confirmed on the
+# full net at W=32: same-process trace, b1c1 586.7->482.8 cyc/px, b1c2 587.0->483.8, b3c3
+# 574.5->483.8 (~16-18%), LOCK_STALL 54.4/45.1/49.2% -> 44.5/33.3/39.0%. Needs DATA_SIZES/
+# SKIP_COND_DEPTHS below to fit L1 at W=32 (see TRACE_RESULTS.md's byte-budget section).
+DEPTH = {"b1c1": 4}
+# aiecc's own measured static-data size for b1c1's silu16 LUT table (checkDataSizeRequirements),
+# reserved explicitly so DEPTH["b1c1"]=4's extra output buffer slot doesn't starve it (automatic
+# placement left only ~1.5 KB where the LUT needs 4160 B once buffers grow).
+DATA_SIZES = {"b1c1": 4160}
+# conv_1's own consumer depth into b1c1 (normally MAIN_DEPTH), dropped by one slot to free 2304 B
+# on b1c1's tile (0,3) -- the other half of DEPTH["b1c1"]=4's L1 cost. conv_1's own compute is
+# only ~40 cyc/px (measured), so alternating conv_1<->b1c1 at zero slack gives a ~360 cyc/px
+# ceiling on that link alone, comfortably under the ~480 cyc/px pace this net now runs at --
+# device-confirmed not to become the new bottleneck (same trace run as above).
+SKIP_CONS_DEPTHS = {"conv_1": 3}
 MAIN_DEPTH = 4   # a 3-row window plus the row being written
 PROD_DEPTH = 2   # producer side of a fifo that leaves the core by DMA (skip broadcasts)
 GATE_SPLIT_LO = 32   # channels on split_gate's "lo" core; NL.split_gate_params' default (32/16)
@@ -118,7 +132,8 @@ def _flags(kind, incs):
 
 def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
          trace_stages=None, trace_config=None, coretile_events=None, egress_shim_col=1,
-         main_depth=None, skip_slack=None, split_gate=None):
+         main_depth=None, skip_slack=None, prod_depth=None, cat_cons_depth=None,
+         data_sizes=None, split_gate=None, skip_cons_depths=None):
     """NP: span_int.Span.net_params(). Returns an iron.jit callable (x, wts, y): x from
     net_layout.conv1_rows (as int8), wts from net_layout.weights_blob, y gets `upto`'s rows.
 
@@ -137,10 +152,42 @@ def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
     skip_slack: override for net_layout.SKIP_SLACK (default None -> the module constant, 2),
     used only to size the join ring (`skip_depth(src) = rows_ahead(src) + skip_slack`) -- the
     skip-ring latency-throttle hypothesis in TRACE_RESULTS.md. Does not touch NL.SKIP_SLACK
-    itself (net_layout stays byte-identical), so the module default is unaffected."""
+    itself (net_layout stays byte-identical), so the module default is unaffected.
+
+    prod_depth: override for PROD_DEPTH (default None -> the module constant, 2), the CORE-side
+    producer depth of a skip source's output ObjectFifo (conv_1/conv_2/b1c3/b6c1). That fifo has
+    TWO consumers -- the next main-path core (depth=main_depth) and the join's MemTile ring
+    (depth=skip_depths[src]) -- and a broadcast producer can only run as far ahead as its
+    slowest consumer allows; prod_depth is the producer's own buffering against that.
+
+    cat_cons_depth: override for conv_cat's own input depth (default None -> 2), the `rowwise()`
+    worker's `f_cat.cons(depth=...)` handle that reads the join ring. Independent of skip_slack
+    (which sizes the ring itself, not conv_cat's read-ahead into it).
+
+    data_sizes: per-stage override for Worker(data_size=...), the explicit static-data (constant
+    array/LUT table) reservation aiecc's own error suggests when buffer allocation leaves too
+    little room for a core's LUT: "aiecc: core main_core_0_3 needs space for 4160 bytes of static
+    data ... but it may fit if you reserve it explicitly." Merged over DATA_SIZES (default {},
+    currently {"b1c1": 4160} -- required for DEPTH["b1c1"]=4 to fit L1 at W=32).
+
+    split_gate: stage names (kind=gate only) to split onto two cores by output channel
+    (BALANCE.md option (a), GATE_SPLIT_LO/NL.C-GATE_SPLIT_LO channels).
+
+    skip_cons_depths: per-SOURCE override (keyed by the skip source's own name, e.g. "conv_1") for
+    the next main-path core's consumer depth on that source's broadcast fifo -- normally hardcoded
+    to `main_depth` for every `prev in skips` hop. Lets a skip source's own main-path hop run at a
+    shallower depth than the network-wide main_depth (e.g. to free L1 on the DOWNSTREAM consumer's
+    tile), at the cost of that hop alternating with its source if the source's own compute is
+    small enough not to become the new ceiling -- check with a trace, do not assume. Merged over
+    SKIP_CONS_DEPTHS (default {}, currently {"conv_1": 3} -- the other half of DEPTH["b1c1"]=4's
+    L1 fix)."""
     main_depth = MAIN_DEPTH if main_depth is None else main_depth
     skip_slack = NL.SKIP_SLACK if skip_slack is None else skip_slack
+    prod_depth = PROD_DEPTH if prod_depth is None else prod_depth
+    cat_cons_depth = 2 if cat_cons_depth is None else cat_cons_depth
+    data_sizes = {**DATA_SIZES, **(data_sizes or {})}
     split_gate = frozenset(split_gate or ())
+    skip_cons_depths = {**SKIP_CONS_DEPTHS, **(skip_cons_depths or {})}
     assert w % 16 == 0, "conv3x3_u8.cc needs width % 16 == 0 (and the x copy, whole 64-byte vectors)"
     gen = Path(gen)
     gen.mkdir(parents=True, exist_ok=True)
@@ -187,7 +234,8 @@ def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
     skip_depths = {s: NL.rows_ahead(s) + skip_slack for s in sorted(skips)}
     digest = hashlib.sha256("".join(texts).encode() + repr(
         (w, h, upto, sorted(stacks.items()), sorted(depth.items()), groups, skip_depths,
-         main_depth, PROD_DEPTH, sorted(trace_stages), tuple(coretile_events or ()),
+         main_depth, prod_depth, cat_cons_depth, sorted(data_sizes.items()),
+         sorted(skip_cons_depths.items()), sorted(trace_stages), tuple(coretile_events or ()),
          egress_shim_col, sorted(split_gate))).encode()).hexdigest()[:12]
     base = _aie_api_include() + [f"-DSPAN_NET_DIGEST={digest}"]
     plen = {cn: spec[cn][3]["blob"].size for cn in core_names}
@@ -290,19 +338,21 @@ def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
                 for suffix, sub in ((f"{n}_lo", lo), (f"{n}_hi", hi)):
                     workers.append(Worker(windowed, fn_args=[out[prev].cons(fi_depth),
                                           p_fifo[suffix].cons(), sub.prod(), kern[suffix]],
-                                          stack_size=stacks["gate_half"]))
+                                          stack_size=stacks["gate_half"],
+                                          data_size=data_sizes.get(suffix)))
                 continue
             if kind[n] == "cat":
-                fi, body = f_cat.cons(depth=2), rowwise
+                fi, body = f_cat.cons(depth=cat_cons_depth), rowwise
             elif i == 0:
                 fi, body = f_in.cons(main_depth), padded
             else:
                 prev = names[i - 1]
-                fi = out[prev].cons(main_depth if prev in skips else depth[prev])
+                fi = out[prev].cons(skip_cons_depths.get(prev, main_depth) if prev in skips
+                                   else depth[prev])
                 body = windowed
-            fo = out[n].prod(depth=PROD_DEPTH) if n in skips else out[n].prod()
+            fo = out[n].prod(depth=prod_depth) if n in skips else out[n].prod()
             workers.append(Worker(body, fn_args=[fi, p_fifo[n].cons(), fo, kern[n]],
-                                  stack_size=stacks[kind[n]]))
+                                  stack_size=stacks[kind[n]], data_size=data_sizes.get(n)))
 
         w_taps, off = [], 0
         for grp in groups:

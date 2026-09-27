@@ -257,6 +257,413 @@ future MAIN_DEPTH/PROD_DEPTH work on the same pool). Re-ran `verify_span_net.py`
 default: **22/22 cores exact** (`up`, 32x64, 32768/32768 -- every stage upto it also exact),
 same as the slack=2 baseline gate.
 
+## Phase 1a: PROD_DEPTH, cat_cons_depth, and the untraced skip stages -- all NULL
+
+Task (`2026-09-27-npu-any-game-realtime.md` phase 1a): at SKIP_SLACK=8, b3c3 still shows ~40%
+LOCK_STALL, ~1.6x over its own isolated compute. Three untested suspects going in: (1) `PROD_DEPTH`
+(the four skip sources' core-side producer depth, default 2 -- their output ObjectFifo has TWO
+consumers, the next main-path core AND the join's MemTile ring, and a broadcast producer can only
+run as far ahead as its slower consumer); (2) conv_cat's own `f_cat.cons(depth=2)` read-ahead into
+the join ring; (3) the untraced skip-related stages b6c1 and conv_2.
+
+`net_design.build()` gained `prod_depth=`/`cat_cons_depth=` overrides (default None -> the prior
+hardcoded values, module byte-identical when omitted; same pattern as `main_depth=`/`skip_slack=`).
+**Compile-only sweep, W=32, skip_slack=8:** `prod_depth` fits L1 up to at least 16 (unlike
+MAIN_DEPTH, the skip-source cores are lightly loaded); `cat_cons_depth` fits at 3, fails at 4
+(conv_cat's own L1, same class of wall as the MAIN_DEPTH tiles).
+
+**Device: same-process b3c3 trace A/B, W=32, H=128, SKIP_SLACK=8 held fixed**
+(`aie_kernels/_test/probe_span_stall_levers.py`). Power mode: `default` (UNPINNED), same caveat
+as every prior measurement in this file.
+
+| lever | compute cyc/px | gap cyc/px | LOCK_STALL % of span | compute+gap |
+|---|---|---|---|---|
+| prod_depth=2 (baseline) | 406.2 | 224.94 | 40.46% | 631.1 |
+| prod_depth=8 | 406.2 | 224.94 | 40.47% | 631.1 |
+| cat_cons_depth=2 (baseline) | 406.2 | 224.94 | 40.46% | 631.1 |
+| cat_cons_depth=3 | 406.2 | 224.94 | 40.46% | 631.1 |
+| prod_depth=8 + cat_cons_depth=3 (combined) | 406.2 | 224.93 | 40.47% | 631.1 |
+
+**All three NULL -- bit-for-bit identical to the baseline within trace noise.** Neither the
+skip-source producer's own buffering nor conv_cat's read-ahead moves b3c3 at all, at any value
+either compiles. This also indirectly refutes the "throttled by its slower consumer" framing for
+PROD_DEPTH: if the main-path consumer (fixed at main_depth=4, L1-bound, already refuted as a
+b3c3 lever) were the ceiling, giving the producer more of its OWN buffer still wouldn't show up at
+b3c3 -- consistent with what was measured, but not a positive confirmation of the mechanism either.
+
+**Untraced stages, same session, defaults (prod_depth=2, cat_cons_depth=2, skip_slack=8):**
+
+| stage | role | compute cyc/px | gap cyc/px | LOCK_STALL % of span | compute+gap |
+|---|---|---|---|---|---|
+| b6c1 | skip source, mid-chain | 250.39 (34.58%) | 366.31 (50.2%) | 65.13% | 616.7 |
+| conv_2 | skip source, feeds join 1 row ahead | 83.29 (11.28%) | 526.58 (70.75%) | 88.44% | 609.9 |
+
+Both land at compute+gap ~610-617, matching b3c3's 631.1 and the earlier-traced conv_1/conv_cat/
+b1c1/b1c2/up signature (all "victims" of the same common pace, LOCK_STALL-dominated) -- no
+different behaviour from being a skip source vs. an ordinary main-path hop, and no anomaly
+localized to either stage.
+
+**Net: all three named suspects are dead ends, and the plateau already reached at SKIP_SLACK=8 is
+reproduced exactly** (631.1 cyc/px, 40.46-40.47% LOCK_STALL here vs. 631.1 cyc/px, 40.49% at
+SKIP_SLACK=25 in the earlier trace) -- SKIP_SLACK=8 is already at the same floor as 25, corroborating
+the plateau finding independently. **What the remaining stall correlates with:** every stage tried
+so far -- skip source, join, ordinary main-path hop, the heaviest core -- converges to the SAME
+~610-631 cyc/px pace regardless of its own compute or of any ObjectFifo depth knob touched (skip
+ring, MAIN_DEPTH, b1c1->b1c2, PROD_DEPTH, cat_cons_depth all refuted at b3c3 specifically). That is
+the same "structural, common-to-every-core" signature the original 3.5x attribution found, just at a
+~2x lower floor after the SKIP_SLACK fix. No object-fifo depth lever tested touches it, which argues
+the remaining ~40% is a LATENCY floor (fixed hop count/DMA round-trip through the array) rather than
+a THROUGHPUT/buffering one -- consistent with `rows_ahead(b3c3)`-style pipeline fill latency, but
+untested directly here (would need e.g. varying the main-path hop COUNT or tracing enough
+intermediate stages to sum the fill latency directly, both out of scope for this phase). Not ruled
+in or out; the object-fifo-depth search space this task named is now exhausted.
+
+## Phase 1a follow-up (coordinator): all 22 stages traced, no pace-setter -- MemTile(4,1) is the
+## shared resource
+
+Coordinator's objection to the "latency floor" reading: latency only throttles a buffer-insensitive
+pipeline, and PROD_DEPTH/cat_cons_depth (both buffers) were null. Alternative: the pace-setter is one
+of the 14 stages not yet traced, or a non-core resource. Traced all 14 (`probe_span_all_stages.py`,
+same conditions: W=32, H=128, SKIP_SLACK=8/default, prod_depth=2/default, cat_cons_depth=2/default,
+one dispatch per stage).
+
+**Full 22-stage table** (8 from earlier sections of this file, 14 new):
+
+| stage | kind | col,row | compute cyc/px | gap cyc/px | LOCK_STALL % | compute+gap |
+|---|---|---|---|---|---|---|
+| conv_1 | conv1 | 0,2 | 40.42 | 1256.15* | 96.68%* | 1296.6* |
+| b1c1 | silu16 | 0,3 | 319.87 | 1015.80* | 75.78%* | 1335.7* |
+| b1c2 | silu_i16 | 0,4 | 322.79 | 1012.77* | 75.67%* | 1335.6* |
+| b1c3 | gate | 0,5 | 406.22 | 236.03 | 37.46% | 642.2 |
+| b2c1 | silu_x | 1,2 | 250.40 | 388.60 | 61.48% | 639.0 |
+| b2c2 | silu | 1,3 | 250.44 | 386.84 | 61.81% | 637.3 |
+| b2c3 | gate | 1,4 | 406.16 | 230.52 | 38.96% | 636.7 |
+| b3c1 | silu_x | 1,5 | 250.42 | 383.00 | 62.52% | 633.4 |
+| b3c2 | silu | 2,2 | 250.46 | 381.27 | 62.75% | 631.7 |
+| b3c3 | gate | 2,3 | 406.20 | 224.94 | 40.46% | 631.1 |
+| b4c1 | silu_x | 2,4 | 250.41 | 377.47 | 63.36% | 627.9 |
+| b4c2 | silu | 2,5 | 250.43 | 374.35 | 63.65% | 624.8 |
+| b4c3 | gate | 3,2 | 406.50 | 219.08 | 41.88% | 625.6 |
+| b5c1 | silu_x | 3,3 | 250.52 | 371.80 | 64.24% | 622.3 |
+| b5c2 | silu | 3,4 | 250.46 | 370.13 | 64.49% | 620.6 |
+| b5c3 | gate | 3,5 | 406.17 | 213.80 | 43.34% | 620.0 |
+| b6c1 | silu_x | 4,2 | 250.39 | 366.31 | 65.13% | 616.7 |
+| b6c2 | silu | 4,3 | 250.50 | 364.54 | 65.31% | 615.0 |
+| b6c3 | gate | 4,4 | 406.26 | 208.18 | 44.58% | 614.4 |
+| conv_2 | plain | 4,5 | 83.29 | 526.58 | 88.44% | 609.9 |
+| conv_cat | cat | 5,2 | 58.23 | 1246.58* | 95.80%* | 1304.8* |
+| up | up | 5,3 | 26.68 | 1273.05* | 97.99%* | 1299.7* |
+
+`col,row` from the compiled MLIR (aie.core/aie.tile ops) of the b1c3-traced build in this run --
+placement is deterministic for that exact digest but not asserted identical across every possible
+`trace_stages=` compile, so treat the *pattern* (grouping, MemTile sharing) as load-bearing, not the
+exact column numbers for a different build. `*` = figures from the earlier per-lever/attribution
+sections above, at SKIP_SLACK=2 (conv_1/b1c1/b1c2/conv_cat/up were traced before the SKIP_SLACK fix
+and not re-traced at slack=8 in this pass -- they are NOT comparable to the slack=8 column at face
+value; re-tracing them is the obvious next step if this needs closing out further).
+
+**No pace-setter.** LOCK_STALL at slack=8 ranges 37.46% (b1c3) to 65.31% (b6c2) -- no stage anywhere
+near the "low LOCK_STALL, compute near the pace" signature the coordinator predicted. Two clean
+patterns instead: (1) **compute is fixed per KIND, not per position** -- every `gate` stage computes
+406.2-406.5, every `silu_x`/`silu` stage computes 250.4-250.5, regardless of where in the chain it
+sits; kernel work never drifts. (2) **compute+gap decreases smoothly and monotonically moving
+downstream**, independent of kind: b1c3 642.2 -> b6c3 614.4 (gate kind, -27.8 over 5 block-hops),
+b2c1 639.0 -> b6c2 615.0 (silu_x/silu kind, -24.0 over 4 block-hops) -- roughly -5 to -6 cyc/px per
+block, both kinds tracking together. Since kernel compute is provably constant, this whole-chain
+gradient is in the GAP only, and it correlates with chain POSITION, not with any per-stage
+structural property (kind, fifo depth, MemTile). **Corrected per coordinator review:** the
+simpler explanation is PIPELINE FILL/DRAIN inside the single H=128-row dispatch, not DVFS -- a
+stage further downstream starts its own first traced row later (after more upstream hops fill),
+so its measured window covers proportionally fewer of the run's fixed-cost fill/drain rows out of
+its own n_rows-1 gap intervals, pulling its average down; this needs no clock-ramp assumption and
+fits the smooth, position-ordered decrease directly. Do not lean on the DVFS framing.
+
+**MemTile(4,1) is the shared resource the coordinator asked to check.** `net_layout.weight_groups`
+(WEIGHT_GROUP=6) makes 4 weight-feed MemTiles; `join()`'s default `tile=AnyMemTile` places the
+4-source `cat_in` join ring wherever the placer picks, and it landed on the SAME MemTile as weight
+group 3 (b6c3/conv_2/conv_cat/up), not a dedicated one. Channel count (from the compiled
+`aie.memtile_dma` blocks, a MemTile has 6 S2MM + 6 MM2S total):
+
+| MemTile | S2MM used | MM2S used | total/12 | role |
+|---|---|---|---|---|
+| (0,1) | 1 | 6 | 7 | weight group 0 only |
+| (2,1) | 1 | 6 | 7 | weight group 1 only |
+| (3,1) | 1 | 6 | 7 | weight group 2 only |
+| (4,1) | 5 | 5 | 10 | weight group 3 AND the entire 4-source join ring (cat_in) |
+
+MemTile(4,1) is the busiest in the design (10/12 channels vs. 7/12 elsewhere) and the only one
+carrying two logically distinct dataflows. Its 4 join inputs are NOT symmetric in placement: b6c1
+(col 4, local) and conv_2 (col 4, local) sit on the SAME column as the join MemTile, but conv_1
+(col 0) and b1c3 (col 0) must cross 4 columns through the stream-switch fabric to reach it.
+conv_cat itself sits at col 5 -- one column PAST its own join MemTile -- so its main-path read of
+the ring also crosses a column. No per-op DMA-hop-count or channel-occupancy trace was taken here
+(would need MEMORY_STALL/STREAM_STALL attribution per hop, not just LOCK_STALL, and ideally a
+pinned power mode first); this is a structural observation from the compiled MLIR, not a measured
+attribution of the remaining stall to this MemTile specifically.
+
+**Net for this follow-up:** every stage is a "victim" in the sense the coordinator meant (no
+core runs near-saturated while others wait), and the compute+gap gradient across the whole chain
+is better explained by pipeline fill/drain within the single dispatch than by position (see the
+correction above). MemTile(4,1)'s channel load (10/12, hosting both the join and a weight group)
+and the conv_1/b1c3 cross-column skip broadcasts are the concrete "shared resource" / "crosses
+columns" candidates this MLIR surfaces, per the coordinator's fallback -- neither has been
+measured against the remaining ~40% LOCK_STALL directly. The chain-length bisection below settles
+which of these (main chain vs. join/tail) is worth pursuing further.
+
+## Phase 1a follow-up 2 (coordinator): chain-length bisection -- the pace is set in the main chain,
+## by the first 4 cores, not the join/tail
+
+Key fact motivating this: the period (~610-640 traced, ~655-690 whole-net) exceeds every single
+core's own compute (max 406.5, the gate kind) and even the LEAST-stalled traced core (b1c3,
+37.46% LOCK_STALL) still stalls -- so the throttle is outside any one core's work, and (per
+coordinator) latency alone cannot explain a lever-insensitive ceiling since PROD_DEPTH/
+cat_cons_depth were both null. Discriminates main-chain vs. join/tail by chain length: whole-net
+rate (repeat/fit probe, same method as the SKIP_SLACK dose-response) at SPAN_UPTO in {b1c3, b3c3,
+b6c3, conv_2, conv_cat, up} -- everything up to and including conv_2 has NO join built at all
+(`net_design.build()` only wires `f_cat`/the join when `"conv_cat"` is in the stage list), so this
+isolates "main chain alone" from "main chain + join + tail" cleanly.
+
+`aie_kernels/_test/probe_span_upto_bisect.py`, W=32, SKIP_SLACK=8/default, HEIGHTS
+[64,128,192,256], 5 trials, alternated per height, fitted slope, same session. Power mode:
+`default` (UNPINNED), same standing caveat.
+
+| upto | cores | fitted cyc/px @ 1.8 GHz (W=32) |
+|---|---|---|
+| b1c3 | 4 | 663 |
+| b3c3 | 10 | 760 |
+| b6c3 | 19 | 666 |
+| conv_2 | 20 (no join) | 655 |
+| conv_cat | 21 (+join) | 688 |
+| up | 22 (full net) | 679 |
+
+**The pace is already fully present at 4 cores.** `upto=b1c3` (663) is within 2.4% of the full
+22-core net (679) -- adding the remaining 18 cores, the entire join, AND the tail (conv_cat, up)
+moves the rate by less than the run-to-run noise this file has repeatedly flagged (compare the
+90/659/703/744 spread across the SKIP_SLACK dose-response's own trials). Removing the join and
+tail entirely (`conv_2`, 655) does not raise the rate toward any single core's isolated compute
+(250-433 cyc/px measured elsewhere) or lower it toward the full net's rate in a way that implicates
+the join -- it's already indistinguishable from `up`. **This rules out the join/tail as the
+throttle**: MemTile(4,1)'s channel sharing and the conv_1/b1c3 cross-column skip broadcasts (the
+candidates flagged above) are NOT where the ~655-690 cyc/px pace comes from, since that pace exists
+identically without them.
+
+`b3c3` (760) is the outlier -- higher than BOTH `b1c3` (a shorter prefix) and `up` (the full net,
+a longer prefix), which is not mechanistically sensible for a monotonically-accumulating chain and
+reads as this file's usual wall-clock-fit noise (box shared throughout) rather than a real
+mid-chain spike; the same-process TRACE of b3c3 IN THE FULL NET (compute+gap=631.1, well below
+this truncated-build's 760) corroborates that 760 is a build/contention artifact of THIS specific
+truncated design, not a property of b3c3 itself.
+
+**Conclusion: the throttle is in the main chain, and it is already fully set within block 1 (the
+first 4 cores: conv_1, b1c1, b1c2, b1c3)** -- not the join, not MemTile(4,1), not the tail. Given
+b1c3's own compute is only 406.2-406.5 cyc/px (well under the ~660-680 pace) and PROD_DEPTH/
+cat_cons_depth/MAIN_DEPTH/b1c1-b1c2-depth are all refuted as levers on it, the mechanism WITHIN
+those first 4 cores is still open -- narrowing further (e.g. upto=conv_1, upto=b1c1, upto=b1c2 to
+find exactly which hop within block 1 first reaches the pace) is the natural next bisection step,
+not run here per "stop at the answer."
+
+## Phase 1a follow-up 3 (coordinator): b1c1<->b1c2 alternation-sum, RE-CONFIRMED at SKIP_SLACK=8 --
+## depth 3->4 collapses the gap, but does not fit L1 at W=32 on the full net
+
+Coordinator's re-read of the earlier REFUTED section above: that test ran at SKIP_SLACK=2, where
+the ring throttle set the pace network-wide and masked whatever the b1c1<->b1c2 link (`DEPTH =
+{"b1c1": 3}` against b1c2's 3-row `windowed()` acquire, i.e. ZERO producer slack) was doing on its
+own. Predicted compute-sum (320+323=643) already matched the chain-bisection's `upto=b1c3` pace
+(663, prior section) suspiciously well. Re-tested at SKIP_SLACK=8 (`probe_span_b1c1b1c2_retest.py`,
+`probe_span_b1c1b1c2_retest2.py`), W=32 unless noted, same-session methods throughout.
+
+**Part 1 -- bisect upto in {conv_1, b1c1, b1c2, b1c3}, fitted rate:**
+
+| upto | cores | fitted cyc/px |
+|---|---|---|
+| conv_1 | 1 | -10 (fit garbage -- too cheap, dominated by dispatch-overhead noise) |
+| b1c1 | 2 | 448 |
+| b1c2 | 3 | 647 |
+| b1c3 | 4 | 813 (this session's own re-measurement; noisier than the prior bisection's 663 for the
+same config -- see the standing box-contention caveat, not a regression) |
+
+**b1c1 alone (448) matches its own isolated compute; b1c2 jumps to 647 -- within 0.6% of the
+320+323=643 cyc/px alternation-sum prediction.** b1c3 is noisier (813) but the qualitative jump
+already lands at b1c2, exactly as predicted.
+
+**Part 2 -- same-process depth 3 vs 4 A/B, `upto=b1c3` (compile-only sweep found depth=4 fits L1
+here, unlike the full net):**
+
+| depth | fitted whole-net cyc/px |
+|---|---|
+| 3 (baseline) | 732 |
+| 4 | 437 |
+
+437 lands almost exactly on the gate-core isolated rate (~406-433). Same-process trace of b1c1 and
+b1c2 individually, W=32 H=128:
+
+| depth | stage | compute cyc/px | gap cyc/px | LOCK_STALL % | compute+gap |
+|---|---|---|---|---|---|
+| 3 | b1c1 | 319.94 | 320.95 | 49.72% | 640.9 |
+| 3 | b1c2 | 322.75 | 318.06 | 49.70% | 640.8 |
+| 4 | b1c1 | 319.52 | 85.74 | 20.89% | 405.3 |
+| 4 | b1c2 | 323.14 | 84.11 | 21.28% | 407.2 |
+
+**At depth=3 the two stages are near-perfectly symmetric: each one's own compute (~320-323) is
+almost exactly half its own compute+gap (~640.8-640.9), and gap ~= the OTHER stage's compute --
+the ping-pong signature the alternation-sum hypothesis predicts.** At depth=4, compute is
+unchanged (confirms kernel work never moved) but gap collapses 74-76% (320.95->85.74,
+318.06->84.11) and LOCK_STALL drops from ~49.7% to ~21% -- both stages land at the isolated gate
+rate. **This is the strongest confirmation in this file**: same shape (compute pinned, gap
+collapses) as the SKIP_SLACK fix, on a completely different link.
+
+Tracing depth=4 on this short chain required a second lever: adding the trace bracket to b1c1
+tipped the SAME tile over an L1 wall that non-traced depth=4 alone did not (see below) --
+`net_design.build()` gained `data_sizes=` (aiecc's own suggested fix: `Worker(data_size=...)`,
+default None -> no override, byte-identical when omitted) to reserve the LUT's static data
+explicitly; `data_sizes={"b1c1": 4160}` fixed it for this short chain.
+
+**Part 3 -- depth 3 vs 4 on the FULL NET (`upto=up`), W=16 (depth=4 does not fit L1 at W=32 on the
+full net -- see below), fitted rate:**
+
+| depth | fitted cyc/px (W=16) |
+|---|---|
+| 3 (baseline) | 781 |
+| 4 | 631 |
+
+19% lower, same direction as the short chain and the earlier corroborated levers in this file, but
+a smaller relative win than the W=32 short-chain result (40%) -- consistent with this file's other
+W=16 fallback sweeps (MAIN_DEPTH, b1c1-depth-at-slack=2) showing smaller/noisier wall-clock swings
+than their W=32/trace counterparts.
+
+**Does depth=4 fit L1 at W=32 on the full net? No, and there are TWO independent walls on the SAME
+tile (0,3) = b1c1, not one:**
+
+1. **b1c1's own static/constant data (its silu16 LUT table).** Without `data_sizes=`, aiecc's
+   automatic buffer placement leaves too little room for the LUT after growing b1c1's own output
+   buffer by one depth-4 slot: `ld.lld: error: section '.data' will not fit in region 'data':
+   overflowed by 2624 bytes` / `aiecc: core main_core_0_3 needs space for 4160 bytes of static
+   data ... but it may fit if you reserve it explicitly` -- exactly the fix `data_sizes=` now
+   applies. **Confirmed fixable**, and fixed, for the short chain.
+2. **Applying that fix on the full net does NOT close the gap -- it exposes a SECOND, independent
+   wall on the exact same tile.** With `data_sizes={"b1c1": 4160}` set, compilation proceeds
+   further (bank-aware allocation now fails only on `b6c2_out_buff_3`/`b3c2_out_buff_3`, which
+   basic-sequential allocation recovers from as warnings, not fatal) and then hits a HARD error
+   back on tile (0,3): `'aie.tile' op basic-sequential allocation failed. Core (0, 3) reserves
+   4160 bytes for its static data ..., which has to fit alongside this tile's buffers` -- the
+   specific buffer that fails to place is `conv_1_skip_1_cons_buff_2` (2304 B), the conv_1->b1c1
+   MAIN-PATH INPUT fifo's own buffer (main_depth=4, 4 x 2304 B = 9216 B total), which is exactly
+   the SAME broadcast objectfifo the PROD_DEPTH investigation named (conv_1's output has two
+   consumers: the join, and this main-path hop into b1c1).
+
+**What is on tile (0,3) and what would have to shrink** (from the compiled buffer sizes in
+`net_layout.py`/`net_design.py`, W=32): LUT/static data 4160 B (fixed, kernel constant table) +
+STACK["silu16"] 3584 B + conv_1->b1c1 input fifo 4 x 2304 B = 9216 B (main_depth=4, network-wide) +
+b1c1's OWN output fifo D x 6912 B (silu16 out_bytes=6912 B; D=3 -> 20736 B, D=4 -> 27648 B, i.e.
+raising D by 1 costs exactly +6912 B) + b1c1's weight sub-blob (model-fixed, `plen["b1c1"]`). D=3
+already compiles with `net_design.py`'s existing `DEPTH={"b1c1": 3}` override -- the module's own
+comment says this block "ha[s] no headroom at all" -- so the tile is already fully committed at
+D=3, and D=4's marginal +6912 B is what overflows it. Candidates to shrink, none free: (a) the
+LUT table itself (4160 B, narrower/fewer entries -- touches SiLU16 approximation quality, out of
+scope here); (b) `STACK["silu16"]` (3584 B, only shrinkable if aiecc's own measured-stack-size
+check confirms slack -- guessing is exactly what this codebase's hanging-numbers doctrine warns
+against); (c) the conv_1->b1c1 input fifo's depth, specifically for this one hop rather than
+`MAIN_DEPTH` network-wide (no per-hop input-depth override exists yet in `net_design.py`; would
+need a new parameter, untested here). None attempted -- flagged for a follow-up, not closed.
+
+**Decision: do NOT flip the default.** Confirmed at W=32 on the short chain (trace) and W=16 on
+the full net (fitted rate); NOT confirmed to fit L1 at W=32 on the full net, which is this file's
+explicit gate for adopting a new default. `verify_span_net.py` was not re-run since
+`net_layout.DEPTH`/`net_design.MAIN_DEPTH` etc. are unchanged -- only the new opt-in `data_sizes=`
+diagnostic parameter (default None, byte-identical when omitted) was added to `net_design.py`.
+
+## Phase 1a follow-up 4 (coordinator): made DEPTH["b1c1"]=4 fit L1 at W=32 -- DEFAULT FLIPPED
+
+Merged `main` (bee0720, "inline the gate epilogue") into this branch first, so all timings below
+are current. That merge alone lowered the whole net's baseline pace network-wide (this session's
+own baseline trace: b1c1/b1c2/b3c3 all ~575-587 cyc/px, down from ~610-690 in pre-merge sessions --
+also visible in b1c1's own compute dropping from ~320 to ~266 cyc/px, unrelated to any lever in
+this file). Net conflict in `net_design.py` (main added `split_gate`/output-channel splitting,
+`aie_kernels/_test/BALANCE.md` epic) resolved by keeping both feature sets side by side; compile-
+and device-verified after the merge before continuing.
+
+Tried the coordinator's candidates in cost order, each measured against the compiled buffer map
+(the exact byte accounting the prior section only estimated):
+
+1. **Measured stack (tried, informative, NOT used in the final fix).** Deliberately under-sizing
+   `stacks={"silu16": 1}` and reading aiecc's own error gives b1c1's MEASURED stack requirement:
+   **1472 B** (vs. the reserved 3584 B -- 2112 B of apparent headroom). But the tile's true deficit
+   at depth=4 (with the LUT fix below applied) is *also* 2112 B, so closing it via stack ALONE
+   would need the bare measured value with ZERO margin (1472, no headroom for e.g. a future shim
+   change) -- confirmed by compiling at `stacks={"silu16": 1600}` (measured + 128 B margin): still
+   FAILS, over by exactly 128 B. Not used because lever 3 (below) closes the gap with margin to
+   spare, without touching stack at all.
+2. **Asymmetric producer/consumer depths through DMA -- not tried.** Lever 1 already gave a full
+   byte-exact accounting (`net_design.py`'s error output prints tile (0,3)'s complete MemoryMap;
+   see below) showing the b1c1<->b1c2 buffer lives ENTIRELY on b1c1's own tile (0,3), not split
+   across b1c1/b1c2 -- an adjacent-core objectFifo link is placed as one buffer array on one tile,
+   not two. b1c2's tile budget is untouched by this whole depth bump, so there is no producer/
+   consumer split to make; the shared-pool bug this lever was meant to route around does not apply
+   here (it is a JOIN pool issue, not an adjacent two-core link).
+3. **conv_1->b1c1 input depth 3 (USED).** New `net_design.build(skip_cons_depths=...)` param
+   (per-skip-source override of the hardcoded `main_depth` on that source's main-path consumer;
+   default `{}`, merged over a new `SKIP_CONS_DEPTHS` module constant, same pattern as `DEPTH`).
+   `skip_cons_depths={"conv_1": 3}` drops ONE `conv_1_skip_1_cons_buff` slot (2304 B) on tile (0,3).
+   Combined with `data_sizes={"b1c1": 4160}` (the LUT-starvation fix from the prior section) and
+   `depths={"b1c1": 4}`, **compiles at W=32 on the full net, with default `STACK["silu16"]`
+   unchanged.**
+
+**Exact byte accounting for tile (0,3), from the compiled buffer map** (forcing a deliberate small
+overflow to print it, `aie_kernels/_test/probe_span_b1c1_w32_fit.py`'s sibling checks):
+
+| item | bytes | note |
+|---|---|---|
+| stack | 3584 | STACK["silu16"], unchanged |
+| p_b1c1_cons_buff_0 | 23040 | weight sub-blob, model-fixed |
+| b1c1_out_buff_0..3 | 4 x 6912 = 27648 | DEPTH["b1c1"]=4 (was 3 x 6912 = 20736) |
+| core data sections | 4160 | LUT table, data_sizes fix |
+| conv_1_skip_1_cons_buff_0..2 | 3 x 2304 = 6912 | skip_cons_depths={"conv_1": 3} (was 4 x 2304 = 9216) |
+| **total** | **65344** | **192 B free of 65536 (64 KB)** |
+
+Without the skip_cons_depths fix (4 x 2304 = 9216), total = 67648, over by 2112 B -- matching lever
+1's stack-alone deficit exactly. With it, the deficit closes with 192 B to spare, no LUT/weight/
+stack change needed.
+
+**Full-net (upto=up) W=32 A/B, alternated per height, 4 heights, medians**
+(`aie_kernels/_test/probe_span_b1c1_w32_fit.py`). Power mode: `default` (UNPINNED).
+
+| config | fitted cyc/px (W=32) |
+|---|---|
+| baseline (depth=3) | 553 |
+| new (depth=4 + data_sizes + skip_cons_depths) | 561 |
+
+**The wall-clock fit shows no clear win (553 vs 561, within this file's usual noise band) -- do
+not read this as a null result; the same-process trace below contradicts it and is the
+instrument this file has trusted throughout.**
+
+**Same-process trace, W=32 H=128, at the new config, then re-traced at baseline for a clean
+same-instrument comparison** (`probe_span_b1c1_w32_fit.py` + `probe_span_b1c1_w32_fit_baseline.py`):
+
+| config | stage | compute cyc/px | gap cyc/px | LOCK_STALL % | compute+gap |
+|---|---|---|---|---|---|
+| baseline | b1c1 | 265.6 | 321.07 | 54.35% | 586.7 |
+| baseline | b1c2 | 322.75 | 264.29 | 45.12% | 587.0 |
+| baseline | b3c3 | 315.08 | 259.4 | 49.17% | 574.5 |
+| new | b1c1 | 266.35 | 216.47 | 44.51% | 482.8 |
+| new | b1c2 | 324.01 | 159.78 | 33.25% | 483.8 |
+| new | b3c3 | 316.26 | 167.49 | 38.98% | 483.8 |
+
+**Compute is unchanged between baseline and new (confirms the fix touches only synchronization,
+not kernel work) and the new config's three stages land within 1 cyc/px of each other (482.8-
+483.8) -- the tightest common-pace convergence in this whole file.** b3c3 (the previously-
+identified heaviest core) drops 574.5 -> 483.8 (15.8%), LOCK_STALL 49.17% -> 38.98%; b1c1 drops
+586.7 -> 482.8 (17.7%), LOCK_STALL 54.35% -> 44.51%. **This is a real, device-confirmed win on the
+full production-width net, decisively shown by the trusted instrument even though the noisier
+wall-clock A/B missed it** -- consistent with this file's standing caveat that same-dispatch trace
+splits are trustworthy where cross-dispatch wall-clock timing is not.
+
+**Gate: `verify_span_net.py` at the new default (no explicit overrides) -- 22/22 cores exact.**
+
+**DEFAULT FLIPPED.** `net_design.py`: `DEPTH["b1c1"]` 3 -> 4; new module constants
+`DATA_SIZES = {"b1c1": 4160}` and `SKIP_CONS_DEPTHS = {"conv_1": 3}`, both merged unconditionally
+(same pattern as `DEPTH`) so a caller with no overrides gets the fixed design. `data_sizes=`/
+`skip_cons_depths=` build() params still override per-call if needed.
+
 ## Caveat
 
 Device is shared with other concurrent lanes (gemma4 prefill gates, this session's own
