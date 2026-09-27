@@ -13,10 +13,11 @@
 //!
 //! Resize is the one stage `gemma4_towers_host_ref.py` never reproduced (its oracle picks an image
 //! size where `get_aspect_ratio_preserving_size` is a no-op specifically to keep the torchvision
-//! resize kernel out of the traced path). This module DOES resize -- a separable bicubic
-//! (a=-0.5, PIL/torchvision's antialias convention) in f32 -- because a served image is not
-//! guaranteed to already fit the patch budget. Its parity against `tvF.resize(..., antialias=True)`
-//! is measured, not assumed; see `tests/gemma4_media_gate.rs`.
+//! resize kernel out of the traced path). This module DOES resize, because a served image is not
+//! guaranteed to already fit the patch budget -- a bit-exact port of ATen's uint8 antialiased
+//! bicubic kernel (fixed-point weights, not a float convolution: see
+//! [`resize_bicubic_antialias_u8`]'s doc for why a float port measured 6.79e-3 rel-L2 off). Parity
+//! against `tvF.resize(..., antialias=True)` is measured, not assumed; see `tests/gemma4_media_gate.rs`.
 
 use std::path::Path;
 
@@ -156,17 +157,19 @@ impl Gemma4Towers {
         let (target_h, target_w) = aspect_ratio_preserving_size(
             h0, w0, PATCH_SIZE, max_patches, POOLING_KERNEL_SIZE)?;
 
-        // CHW f32 in [0,255], resized if needed (a no-op resize is skipped, matching the HF
-        // processor exactly rather than resizing-to-self and picking up float noise for nothing).
-        let chw: Vec<Vec<Vec<f32>>> = if (target_h, target_w) == (h0, w0) {
-            to_chw_f32(&img)
+        // Resize in u8 (a no-op resize is skipped, matching the HF processor exactly): the
+        // processor's own tensor is uint8 end to end, and torchvision's `resize(..., antialias=True)`
+        // on a uint8 input runs the fixed-point ATen kernel below, not a float convolution --
+        // see [`resize_bicubic_antialias_u8`]'s doc.
+        let resized: Vec<Vec<Vec<u8>>> = if (target_h, target_w) == (h0, w0) {
+            to_chw_u8(&img)
         } else {
-            resize_bicubic_antialias(&to_chw_f32(&img), h0, w0, target_h, target_w)
+            resize_bicubic_antialias_u8(&to_chw_u8(&img), h0, w0, target_h, target_w)
         };
 
         // rescale: 1/255, no normalize (image_mean=0, image_std=1 in processor_config.json).
-        let rescaled: Vec<Vec<Vec<f32>>> = chw.iter()
-            .map(|plane| plane.iter().map(|row| row.iter().map(|&v| v / 255.0).collect()).collect())
+        let rescaled: Vec<Vec<Vec<f32>>> = resized.iter()
+            .map(|plane| plane.iter().map(|row| row.iter().map(|&v| v as f32 / 255.0).collect()).collect())
             .collect();
 
         let patch_h = target_h / PATCH_SIZE;
@@ -310,18 +313,22 @@ fn linear(x: &[f32], weight: &[f32], bias: Option<&[f32]>, out: usize, inp: usiz
 }
 
 /// Test-only entry point into the resize stage alone, for `tests/gemma4_media_gate.rs` to measure
-/// its rel-L2 against the oracle independent of patchify/tower error.
+/// its rel-L2 against the oracle independent of patchify/tower error. `chw` is the uint8-domain
+/// tensor upcast to f32 (as the oracle's `.npy` dump stores it) -- rounded back to u8 here.
 #[doc(hidden)]
 pub fn resize_for_gate(chw: &[Vec<Vec<f32>>], in_h: usize, in_w: usize, out_h: usize, out_w: usize)
     -> Vec<Vec<Vec<f32>>> {
-    resize_bicubic_antialias(chw, in_h, in_w, out_h, out_w)
+    let u8_chw: Vec<Vec<Vec<u8>>> = chw.iter()
+        .map(|p| p.iter().map(|r| r.iter().map(|&v| v.round() as u8).collect()).collect()).collect();
+    resize_bicubic_antialias_u8(&u8_chw, in_h, in_w, out_h, out_w).iter()
+        .map(|p| p.iter().map(|r| r.iter().map(|&v| v as f32).collect()).collect()).collect()
 }
 
 // ---------------------------------------------------------------- image preprocessing ----
 
-fn to_chw_f32(img: &image::RgbImage) -> Vec<Vec<Vec<f32>>> {
+fn to_chw_u8(img: &image::RgbImage) -> Vec<Vec<Vec<u8>>> {
     let (w, h) = (img.width() as usize, img.height() as usize);
-    (0..3).map(|c| (0..h).map(|y| (0..w).map(|x| img.get_pixel(x as u32, y as u32).0[c] as f32)
+    (0..3).map(|c| (0..h).map(|y| (0..w).map(|x| img.get_pixel(x as u32, y as u32).0[c])
         .collect()).collect()).collect()
 }
 
@@ -415,29 +422,32 @@ fn pad_along_first_dim(patches: &[Vec<f32>], positions: &[(i64, i64)], target_le
     (p, pos)
 }
 
-/// Separable bicubic resize with antialiasing, matching PIL/torchvision's convention: cubic
-/// convolution kernel `a=-0.5`, half-pixel-center sampling (`(i+0.5)*scale - 0.5`), and -- on
-/// DOWNscale only -- the filter support widened by `1/scale` with weights renormalized, which is
-/// what "antialias=True" means for a separable resize. Operates in f32 on already-CHW-laid-out
-/// pixel values (0..255 domain); output is NOT re-clamped to u8 here, matching the HF pipeline
-/// which resizes before rescale, not after.
-fn resize_bicubic_antialias(
-    chw: &[Vec<Vec<f32>>], in_h: usize, in_w: usize, out_h: usize, out_w: usize,
-) -> Vec<Vec<Vec<f32>>> {
-    let wy = resize_weights(in_h, out_h);
-    let wx = resize_weights(in_w, out_w);
+/// Separable bicubic resize with antialiasing, bit-exact port of `upsample_avx_bilinear_bicubic_uint8`
+/// (`aten/src/ATen/native/cpu/UpSampleKernel.cpp`) -- the kernel torchvision's
+/// `resize(..., antialias=True)` actually runs on a uint8 tensor, which is what the HF processor's
+/// `process_image` produces. It is NOT the plain float separable-cubic convolution: weights are
+/// quantized to int16 at a precision chosen so the largest weight stays under 2^15, each pass
+/// accumulates in fixed-point and rounds+clamps to u8 BEFORE the next pass runs (horizontal, then
+/// vertical) -- confirmed bit-exact against the oracle (rel-L2 0.0), where a plain f32 port
+/// measured 6.79e-3 off. See [`quantized_resize_taps`], [`convolve_u8`].
+fn resize_bicubic_antialias_u8(
+    chw: &[Vec<Vec<u8>>], in_h: usize, in_w: usize, out_h: usize, out_w: usize,
+) -> Vec<Vec<Vec<u8>>> {
+    let horiz = (in_w != out_w).then(|| quantized_resize_taps(in_w, out_w));
+    let vert = (in_h != out_h).then(|| quantized_resize_taps(in_h, out_h));
     chw.iter().map(|plane| {
-        // horizontal pass first (matches torchvision's default separable order for a
-        // both-dims-change resize closely enough for float parity purposes; either order
-        // converges to the same result up to O(eps) since the two passes commute for a linear
-        // separable filter).
-        let mid: Vec<Vec<f32>> = plane.iter().map(|row| {
-            wx.iter().map(|taps| taps.iter().map(|&(idx, w)| row[idx] * w as f32).sum()).collect()
-        }).collect();
-        (0..out_h).map(|oy| {
-            let taps = &wy[oy];
-            (0..out_w).map(|ox| taps.iter().map(|&(iy, w)| mid[iy][ox] * w as f32).sum()).collect()
-        }).collect()
+        let mid: Vec<Vec<u8>> = match &horiz {
+            Some((precision, taps)) => plane.iter()
+                .map(|row| taps.iter().map(|t| convolve_u8(t, |i| row[i], *precision)).collect())
+                .collect(),
+            None => plane.clone(),
+        };
+        match &vert {
+            Some((precision, taps)) => taps.iter()
+                .map(|t| (0..out_w).map(|ox| convolve_u8(t, |iy| mid[iy][ox], *precision)).collect())
+                .collect(),
+            None => mid,
+        }
     }).collect()
 }
 
@@ -448,39 +458,59 @@ fn cubic_weight(x: f64, a: f64) -> f64 {
     else { 0.0 }
 }
 
-/// Per-output-index tap list `(input_index, weight)`, weights summing to 1 after edge clamping.
-fn resize_weights(in_size: usize, out_size: usize) -> Vec<Vec<(usize, f64)>> {
-    if in_size == out_size {
-        return (0..out_size).map(|i| vec![(i, 1.0)]).collect();
+/// One dimension's per-output-index `(input_index, int16_weight)` tap lists plus the shared
+/// fixed-point `precision` (bits), ported field-for-field from
+/// `HelperInterpBase::_compute_index_ranges_int16_weights` / `HelperInterpCubic::aa_filter`
+/// (`a=-0.5`, matching PIL). `scale` here is ATen's convention (input/output, NOT output/input).
+fn quantized_resize_taps(in_size: usize, out_size: usize) -> (u32, Vec<Vec<(usize, i32)>>) {
+    let scale = in_size as f64 / out_size as f64;
+    let (support, invscale) = if scale >= 1.0 { (2.0 * scale, 1.0 / scale) } else { (2.0, 1.0) };
+    let max_interp = support.ceil() as i64 * 2 + 1;
+
+    let mut raw: Vec<Vec<(usize, f64)>> = Vec::with_capacity(out_size);
+    let mut wt_max = 0.0f64;
+    for o in 0..out_size {
+        let center = scale * (o as f64 + 0.5);
+        let xmin = ((center - support + 0.5).floor() as i64).max(0);
+        let xmax_excl = ((center + support + 0.5).floor() as i64).min(in_size as i64);
+        let xsize = (xmax_excl - xmin).clamp(0, max_interp) as usize;
+        let mut taps: Vec<(usize, f64)> = Vec::with_capacity(xsize);
+        let mut total = 0.0;
+        for j in 0..xsize {
+            let idx = xmin as usize + j;
+            let w = cubic_weight((idx as f64 - center + 0.5) * invscale, -0.5);
+            taps.push((idx, w));
+            total += w;
+        }
+        if total != 0.0 {
+            for t in &mut taps { t.1 /= total; }
+        }
+        wt_max = taps.iter().fold(wt_max, |m, &(_, w)| m.max(w));
+        raw.push(taps);
     }
-    let scale = out_size as f64 / in_size as f64;
-    let a = -0.5;
-    let (support, filter_scale) = if scale < 1.0 { (2.0 / scale, scale) } else { (2.0, 1.0) };
-    (0..out_size).map(|o| {
-        let center = (o as f64 + 0.5) / scale - 0.5;
-        let lo = (center - support).floor() as i64;
-        let hi = (center + support).ceil() as i64;
-        let mut taps: Vec<(usize, f64)> = Vec::new();
-        let mut wsum = 0.0;
-        for i in lo..=hi {
-            let w = cubic_weight((i as f64 - center) * filter_scale, a) * filter_scale;
-            if w == 0.0 { continue; }
-            let clamped = i.clamp(0, in_size as i64 - 1) as usize;
-            wsum += w;
-            taps.push((clamped, w));
-        }
-        if wsum != 0.0 {
-            for t in &mut taps { t.1 /= wsum; }
-        }
-        // Merge duplicate (clamped-edge) indices so a caller summing `taps` gets each input index
-        // once -- `resize_bicubic_antialias`'s inner loop assumes that.
-        let mut merged: Vec<(usize, f64)> = Vec::new();
-        for (idx, w) in taps {
-            if let Some(e) = merged.iter_mut().find(|(i, _)| *i == idx) { e.1 += w; }
-            else { merged.push((idx, w)); }
-        }
-        merged
-    }).collect()
+
+    // Largest bit count such that round(wt_max * 2^(precision+1)) still fits an int16.
+    let mut precision = 0u32;
+    while precision < 22 {
+        let next = (0.5 + wt_max * (1i64 << (precision + 1)) as f64) as i64;
+        if next >= 1 << 15 { break; }
+        precision += 1;
+    }
+
+    let quant = raw.iter().map(|taps| taps.iter().map(|&(idx, w)| {
+        let v = w * (1i64 << precision) as f64;
+        (idx, if v < 0.0 { (v - 0.5) as i32 } else { (v + 0.5) as i32 })
+    }).collect()).collect();
+    (precision, quant)
+}
+
+/// The uint8 fixed-point tap sum: `NOTE [ Weights computation for uint8_t and multiplication
+/// trick ]` in `UpSampleKernel.cpp` -- round via a `1 << (precision-1)` bias then arithmetic
+/// shift, clamped to `[0, 255]`.
+fn convolve_u8(taps: &[(usize, i32)], src: impl Fn(usize) -> u8, precision: u32) -> u8 {
+    let mut acc: i64 = if precision == 0 { 0 } else { 1i64 << (precision - 1) };
+    for &(idx, w) in taps { acc += src(idx) as i64 * w as i64; }
+    (acc >> precision).clamp(0, 255) as u8
 }
 
 // ---------------------------------------------------------------- audio: WAV decode ----
@@ -556,23 +586,25 @@ mod tests {
     }
 
     #[test]
-    fn resize_weights_is_identity_when_sizes_match() {
-        let w = resize_weights(10, 10);
-        for (i, taps) in w.iter().enumerate() {
-            assert_eq!(taps, &vec![(i, 1.0)]);
+    fn quantized_resize_taps_int16_weights_sum_to_the_precision_unit() {
+        // Quantized taps sum to ~2^precision (the float taps sum to 1 before quantization; each
+        // is independently rounded, so the reconstructed sum is within a few ULPs of the unit).
+        for (in_size, out_size) in [(37, 16), (16, 37)] {
+            let (precision, taps) = quantized_resize_taps(in_size, out_size);
+            let unit = 1i64 << precision;
+            for t in &taps {
+                let s: i64 = t.iter().map(|(_, w)| *w as i64).sum();
+                assert!((s - unit).abs() <= 4, "sum={s} unit={unit}");
+            }
         }
     }
 
     #[test]
-    fn resize_weights_taps_sum_to_one() {
-        for taps in resize_weights(37, 16) {
-            let s: f64 = taps.iter().map(|(_, w)| w).sum();
-            assert!((s - 1.0).abs() < 1e-9, "{s}");
-        }
-        for taps in resize_weights(16, 37) {
-            let s: f64 = taps.iter().map(|(_, w)| w).sum();
-            assert!((s - 1.0).abs() < 1e-9, "{s}");
-        }
+    fn resize_bicubic_antialias_u8_is_a_noop_when_sizes_match() {
+        let plane = vec![vec![10u8, 20, 30], vec![40, 50, 60]];
+        let chw = vec![plane.clone()];
+        let out = resize_bicubic_antialias_u8(&chw, 2, 3, 2, 3);
+        assert_eq!(out[0], plane);
     }
 
     #[test]

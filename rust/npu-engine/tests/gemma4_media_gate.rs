@@ -16,6 +16,9 @@ const GATE: f64 = 1e-4;
 
 fn checkpoint_dir() -> PathBuf { PathBuf::from("/mnt/data/xdna/artifacts/gemma4-12b-qat/checkpoint") }
 fn oracle_dir() -> PathBuf { PathBuf::from("/mnt/data/xdna/artifacts/gemma4-12b-qat/resize_oracle") }
+fn upscale_oracle_dir() -> PathBuf {
+    PathBuf::from("/mnt/data/xdna/artifacts/gemma4-12b-qat/resize_oracle_upscale")
+}
 
 fn skip_if_missing(p: &Path) -> bool {
     if !p.exists() {
@@ -43,13 +46,12 @@ fn load_npy_shape(path: &Path) -> Vec<usize> {
 }
 
 /// Isolates the resize stage alone: decode the oracle's pre-resize tensor, resize with our Rust
-/// bicubic-antialias port, compare directly to torchvision's `tvF.resize(..., antialias=True)`
-/// output. This is the stage `gemma4_towers_host_ref.py` never attempted (see its docstring) --
-/// reported honestly here rather than assumed.
-#[test]
-fn resize_stage_rel_l2_against_torchvision_bicubic_antialias() {
-    let dir = oracle_dir();
-    if skip_if_missing(&dir) { return; }
+/// uint8 fixed-point port, compare directly to torchvision's `tvF.resize(..., antialias=True)`
+/// output. Runs against both a downscale fixture (1200x1600 -> 672x912) and an upscale one
+/// (100x140 -> 672x912, HF's budget upsamples small images too) since the antialias filter support
+/// differs between the two regimes.
+fn resize_stage_case(dir: &Path) {
+    if skip_if_missing(dir) { return; }
     let meta: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(dir.join("meta.json")).unwrap()).unwrap();
     let (in_h, in_w) = (meta["image_hw_in"][0].as_u64().unwrap() as usize,
@@ -68,13 +70,18 @@ fn resize_stage_rel_l2_against_torchvision_bicubic_antialias() {
     let oracle = load_npy_f32(&dir.join("prep_image_resized.npy"));
     assert_eq!(mine.len(), oracle.len());
     let err = rel_l2(&mine, &oracle);
-    eprintln!("resize stage rel-L2 = {err:.3e} (gate {GATE:.0e})");
-    // Reported, not silently loosened: this is the honest number for the one stage never
-    // reproduced before. See the report for whatever this prints.
-    if err > GATE {
-        eprintln!("ABOVE GATE -- resize does not match torchvision's antialiased bicubic bit-for-bit \
-                    (expected: this is a from-scratch separable-cubic port, not the vendored kernel)");
-    }
+    eprintln!("resize stage ({}) rel-L2 = {err:.3e} (gate {GATE:.0e})", dir.display());
+    assert!(err <= GATE, "resize stage rel-L2 {err:.3e} exceeds gate {GATE:.0e} ({})", dir.display());
+}
+
+#[test]
+fn resize_stage_rel_l2_against_torchvision_bicubic_antialias_downscale() {
+    resize_stage_case(&oracle_dir());
+}
+
+#[test]
+fn resize_stage_rel_l2_against_torchvision_bicubic_antialias_upscale() {
+    resize_stage_case(&upscale_oracle_dir());
 }
 
 /// Full vision pipeline (PNG decode -> resize -> rescale -> patchify -> merge -> pad -> tower ->
