@@ -167,8 +167,12 @@ conv3x3_core(const PA *__restrict line0, const PA *__restrict line1,
     aie::vector<int16, LANES> v = acc.template to_vector<int16>(pre_shift);
     return aie::mul(v, m);
   };
-  // one tile of PX pixels x 8 channels: requant, epilogue, column mask, store
-  auto put = [&](PO *dst, MMUL &acc, const aie::vector<int16, LANES> &m, int xs) {
+  // one tile of PX pixels x 8 channels: requant, epilogue, column mask, store.
+  // GATE's body is large enough that Peano was outlining it as a real call (4x
+  // per output tile, each paying a full register-spill prologue/epilogue) --
+  // force it back inline, same as NONE/LUT already get.
+  auto put = [&](PO *dst, MMUL &acc, const aie::vector<int16, LANES> &m, int xs)
+      __attribute__((always_inline)) {
     if constexpr (EPI == NONE) {
       aie::store_v(dst, mask_block(rq(acc, m).template to_vector<TO>(shift), xs,
                                    valid_lo, valid_hi));
