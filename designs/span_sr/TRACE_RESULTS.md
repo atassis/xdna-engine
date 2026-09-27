@@ -664,6 +664,191 @@ splits are trustworthy where cross-dispatch wall-clock timing is not.
 (same pattern as `DEPTH`) so a caller with no overrides gets the fixed design. `data_sizes=`/
 `skip_cons_depths=` build() params still override per-call if needed.
 
+## Phase 1c: fresh 22-stage trace at main's new defaults -- still no pace-setter, zero-slack
+## census closed, split-gate trace lever landed at ~1.5%
+
+Continuation on `main` d898bfe (the block-1 `DEPTH["b1c1"]=4` flip and the gate-epilogue inline
+both already landed). `probe_span_all_stages_phase1c.py` re-traces all 22 stages fresh, one per
+dispatch (`ALREADY_TRACED = set()`, was 8/22 before). Power mode: `default` (UNPINNED), standing
+caveat.
+
+| stage | kind | compute cyc/px | gap cyc/px | LOCK_STALL % | compute+gap |
+|---|---|---|---|---|---|
+| conv_1 | conv1 | 40.42 | 436.45 | 91.0% | 476.9 |
+| b1c1 | silu16 | 266.35 | 216.5 | 44.53% | 482.9 |
+| b1c2 | silu_i16 | 324.01 | 159.77 | 33.2% | 483.8 |
+| b1c3 | gate | 315.29 | 168.83 | 35.75% | 484.1 |
+| b2c1 | silu_x | 250.82 | 232.55 | 49.09% | 483.4 |
+| b2c2 | silu | 251.09 | 232.41 | 49.56% | 483.5 |
+| b2c3 | gate | 315.61 | 168.3 | 37.37% | 483.9 |
+| b3c1 | silu_x | 250.72 | 232.44 | 50.59% | 483.2 |
+| b3c2 | silu | 251.24 | 232.04 | 50.86% | 483.3 |
+| b3c3 | gate | 316.28 | 167.47 | 38.97% | 483.8 |
+| b4c1 | silu_x | 250.93 | 232.05 | 51.83% | 483.0 |
+| b4c2 | silu | 250.66 | 231.77 | 52.33% | 482.4 |
+| b4c3 | gate | 315.78 | 167.79 | 40.63% | 483.6 |
+| b5c1 | silu_x | 251.47 | 231.34 | 52.98% | 482.8 |
+| b5c2 | silu | 251.01 | 231.88 | 53.46% | 482.9 |
+| b5c3 | gate | 315.4 | 168.0 | 42.31% | 483.3 |
+| b6c1 | silu_x | 250.39 | 232.15 | 54.44% | 482.5 |
+| b6c2 | silu | 251.23 | 231.5 | 54.56% | 482.7 |
+| b6c3 | gate | 316.17 | 167.02 | 43.51% | 483.2 |
+| conv_2 | plain | 83.5 | 397.65 | 84.87% | 481.1 |
+| conv_cat | cat | 58.23 | 423.05 | 89.4% | 481.3 |
+| up | up | 26.68 | 452.02 | 94.93% | 478.7 |
+
+**Per-kind compute (fixed regardless of chain position, confirming the kind-not-position finding
+still holds after the epilogue inline -- these numbers are unchanged from the last section's
+"new" config, i.e. main's current computes ARE already the post-inline ones):** conv1=40.4,
+silu16=266.4, silu_i16=324.0, gate=315-316, silu_x=250.4-251.5, silu=250.7-251.2, plain=83.5,
+cat=58.2, up=26.7.
+
+**Still no pace-setter.** Every stage converges to compute+gap 477-484, LOCK_STALL ranging
+33.2% (b1c2, the highest-compute stage) to 94.93% (up, the cheapest) -- the same inverse
+compute-vs-stall ordering as before the block-1 fix, just at a ~480 floor instead of ~610-690.
+
+**Zero-slack census, from the compiled buffer map (not guessed), network-wide:** every ordinary
+main-path hop's consumer window is 3 rows (`windowed()`'s steady-state `fi.acquire(3)`) against a
+depth-4 fifo (`MAIN_DEPTH`), 1 row of slack; `conv_cat` acquires 1 row (`rowwise()`) against
+`cat_cons_depth=2`, 1 row of slack. Exactly ONE link in the whole network has zero slack:
+**conv_1 -> b1c1**, where `SKIP_CONS_DEPTHS = {"conv_1": 3}` (the fix that made `DEPTH["b1c1"]=4`
+fit L1, landed in the prior section) drops that specific consumer depth to 3, matching the
+3-row window exactly. Checked against the trace for the block-1 alternation-sum signature that
+found the *previous* zero-slack link (b1c1<->b1c2, now fixed): conv_1's gap (436.45) does not
+match b1c1's compute (266.35), and b1c1's gap (216.5) does not match conv_1's compute (40.42) --
+**refuted as a coupled pair**. conv_1's own compute is small enough (40.4 cyc/px) that the zero
+slack here does not visibly throttle b1c1; b1c1 sits at the common ~483 pace like everything else.
+No other zero-slack link exists to check.
+
+**Chain-length bisection re-run at the new baseline** (`probe_span_upto_bisect.py`, unchanged
+script, W=32, same alternated-per-height fitted-slope method). Log:
+`/mnt/data/xdna/traces/span/phase1c_bisect.log`.
+
+| upto | cores | fitted cyc/px (W=32) |
+|---|---|---|
+| b1c3 | 4 | 572 |
+| b3c3 | 10 | 704 |
+| b6c3 | 19 | 353 |
+| conv_2 | 20 (no join) | 236 |
+| conv_cat | 21 (+join) | 582 |
+| up | 22 (full net) | 616 |
+
+Non-monotonic (b6c3/conv_2 below both a shorter prefix and the full net -- mechanistically
+impossible for an accumulating chain, the same box-contention pattern flagged throughout this
+file). `b1c3` (572) is within ~7% of `up` (616) -- **same conclusion as the pre-fix bisection: the
+pace is already essentially set within block 1's first 4 cores**, just ~530-680 instead of
+~660-680. No new lever found by this pass; the mechanism *within* block 1 (given b1c1's own
+compute, 266.4, is well under the ~480-620 pace, and the sole zero-slack link there is refuted
+above) remains open, as it was before this phase.
+
+**Split-gate opt-in lever (`net_design.build(split_gate={"b2c3"})`), same-process trace of the
+halves and neighbours** -- previously measured only by whole-net repeat/fit
+(`probe_span_split_gate.py`); tracing the halves needed two source fixes to `net_design.py`
+(both additive/default-off, applied and gated below):
+
+1. `_shim_gate_half()` had no `bracket=` parameter at all, so a split gate's half-kernels could
+   never carry the event0()/event1() trace bracket. Added `bracket=False` (default off, same
+   convention as `_shim()`).
+2. `design()`'s trace-worker lookup was `workers[names.index(n)]` -- broken for split gates,
+   since `names` never contains the half-suffixed names (`"b2c3_lo"`/`"b2c3_hi"`) and the split
+   branch appends 2 workers per one `names` entry, desyncing the index from `workers`. Replaced
+   with a `worker_by_name` dict built alongside `workers` (keyed by the half suffix for split
+   stages, by `n` otherwise); a strict superset -- identical lookup result whenever `split_gate`
+   is empty.
+
+**Found and worked around a real defect in `trace_span_net.summarize()`**: it aggregates every
+traced-core event in a JSON by event NAME only, not by (pid, stage) -- so tracing 2 stages in one
+dispatch (which the module's own docstring claims works, "at most 2 stages per run") silently
+merges two cores' timelines. Reproduced directly: an unsplit `b2c2`+`b2c3` 2-stage dispatch gave
+*identical* numbers for both stages, compute >100% of span, negative gap -- obviously wrong.
+Every number in this file and its predecessor was, on inspection, traced ONE stage per dispatch
+despite the docstring's claim; worked around here the same way (one stage per dispatch
+throughout). `summarize()` needs a pid filter before a 2-stage trace is trusted again -- flagged,
+not fixed, since fixing the instrument is out of scope for this phase.
+
+Device trace, W=32 H=128, one stage per dispatch:
+
+| build | stage | compute cyc/px | gap cyc/px | LOCK_STALL % | compute+gap |
+|---|---|---|---|---|---|
+| unsplit | b2c2 | 251.11 | 232.4 | 49.52% | 483.5 |
+| unsplit | b2c3 | 315.61 | 168.33 | 37.41% | 483.9 |
+| unsplit | b3c1 | 250.72 | 232.46 | 50.6% | 483.2 |
+| split | b2c3_lo | 210.7 | 265.46 | 57.44% | 476.2 |
+| split | b2c3_hi | 103.42 | 371.97 | 78.83% | 475.4 |
+| split | b2c2 | 250.79 | 226.38 | 49.07% | 477.2 |
+| split | b3c1 | 250.79 | 225.9 | 49.82% | 476.7 |
+
+`b2c3_lo` + `b2c3_hi` compute = 314.12, matching unsplit `b2c3`'s 315.61 (splitting a 48-channel
+gate into 32/16 preserves total compute, as expected). All four split-build stages converge at
+~476-477, ~1.4-1.7% below the unsplit ~483 pace -- a small, real win, consistent with (not
+contradicting) task 2/3's finding that `gate`'s own compute was never the pace-setter: splitting
+it relieves its own LOCK_STALL (37.41% -> 57.44%/78.83% split across the two halves, each now
+further from the pace) but barely moves the whole-chain floor, because the floor was never set
+by gate's compute in the first place.
+
+**Net for this phase:** the 22-stage census, zero-slack check, and re-bisection all corroborate
+each other and the pre-fix pass -- the throttle is structural, common to every core, and already
+fully present within block 1's first 4 cores, at a ~480-620 floor (down from ~610-690). No new
+buffer-depth lever closes it; `split_gate={"b2c3"}` buys ~1.5% (expected, since it was never
+implicated). The open item carried forward is unchanged: the mechanism *within* block 1's first
+4 cores, given every buffer-depth knob tried on it (MAIN_DEPTH, PROD_DEPTH, cat_cons_depth,
+b1c1<->b1c2, conv_1->b1c1) is now refuted or null.
+
+## Phase 1c follow-up (coordinator): DMA-crossing-hop hypothesis -- REFUTED
+
+Hypothesis: every main-path hop has depth 4 against a 3-row window (1 free slot). On a
+SHARED-MEMORY hop (adjacent tiles, same column) the freed slot costs no copy. On a DMA-crossing
+hop the freed slot must be refilled by an actual DMA transfer after the consumer releases a row,
+so that latency sits on the critical path every row: pace ~= max compute + T_dma.
+
+**Confirmed from the compiled MLIR (`span_net_physical.mlir`) which links actually cross tiles,
+not assumed:** block 1 (`conv_1` (0,2), `b1c1` (0,3), `b1c2` (0,4), `b1c3` (0,5)) sits on ONE
+column, and its objectFifo buffer for e.g. `b1c1<->b1c2` lives as ONE array on ONE tile (already
+noted in the earlier byte-accounting section) -- shared memory, no DMA. The four column-crossing
+main-path hops are `b1c3`(0,5)`->b2c1`(1,2), `b3c1`(1,5)`->b3c2`(2,2), `b4c2`(2,5)`->b4c3`(3,2),
+`b5c3`(3,5)`->b6c1`(4,2) -- and for the one checked directly, `b1c3->b2c1`, the MLIR allocates
+TWO separate buffer arrays: `b1c3_skip_buff_0/1` (2 buffers, PROD_DEPTH=2) on `b1c3`'s own tile
+(0,5), and a SEPARATE `b1c3_skip_1_cons_buff_0..3` (4 buffers, matching `main_depth`) on `b2c1`'s
+tile (1,2) -- confirming a real DMA copy backs this link, unlike the one-array-one-tile
+shared-memory case.
+
+`b1c3` is also a skip source (`CAT_SOURCES`), so its main-path consumer depth is keyed by
+`skip_cons_depths`, not `depths`; the other three column-crossing hops are plain stages, keyed
+by `depths`. Compile-only sweep, W=32: `depths={"b3c1": 5, "b4c2": 5, "b5c3": 5},
+skip_cons_depths={"b1c3": 5}` -- **fits L1** (all four raised simultaneously, no per-hop
+override needed beyond the existing `build()` parameters -- no new code required for this test).
+
+**Device: same-process A/B trace of `conv_1`, `b1c2`, `b3c3`, W=32 H=128**
+(`aie_kernels/_test/probe_span_dmahop_depth.py`). Power mode: `default` (UNPINNED), standing
+caveat.
+
+| config | stage | compute cyc/px | gap cyc/px | LOCK_STALL % | compute+gap |
+|---|---|---|---|---|---|
+| baseline | conv_1 | 40.42 | 436.32 | 90.99% | 476.7 |
+| baseline | b1c2 | 324.02 | 159.78 | 33.21% | 483.8 |
+| baseline | b3c3 | 316.27 | 167.48 | 38.92% | 483.8 |
+| dmahop+1 | conv_1 | 40.42 | 436.63 | 91.0% | 477.1 |
+| dmahop+1 | b1c2 | 324.04 | 159.74 | 33.24% | 483.8 |
+| dmahop+1 | b3c3 | 316.29 | 167.43 | 38.93% | 483.7 |
+
+**REFUTED -- bit-for-bit identical within trace noise (<0.1-0.4 cyc/px) at all three stages.**
+Giving every column-crossing hop one more consumer slot does not move the pace at all, even
+though the compile-only check confirmed it actually changed the buffer allocation (fits L1 only
+because it grew). So the ~480-620 floor is not a per-row DMA-refill latency on these four links
+either -- ruling out the specific mechanism this hypothesis named, on top of every buffer-depth
+lever already refuted in this file (SKIP_SLACK past 8, MAIN_DEPTH, PROD_DEPTH, cat_cons_depth,
+b1c1<->b1c2 at slack=8, conv_1->b1c1's zero-slack link). The DMA-vs-shared-memory distinction is
+real (confirmed in the MLIR) but this experiment shows it is not where the remaining stall lives.
+
+## `trace_span_net.summarize()` fixed: pid-filtered, no longer silently merges multi-core traces
+
+`summarize()` gained a `pid=` parameter (default `None`): auto-detects the traced core from
+`INSTR_EVENT_0`'s pid and, if more than one is present in the JSON, RAISES instead of silently
+aggregating both cores' events under one event name (the defect found in the split-gate section
+above). Every existing call site is single-stage-per-dispatch, so behavior is unchanged for all
+of them; a future 2-stage-per-dispatch caller must now pass `pid=` explicitly or gets a loud
+error instead of a wrong number.
+
 ## Caveat
 
 Device is shared with other concurrent lanes (gemma4 prefill gates, this session's own

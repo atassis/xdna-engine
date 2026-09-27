@@ -15,6 +15,13 @@ Traces at most 2 stages per run (a traced tile needs a free CORE-tile South egre
 method-profile-a-brick-with-enable-trace.md gotcha 1 -- and 2 cores keeps shim/channel pressure
 low against the net's own 5 weight-group + x/y channels).
 
+summarize() now REQUIRES a `pid` when >1 traced core shares a JSON (found 2026-09-27,
+TRACE_RESULTS.md Phase 1c): the old default silently aggregated ALL traced cores' events by
+event NAME only, so a 2-stage dispatch produced one bogus merged compute/gap split for BOTH
+stages (reproduced: identical numbers, compute >100% of span, negative gap). Pass one stage per
+dispatch (every number in TRACE_RESULTS.md already does this) unless you also pass the specific
+pid to disaggregate a multi-core JSON.
+
 Usage (device held under the NPU lock):
   python3 trace_span_net.py --stages conv_1,conv_cat --out trace-out
 """
@@ -78,11 +85,27 @@ def union_cycles(ivs):
     return total + (cur_e - cur_s) if cur_s is not None else 0
 
 
-def summarize(trace_json_path, clock_ghz, w, stage):
+def summarize(trace_json_path, clock_ghz, w, stage, pid=None):
+    """pid: restrict to one traced core's events. None (default) auto-detects the set of pids
+    carrying INSTR_EVENT_0 -- if exactly one, uses it (byte-identical to the pre-2026-09-27
+    behavior for every single-stage-per-dispatch trace this file has ever produced); if more
+    than one, RAISES rather than silently aggregating across cores (see the module docstring's
+    Phase 1c note -- that silent aggregation is the defect this parameter closes)."""
     ev = json.load(open(trace_json_path))
     ts = [e["ts"] for e in ev if "ts" in e]
     if not ts:
         return {"stage": stage, "events": len(ev), "error": "no timestamped events in trace JSON"}
+    if pid is None:
+        pids = sorted({e["pid"] for e in ev if e.get("name") == "INSTR_EVENT_0" and "pid" in e})
+        if len(pids) > 1:
+            raise ValueError(
+                f"summarize({trace_json_path!r}): {len(pids)} traced cores in one JSON "
+                f"(pids={pids}) -- pass pid= explicitly to disaggregate, do not average them")
+        pid = pids[0] if pids else None
+    # keep pid-less (global/metadata) events; drop only OTHER cores' per-tile events, so a
+    # single-pid trace (every prior call in this file) is filtered to a no-op.
+    ev = [e for e in ev if pid is None or e.get("pid") is None or e.get("pid") == pid]
+    ts = [e["ts"] for e in ev if "ts" in e]
     span = max(ts) - min(ts)
     iv = intervals(ev)
 

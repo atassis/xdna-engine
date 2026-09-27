@@ -102,14 +102,16 @@ def weights_blob(NP, names, split_gate=None, lo_channels=GATE_SPLIT_LO):
     return np.concatenate(parts).astype(np.int8)
 
 
-def _shim_gate_half(path, sym, p, w, xoff):
+def _shim_gate_half(path, sym, p, w, xoff, bracket=False):
     """Half-COUT gate core (BALANCE.md option (a)): same conv3x3_i8_gate call as the unsplit gate,
-    CONV3X3_COUT at the call site's compile flags, x read at its own channel half's offset."""
+    CONV3X3_COUT at the call site's compile flags, x read at its own channel half's offset.
+    bracket=True: same event0()/event1() convention as _shim (off by default, byte-identical)."""
     args = "int8_t *l0, int8_t *l1, int8_t *l2, int8_t *p, int8_t *o, int32_t check"
     call = (f"conv3x3_i8_gate(l0, l1, l2, l1 + {xoff}, p, o, {w}, check, {p['pre']}, {p['shift']}, "
            f"0, {w}, {p['ga']}, {p['gb']}, {p['gs1']}, {p['gc']}, {p['gs2']});")
+    ev0, ev1 = ("  event0();\n", "  event1();\n") if bracket else ("", "")
     path.write_text(f'#include <stdint.h>\n#include "{KDIR / "conv3x3_u8.cc"}"\n'
-                    f'extern "C" void {sym}({args}) {{\n  {call}\n}}\n')
+                    f'extern "C" void {sym}({args}) {{\n{ev0}  {call}\n{ev1}}}\n')
     return path
 
 
@@ -217,7 +219,8 @@ def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
             for suffix, npi, xo, cout in halves:
                 sym = f"{tag}_{suffix}_w{w}"
                 incs = [g.lut_inc(t, gen / f"{sym}_t{i}.inc") for i, t in enumerate(npi.get("tables", []))]
-                shim = _shim_gate_half(gen / f"{sym}.cc", sym, npi, w, xo)
+                shim = _shim_gate_half(gen / f"{sym}.cc", sym, npi, w, xo,
+                                       bracket=suffix in trace_stages)
                 spec[suffix] = (sym, shim, incs, npi)
                 texts += [shim.read_text()] + [Path(i).read_text() for i in incs]
                 core_names.append(suffix)
@@ -326,7 +329,7 @@ def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
         for n in names:
             if n not in out:
                 out[n] = ObjectFifo(ty(lay[n].out_bytes), name=f"{n}_out", depth=depth[n])
-        workers = []
+        workers, worker_by_name = [], {}
         for i, n in enumerate(names):
             if n in split_gate:
                 prev = names[i - 1]
@@ -336,10 +339,11 @@ def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
                     [0, lo_bytes], obj_types=[ty(lo_bytes), ty(hi_bytes)], depths=[depth[n]] * 2,
                     names=[f"{n}_lo_j", f"{n}_hi_j"])
                 for suffix, sub in ((f"{n}_lo", lo), (f"{n}_hi", hi)):
-                    workers.append(Worker(windowed, fn_args=[out[prev].cons(fi_depth),
-                                          p_fifo[suffix].cons(), sub.prod(), kern[suffix]],
-                                          stack_size=stacks["gate_half"],
-                                          data_size=data_sizes.get(suffix)))
+                    wk = Worker(windowed, fn_args=[out[prev].cons(fi_depth),
+                               p_fifo[suffix].cons(), sub.prod(), kern[suffix]],
+                               stack_size=stacks["gate_half"], data_size=data_sizes.get(suffix))
+                    workers.append(wk)
+                    worker_by_name[suffix] = wk
                 continue
             if kind[n] == "cat":
                 fi, body = f_cat.cons(depth=cat_cons_depth), rowwise
@@ -351,8 +355,10 @@ def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
                                    else depth[prev])
                 body = windowed
             fo = out[n].prod(depth=prod_depth) if n in skips else out[n].prod()
-            workers.append(Worker(body, fn_args=[fi, p_fifo[n].cons(), fo, kern[n]],
-                                  stack_size=stacks[kind[n]], data_size=data_sizes.get(n)))
+            wk = Worker(body, fn_args=[fi, p_fifo[n].cons(), fo, kern[n]],
+                       stack_size=stacks[kind[n]], data_size=data_sizes.get(n))
+            workers.append(wk)
+            worker_by_name[n] = wk
 
         w_taps, off = [], 0
         for grp in groups:
@@ -372,7 +378,7 @@ def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
                                 out[names[-1]].cons()] + [wf.prod() for wf in w_fifos])
         prog = Program(iron.get_current_device(), rt, workers=workers)
         if trace_size:
-            traced = [workers[names.index(n)] for n in trace_stages]
+            traced = [worker_by_name[n] for n in trace_stages]
             prog.enable_trace(trace_size=trace_size, workers=traced,
                               coretile_events=coretile_events, egress_shim_col=egress_shim_col)
         return prog.resolve_program()
