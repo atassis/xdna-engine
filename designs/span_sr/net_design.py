@@ -176,7 +176,7 @@ def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet"):
             # a join's inputs and output share one MemTile pool, sized by the output fifo, so
             # it must hold the deepest skip
             f_cat = ObjectFifo(ty(lay["conv_cat"].in_bytes), name="cat_in",
-                               depth=max(skip_depths.values()))
+                               depth=max(skip_depths.values()), iterate_bds=True)
             subs = f_cat.prod().join(
                 [o * NL.half(w) for _, o in NL.CAT_SOURCES],
                 obj_types=[ty(lay[s].out_bytes) for s, _ in NL.CAT_SOURCES],

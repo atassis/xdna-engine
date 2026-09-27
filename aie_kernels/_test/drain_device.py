@@ -77,6 +77,7 @@ SCRIPT_TARGETS = [
     "verify_conv3x3_u8",
     "verify_conv1x1_cat",
     "verify_span_block",
+    "verify_span_net",
     "verify_gelu_erf",
     "verify_mha_decode_hd128",
     "verify_prefill_attn",  # device-green 2026-08-31: 32/32 heads, worst rel-L2 8.540e-08
