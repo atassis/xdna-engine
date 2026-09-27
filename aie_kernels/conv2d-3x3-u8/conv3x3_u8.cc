@@ -86,36 +86,44 @@ alignas(aie::vector_decl_align) static const uint16_t kLut2Cd[512] = {
 #endif
 
 #ifdef CONV3X3_LUT_INC
-// Applies the table in place to n int8 values at dst (n % 16 == 0). Keys are
-// loaded as 16-lane vectors: extracting 16-lane groups from a 64-lane register
-// vector fed fetch() wrong keys on device (probe_lut_gather_isolated.py). The
-// lookup object is built per call: one built once at the top of the gate kernel
-// and captured by reference gathered every key as 0
-// (probe_conv3x3_gate_stages.py).
-inline void apply_lut_inplace(int8_t *dst, int n) {
+// Applies the table in place to n int8 values at dst (n % 32 == 0). Keys are
+// gathered 32 at a time: fetch()'s own Vec::size()==32 path (aie_api's
+// aie2/parallel_lookup.hpp, two internal extract<16>() from a 32-lane
+// accumulator) is bit-exact on a directly-loaded 32-lane vector
+// (probe_lut_gather32.py, 64/64 match) -- a different path from the earlier
+// extract<16>-from-a-64-lane-REGISTER failure (probe_lut_gather_isolated.py),
+// which this does not revisit. Halves the fetch-call/load/store count versus
+// the prior 16-lane loop. The lookup object is built per call: one built once
+// at the top of the gate kernel and captured by reference gathered every key
+// as 0 (probe_conv3x3_gate_stages.py).
+inline void apply_lut_inplace(int8_t *__restrict dst, int n) {
   const aie::lut<4, bfloat16> t(256, (const bfloat16 *)kLutAb,
                                 (const bfloat16 *)kLutCd);
   Look look(t, 0, 128);
-  for (int g = 0; g < n; g += 16) {
-    aie::vector<int8, 16> k = aie::load_v<16>(dst + g);
+  C3_LOOP_RANGE(1, 2)
+  for (int g = 0; g < n; g += 32) {
+    aie::vector<int8, 32> k = aie::load_v<32>(dst + g);
     aie::store_v(dst + g, aie::to_fixed<int8>(look.fetch(k), 0));
   }
 }
 #endif
 
 #if defined(CONV3X3_LUT_INC) && defined(CONV3X3_LUT2_INC)
-// 64 int8 keys at keys -> 64 int16 values hi*256 + lo at dst. keys may be the
-// second half of dst's 128 bytes: group g is read before bytes [32g, 32g+32)
-// are written, and those only ever overlap keys already consumed.
+// 64 int8 keys at keys -> 64 int16 values hi*256 + lo at dst, 32 keys/call
+// (see apply_lut_inplace). keys may be the second half of dst's 128 bytes:
+// group g is read before bytes [2g, 2g+64) are written, and those only ever
+// overlap keys already consumed (same ordering as the prior 16-lane version,
+// just at 32-granularity).
 inline void apply_lut16(const int8_t *keys, int16_t *dst) {
   const aie::lut<4, bfloat16> th(256, (const bfloat16 *)kLutAb,
                                  (const bfloat16 *)kLutCd);
   const aie::lut<4, bfloat16> tl(256, (const bfloat16 *)kLut2Ab,
                                  (const bfloat16 *)kLut2Cd);
   Look hi(th, 0, 128), lo(tl, 0, 128);
-  for (int g = 0; g < 64; g += 16) {
-    aie::vector<int8, 16> k = aie::load_v<16>(keys + g);
-    aie::accum<acc32, 16> a;
+  C3_LOOP_RANGE(2, 2)
+  for (int g = 0; g < 64; g += 32) {
+    aie::vector<int8, 32> k = aie::load_v<32>(keys + g);
+    aie::accum<acc32, 32> a;
     a.from_vector(aie::to_fixed<int16>(lo.fetch(k), 0));
     a = aie::mac(a, aie::to_fixed<int16>(hi.fetch(k), 0), (int16)256);
     aie::store_v(dst + g, a.template to_vector<int16>(0));
@@ -195,22 +203,25 @@ conv3x3_core(const PA *__restrict line0, const PA *__restrict line1,
 #endif
     } else { // GATE
 #ifdef CONV3X3_LUT_INC
-      // One pass: each 16-lane group of c feeds both the sum and the table
-      // fetch from registers.
+      // One pass: each 32-lane group of c feeds both the sum and the table
+      // fetch from registers (fetch()'s own Vec::size()==32 path, see
+      // apply_lut_inplace).
       aie::store_v(dst, rq(acc, m).template to_vector<int8>(shift));
       const aie::lut<4, bfloat16> t(256, (const bfloat16 *)kLutAb,
                                     (const bfloat16 *)kLutCd);
       Look look(t, 0, 128);
-      PO *xp = const_cast<PO *>(xrow) + (dst - out);
-      for (int g = 0; g < LANES; g += 16) {
-        aie::vector<int8, 16> c = aie::load_v<16>(dst + g);
-        aie::vector<int8, 16> x = aie::load_v<16>(xp + g);
-        aie::accum<acc32, 16> a = aie::mul(c, (int8)ga);
+      PO *__restrict xp = const_cast<PO *>(xrow) + (dst - out);
+      PO *__restrict dst_r = dst;
+      C3_LOOP_RANGE(2, 2)
+      for (int g = 0; g < LANES; g += 32) {
+        aie::vector<int8, 32> c = aie::load_v<32>(dst_r + g);
+        aie::vector<int8, 32> x = aie::load_v<32>(xp + g);
+        aie::accum<acc32, 32> a = aie::mul(c, (int8)ga);
         a = aie::mac(a, x, (int8)gb);
-        aie::vector<int8, 16> s = a.template to_vector<int8>(gs1);
-        aie::vector<int8, 16> att = aie::to_fixed<int8>(look.fetch(c), 0);
-        aie::vector<int16, 16> p16 = aie::mul(s, att).template to_vector<int16>(0);
-        aie::store_v(dst + g,
+        aie::vector<int8, 32> s = a.template to_vector<int8>(gs1);
+        aie::vector<int8, 32> att = aie::to_fixed<int8>(look.fetch(c), 0);
+        aie::vector<int16, 32> p16 = aie::mul(s, att).template to_vector<int16>(0);
+        aie::store_v(dst_r + g,
                      aie::mul(p16, (int16)gc).template to_vector<int8>(gs2));
       }
       if (!(xs >= valid_lo && xs + PX <= valid_hi))
