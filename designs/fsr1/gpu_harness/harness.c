@@ -4,7 +4,18 @@
  * (ffx_a.h/ffx_fsr1.h), not a re-implementation.
  *
  * Usage: harness <in_w> <in_h> <in.rgba8> <out.rgba8> [easu_out.rgba8]
- * Fixed x3 integer scale: out_w=in_w*3, out_h=in_h*3.
+ * Default: fixed x3 integer scale (out_w=in_w*3, out_h=in_h*3), no timing --
+ * this is what run_gate.py depends on and stays unchanged.
+ *
+ * Env overrides (all optional, off by default):
+ *   FSR1_OUT_W, FSR1_OUT_H  -- arbitrary output size (FsrEasuCon supports any scale).
+ *   FSR1_GPU_SUBSTR         -- pick the physical device whose name contains this
+ *                              substring (e.g. "890M", "RTX"); default: devs[0].
+ *   FSR1_TIME_ITERS         -- if >0, after the correctness pass, run this many extra
+ *                              timed iterations with GPU timestamp queries around EASU
+ *                              and RCAS separately, then print "EASU/RCAS ms: min median p95"
+ *                              per-stage lines to stdout. FSR1_TIME_WARMUP (default 20)
+ *                              iterations run first and are discarded.
  */
 #include <vulkan/vulkan.h>
 #include <stdio.h>
@@ -89,12 +100,22 @@ static HostBuf make_host_buf(VkDevice dev, VkPhysicalDevice phys, VkDeviceSize s
 /* AU1_AF1 bit-cast, matches ffx_a.h. */
 static uint32_t f2u(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
 
+static int cmp_double(const void *a, const void *b) {
+    double da = *(const double *)a, db = *(const double *)b;
+    return (da > db) - (da < db);
+}
+
 int main(int argc, char **argv) {
     if (argc < 5) { fprintf(stderr, "usage: %s in_w in_h in.rgba8 out.rgba8 [easu_out.rgba8]\n", argv[0]); return 1; }
     uint32_t in_w = atoi(argv[1]), in_h = atoi(argv[2]);
-    uint32_t out_w = in_w * 3, out_h = in_h * 3;
+    const char *env_ow = getenv("FSR1_OUT_W"), *env_oh = getenv("FSR1_OUT_H");
+    uint32_t out_w = env_ow ? (uint32_t)atoi(env_ow) : in_w * 3;
+    uint32_t out_h = env_oh ? (uint32_t)atoi(env_oh) : in_h * 3;
     const char *in_path = argv[3], *out_path = argv[4];
     const char *easu_dump_path = argc > 5 ? argv[5] : NULL;
+    const char *gpu_substr = getenv("FSR1_GPU_SUBSTR");
+    int time_iters = getenv("FSR1_TIME_ITERS") ? atoi(getenv("FSR1_TIME_ITERS")) : 0;
+    int time_warmup = getenv("FSR1_TIME_WARMUP") ? atoi(getenv("FSR1_TIME_WARMUP")) : 20;
 
     size_t in_len;
     char *in_pixels = read_file(in_path, &in_len);
@@ -110,9 +131,15 @@ int main(int argc, char **argv) {
     if (!ndev) { fprintf(stderr, "no vulkan device\n"); return 1; }
     VkPhysicalDevice *devs = malloc(ndev * sizeof(VkPhysicalDevice));
     vkEnumeratePhysicalDevices(inst, &ndev, devs);
-    VkPhysicalDevice phys = devs[0];
+    uint32_t dev_idx = 0;
+    for (uint32_t i = 0; i < ndev; i++) {
+        VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(devs[i], &p);
+        fprintf(stderr, "found GPU %u: %s\n", i, p.deviceName);
+        if (gpu_substr && strstr(p.deviceName, gpu_substr)) dev_idx = i;
+    }
+    VkPhysicalDevice phys = devs[dev_idx];
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(phys, &props);
-    fprintf(stderr, "GPU: %s\n", props.deviceName);
+    fprintf(stderr, "GPU: %s (timestampPeriod=%f ns/tick)\n", props.deviceName, props.limits.timestampPeriod);
 
     uint32_t nq = 0; vkGetPhysicalDeviceQueueFamilyProperties(phys, &nq, NULL);
     VkQueueFamilyProperties *qprops = malloc(nq * sizeof(VkQueueFamilyProperties));
@@ -120,6 +147,9 @@ int main(int argc, char **argv) {
     uint32_t qfam = UINT32_MAX;
     for (uint32_t i = 0; i < nq; i++) if (qprops[i].queueFlags & VK_QUEUE_COMPUTE_BIT) { qfam = i; break; }
     if (qfam == UINT32_MAX) { fprintf(stderr, "no compute queue\n"); return 1; }
+    if (qprops[qfam].timestampValidBits == 0 && time_iters > 0) {
+        fprintf(stderr, "queue family has no timestamp support\n"); return 1;
+    }
 
     float qprio = 1.0f;
     VkDeviceQueueCreateInfo dqci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
@@ -307,5 +337,79 @@ int main(int argc, char **argv) {
         fclose(fm);
     }
     fprintf(stderr, "wrote %s (%ux%u rgba8)\n", out_path, out_w, out_h);
+
+    if (time_iters > 0) {
+        /* Separate timing command buffer + pool (reset-per-record), so the correctness
+         * pass above is untouched. 4 timestamps/iter: before/after EASU, before/after RCAS. */
+        VkCommandPoolCreateInfo tcpci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        tcpci.queueFamilyIndex = qfam;
+        tcpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        VkCommandPool tpool; CHK(vkCreateCommandPool(dev, &tcpci, NULL, &tpool));
+        VkCommandBufferAllocateInfo tcbai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        tcbai.commandPool = tpool; tcbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; tcbai.commandBufferCount = 1;
+        VkCommandBuffer tcmd; CHK(vkAllocateCommandBuffers(dev, &tcbai, &tcmd));
+
+        VkQueryPoolCreateInfo qpci = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qpci.queryType = VK_QUERY_TYPE_TIMESTAMP; qpci.queryCount = 4;
+        VkQueryPool qpool; CHK(vkCreateQueryPool(dev, &qpci, NULL, &qpool));
+
+        int total = time_warmup + time_iters;
+        double *easu_ms = malloc(time_iters * sizeof(double));
+        double *rcas_ms = malloc(time_iters * sizeof(double));
+        double period = props.limits.timestampPeriod;
+
+        for (int it = 0; it < total; it++) {
+            CHK(vkResetCommandBuffer(tcmd, 0));
+            VkCommandBufferBeginInfo tcbbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            CHK(vkBeginCommandBuffer(tcmd, &tcbbi));
+            vkCmdResetQueryPool(tcmd, qpool, 0, 4);
+
+            /* WAR guard: previous iter's RCAS read of `mid` must finish before this EASU overwrites it. */
+            VkMemoryBarrier guard = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT};
+            vkCmdPipelineBarrier(tcmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,1,&guard,0,NULL,0,NULL);
+
+            vkCmdWriteTimestamp(tcmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, qpool, 0);
+            vkCmdBindPipeline(tcmd, VK_PIPELINE_BIND_POINT_COMPUTE, easu_pipe);
+            vkCmdBindDescriptorSets(tcmd, VK_PIPELINE_BIND_POINT_COMPUTE, playout, 0, 1, &dsets[0], 0, NULL);
+            vkCmdPushConstants(tcmd, playout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 64, con_push);
+            vkCmdDispatch(tcmd, (out_w+7)/8, (out_h+7)/8, 1);
+            vkCmdWriteTimestamp(tcmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, qpool, 1);
+
+            vkCmdPipelineBarrier(tcmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,1,&mb,0,NULL,0,NULL);
+
+            vkCmdWriteTimestamp(tcmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, qpool, 2);
+            vkCmdBindPipeline(tcmd, VK_PIPELINE_BIND_POINT_COMPUTE, rcas_pipe);
+            vkCmdBindDescriptorSets(tcmd, VK_PIPELINE_BIND_POINT_COMPUTE, playout, 0, 1, &dsets[1], 0, NULL);
+            vkCmdPushConstants(tcmd, playout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 64, con_rcas);
+            vkCmdDispatch(tcmd, (out_w+7)/8, (out_h+7)/8, 1);
+            vkCmdWriteTimestamp(tcmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, qpool, 3);
+
+            CHK(vkEndCommandBuffer(tcmd));
+            VkSubmitInfo tsi = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            tsi.commandBufferCount = 1; tsi.pCommandBuffers = &tcmd;
+            CHK(vkQueueSubmit(queue, 1, &tsi, VK_NULL_HANDLE));
+            CHK(vkQueueWaitIdle(queue));
+
+            uint64_t ts[4];
+            CHK(vkGetQueryPoolResults(dev, qpool, 0, 4, sizeof(ts), ts, sizeof(uint64_t),
+                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
+
+            if (it >= time_warmup) {
+                int i = it - time_warmup;
+                easu_ms[i] = (double)(ts[1] - ts[0]) * period / 1e6;
+                rcas_ms[i] = (double)(ts[3] - ts[2]) * period / 1e6;
+            }
+        }
+
+        qsort(easu_ms, time_iters, sizeof(double), cmp_double);
+        qsort(rcas_ms, time_iters, sizeof(double), cmp_double);
+        int p50 = time_iters / 2, p95 = (int)(time_iters * 0.95);
+        if (p95 >= time_iters) p95 = time_iters - 1;
+        printf("EASU_ms min=%.4f median=%.4f p95=%.4f\n", easu_ms[0], easu_ms[p50], easu_ms[p95]);
+        printf("RCAS_ms min=%.4f median=%.4f p95=%.4f\n", rcas_ms[0], rcas_ms[p50], rcas_ms[p95]);
+        printf("TOTAL_ms min=%.4f median=%.4f p95=%.4f\n",
+            easu_ms[0]+rcas_ms[0], easu_ms[p50]+rcas_ms[p50], easu_ms[p95]+rcas_ms[p95]);
+    }
+
     return 0;
 }
