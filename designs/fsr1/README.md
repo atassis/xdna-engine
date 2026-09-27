@@ -177,18 +177,16 @@ instead of the hardware SFU; the one exact case (`invW`, FSR1's own plain `ARcpF
   the prior session hit is gone -- per toolchain-bug-test-latest-before-workaround doctrine this should
   be dropped, not carried forward on a stale premise; left in place here since removing it was out of
   this pass's scope (report-only per the task brief), but it is dead weight now.
-- **Cycles/px** (`kernel/time_fsr1_vec.py`, same marginal two-size method, `FSR1_IN_W=16` fixed since
-  it doubles as the vector width, `FSR1_IN_H` 6 vs 12): marginal **1550.3 ns/px** (16x6->48x18: 1706.0
-  ns/px; 16x12->48x36: 1628.2 ns/px) = **~2791 cycles/px @1.8GHz** (canonical measured clock,
-  `decode-perop-aie-clock`; box was AC-powered, `performance` power profile). This is EASU only --
-  **not comparable 1:1 to the scalar kernel's 25476 ns/px, which includes RCAS** -- but as an EASU-vs-
-  EASU proxy (RCAS is ~1/5 of the scalar kernel's flop count per the op-count table) the vectorization
-  is roughly **16x** faster per pixel than the scalar EASU+RCAS kernel.
-- **Projected, EASU-only, not yet the whole FSR1 pipeline**: 1920x1080 = 2,073,600 px x 1550.3 ns/px =
-  **~3.21 s/frame on one core**; ideal 32-core scaling (all AIE2p columns, not the 8 used for the scalar
-  projection) -> **~100 ms/frame**. RCAS is still scalar and unvectorized on this path and has not been
-  separately timed here, so the combined EASU+RCAS per-frame cost is not yet known -- vectorizing RCAS
-  the same way is the next concrete step before this number means anything for the whole filter.
+- **Cycles/px -- SUPERSEDED, see Step 2c.** `kernel/time_fsr1_vec.py`'s marginal two-crop-size method
+  reported **1550.3 ns/px** (~2791 cyc/px @1.8GHz), kept below for the record but not trusted: the
+  method turned out not reproducible under host dispatch jitter (~300-400us) once probe crops are
+  small (found on `wt-npu-warp`'s vec kernel, whose marginal method returned a NEGATIVE per-pixel
+  delta at one crop size; FSR1's probe crops are smaller still). Superseded by Step 2c's repeat-count
+  measurement: **1395.9 ns/px = 2513 cyc/px @1.8GHz**, linearity ratio 0.998 (near-perfect -- a real
+  per-call cost, not jitter). Original marginal figures, unchanged: 16x6->48x18: 1706.0 ns/px;
+  16x12->48x36: 1628.2 ns/px, canonical clock 1.8GHz (`decode-perop-aie-clock`), box AC-powered,
+  `performance` power profile.
+- **Projected, EASU-only -- see Step 2c for the trusted number and the fused-kernel comparison.**
 
 ## Step 2c -- vectorized RCAS, fused EASU+RCAS gated on device
 
@@ -232,31 +230,53 @@ why `time_fsr1_rcas_vec.py`'s two probe crops (12/21 output rows) are smaller th
 usual depth-2 in/out objectFifos, so `time_fsr1_strip_vec.py`'s max feasible crop is `in_h=8`
 (out 24x48), not the vec-EASU probe's 12.
 
-**Cycles/px** (`time_fsr1_rcas_vec.py`/`time_fsr1_strip_vec.py`, same marginal two-crop-size
-method as `time_fsr1_vec.py`, device-measured, npu_lock-serialized against several other agents'
-concurrent jobs -- box AC-powered, `performance` power profile, canonical clock 1.8GHz per
-`decode-perop-aie-clock`):
+**A second static scratch buffer was found and removed before timing was trusted.** RCAS-alone's
+`.bss` overflow (above) was fixed first, but the fused `fsr1_strip_vec` still overflowed at larger
+crops (`'.bss' will not fit in region 'data': overflowed by 648 bytes`, needing 15496 B) even after
+shrinking the timing probe's crop -- because `fsr1_easu_vec` carried its OWN static `planar[]`
+deinterleave scratch (the same pattern already fixed for RCAS, missed on EASU), which stacked with
+`easu_buf` in the fused kernel. Fixed the same way: EASU's `load_tap` now reads the interleaved
+buffer directly, no scratch copy. Re-verified all three kernels after the fix -- rel_l2 and
+determinism unchanged from the table above, confirming the fix changed only the access pattern.
 
-| kernel | probe crops (out rows) | marginal ns/px | cycles/px @1.8GHz |
-|---|---|---|---|
-| `fsr1_rcas_vec` (RCAS alone) | 12, 21 | 344.8 | 620.6 |
-| `fsr1_strip_vec` (EASU+RCAS fused) | 12, 24 | pending re-run (see below) | -- |
+**Cycles/px -- marginal two-crop-size method SUPERSEDED.** The method used above (and in Step 2b)
+is not reproducible under host dispatch jitter (~300-400us) once the marginal delta is small
+relative to it -- shown on `wt-npu-warp`'s vec kernel, whose two-size probe returned numbers 15-54%
+off its own earlier measurement on a rerun, and FSR1's RCAS/fused probe crops are smaller still (12
+vs warp's already-too-small ones). Superseded by a repeat-count instrument
+(`kernel/time_fsr1_reps.py`, following `wt-npu-warp/designs/warp/kernel/time_warp_reps.py`,
+e5fa996): a compile-time `REPS` loop calls the kernel REPS times inside ONE dispatch at ONE fixed
+crop (16x6->48x18, the same size the verify scripts already build at), so `(T(K_hi)-T(K_lo))/(K_hi-K_lo)`
+isolates device-side per-call time from the fixed dispatch overhead; a 3-point (K=4/200/800)
+linearity check confirms the slope is a real per-call cost (ratio near 1.0), not a `K_lo`/`K_hi`
+artifact.
 
-**Projected, 1920x1080, RCAS alone:** 2,073,600 px x 344.8 ns/px = **~715.0 ms/frame on one
-core**; ideal 32-core scaling -> **~22.3 ms/frame**. Note this is a lower bound relative to the
-EASU-vec proxy comparison in Step 2b: RCAS alone is already ~4.7x more ns/px than EASU alone
-(1550.3 ns/px), not the ~1/5-flop-count ratio the op-count table's naive FLOP estimate suggested
--- RCAS's same-size in->out shape gets no benefit from EASU's 9-output-per-source-quad sharing,
-and its per-pixel overhead (5 taps x 3 channels of clamp-addressed scalar loads, `load_strip`) is
-not FLOP-bound the way the count table assumed.
+| kernel | ns/px | cycles/px @1.8GHz | linearity ratio | superseded marginal-method figure |
+|---|---|---|---|---|
+| `fsr1_easu_vec` (EASU alone) | 1395.9 | 2513 | 0.998 | 1550.3 ns/px (Step 2b) |
+| `fsr1_rcas_vec` (RCAS alone) | 391.3 | 704 | 0.988 | 344.8 ns/px |
+| `fsr1_strip_vec` (EASU+RCAS fused) | 1786.1 | 3215 | 0.999 | -- (never landed under the old method) |
 
-**Combined EASU+RCAS projection is pending a re-run.** `time_fsr1_strip_vec.py`'s first attempt
-used the vec-EASU probe's crop sizes (6/12 output rows) and hit the same data-memory overflow as
-RCAS-alone's first attempt (`'.bss' will not fit in region 'data': overflowed by 20104 bytes` --
-the `easu_buf` intermediate at the larger crop); fixed to probe at 4/8 output rows instead and
-re-queued under the shared npu_lock (device was held by other agents' jobs for this whole
-session -- see the commit for the queue state). Once it lands: ns/px x 2,073,600 for 1-core
-ms/frame, /32 for ideal-core, same as the RCAS-alone projection above.
+All three ratios sit within ~1.2% of 1.0 -- trusted. **Fusion costs nothing measurable**:
+EASU (2513) + RCAS (704) = 3217 cyc/px, against the fused kernel's own measured 3215 -- the two
+numbers agree to within rounding, so calling both passes from one dispatch neither adds nor saves
+overhead relative to running them separately.
+
+**Projected, 640x360->1920x1080 (2,073,600 output px), from the trusted REPS numbers:**
+
+| kernel | 1-core ms/frame | ideal 32-core ms/frame |
+|---|---|---|
+| EASU alone | 2,073,600 x 1395.9 ns = ~2894 ms | ~90.4 ms |
+| RCAS alone | 2,073,600 x 391.3 ns = ~811 ms | ~25.3 ms |
+| EASU+RCAS fused | 2,073,600 x 1786.1 ns = ~3704 ms | ~115.7 ms |
+
+**FSR1-on-NPU is parked as a correctness baseline, not an fps lever.** ~3.7 s/frame at 1 core and
+~116 ms/frame at an ideal, unattainable 32 cores are both far outside real-time (16-33 ms/frame for
+30-60fps) on this box's actual GPU path, which does the same 640x360->1920x1080 EASU+RCAS pass in
+0.66-1.20 ms on the 890M iGPU (this workspace's own Vulkan harness, see Step 1). The NPU port stays
+useful as a bit-faithful correctness reference and a brick-vectorization exercise, not as a
+candidate render-path accelerator for this filter. Broader NPU-for-real-time-games framing is tracked separately
+(internal planning, not in this repo).
 
 ## Step 3 -- whole frame, one dispatch: NOT REACHED (two demonstrated blockers, not scope)
 
@@ -293,4 +313,16 @@ Conditional on step 3 landing (per the task brief); step 3 did not land, so this
 
 ## Files added this pass (step 2b)
 - `kernel/time_fsr1_vec.py` -- device cycles/pixel measurement for `fsr1_easu_vec` at two crop
-  sizes (`FSR1_IN_H` 6/12, `FSR1_IN_W` fixed at 16 since it is also the vector width).
+  sizes (`FSR1_IN_H` 6/12, `FSR1_IN_W` fixed at 16 since it is also the vector width). DELETED --
+  see step 2c: the marginal two-crop-size method it used is not reproducible under host dispatch
+  jitter; superseded by `kernel/time_fsr1_reps.py`.
+
+## Files added/removed this pass (step 2c)
+- `kernel/fsr1_kernel_vec.cc` -- `fsr1_rcas_vec` (RCAS, vectorized) and `fsr1_strip_vec` (fused
+  EASU+RCAS, one dispatch) added; `easu_tap_v`'s dead `optnone` removed; both `load_tap` and the
+  new `load_strip` read the interleaved RGB buffer directly (no planar deinterleave scratch).
+- `kernel/verify_fsr1_rcas_vec.py`, `kernel/verify_fsr1_strip_vec.py` -- device correctness gates.
+- `kernel/time_fsr1_reps.py` -- repeat-count cycles/pixel measurement for all three vectorized
+  kernels (EASU, RCAS, fused), one fixed crop, `K=4/200/800` with a linearity check. Supersedes and
+  replaces `kernel/time_fsr1_rcas_vec.py`/`kernel/time_fsr1_strip_vec.py` (also DELETED, same
+  jitter problem as `time_fsr1_vec.py`) and `kernel/time_fsr1_vec.py`.
