@@ -1,0 +1,30 @@
+#version 460
+// Standalone EASU dispatch: same ffx_fsr1.h/ffx_a.h as gamescope's cs_easu.comp,
+#extension GL_GOOGLE_include_directive : require
+// minus gamescope's descriptor-set/layer plumbing. Ground truth for designs/fsr1/cpu_ref.py.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0) uniform sampler2D u_src;
+layout(binding = 1, rgba8) uniform writeonly image2D u_dst;
+
+layout(push_constant) uniform Con {
+    uvec4 con0, con1, con2, con3;
+} pc;
+
+#define A_GPU 1
+#define A_GLSL 1
+#include "ffx_a.h"
+#define FSR_EASU_F 1
+AF4 FsrEasuRF(AF2 p){return AF4(textureGather(u_src, p, 0));}
+AF4 FsrEasuGF(AF2 p){return AF4(textureGather(u_src, p, 1));}
+AF4 FsrEasuBF(AF2 p){return AF4(textureGather(u_src, p, 2));}
+#include "ffx_fsr1.h"
+
+void main() {
+    uvec2 pos = gl_GlobalInvocationID.xy;
+    ivec2 sz = imageSize(u_dst);
+    if (pos.x >= uint(sz.x) || pos.y >= uint(sz.y)) return;
+    vec3 color;
+    FsrEasuF(color, pos, pc.con0, pc.con1, pc.con2, pc.con3);
+    imageStore(u_dst, ivec2(pos), vec4(color, 1.0));
+}

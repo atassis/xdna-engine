@@ -24,12 +24,13 @@ CAT_DIR = KDIR.parent / "conv2d-1x1-cat"
 
 # stack reservation per kind; aiecc measures each core and fails naming the bytes it needs
 STACK = {"conv1": 2048, "silu16": 3584, "silu_i16": 3584, "silu_x": 2560, "silu": 2560,
-         "gate": 3584, "plain": 2048, "cat": 2048, "up": 2048}
+         "gate": 3584, "plain": 2048, "cat": 2048, "up": 2048, "gate_half": 3584}
 # objectFIFO depth of a stage's output (both ends, see the shared-pool trap). b1c1's rows are
 # three halves wide: four of them do not fit in L1 beside its weights and its input window.
 DEPTH = {"b1c1": 3}
 MAIN_DEPTH = 4   # a 3-row window plus the row being written
 PROD_DEPTH = 2   # producer side of a fifo that leaves the core by DMA (skip broadcasts)
+GATE_SPLIT_LO = 32   # channels on split_gate's "lo" core; NL.split_gate_params' default (32/16)
 
 
 def _call(kind, p, w, lay):
@@ -72,6 +73,39 @@ def _shim(path, sym, kind, p, w, bracket=False):
     return path
 
 
+def weights_blob(NP, names, split_gate=None, lo_channels=GATE_SPLIT_LO):
+    """NL.weights_blob, but honoring split_gate the way build() lays weights out on the wire: a
+    split stage contributes its lo half then its hi half (NL.split_gate_params) instead of one
+    full blob -- build()'s weight groups are keyed on core_names, not `names`."""
+    split_gate = frozenset(split_gate or ())
+    parts = []
+    for n in names:
+        if n in split_gate:
+            npl, nph = NL.split_gate_params(NP[n], lo_channels=lo_channels)
+            parts += [npl["blob"], nph["blob"]]
+        else:
+            parts.append(NP[n]["blob"])
+    return np.concatenate(parts).astype(np.int8)
+
+
+def _shim_gate_half(path, sym, p, w, xoff):
+    """Half-COUT gate core (BALANCE.md option (a)): same conv3x3_i8_gate call as the unsplit gate,
+    CONV3X3_COUT at the call site's compile flags, x read at its own channel half's offset."""
+    args = "int8_t *l0, int8_t *l1, int8_t *l2, int8_t *p, int8_t *o, int32_t check"
+    call = (f"conv3x3_i8_gate(l0, l1, l2, l1 + {xoff}, p, o, {w}, check, {p['pre']}, {p['shift']}, "
+           f"0, {w}, {p['ga']}, {p['gb']}, {p['gs1']}, {p['gc']}, {p['gs2']});")
+    path.write_text(f'#include <stdint.h>\n#include "{KDIR / "conv3x3_u8.cc"}"\n'
+                    f'extern "C" void {sym}({args}) {{\n  {call}\n}}\n')
+    return path
+
+
+def _flags_gate_half(incs, cout):
+    f = ["-DCONV3X3_CIN=48", f"-DCONV3X3_COUT={cout}"]
+    for i, inc in enumerate(incs):
+        f.append(f'-DCONV3X3_LUT{"" if i == 0 else "2"}_INC="{inc}"')
+    return f
+
+
 def _flags(kind, incs):
     if kind == "cat":
         return ["-DCONV1X1_NSRC=4", "-DCONV1X1_CSRC=48", "-DCONV1X1_COUT=48"]
@@ -85,7 +119,7 @@ def _flags(kind, incs):
 def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
          trace_stages=None, trace_config=None, coretile_events=None, egress_shim_col=1,
          main_depth=None, skip_slack=None, prod_depth=None, cat_cons_depth=None,
-         data_sizes=None):
+         data_sizes=None, split_gate=None):
     """NP: span_int.Span.net_params(). Returns an iron.jit callable (x, wts, y): x from
     net_layout.conv1_rows (as int8), wts from net_layout.weights_blob, y gets `upto`'s rows.
 
@@ -120,18 +154,24 @@ def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
     array/LUT table) reservation aiecc's own error suggests when buffer allocation leaves too
     little room for a core's LUT: "aiecc: core main_core_0_3 needs space for 4160 bytes of static
     data ... but it may fit if you reserve it explicitly." Default None -> no override (aiecc's
-    automatic placement, byte-identical to before this param existed)."""
+    automatic placement, byte-identical to before this param existed).
+
+    split_gate: stage names (kind=gate only) to split onto two cores by output channel
+    (BALANCE.md option (a), GATE_SPLIT_LO/NL.C-GATE_SPLIT_LO channels)."""
     main_depth = MAIN_DEPTH if main_depth is None else main_depth
     skip_slack = NL.SKIP_SLACK if skip_slack is None else skip_slack
     prod_depth = PROD_DEPTH if prod_depth is None else prod_depth
     cat_cons_depth = 2 if cat_cons_depth is None else cat_cons_depth
     data_sizes = data_sizes or {}
+    split_gate = frozenset(split_gate or ())
     assert w % 16 == 0, "conv3x3_u8.cc needs width % 16 == 0 (and the x copy, whole 64-byte vectors)"
     gen = Path(gen)
     gen.mkdir(parents=True, exist_ok=True)
     g = _golden()
     names = NL.stage_names(upto)
     kind = dict(NL.STAGES)
+    for n in split_gate:
+        assert kind[n] == "gate", f"split_gate is for kind=gate stages, got {n}={kind[n]}"
     lay = {n: NL.layout(kind[n], w) for n in names}
     stacks = {**STACK, **(stacks or {})}
     depth = {n: main_depth for n in names} | DEPTH | (depths or {})
@@ -140,21 +180,41 @@ def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
 
     trace_stages = set(trace_stages or [])
     texts = [(KDIR / "conv3x3_u8.cc").read_text(), (CAT_DIR / "conv1x1_cat.cc").read_text()]
-    spec = {}
+    spec, core_names, half_of, split_bytes, split_cout = {}, [], {}, {}, {}
     for n in names:
-        sym = f"{tag}_{n}_w{w}"
-        incs = [g.lut_inc(t, gen / f"{sym}_t{i}.inc") for i, t in enumerate(NP[n].get("tables", []))]
-        shim = _shim(gen / f"{sym}.cc", sym, kind[n], NP[n], w, bracket=n in trace_stages)
-        spec[n] = (sym, shim, incs)
-        texts += [shim.read_text()] + [Path(i).read_text() for i in incs]
-    groups = NL.weight_groups(names)
+        if n in split_gate:
+            npl, nph = NL.split_gate_params(NP[n], lo_channels=GATE_SPLIT_LO)
+            lo_bytes = NL.half(w) * GATE_SPLIT_LO // NL.C
+            hi_bytes = lay[n].out_bytes - lo_bytes
+            split_bytes[n] = (lo_bytes, hi_bytes)
+            xoff = lay[n].x_in + lo_bytes
+            halves = ((f"{n}_lo", npl, lay[n].x_in, GATE_SPLIT_LO),
+                     (f"{n}_hi", nph, xoff, NL.C - GATE_SPLIT_LO))
+            for suffix, npi, xo, cout in halves:
+                sym = f"{tag}_{suffix}_w{w}"
+                incs = [g.lut_inc(t, gen / f"{sym}_t{i}.inc") for i, t in enumerate(npi.get("tables", []))]
+                shim = _shim_gate_half(gen / f"{sym}.cc", sym, npi, w, xo)
+                spec[suffix] = (sym, shim, incs, npi)
+                texts += [shim.read_text()] + [Path(i).read_text() for i in incs]
+                core_names.append(suffix)
+                half_of[suffix] = n
+                split_cout[suffix] = cout
+        else:
+            sym = f"{tag}_{n}_w{w}"
+            incs = [g.lut_inc(t, gen / f"{sym}_t{i}.inc") for i, t in enumerate(NP[n].get("tables", []))]
+            shim = _shim(gen / f"{sym}.cc", sym, kind[n], NP[n], w, bracket=n in trace_stages)
+            spec[n] = (sym, shim, incs, NP[n])
+            texts += [shim.read_text()] + [Path(i).read_text() for i in incs]
+            core_names.append(n)
+    groups = NL.weight_groups(core_names)
     skip_depths = {s: NL.rows_ahead(s) + skip_slack for s in sorted(skips)}
     digest = hashlib.sha256("".join(texts).encode() + repr(
         (w, h, upto, sorted(stacks.items()), sorted(depth.items()), groups, skip_depths,
          main_depth, prod_depth, cat_cons_depth, sorted(data_sizes.items()),
-         sorted(trace_stages), tuple(coretile_events or ()), egress_shim_col)).encode()).hexdigest()[:12]
+         sorted(trace_stages), tuple(coretile_events or ()), egress_shim_col,
+         sorted(split_gate))).encode()).hexdigest()[:12]
     base = _aie_api_include() + [f"-DSPAN_NET_DIGEST={digest}"]
-    plen = {n: NP[n]["blob"].size for n in names}
+    plen = {cn: spec[cn][3]["blob"].size for cn in core_names}
     wtotal = sum(plen.values())
     x_row, y_row = lay["conv_1"].in_bytes, lay[names[-1]].out_bytes
 
@@ -204,8 +264,16 @@ def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
 
     def design(x: In, wts: In, y: Out, *, trace_size: CompileTime[int] = 0):
         kern = {}
-        for n in names:
-            sym, shim, incs = spec[n]
+        for cn in core_names:
+            sym, shim, incs, npi = spec[cn]
+            if cn in half_of:
+                n = half_of[cn]
+                out_bytes = split_bytes[n][0 if cn.endswith("_lo") else 1]
+                args = [ty(lay[n].in_bytes)] * 3 + [ty(plen[cn]), ty(out_bytes), np.int32]
+                kern[cn] = ExternalFunction(sym, source_file=str(shim), arg_types=args,
+                                            compile_flags=base + _flags_gate_half(incs, split_cout[cn]))
+                continue
+            n = cn
             args = ([ty(lay[n].in_bytes), ty(plen[n]), ty(lay[n].out_bytes)] if kind[n] == "cat"
                     else [ty(lay[n].in_bytes)] * 3 + [ty(plen[n]), ty(lay[n].out_bytes), np.int32])
             kern[n] = ExternalFunction(sym, source_file=str(shim), arg_types=args,
@@ -236,6 +304,19 @@ def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
                 out[n] = ObjectFifo(ty(lay[n].out_bytes), name=f"{n}_out", depth=depth[n])
         workers = []
         for i, n in enumerate(names):
+            if n in split_gate:
+                prev = names[i - 1]
+                fi_depth = main_depth if prev in skips else depth[prev]
+                lo_bytes, hi_bytes = split_bytes[n]
+                lo, hi = out[n].prod().join(
+                    [0, lo_bytes], obj_types=[ty(lo_bytes), ty(hi_bytes)], depths=[depth[n]] * 2,
+                    names=[f"{n}_lo_j", f"{n}_hi_j"])
+                for suffix, sub in ((f"{n}_lo", lo), (f"{n}_hi", hi)):
+                    workers.append(Worker(windowed, fn_args=[out[prev].cons(fi_depth),
+                                          p_fifo[suffix].cons(), sub.prod(), kern[suffix]],
+                                          stack_size=stacks["gate_half"],
+                                          data_size=data_sizes.get(suffix)))
+                continue
             if kind[n] == "cat":
                 fi, body = f_cat.cons(depth=cat_cons_depth), rowwise
             elif i == 0:
