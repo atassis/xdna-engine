@@ -1085,3 +1085,104 @@ stream-switch routing/arbitration across the 4 real producer cores' distinct sou
 this microbench's producers do not share with SPAN's real skip-source placement). **No fork fix
 is warranted**: the task's premise (iterate_bds itself carries a per-row tax) does not hold under
 the trusted instrument, so there is nothing in the MemTile objectFifo lowering to change.
+
+## Phase 1g: PROD_DEPTH/cat_cons_depth/skip_cons_depths re-tested now that the join is the ONLY
+## throttle -- still ALL NULL; object-fifo-depth space is now exhausted twice over
+
+Methodological point from the task: Phase 1a's PROD_DEPTH/cat_cons_depth nulls (and the earlier
+1c DMA-hop-depth null) ran while the pace was still ~610-690, set by the pre-block-1-fix
+b1c1/b1c2 ping-pong -- a lever that only affects the JOIN could not have shown up on a b3c3/b1c2
+probe that was itself the bottleneck. Since then, Phase 1e/1f pinned the pace-setter precisely to
+the join build (conv_2->conv_cat, ~326->483.8 cyc/px, `iterate_bds` itself and MemTile(4,1)
+channel-sharing both refuted). Re-test the three named levers against THIS corrected baseline,
+one stage per dispatch, W=32 H=128, main defaults otherwise (worktree `wt-span-phase1g`, off main
+45ceaf1). Power mode: `default` (UNPINNED), standing caveat.
+
+**Step 1 -- baseline, the 6 named stages plus b1c2 as the pace probe (device):**
+
+| stage | compute cyc/px | gap cyc/px | LOCK_STALL % | compute+gap |
+|---|---|---|---|---|
+| conv_1 | 40.42 | 436.45 | 90.99% | 476.9 |
+| b1c1 | 266.33 | 216.5 | 44.48% | 482.8 |
+| b1c3 | 315.30 | 168.86 | 35.79% | 484.2 |
+| b6c1 | 250.39 | 232.18 | 54.45% | 482.6 |
+| conv_2 | 83.50 | 397.65 | 84.87% | 481.1 |
+| conv_cat | 58.23 | 423.07 | 89.40% | 481.3 |
+| b1c2 (pace probe) | 324.04 | 159.76 | 33.21% | 483.8 |
+
+Matches Phase 1c/1e's own baseline within noise -- nothing drifted on main between phases.
+
+**Step 2 -- compile-only sweep (no device, W=32) to find which lever values even fit L1**
+(`compile_sweep_phase1g.py`): `prod_depth` fits up to 16; `cat_cons_depth` fits at 3 **and now at
+4** (Phase 1a's doc said 4 failed -- main's intervening merges, e.g. the gate-epilogue inline,
+freed enough L1 elsewhere that this is no longer true; re-measure, don't quote the old number);
+`skip_cons_depths={"conv_1": 4}` (undoing the Phase 1a-follow-up-4 fix) now ALSO fits untraced --
+same reason; `skip_cons_depths={"b1c3": 5}` and `{"b6c1": 5}` (main_depth+1 on the other two
+skip sources' main-path hop) both fit untraced.
+
+**Step 3 -- device A/B on `conv_cat` (the join emission stage, primary indicator) and `b1c2`**
+(`trace_span_phase1g.py` + 3 continuations, forced by device crashes below):
+
+| lever | conv_cat compute+gap | conv_cat LOCK% | b1c2 compute+gap | b1c2 LOCK% |
+|---|---|---|---|---|
+| baseline | 481.3 | 89.40% | 483.8 | 33.21% |
+| prod_depth=8 | 481.3 | 89.40% | -- | -- |
+| cat_cons_depth=3 | 481.2 | 89.35% | -- | -- |
+| skip_cons_depths={"b1c3":5} | 481.3 | 89.39% | -- | -- |
+| prod_depth=8 + cat_cons_depth=3 (combo) | 481.3 | 89.35% | -- | -- |
+| combo + skip_cons_depths={"b1c3":5} (combo2) | 481.3 | 89.35% | 483.8 | 33.20% |
+
+**ALL NULL -- every value lands within 0.1-0.2 cyc/px of baseline, at both the join-emission
+stage and the whole-chain pace probe.** Re-testing under the corrected (join-is-the-only-
+throttle) baseline changes nothing: the methodological objection was valid (the Phase 1a nulls
+*were* potentially masked), but re-running the same experiments after the mask is gone reproduces
+the same nulls. PROD_DEPTH and cat_cons_depth are now refuted as levers on the join tax under BOTH
+baselines tested across this file (pre- and post-block-1-fix); `skip_cons_depths={"b1c3":5}` is a
+new negative result (b1c3's own main-path hop headroom does not touch the join tax either).
+
+**`cat_cons_depth=4`, `skip_cons_depths={"conv_1":4}`, and `skip_cons_depths={"b6c1":5}` are
+untestable by TRACE on this exact full-net W=32 build, though all three fit L1 UNTRACED** --
+enabling `coretile_events`/`trace_config` at all (even to trace a different stage, `conv_cat`) is
+network-wide instrumentation, not local to the traced core, and it was enough to tip two
+different tiles back over their L1 wall:
+
+- `skip_cons_depths={"conv_1":4}` (undoing the b1c1 fix) overflows tile (0,3)=b1c1 by **2624 B**
+  once tracing is enabled anywhere in the build (basic-sequential allocation needs 68160 B of
+  65536 available -- `conv_1_skip_1_cons_buff_3` ends at `0x1083F`). This is the SAME tile/same
+  mechanism Phase 1a-follow-up-4 fixed (192 B of margin there was untraced margin; tracing's own
+  overhead exceeds it).
+- `skip_cons_depths={"b6c1":5}` overflows tile (4,3)=b6c2 by **2048 B** the same way
+  (`b6c2_out_buff_3` ends at `0x105FF`, 67584/65536 B) -- the same `b6c2_out_buff` class flagged
+  repeatedly in this file's MAIN_DEPTH/L1-wall sections as the tightest tile in the network.
+- `cat_cons_depth=4` overflows tile (5,2)=conv_cat itself by a comparable margin
+  (`p_conv_cat_cons_buff_0` fails to place alongside 4x `cat_in_cons_buff` + 4x
+  `conv_cat_out_buff`).
+
+Dropped from the traced sweep rather than chased (would need a per-lever `data_sizes=`-style L1
+concession on top of the lever itself, conflating two variables); `megacombo` (all levers
+together) was abandoned for the same reason before it ran. **These are compile/tooling artifacts
+of the trace harness, not evidence about the levers in production** -- flagged, not resolved.
+
+**Net for Phase 1g: no default flipped.** Every object-fifo-depth lever this task and Phase 1a
+named is now refuted at the join, under two different baselines, at every value the trace
+harness can reach. `verify_span_net.py` was not re-run since no default in `net_design.py`/
+`net_layout.py` changed.
+
+**Best remaining hypothesis (task step 4): stream-switch routing/arbitration across the join's 4
+distinct-column producers, not the MemTile-DMA layer.** Unchanged from Phase 1f's own conclusion,
+now on firmer ground since the ENTIRE object-fifo-depth search space (buffer depths on every side
+of the join: producer, ring, conv_cat's own read-ahead, and the downstream main-path hop for two
+of the four sources) is exhausted with no effect. From the compiled MLIR structure already
+established in this file (Phase 1a follow-up 2/1e): the join's 4 sources sit on **3 different
+columns** -- conv_1 and b1c3 at column 0, b6c1 and conv_2 at column 4 (the join's own MemTile
+column) -- so 2 of 4 producer-to-join paths cross 4 columns of stream-switch fabric while the
+other 2 are column-local; conv_cat itself sits at column 5, one column past its own join MemTile,
+so even the join's OWN read crosses a column. Phase 1f's isolated `trace_iterate_bds.py`
+microbench used NSRC=4 trivial producers without matching this cross-column topology (mechanism
+in that benchmark's own producer placement was never pinned to match SPAN's real layout), so it
+could refute the `iterate_bds` BD-lowering cost in isolation without reproducing whatever a real
+4-source, cross-column, mixed-local/remote convergence onto one MemTile costs in situ. Not
+measured directly here (would need MEMORY_STALL/STREAM_STALL per-hop attribution on the real
+4 producers, or an isolated microbench with producers pinned to match conv_1/b1c3's column-0 and
+b6c1/conv_2's column-4 placement, plus a pinned power mode -- both out of scope for this phase's
+budget); this is the last standing candidate this file has surfaced, not a new one.
