@@ -64,6 +64,23 @@ def layout(kind, w):
     }[kind]
 
 
+def stages(b1_int8=False):
+    """STAGES, with b1c1/b1c2 switched from silu16/silu_i16 to blocks 2-6's own int8 kinds
+    (silu_x/silu) when b1_int8 -- INT8_BLOCK1.md's block-1 quantization option."""
+    d = dict(STAGES)
+    if b1_int8:
+        d["b1c1"], d["b1c2"] = "silu_x", "silu"
+    return d
+
+
+def golden(b1_int8=False):
+    """GOLDEN, with b1c1's dtype switched to int8 when b1_int8 (see `stages`)."""
+    g = dict(GOLDEN)
+    if b1_int8:
+        g["b1c1"] = ("b1.c1.silu", 48, np.int8)
+    return g
+
+
 def stage_names(upto="up"):
     names = [n for n, _ in STAGES]
     return names[:names.index(upto) + 1]
@@ -124,9 +141,9 @@ def split_gate_params(p, cin=C, cout=C, lo_channels=32):
     return {**p, "blob": part(True)}, {**p, "blob": part(False)}
 
 
-def unpack_out(y, upto, h, w):
+def unpack_out(y, upto, h, w, b1_int8=False):
     """Device output rows of stage `upto` -> [ch, h, w], dropping any in-band x."""
-    _, ch, dt = GOLDEN[upto]
+    _, ch, dt = golden(b1_int8)[upto]
     own = ch * (w + 2 * PAD) * np.dtype(dt).itemsize
     rows = np.ascontiguousarray(np.asarray(y).view(np.int8).reshape(h, -1)[:, :own])
     return c3.unpack_rows(rows.view(dt).reshape(-1), ch, h, w)

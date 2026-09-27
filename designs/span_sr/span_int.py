@@ -45,6 +45,9 @@ c1 = _load(KERNELS / "conv2d-1x1-cat" / "golden.py", "c1g")
 silu = lambda t: t / (1 + np.exp(-t))
 sig = lambda t: 1 / (1 + np.exp(-t))
 
+# INT8_BLOCK1.md variant (c), p99.5: block_1's one int16 tensor at int8, zero kernel work
+B1_INT8_PCT = 99.5
+
 
 def fconv(x, w, b, pad_value=None):
     c, h, wd = x.shape
@@ -60,7 +63,11 @@ def fconv(x, w, b, pad_value=None):
 
 
 class Span:
-    def __init__(self, export_dir):
+    def __init__(self, export_dir, b1_mode="int16"):
+        """b1_mode: "int16" (shipped) or "int8" (INT8_BLOCK1.md variant (c), p99.5 percentile
+        clip, amax/127 elsewhere -- the zero-kernel-work option)."""
+        assert b1_mode in ("int16", "int8"), b1_mode
+        self.b1_mode = b1_mode
         self.dir = Path(export_dir)
         self.man = json.loads((self.dir / "manifest.json").read_text())
         self.mean255 = np.array(self.man["rgb_mean"]) * 255
@@ -86,6 +93,8 @@ class Span:
                     t = put(f"b{i}.c{j}.silu", silu(t))
                 if j == 1:
                     outs[f"b{i}.c1.silu"] = t
+                    if i == 1:
+                        self._b1c1_silu_f = t             # for b1_mode="int8"'s percentile calib
             att = sig(t) - 0.5
             s = put(f"b{i}.sum", t + xb)
             xb = put(f"b{i}.out", s * att)
@@ -104,7 +113,8 @@ class Span:
     def quantize(self, calib_rgb01):
         _, amax = self.forward_float(calib_rgb01)
         S = {k: v / 127 for k, v in amax.items()}                   # int8 scales
-        S["b1.c1.silu"] = amax["b1.c1.silu"] / 32767                # the one int16 tensor
+        S["b1.c1.silu"] = (amax["b1.c1.silu"] / 32767 if self.b1_mode == "int16" else
+                          np.percentile(np.abs(self._b1c1_silu_f), B1_INT8_PCT) / 127)
         S["att"] = 0.5 / 127
         self.S, L = S, {}
 
@@ -146,7 +156,7 @@ class Span:
             s_x = S["conv_1"] if i == 1 else S[f"b{i - 1}.out"]
             s_c1silu = S[f"b{i}.c1.silu"]
             L[f"b{i}.c1"] = conv_params(f"block_{i}.c1_r", s_x, S[f"b{i}.c1"])
-            if i == 1:  # SiLU to int16 via hi/lo tables
+            if i == 1 and self.b1_mode == "int16":  # SiLU to int16 via hi/lo tables
                 L["b1.c1"]["lut16"] = table(silu, S["b1.c1"], s_c1silu, -32768, 32767)
             else:
                 L[f"b{i}.c1"]["lut"] = table(silu, S[f"b{i}.c1"], s_c1silu)
@@ -189,7 +199,7 @@ class Span:
         """SPAB block i on its int8 input [48,H,W] -> (int8 output, c1 SiLU output)."""
         p1, p2, p3 = self.L[f"b{i}.c1"], self.L[f"b{i}.c2"], self.L[f"b{i}.c3"]
         t = self._conv(xb, p1)
-        if i == 1:
+        if i == 1 and self.b1_mode == "int16":
             t = p1["lut16"][t.astype(np.int64) + 128].astype(np.int16)
         else:
             t = p1["lut"][t.astype(np.int64) + 128].astype(np.int8)
@@ -255,8 +265,8 @@ class Span:
         P["conv_1"] = conv(L["conv_1"])
         for i in range(1, 7):
             p1, p2, p3 = (L[f"b{i}.c{j}"] for j in (1, 2, 3))
-            P[f"b{i}c1"] = conv(p1, tables=list(c3.split_lut16(p1["lut16"])) if i == 1
-                                else [p1["lut"]])
+            P[f"b{i}c1"] = conv(p1, tables=list(c3.split_lut16(p1["lut16"]))
+                                if i == 1 and self.b1_mode == "int16" else [p1["lut"]])
             P[f"b{i}c2"] = conv(p2, tables=[p2["lut"]])
             P[f"b{i}c3"] = conv(p3, tables=[p3["lut"]],
                                 **{k: p3[k] for k in ("ga", "gb", "gs1", "gc", "gs2")})
@@ -285,7 +295,7 @@ def main():
     export = Path(sys.argv[1])
     demo = Path(sys.argv[2] if len(sys.argv) > 2 else
                 os.environ.get("SPAN_DEMO_DIR", HERE.parent.parent / "artifacts/edsr/demo"))
-    net = Span(export)
+    net = Span(export, b1_mode=os.environ.get("SPAN_B1_MODE", "int16"))
     hr_img = Image.open(demo / "hr.png").convert("RGB")
     w0, h0 = hr_img.size
     hr_img = hr_img.crop((0, 0, w0 - w0 % 4, h0 - h0 % 2))
