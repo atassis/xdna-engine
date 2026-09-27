@@ -68,8 +68,12 @@ def time_one(ch, tile_h):
 
 
 def sweep(ch):
+    # Wide size gap (8 vs 48 rows): the vectorized kernel's per-pixel cost turned out small
+    # enough that an 8-vs-16 gap (time_warp.py's scalar-kernel spacing) is swamped by host
+    // dispatch jitter (~300-400us) -- see README for the 8-vs-16 measurement that came back
+    # with a NEGATIVE marginal for C=3, i.e. pure noise, not a real per-pixel cost.
     r1 = time_one(ch, 8)
-    r2 = time_one(ch, 16)
+    r2 = time_one(ch, 48)
     d_time = r2[0] - r1[0]
     d_px = r2[1] - r1[1]
     ns_px = d_time / d_px * 1e9

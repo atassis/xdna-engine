@@ -51,10 +51,16 @@ static inline fvec widen_bf16(::aie::vector<bfloat16, VW> v) {
   a.from_vector(v);
   return a.template to_vector<float>();
 }
+// conv_even (round-to-nearest-even), matching a host f32->bf16 pack -- see cast_f32_bf16.cc.
+// Without this the narrow uses AIE's default (truncation), which is what the ~4e-3 rel_l2
+// against the numpy golden's astype(bfloat16) (round-to-nearest) traced back to.
 static inline ::aie::vector<bfloat16, VW> narrow_bf16(fvec v) {
+  ::aie::rounding_mode saved = ::aie::swap_rounding(::aie::rounding_mode::conv_even);
   ::aie::accum<accfloat, VW> a;
   a.from_vector(v);
-  return a.template to_vector<bfloat16>();
+  auto r = a.template to_vector<bfloat16>();
+  ::aie::set_rounding(saved);
+  return r;
 }
 
 // in_padded: [WPAD_H, WPAD_W, WARP_CH] bf16, tile origin at (WARP_HALO, WARP_HALO).
