@@ -242,6 +242,32 @@ class Span:
             P[key] = d
         return P
 
+    def net_params(self):
+        """Every stage's device inputs, keyed by net_layout.STAGES name: packed params blob,
+        requant pre/shift, tables (int8 table, or hi/lo halves of block 1's int16 SiLU) and the
+        gate constants."""
+        L, P = self.L, {}
+
+        def conv(p, **extra):
+            return dict(blob=c3.pack_params(p["w"], p["b"], p["mult"]), pre=p["pre"],
+                        shift=p["shift"], **extra)
+
+        P["conv_1"] = conv(L["conv_1"])
+        for i in range(1, 7):
+            p1, p2, p3 = (L[f"b{i}.c{j}"] for j in (1, 2, 3))
+            P[f"b{i}c1"] = conv(p1, tables=list(c3.split_lut16(p1["lut16"])) if i == 1
+                                else [p1["lut"]])
+            P[f"b{i}c2"] = conv(p2, tables=[p2["lut"]])
+            P[f"b{i}c3"] = conv(p3, tables=[p3["lut"]],
+                                **{k: p3[k] for k in ("ga", "gb", "gs1", "gc", "gs2")})
+        P["conv_2"] = conv(L["conv_2"])
+        pc = L["conv_cat"]
+        P["conv_cat"] = dict(blob=c1.pack_params(pc["w"].reshape(48, -1), pc["b"], 4, pc["mult"]),
+                             pre=pc["pre"], shift=pc["shift"])
+        P["up"] = conv(L["up"])
+        return P
+
+
 def _y(rgb):
     return (65.481 * rgb[0] + 128.553 * rgb[1] + 24.966 * rgb[2] + 16) / 255
 
