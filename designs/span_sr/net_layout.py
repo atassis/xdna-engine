@@ -24,14 +24,14 @@ CAT_SOURCES = [("conv_1", 0), ("conv_2", 1), ("b1c3", 2), ("b6c1", 3)]
 CAT_HALVES = 5
 
 # policy: rows of headroom past the minimum a skip must hold, so a source is not throttled by
-# its skip before the main path catches up. Was 2; raised to 8 2026-09-27 (device dose-response,
-# TRACE_RESULTS.md skip-ring latency-throttle section): whole-net wall-clock fell from ~2624 to
-# ~659 cyc/px between slack=2 and slack=8, with slack=16/25 buying no further win in the same
-# run (noise-bound plateau at 660-750). A same-process trace at the two ends (slack=2 vs 25)
-# corroborates the mechanism directly: b3c3's gap fell 919.72 -> 224.92 cyc/px with compute
-# pinned at 406.2 throughout. 8 sits well under the 512 KB MemTile ring ceiling (max fitting
-# slack=25 at W=32), leaving headroom for later MAIN_DEPTH/PROD_DEPTH work.
-SKIP_SLACK = 8
+# its skip before the main path catches up. Was 2, raised to 8 2026-09-27 (see git history for
+# that dose-response); that 8-was-enough plateau (659-744-703 cyc/px through slack=25) was itself
+# masked by the pre-fix b1c1<->b1c2 zero-slack ping-pong pace (~643 cyc/px). Re-tested 2026-09-27
+# (Phase 1h, TRACE_RESULTS.md) after that ping-pong was fixed: raised to 16 -- b1c2's compute+gap
+# (the whole-chain pace probe) falls 483.8 -> 364.5 -> 326.9 cyc/px at slack 8/12/16, LOCK_STALL
+# 33.2% -> 2.0%, then FLAT at 16/20/25 (326.9 exactly) -- 16 reaches the no-join floor (~326,
+# matching the join-free main-chain rate from Phase 1e/1d) with margin to spare.
+SKIP_SLACK = 16
 # policy: a MemTile has 6 MM2S channels, so one weight split feeds at most 6 cores
 WEIGHT_GROUP = 6
 

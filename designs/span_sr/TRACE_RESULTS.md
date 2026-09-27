@@ -1186,3 +1186,73 @@ measured directly here (would need MEMORY_STALL/STREAM_STALL per-hop attribution
 4 producers, or an isolated microbench with producers pinned to match conv_1/b1c3's column-0 and
 b6c1/conv_2's column-4 placement, plus a pinned power mode -- both out of scope for this phase's
 budget); this is the last standing candidate this file has surfaced, not a new one.
+
+## Phase 1h: SKIP_SLACK re-tested post-block-1-fix -- the 8-was-enough plateau WAS masked;
+## default raised to 16, gated 22/22; a vacuous compile-only check found and fixed
+
+Coordinator's hypothesis: the SKIP_SLACK dose-response that set the 2->8 default (way above, "the
+skip-ring latency-throttle hypothesis" section) ran BEFORE the block-1 `DEPTH["b1c1"]=4` fix landed
+(Phase 1a follow-up 4), while the b1c1<->b1c2 zero-slack ping-pong (Phase 1a follow-up 3) was still
+setting the whole-net pace at ~643-690 cyc/px. Slack 8's plateau (659/744/703 through slack 25) is
+consistent with THAT pace, not with the ring itself being saturated -- so "8 is enough" was never
+actually tested against the corrected, join-only floor (~326-484 cyc/px, Phase 1e/1f/1g). Re-run
+here (worktree `wt-span-phase1h`, off main b275253, toolchain instance `83c26a8138af`), one stage
+per dispatch, W=32 H=128, main defaults otherwise except the swept `skip_slack=`. Power mode:
+`default` (UNPINNED), standing caveat.
+
+**Dose-response, `conv_1` (skip source) and `b1c2` (whole-chain pace probe, used since Phase 1c):**
+
+| SKIP_SLACK | conv_1 compute+gap | b1c2 compute cyc/px | b1c2 gap cyc/px | b1c2 LOCK_STALL % | b1c2 compute+gap |
+|---|---|---|---|---|---|
+| 8 (old default) | 477.0 | 324.01 | 159.78 | 33.2% | 483.8 |
+| 12 | 357.7 | 324.07 | 40.46 | 11.92% | 364.5 |
+| 16 | 319.2 | 324.23 | 2.69 | 2.01% | 326.9 |
+| 20 | 319.2 | 324.23 | 2.69 | 1.96% | 326.9 |
+| 25 (max fitting) | 319.1 | 324.23 | 2.69 | 1.97% | 326.9 |
+
+**CONFIRMED, not masked-null.** Unlike every PROD_DEPTH/cat_cons_depth/skip_cons_depths lever
+Phase 1g re-tested at this same corrected baseline (all null), SKIP_SLACK itself moves the pace by
+a large, monotonic amount: b1c2 483.8 -> 364.5 -> 326.9 cyc/px (8->12->16), LOCK_STALL 33.2% ->
+2.0%, with compute pinned throughout (324.0-324.2, confirming pure synchronization, not kernel
+work) -- then FLAT at 20/25 (326.9 exactly, matching to 0.1 cyc/px). 16 lands within 0.3% of the
+no-join main-chain floor measured in Phase 1e/1d (~326.0-326.4 cyc/px at W=32), i.e. it removes
+essentially all of the join's synchronization tax that 8 left in place. conv_1 shows the identical
+shape (477.0 -> 357.7 -> 319.2, flat after).
+
+**Default flipped: `SKIP_SLACK` 8 -> 16** (`net_layout.py`, comment updated with this measured
+reason). Gate: `verify_span_net.py` at the new default (no override) -- **22/22 cores exact**
+(conv_1 through up, 98304/98304 and 32768/32768). Confirmed network-wide with a same-process
+trace at the new default (no `skip_slack=` override, `NL.SKIP_SLACK` picked up as 16 directly):
+`b3c3` compute+gap 326.9 (compute 316.44, LOCK_STALL 12.9%), `conv_cat` compute+gap 324.4 (compute
+58.22, LOCK_STALL 85.37% -- conv_cat's own compute is tiny, as in every prior section, so a high
+LOCK_STALL% there is expected and not a sign of remaining throttle). Both land at the same ~325-327
+cyc/px floor as `b1c2`, i.e. the whole network is now at the no-join pace, not just the probed
+stage.
+
+**MemTile-ceiling correction: the old 25-fits/26-fails boundary from the original skip-ring
+section stands, but the FIRST tool built for this phase could not have found it.** A
+compile-only sweep (`compile_sweep_phase1h.py`) that called only `N.build()` reported OK through
+skip_slack=40 -- `N.build()` returns a lazily-jitted `CallableDesign`; aiecc's placement/address-
+allocation passes (where a MemTile buffer overflow is actually raised) run only on first
+invocation (`design(*args)`, needing device tensors) or an explicit `.compile()` call, neither of
+which that script did. **This was a vacuous check** -- it exercised the Python-side objectFifo
+graph construction only, not the thing being tested. Caught on device: `inspect_join_mlir_
+phase1h.py`'s slack=40 dispatch failed at aiecc's address-allocation pass with `'aie.objectfifo.
+pool' op iterate_bds needs one 691200-byte buffer on its MemTile, which has 524288 bytes free`.
+524288 B = 512 KiB exactly, confirming the ring IS one single-MemTile buffer, as the original
+section assumed. **Fixed**: `compile_sweep_phase1h.py` now calls `.compile()` (pre-warms the
+aiecc cache, still no device) on every candidate, and its docstring states exactly what it
+checks. Re-run: OK through skip_slack=25, FAIL at 26 onward (`aiecc: pipeline failed`) -- exactly
+the original boundary, now via a real compile rather than a vacuous one.
+
+**Exact byte accounting at the new default, from the compiled MLIR** (`ij1h_16_physical.mlir`,
+`design(*args)` dispatch, slack=16): `cat_in_buff` is ONE buffer on tile `(4,1)`, `memref<
+414720xi8>` -- matching `depth(conv_1) = rows_ahead(20) + 16 = 36`, `36 x 11520 B/row-slot =
+414720 B`, 109568 B (21%) free of 524288. At slack=25 (the old max): `45 x 11520 = 518400 B`,
+5888 B free. At slack=26: `46 x 11520 = 529920 B`, over by 5632 B -- matches the FAIL exactly.
+
+**Net for this phase: default raised 8 -> 16, gated 22/22, network-wide-confirmed by trace, and
+the tooling defect this phase's own first script introduced is fixed and documented.** The
+methodological point that motivated this phase (an earlier plateau can be masked by a since-fixed
+bottleneck) is now itself the second confirmed instance in this file, after the block-1 ping-pong
+correction to the SKIP_SLACK section above -- both were re-tested rather than assumed closed.
