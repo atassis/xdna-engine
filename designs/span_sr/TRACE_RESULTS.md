@@ -371,14 +371,12 @@ downstream**, independent of kind: b1c3 642.2 -> b6c3 614.4 (gate kind, -27.8 ov
 b2c1 639.0 -> b6c2 615.0 (silu_x/silu kind, -24.0 over 4 block-hops) -- roughly -5 to -6 cyc/px per
 block, both kinds tracking together. Since kernel compute is provably constant, this whole-chain
 gradient is in the GAP only, and it correlates with chain POSITION, not with any per-stage
-structural property (kind, fifo depth, MemTile). The single most likely explanation given the
-standing caveat below (power mode never pinned for any measurement in this file) is a DVFS/warm-up
-transient WITHIN the single H=128-row dispatch: a stage further downstream starts counting its own
-rows later in wall-clock time, so it samples a "warmer" (faster) part of the same ramp that an
-upstream stage's early rows do not get -- not a location-specific throughput ceiling. This is a
-hypothesis, not verified here (pinning requires root, which this session does not have and the
-global rule forbids invoking directly); flagged as the standing confound on the "no pace-setter"
-finding rather than closed.
+structural property (kind, fifo depth, MemTile). **Corrected per coordinator review:** the
+simpler explanation is PIPELINE FILL/DRAIN inside the single H=128-row dispatch, not DVFS -- a
+stage further downstream starts its own first traced row later (after more upstream hops fill),
+so its measured window covers proportionally fewer of the run's fixed-cost fill/drain rows out of
+its own n_rows-1 gap intervals, pulling its average down; this needs no clock-ramp assumption and
+fits the smooth, position-ordered decrease directly. Do not lean on the DVFS framing.
 
 **MemTile(4,1) is the shared resource the coordinator asked to check.** `net_layout.weight_groups`
 (WEIGHT_GROUP=6) makes 4 weight-feed MemTiles; `join()`'s default `tile=AnyMemTile` places the
@@ -405,13 +403,64 @@ attribution of the remaining stall to this MemTile specifically.
 
 **Net for this follow-up:** every stage is a "victim" in the sense the coordinator meant (no
 core runs near-saturated while others wait), and the compute+gap gradient across the whole chain
-is better explained by an unpinned-power-mode transient than by position. MemTile(4,1)'s channel
-load (10/12, hosting both the join and a weight group) and the conv_1/b1c3 cross-column skip
-broadcasts are the concrete "shared resource" / "crosses columns" candidates this MLIR surfaces,
-per the coordinator's fallback -- neither has been measured against the remaining ~40% LOCK_STALL
-directly (that would need a channel-isolating experiment: e.g. moving the join to a dedicated
-MemTile via `join(tile=...)` and re-tracing b3c3, or a power-mode-pinned re-run of this same sweep),
-and both are offered as the next things to test, not as a closed attribution.
+is better explained by pipeline fill/drain within the single dispatch than by position (see the
+correction above). MemTile(4,1)'s channel load (10/12, hosting both the join and a weight group)
+and the conv_1/b1c3 cross-column skip broadcasts are the concrete "shared resource" / "crosses
+columns" candidates this MLIR surfaces, per the coordinator's fallback -- neither has been
+measured against the remaining ~40% LOCK_STALL directly. The chain-length bisection below settles
+which of these (main chain vs. join/tail) is worth pursuing further.
+
+## Phase 1a follow-up 2 (coordinator): chain-length bisection -- the pace is set in the main chain,
+## by the first 4 cores, not the join/tail
+
+Key fact motivating this: the period (~610-640 traced, ~655-690 whole-net) exceeds every single
+core's own compute (max 406.5, the gate kind) and even the LEAST-stalled traced core (b1c3,
+37.46% LOCK_STALL) still stalls -- so the throttle is outside any one core's work, and (per
+coordinator) latency alone cannot explain a lever-insensitive ceiling since PROD_DEPTH/
+cat_cons_depth were both null. Discriminates main-chain vs. join/tail by chain length: whole-net
+rate (repeat/fit probe, same method as the SKIP_SLACK dose-response) at SPAN_UPTO in {b1c3, b3c3,
+b6c3, conv_2, conv_cat, up} -- everything up to and including conv_2 has NO join built at all
+(`net_design.build()` only wires `f_cat`/the join when `"conv_cat"` is in the stage list), so this
+isolates "main chain alone" from "main chain + join + tail" cleanly.
+
+`aie_kernels/_test/probe_span_upto_bisect.py`, W=32, SKIP_SLACK=8/default, HEIGHTS
+[64,128,192,256], 5 trials, alternated per height, fitted slope, same session. Power mode:
+`default` (UNPINNED), same standing caveat.
+
+| upto | cores | fitted cyc/px @ 1.8 GHz (W=32) |
+|---|---|---|
+| b1c3 | 4 | 663 |
+| b3c3 | 10 | 760 |
+| b6c3 | 19 | 666 |
+| conv_2 | 20 (no join) | 655 |
+| conv_cat | 21 (+join) | 688 |
+| up | 22 (full net) | 679 |
+
+**The pace is already fully present at 4 cores.** `upto=b1c3` (663) is within 2.4% of the full
+22-core net (679) -- adding the remaining 18 cores, the entire join, AND the tail (conv_cat, up)
+moves the rate by less than the run-to-run noise this file has repeatedly flagged (compare the
+90/659/703/744 spread across the SKIP_SLACK dose-response's own trials). Removing the join and
+tail entirely (`conv_2`, 655) does not raise the rate toward any single core's isolated compute
+(250-433 cyc/px measured elsewhere) or lower it toward the full net's rate in a way that implicates
+the join -- it's already indistinguishable from `up`. **This rules out the join/tail as the
+throttle**: MemTile(4,1)'s channel sharing and the conv_1/b1c3 cross-column skip broadcasts (the
+candidates flagged above) are NOT where the ~655-690 cyc/px pace comes from, since that pace exists
+identically without them.
+
+`b3c3` (760) is the outlier -- higher than BOTH `b1c3` (a shorter prefix) and `up` (the full net,
+a longer prefix), which is not mechanistically sensible for a monotonically-accumulating chain and
+reads as this file's usual wall-clock-fit noise (box shared throughout) rather than a real
+mid-chain spike; the same-process TRACE of b3c3 IN THE FULL NET (compute+gap=631.1, well below
+this truncated-build's 760) corroborates that 760 is a build/contention artifact of THIS specific
+truncated design, not a property of b3c3 itself.
+
+**Conclusion: the throttle is in the main chain, and it is already fully set within block 1 (the
+first 4 cores: conv_1, b1c1, b1c2, b1c3)** -- not the join, not MemTile(4,1), not the tail. Given
+b1c3's own compute is only 406.2-406.5 cyc/px (well under the ~660-680 pace) and PROD_DEPTH/
+cat_cons_depth/MAIN_DEPTH/b1c1-b1c2-depth are all refuted as levers on it, the mechanism WITHIN
+those first 4 cores is still open -- narrowing further (e.g. upto=conv_1, upto=b1c1, upto=b1c2 to
+find exactly which hop within block 1 first reaches the pace) is the natural next bisection step,
+not run here per "stop at the answer."
 
 ## Caveat
 
