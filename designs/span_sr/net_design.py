@@ -83,7 +83,8 @@ def _flags(kind, incs):
 
 
 def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
-         trace_stages=None, trace_config=None, coretile_events=None, egress_shim_col=1):
+         trace_stages=None, trace_config=None, coretile_events=None, egress_shim_col=1,
+         main_depth=None):
     """NP: span_int.Span.net_params(). Returns an iron.jit callable (x, wts, y): x from
     net_layout.conv1_rows (as int8), wts from net_layout.weights_blob, y gets `upto`'s rows.
 
@@ -91,7 +92,14 @@ def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
     trace_config (a TraceConfig, REQUIRED if trace_stages is given) is passed to iron.jit so it
     injects a `trace_size` compile kwarg into `design`; that call bakes Program.enable_trace on
     exactly the Workers named in trace_stages, bracketed with event0()/event1() in their shim.
-    None (default) leaves every shim byte-identical to production."""
+    None (default) leaves every shim byte-identical to production.
+
+    main_depth: override for MAIN_DEPTH (default None -> the module constant, 4). `windowed()`
+    holds a 3-row sliding window and releases 1/iteration, so depth=4 leaves exactly 1 free
+    slot for the upstream producer -- diagnostic for the per-row lockstep hypothesis in
+    TRACE_RESULTS.md. Does not touch PROD_DEPTH (skip-broadcast producer depth) or the
+    per-stage DEPTH overrides (e.g. b1c1=3), which still take precedence via `depths=`."""
+    main_depth = MAIN_DEPTH if main_depth is None else main_depth
     assert w % 16 == 0, "conv3x3_u8.cc needs width % 16 == 0 (and the x copy, whole 64-byte vectors)"
     gen = Path(gen)
     gen.mkdir(parents=True, exist_ok=True)
@@ -100,7 +108,7 @@ def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
     kind = dict(NL.STAGES)
     lay = {n: NL.layout(kind[n], w) for n in names}
     stacks = {**STACK, **(stacks or {})}
-    depth = {n: MAIN_DEPTH for n in names} | DEPTH | (depths or {})
+    depth = {n: main_depth for n in names} | DEPTH | (depths or {})
     joined = "conv_cat" in names
     skips = {s for s, _ in NL.CAT_SOURCES} if joined else set()
 
@@ -117,7 +125,7 @@ def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
     skip_depths = {s: NL.skip_depth(s) for s in sorted(skips)}
     digest = hashlib.sha256("".join(texts).encode() + repr(
         (w, h, upto, sorted(stacks.items()), sorted(depth.items()), groups, skip_depths,
-         MAIN_DEPTH, PROD_DEPTH, sorted(trace_stages), tuple(coretile_events or ()),
+         main_depth, PROD_DEPTH, sorted(trace_stages), tuple(coretile_events or ()),
          egress_shim_col)).encode()).hexdigest()[:12]
     base = _aie_api_include() + [f"-DSPAN_NET_DIGEST={digest}"]
     plen = {n: NP[n]["blob"].size for n in names}
@@ -184,7 +192,7 @@ def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
                                    depths=[1] * len(grp), names=[f"p_{n}" for n in grp])
             p_fifo.update(zip(grp, subs))
             w_fifos.append(wf)
-        f_in = ObjectFifo(ty(x_row), name="x_in", depth=MAIN_DEPTH)
+        f_in = ObjectFifo(ty(x_row), name="x_in", depth=main_depth)
         out, f_cat = {}, None
         if joined:
             # a join's inputs and output share one MemTile pool, sized by the output fifo, so
@@ -205,10 +213,10 @@ def build(w, h, NP, gen, upto="up", depths=None, stacks=None, tag="spannet",
             if kind[n] == "cat":
                 fi, body = f_cat.cons(depth=2), rowwise
             elif i == 0:
-                fi, body = f_in.cons(MAIN_DEPTH), padded
+                fi, body = f_in.cons(main_depth), padded
             else:
                 prev = names[i - 1]
-                fi = out[prev].cons(MAIN_DEPTH if prev in skips else depth[prev])
+                fi = out[prev].cons(main_depth if prev in skips else depth[prev])
                 body = windowed
             fo = out[n].prod(depth=PROD_DEPTH) if n in skips else out[n].prod()
             workers.append(Worker(body, fn_args=[fi, p_fifo[n].cons(), fo, kern[n]],
