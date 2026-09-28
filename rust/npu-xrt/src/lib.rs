@@ -1031,10 +1031,13 @@ impl Device {
         }
     }
 
-    /// Open a resident runner for a CONSTANT scratchpad-parameter ELF (Option C). Registers the ELF
-    /// ONCE. Returns `Err` if the ELF has no ctrl scratchpad (i.e. not a scratchpad-parameter build —
-    /// caller should fall back to the patch path). `name=None` uses `"main:sequence"`. No QoS
-    /// declared; use [`open_elf_resident_qos`](Self::open_elf_resident_qos) for a background context.
+    /// Open a resident runner: registers the ELF's hw_context ONCE and shares it with every
+    /// [`ElfResident::open_named`] variant. Works for a CONSTANT scratchpad-parameter build
+    /// (Option C, [`ElfResident::write_scratchpad`]/[`scratchpad_size`](ElfResident::scratchpad_size)
+    /// then non-zero) and equally for a plain positional-args full ELF with no ctrl scratchpad at
+    /// all (`scratchpad_size() == 0`; bind + dispatch with no scratchpad writes). `name=None` uses
+    /// `"main:sequence"`. No QoS declared; use
+    /// [`open_elf_resident_qos`](Self::open_elf_resident_qos) for a background context.
     pub fn open_elf_resident(&self, elf_bytes: &[u8], name: Option<&str>) -> Result<ElfResident> {
         self.open_elf_resident_qos(elf_bytes, name, None)
     }

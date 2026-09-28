@@ -475,11 +475,21 @@ ShimElfResident* shim_elf_resident_open(ShimDevice* d, const void* elf_bytes, si
                                                        : std::string("main:sequence");
     xrt::ext::kernel k(ctx, name);
     xrt::run run(k);
-    // get_ctrl_scratchpad_bo throws if the ELF has no scratchpad section — that means this ELF is not
-    // a scratchpad-parameter build, so the caller must use the patch path. Surface as NULL.
-    xrt::bo sp = run.get_ctrl_scratchpad_bo();
-    uint8_t* mp = sp.map<uint8_t*>();
-    size_t sz = sp.size();
+    // get_ctrl_scratchpad_bo throws if the ELF has no scratchpad section. That is a legal shape
+    // (a plain positional-args full ELF, not an aiex.scratchpad_parameter build) rather than a
+    // fatal error: the resident still opens, sharing the same hw_context/bind/dispatch every
+    // other resident does, just with scratchpad_size() == 0 -- write_scratchpad already refuses
+    // on a null scratch_map, and dispatch() below skips the scratchpad sync when there is none.
+    xrt::bo sp;
+    uint8_t* mp = nullptr;
+    size_t sz = 0;
+    try {
+      sp = run.get_ctrl_scratchpad_bo();
+      mp = sp.map<uint8_t*>();
+      sz = sp.size();
+    } catch (const std::exception&) {
+      // no ctrl scratchpad -- sp/mp/sz keep their no-scratchpad defaults.
+    }
     return new ShimElfResident{ std::move(elf), std::move(ctx), std::move(k), std::move(run),
                                 name, std::move(sp), mp, sz };
   )
@@ -493,9 +503,16 @@ ShimElfResident* shim_elf_resident_open_named(ShimElfResident* base, const char*
     // hw_context is the expensive object (16 of them device-wide) and a variant must not spend one.
     xrt::ext::kernel k(base->ctx, std::string(kernel_name));
     xrt::run run(k);
-    xrt::bo sp = run.get_ctrl_scratchpad_bo();
-    uint8_t* mp = sp.map<uint8_t*>();
-    size_t sz = sp.size();
+    // Same no-scratchpad allowance as shim_elf_resident_open -- see its comment.
+    xrt::bo sp;
+    uint8_t* mp = nullptr;
+    size_t sz = 0;
+    try {
+      sp = run.get_ctrl_scratchpad_bo();
+      mp = sp.map<uint8_t*>();
+      sz = sp.size();
+    } catch (const std::exception&) {
+    }
     return new ShimElfResident{ base->elf, base->ctx, std::move(k), std::move(run),
                                 std::string(kernel_name), std::move(sp), mp, sz };
   )
@@ -527,7 +544,9 @@ int shim_elf_resident_write(ShimElfResident* r, size_t offset, const void* data,
 
 int shim_elf_resident_dispatch(ShimElfResident* r) {
   GUARD_INT(
-    r->scratchpad.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    // Only a real scratchpad has bytes to push; a plain positional-args resident (scratch_map
+    // null) has nothing to sync here -- its args are bound directly (shim_elf_resident_bind).
+    if (r->scratch_map) { r->scratchpad.sync(XCL_BO_SYNC_BO_TO_DEVICE); }
     r->run.start();
     wait_deadline(r->run, "resident:" + r->name);
     return 0;
