@@ -30,7 +30,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
 from llm_decode_spec import SPECS, k_chunks_for  # noqa: E402
 
 HF_REPO = {"qwen3-0.6b": "Qwen/Qwen3-0.6B", "gemma3-270m": "unsloth/gemma-3-270m-it",
-           "gemma4-12b": "unsloth/gemma-4-12b-it", "qwen3.5-4b": "Qwen/Qwen3.5-4B"}
+           "gemma4-12b": "google/gemma-4-12B-it-qat-q4_0-unquantized", "qwen3.5-4b": "Qwen/Qwen3.5-4B"}
 
 # The projection leaves, i.e. everything that is a [out, in] matrix rather than a norm gain or the
 # embedding table. Only these are packable.
