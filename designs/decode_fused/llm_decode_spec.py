@@ -19,7 +19,7 @@ inferred from a sibling model, because three of them are same-name-different-mea
 Qwen3 by `head_dim**0.5`. And Gemma scales the embedding by `sqrt(d_model)` on the way in while Qwen3
 does not (`embed_scale`), which is a HOST-side per-token step, recorded here so the two sides agree.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import product
 
 # ---------------------------------------------------------------------------------------------
@@ -535,6 +535,20 @@ class LlmSpec:
     # proportional convention (full width, exponent over head_dim) and would be silently wrong here.
     rope_rotary_dim: int | None = None
 
+    # ---- encoder-decoder axes (Whisper), read off transformers/models/whisper ----
+    # "layer": LayerNorm with gain and bias. The generator folds both into the projection each norm
+    # feeds (W*g, W@beta + b), so the device runs the normalise-only LayerNorm op.
+    norm_kind: str = "rms"
+    # q/v/o and both MLP projections carry a bias; k_proj has none.
+    proj_bias: bool = False
+    # False: fc1 -> act -> fc2, no gate projection.
+    mlp_gated: bool = True
+    # "learned": the host adds embed_positions[pos] to the token embedding; the graph has no RoPE.
+    pos_embed: str = "rope"
+    # Encoder positions every layer's cross-attention reads. The host writes that K/V once per
+    # utterance; the graph only reads it.
+    cross_len: int | None = None
+
     # ---- derived ----
     def head_weight_name(self) -> str:
         """The dump key the LM head's weights come from.
@@ -702,7 +716,45 @@ class LlmSpec:
         # (IRON ef5dd58). They are parameters now, threaded at the construction site in
         # gen_llm_decode.py; build_llm_decode.sh gates on the symbol so an older IRON fails by
         # name instead of by TypeError.
+        if not self.mlp_gated or self.norm_kind != "rms" or self.proj_bias:
+            return "the op is a gated, bias-free MLP behind an RMSNorm"
         return None
+
+    def padded_vocab(self, cols: int = 8, tsi: int = 4) -> int:
+        """The lm-head GEMV's M: the smallest M >= vocab that `check` and `gemv_tile_output` both
+        accept. The host trims the padding rows. Identity for every vocab that already tiles."""
+        step = cols * max(tsi, C_TILE_GRANULE)
+        m = -(-self.vocab // step) * step
+        while True:
+            try:
+                gemv_tile_output(m, self.d_model, cols=cols)
+                return m
+            except ValueError:
+                m += step
+
+    def cross_len_padded(self) -> int:
+        """Cross K/V rows as allocated: the same S rules `check_seq` puts on the self cache."""
+        return -(-self.cross_len // 256) * 256
+
+    def encdec_tensors(self, layer: int) -> dict:
+        """role -> (dump key, shape) for one encoder-decoder layer. HF Linear weights are
+        [out, in]; biases absent from the checkpoint (k_proj) are not listed."""
+        p = f"{self.weight_prefix}layers.{layer}."
+        D, FF = self.d_model, self.ffn
+        t = {}
+        for pre, att in (("", "self_attn"), ("x", "encoder_attn")):
+            for leaf, key, bias in (("q_proj", "Wq", True), ("k_proj", "Wk", False),
+                                    ("v_proj", "Wv", True), ("out_proj", "Wo", True)):
+                t[pre + key] = (f"{p}{att}.{leaf}.weight", (D, D))
+                if bias:
+                    t[pre + "b" + key[1:]] = (f"{p}{att}.{leaf}.bias", (D,))
+        t.update({"Wu": (p + "fc1.weight", (FF, D)), "bu": (p + "fc1.bias", (FF,)),
+                  "Wd": (p + "fc2.weight", (D, FF)), "bd": (p + "fc2.bias", (D,))})
+        for key, leaf in (("n_in", "self_attn_layer_norm"), ("n_x", "encoder_attn_layer_norm"),
+                          ("n_pf", "final_layer_norm")):
+            t[key] = (f"{p}{leaf}.weight", (D,))
+            t[key + "_b"] = (f"{p}{leaf}.bias", (D,))
+        return t
 
     def has_v_proj(self, layer: int) -> bool:
         """False where attention_k_eq_v applies: the layer has no v_proj and V comes from K.
@@ -768,7 +820,8 @@ class LlmSpec:
             geoms.append((" [global]", gl, self.n_q_heads * gl, gkv * gl, gkv))
         for tag, hd, qd, kvd, kvh in geoms:
             for label, m in ((f"q_dim{tag}", qd), (f"kv_dim{tag}", kvd), ("d_model", self.d_model),
-                             (f"head_dim{tag}", hd), ("ffn", self.ffn), ("vocab", self.vocab)):
+                             (f"head_dim{tag}", hd), ("ffn", self.ffn),
+                             ("vocab", self.padded_vocab(cols, tsi))):
                 if m % cols:
                     raise ValueError(f"{self.name}: GEMV M={label}={m} not divisible by cols={cols}")
                 if (m // cols) % tsi:
@@ -796,6 +849,14 @@ class LlmSpec:
             raise ValueError(f"{self.name}: unknown act {self.act!r}")
         if self.norm_gain not in ("one_plus_w", "w"):
             raise ValueError(f"{self.name}: unknown norm_gain {self.norm_gain!r}")
+        if self.norm_kind not in ("rms", "layer") or self.pos_embed not in ("rope", "learned"):
+            raise ValueError(f"{self.name}: unknown norm_kind {self.norm_kind!r} or pos_embed "
+                             f"{self.pos_embed!r}")
+        if self.cross_len is not None and not (self.norm_kind == "layer" and self.proj_bias
+                                               and not self.mlp_gated and not self.qk_norm
+                                               and self.pos_embed == "learned"):
+            raise ValueError(f"{self.name}: cross_len is built only as the Whisper block "
+                             f"(LayerNorm, biased projections, ungated MLP, learned positions)")
 
     def check_seq(self, S: int) -> None:
         """Constraints that depend on the KV capacity, so they cannot be checked on the spec alone."""
@@ -1057,8 +1118,24 @@ QWEN35_4B = LlmSpec(
     attn_output_gate=True, rope_rotary_dim=64,
 )
 
+# openai/whisper-small's decoder. act is gelu_tanh standing in for the checkpoint's exact GELU,
+# gated on argmax parity against the host decode rather than assumed equivalent.
+WHISPER_SMALL = LlmSpec(
+    name="whisper-small", d_model=768, n_layers=12, n_q_heads=12, n_kv_heads=12, head_dim=64,
+    ffn=3072, vocab=51865, eps=1e-5, act="gelu_tanh", norm_gain="w",
+    sandwich_norms=False, qk_norm=False, embed_scale="none",
+    rope_theta_global=0.0, rope_theta_local=None,
+    sliding_window=None, sw_pattern=None, query_pre_attn_scalar=None,
+    weight_prefix="model.decoder.",
+    norm_kind="layer", proj_bias=True, mlp_gated=False, pos_embed="learned", cross_len=1500,
+)
+
+WHISPER_TURBO = replace(
+    WHISPER_SMALL, name="whisper-turbo", d_model=1280, n_layers=4, n_q_heads=20, n_kv_heads=20,
+    ffn=5120, vocab=51866)
+
 SPECS = {s.name: s for s in (GEMMA3_270M, QWEN3_0_6B, GEMMA4_12B, QWEN35_4B, S2_PRO_SLOW_AR,
-                             S1_MINI_SLOW_AR, S1_MINI_FAST_AR)}
+                             S1_MINI_SLOW_AR, S1_MINI_FAST_AR, WHISPER_SMALL, WHISPER_TURBO)}
 
 
 def operator_rejects(op_cls, kwargs):
