@@ -3648,6 +3648,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             rl += [(op_head, "W_head", "xf", "logits")]
         bufsz["xf"] = D * 2
     bufsz["logits"] = VOCAB * 2
+    final_hidden = "xf" if "xf" in bufsz else None
 
     if os.environ.get("DUMP_OPS"):
         from collections import Counter
@@ -3802,7 +3803,10 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                   f"{len(_extra) + 1} named control codes in one ELF")
         _scratch_order_kw = {}
         if BUCKET_SCRATCH_ORDER:
-            _scratch_order_kw = {"scratch_order": list(weights.keys())}
+            # The host reads final_hidden by offset, so it must sit ahead of the window-sized
+            # scratch with the weights, or it moves between buckets.
+            _scratch_order_kw = {"scratch_order": list(weights.keys())
+                                 + ([final_hidden] if final_hidden in seg_bufsz else [])}
         elif SCRATCH_ORDER_FROM:
             _ref_order, _ref_lens = _reference_scratch_layout(_SCRATCH_ORDER_ENTRIES)
             _candidates = set(weights) | set(seg_bufsz)
@@ -3880,7 +3884,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         head.compile()
     return sp, fused, weights, dict(NL=NL, S=S, T=T, inputs=inputs, cache_names=cache_names,
                                         recurrent_names=recurrent_names,
-                                        final_hidden="xf" if "xf" in bufsz else None,
+                                        final_hidden=final_hidden,
                                         decode_layer_active=op_decode_layer is not None,
                                         # getattr, not attribute access: a spec whose fused
                                         # layer did not build has no such attribute.
