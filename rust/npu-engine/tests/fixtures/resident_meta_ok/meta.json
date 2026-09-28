@@ -1,0 +1,48 @@
+{
+  "kind": "resident_forward",
+  "schema": 1,
+  "boot": "boot",
+  "classes": [
+    {"code": "p1", "nt": 1},
+    {"code": "p2", "nt": 2}
+  ],
+  "segments": [
+    {"layers": [0, 2], "x_in": true, "head": true, "suffix": ""}
+  ],
+  "dims": {
+    "layers": 2,
+    "d_model": 3840,
+    "q_heads": 16,
+    "kv_heads": 8,
+    "head_dim_sliding": 256,
+    "head_dim_global": 512,
+    "ffn": 15360,
+    "vocab": 262144,
+    "sliding_window": 1024,
+    "row_block": 16,
+    "pcap_blocks": 2
+  },
+  "derived": {
+    "pcap_blocks": {"value": 2, "bound": "MemTile live set, format F1", "source": "seeded fixture, not measured"},
+    "sliding_capacity": {"value": 1152, "bound": "sliding_window + 16*pcap_blocks, up to a 64-key block", "source": "arithmetic"},
+    "global_capacity": {"value": 262144, "bound": "scratch arena and the global attention repeat plan", "source": "seeded fixture"},
+    "segments": {"t_layer_fit": {"a_ms": 0.1, "b_ms_per_row": 0.01, "slug": "fixture"}, "tdr_budget_ms": 1000}
+  },
+  "scratchpad": {
+    "params": {
+      "kv_slot_s": {"byte_offset": 0, "kind": "addr", "range": [0, 1151]},
+      "kv_len_s0": {"byte_offset": 4, "kind": "addr", "range": [0, 16]},
+      "kv_len_s1": {"byte_offset": 8, "kind": "addr", "range": [0, 16]},
+      "kv_pos_g": {"byte_offset": 12, "kind": "addr", "range": [0, 262143]},
+      "att_s_first": {"byte_offset": 16, "kind": "addr", "range": [0, 1088]},
+      "att_s_blocks": {"byte_offset": 20, "kind": "core", "range": [1, 18], "compiled_max": 18},
+      "att_g_blocks": {"byte_offset": 24, "kind": "core", "range": [1, 4096], "compiled_max": 255},
+      "head_row": {"byte_offset": 28, "kind": "addr", "range": [0, 1792]}
+    }
+  },
+  "canary": {"bytes_per_memtile": 64, "memtile_addr": 0, "in": "canary_in", "out": "canary_out"},
+  "store": {"manifest": "fixture-sha256", "path": "../store_fixture"},
+  "layout": {
+    "layer0.mlp_stream": {"manifest_key": "layer0.mlp_stream", "scratch_off": 0, "len": 99753984, "layout": "chain_resident_v1_mlp"}
+  }
+}
