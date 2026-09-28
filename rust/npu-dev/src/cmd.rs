@@ -4,6 +4,7 @@ pub mod kernels_build;
 pub mod kernels_manifest;
 pub mod kernels_verify;
 pub mod mha_decode;
+pub mod parakeet_e2e;
 pub mod parakeet_encode;
 pub mod prefill_golden;
 pub mod prefill_time;
