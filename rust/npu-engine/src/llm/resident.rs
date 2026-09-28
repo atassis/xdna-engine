@@ -1,17 +1,27 @@
-//! Stage 0 of a resident-forward `DecodeStep` backend: an artifact that keeps every layer's
-//! weights MemTile-resident across a whole generation instead of streaming one layer's weights
-//! per dispatch. This module holds the `ResidentForward` skeleton plus every per-piece value
-//! builder, the K/V ring rule and the TDR segment planner, as CPU-only pure functions. No device
-//! access -- opening an [`npu_xrt::Arena`]/[`crate::llm::npu_decode::ElfResident`], the piece
-//! dispatch loop and the canary check land in a later stage.
+//! A resident-forward `DecodeStep` backend: an artifact that keeps every layer's weights
+//! MemTile-resident across a whole generation instead of streaming one layer's weights per
+//! dispatch. This module holds every per-piece value builder, the K/V ring rule and the TDR
+//! segment planner as CPU-only pure functions, plus [`ResidentForward`]: a real driver over
+//! `ElfResident`/`FusedArena` (`open` loads the artifact, fills the scratch arena from the weight
+//! store, boots the context and opens one control code per class; `run_piece` writes one piece's
+//! values and dispatches).
 //!
 //! Land-first note (owner, 2026-09-29): the differential tests against the reference Python
-//! functions these port, and the negative-test suite for every loader check, are DEFERRED. What is
-//! here compiles and the loader reads the real store manifest and a seeded `meta.json` fixture
-//! (`resident_artifact.rs` tests).
+//! functions the pure builders port, and the negative-test suite for every loader check, are
+//! DEFERRED. `open`/`run_piece` compile and are unit-testable in isolation, but nothing in this
+//! tree calls `open` against a live `Device` yet -- untested on hardware until the device lane
+//! names a build whose generator emits arena-order arguments (`[input, output, scratch]`).
+
+use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
+use std::rc::Rc;
+
+use npu_xrt::{Device, ElfResident, FusedArena};
 
 use crate::api::EngineError;
 use crate::llm::generator::{CacheState, DecodeStep};
+use crate::llm::npu_decode::unpack_bf16_bytes;
 use crate::llm::resident_artifact::{ResidentArtifact, StoreManifest};
 
 /// A piece's key-window widths for one 16-row pass of the resident attention: `[lo, hi)` relative
@@ -77,10 +87,28 @@ pub fn ring_read_first(s: usize, w: usize) -> usize {
 /// slack) by passing `c_s - w == 0`, which is the shape a resumed request must satisfy on any
 /// backend whose ring capacity equals its window.
 ///
+/// `n` and `r` are both POSITION INDICES (0-based), not counts: `n` is the index of the last
+/// position written, `r` is the index of the first position this resume will (re)write -- the same
+/// value a caller usually holds as "how many prefix positions matched" (a count), since a count of
+/// `k` trusted positions `[0, k)` and "first new index `k`" are numerically identical.
+///
+/// Derivation, in index terms: a resumed piece's first new row at index `r` reads the window
+/// `[r-w+1, r-1]` (its own row is freshly written before it is read: write-first, one ring slot per
+/// position, `slot = pos % capacity`). A sequentially-written ring holds position `p` correctly
+/// only while `p > n - c_s` (a later position at the same slot, `p + c_s <= n`, overwrote it
+/// otherwise); requiring that for the window's oldest row, `r - w + 1 > n - c_s`, rearranges to
+/// `n - r <= c_s - w`.
+///
+/// Empirically checked, not just derived, against a host-side ring oracle (float64 stepwise
+/// decode vs. a resumed run, teacher-forced): with `w = 1024` and `c_s == w` (a plain circular
+/// cache, no slack), a ring primed to `n = 1099` (1100 positions written) resumed at `r = 1090`
+/// (`n - r = 9 > 0`) measures a real divergence between the two runs -- that resume point IS wrong,
+/// independent of this function. At the same `n`, `r = 1099` (`n - r = 0`) is the boundary this
+/// function accepts.
+///
 /// Returns the resume point to actually use: `r` unchanged when safe, `0` (a full reset) when not.
-/// `n` is the last position written to the ring; `r <= n` is the caller's own invariant (a resume
-/// point is never ahead of what was primed) and is asserted in debug builds only, matching this
-/// module's other pure functions.
+/// `r <= n` is the caller's own invariant (a resume point is never ahead of what was primed) and is
+/// asserted in debug builds only, matching this module's other pure functions.
 pub fn ring_safe_resume(r: usize, n: usize, c_s: usize, w: usize) -> usize {
     debug_assert!(r <= n, "resume point {r} must not be ahead of the last written position {n}");
     let slack = c_s.saturating_sub(w);
@@ -118,33 +146,158 @@ pub fn piece_nt(p_len: usize, row_block: usize) -> usize {
     p_len.div_ceil(row_block)
 }
 
-/// Skeleton for the resident-forward `DecodeStep` backend (spec §2/§3). S0 holds the loaded,
-/// checked artifact and store manifest; it does not yet open a device context or dispatch anything
-/// -- every `DecodeStep` method below returns `Unsupported` until S1 wires `FusedArena`/
-/// `ElfResident` through the value builders above.
+/// The resident-forward `DecodeStep` backend (spec §2/§3): one hardware context (`boot` + a named
+/// control code per class), one `FusedArena` holding the weight store and the K/V cache, driven by
+/// [`ResidentForward::run_piece`] using the value builders above.
 pub struct ResidentForward {
     pub artifact: ResidentArtifact,
     pub store: StoreManifest,
+    arena: Rc<FusedArena>,
+    /// One `ElfResident` per class code (`main:p{nt}`), each bound to `arena` -- §1.1's "each
+    /// variant owns its OWN run and therefore its OWN ctrl scratchpad" (`npu_xrt::ElfResident`'s
+    /// own doc). Keyed by `nt`, not the code string, since [`piece_nt`] is what a caller has in
+    /// hand at dispatch time.
+    classes: HashMap<usize, ElfResident>,
     /// The last K/V ring position written, for [`ring_safe_resume`]. `None` before the first
     /// piece of a generation.
     last_written: Option<usize>,
 }
 
 impl ResidentForward {
-    /// Load and cross-check the artifact against its store manifest (§1.3), but do not touch a
-    /// device. Fails loud on every S0 loader check (`ResidentArtifact::load`,
+    /// Load and cross-check the artifact against its store manifest (§1.3, unchanged from S0), but
+    /// do not touch a device. Fails loud on every S0 loader check (`ResidentArtifact::load`,
     /// `check_weights_against_store`).
-    pub fn load(dir: &std::path::Path) -> Result<ResidentForward, EngineError> {
+    pub fn load(dir: &Path) -> Result<(ResidentArtifact, StoreManifest), EngineError> {
         let artifact = ResidentArtifact::load(dir)?;
         let store = StoreManifest::load(&artifact.store.path)?;
         artifact.check_weights_against_store(&store)?;
-        Ok(ResidentForward { artifact, store, last_written: None })
+        Ok((artifact, store))
     }
+
+    /// Load, fill the scratch arena from the store, and open the hardware context: `boot` (the
+    /// only `load_pdi`, dispatched once here per §2 step 4), then `open_named` + `bind_resident`
+    /// for every declared class code. Mirrors `NpuDecodeStep::build`'s shape (load -> arena ->
+    /// upload weights -> zero caches -> `open_elf_resident` -> bind -> per-variant `open_named`).
+    pub fn open(dev: &Rc<Device>, dir: &Path) -> Result<ResidentForward, EngineError> {
+        let (artifact, store) = Self::load(dir)?;
+
+        let arena = Rc::new(
+            FusedArena::new(dev, artifact.input_size, artifact.output_size, artifact.scratch_size)
+                .map_err(|e| EngineError::Load(format!("alloc fused arenas: {e}")))?,
+        );
+
+        // Every weight region the artifact declares, read from the store's blob file at the
+        // region's own (blob, offset, length) and written to the artifact's own scratch offset --
+        // two independent claims (§1.3), already cross-checked in `load`.
+        for (name, region) in &artifact.weights {
+            let entry = store.resolve(&region.manifest_key).ok_or_else(|| {
+                EngineError::Load(format!("weight region `{name}`: no store entry for `{}` (should have failed at load)", region.manifest_key))
+            })?;
+            let blob_path = store.blob_path(entry);
+            let bytes = read_blob_slice(&blob_path, entry.offset, entry.length)?;
+            arena
+                .write_at(npu_xrt::Arena::Scratch, region.scratch_off, &bytes)
+                .map_err(|e| EngineError::Load(format!("write weight region `{name}`: {e}")))?;
+        }
+        arena.sync_to_device().map_err(|e| EngineError::Load(format!("sync weights to device: {e}")))?;
+
+        let elf = artifact.read_elf_bytes()?;
+        let boot = dev
+            .open_elf_resident(&elf, Some(&format!("main:{}", artifact.boot)))
+            .map_err(|e| EngineError::Load(format!("open_elf_resident (boot): {e}")))?;
+        arena.bind_resident(&boot).map_err(|e| EngineError::Load(format!("bind boot arena BOs: {e}")))?;
+        // "dispatched once after the context opens" (spec §1.1) -- the boot code carries only
+        // `aiex.npu.load_pdi`, nothing to write beforehand.
+        boot.dispatch().map_err(EngineError::Device)?;
+
+        let mut classes = HashMap::new();
+        for c in &artifact.classes {
+            let r = boot
+                .open_named(&format!("main:{}", c.code))
+                .map_err(|e| EngineError::Load(format!("open class code {} (nt={}): {e}", c.code, c.nt)))?;
+            arena.bind_resident(&r).map_err(|e| EngineError::Load(format!("bind class {} to the shared arena: {e}", c.code)))?;
+            classes.insert(c.nt, r);
+        }
+
+        Ok(ResidentForward { artifact, store, arena, classes, last_written: None })
+    }
+
+    /// Run one piece of `p_len` positions starting at `s`, and read back whatever the artifact's
+    /// `io["logits"]` names (spec §3.1's per-piece loop, minus the embedding gather and RoPE table
+    /// writes -- those need an `EmbedTable`/`rope_row` wiring this stage does not yet do; `x_bytes`
+    /// is the caller's already-embedded input row(s)).
+    ///
+    /// Writes, in order: `x_bytes` into `io["x_in"]`; the K/V ring split (`ring_write`) into
+    /// `kv_slot_s`/`kv_len_s0`/`kv_len_s1` when the artifact declares them (a fixture or an early
+    /// build may not yet); `nt` into its own scratchpad param when declared. Then `sync_input`,
+    /// dispatch the class code [`piece_nt`] selects, `sync_from_device`, and return the unpacked
+    /// bf16 logits.
+    pub fn run_piece(&mut self, s: usize, p_len: usize, x_bytes: &[u8]) -> Result<Vec<f32>, EngineError> {
+        let nt = piece_nt(p_len, self.artifact.dims.row_block);
+        let res = self.classes.get(&nt).ok_or_else(|| {
+            EngineError::Unsupported(format!("no class code carries nt={nt} (piece of {p_len} rows)"))
+        })?;
+
+        let x_in = self.artifact.io.get("x_in").ok_or_else(|| EngineError::Load("artifact declares no `io.x_in`".to_string()))?;
+        self.arena.write_at(x_in.arena, x_in.off, x_bytes).map_err(|e| EngineError::Device(format!("write x_in: {e}")))?;
+
+        let sliding_capacity = self
+            .artifact
+            .derived
+            .get("sliding_capacity")
+            .ok_or_else(|| EngineError::Load("artifact declares no `derived.sliding_capacity`".to_string()))?
+            .value;
+        let rw = ring_write(s, p_len, sliding_capacity);
+        write_param_if_present(res, &self.artifact.scratchpad_params, "kv_slot_s", rw.slot as u32)?;
+        write_param_if_present(res, &self.artifact.scratchpad_params, "kv_len_s0", rw.len0 as u32)?;
+        write_param_if_present(res, &self.artifact.scratchpad_params, "kv_len_s1", rw.len1 as u32)?;
+        write_param_if_present(res, &self.artifact.scratchpad_params, "nt", nt as u32)?;
+
+        self.arena.sync_input().map_err(|e| EngineError::Device(format!("sync input: {e}")))?;
+        res.dispatch().map_err(EngineError::Device)?;
+        self.arena.sync_from_device().map_err(|e| EngineError::Device(format!("sync output: {e}")))?;
+
+        self.last_written = Some(s + p_len - 1);
+
+        let logits_loc = self.artifact.io.get("logits").ok_or_else(|| EngineError::Load("artifact declares no `io.logits`".to_string()))?;
+        let mut bytes = vec![0u8; logits_loc.len];
+        self.arena
+            .read_at(logits_loc.arena, logits_loc.off, &mut bytes)
+            .map_err(|e| EngineError::Device(format!("read logits: {e}")))?;
+        Ok(unpack_bf16_bytes(&bytes))
+    }
+}
+
+/// `store/blobs/<blob>.bin[offset..offset+length]` -- reads the whole file (blobs are one matrix
+/// each, not multi-GB) and slices rather than seeking, since S0/S1 have no mmap loader yet (tracked
+/// as a follow-up: `StoreManifest`'s own doc).
+fn read_blob_slice(path: &Path, offset: usize, length: usize) -> Result<Vec<u8>, EngineError> {
+    let bytes = fs::read(path).map_err(|e| EngineError::Load(format!("read blob {}: {e}", path.display())))?;
+    bytes
+        .get(offset..offset + length)
+        .map(|s| s.to_vec())
+        .ok_or_else(|| EngineError::Load(format!("blob {} is {} bytes, region wants [{offset}, {})", path.display(), bytes.len(), offset + length)))
+}
+
+/// Write `value` (little-endian u32) to `name`'s scratchpad slot if the artifact declares one,
+/// no-op otherwise. Scratchpad params are OPTIONAL per-artifact (an early or seeded build may carry
+/// only a subset), unlike the shipped decode's fixed set -- see `ResidentArtifact`'s own doc.
+fn write_param_if_present(
+    res: &ElfResident, params: &HashMap<String, crate::llm::resident_artifact::ScratchpadParam>, name: &str,
+    value: u32,
+) -> Result<(), EngineError> {
+    if let Some(p) = params.get(name) {
+        res.write_scratchpad(p.byte_offset, &value.to_le_bytes())
+            .map_err(|e| EngineError::Device(format!("write {name} scratchpad: {e}")))?;
+    }
+    Ok(())
 }
 
 impl DecodeStep for ResidentForward {
     fn step(&mut self, _token: u32, _pos: usize) -> Result<Vec<f32>, EngineError> {
-        Err(EngineError::Unsupported("ResidentForward: device dispatch is not built yet (S0 is host-side only)".into()))
+        // `run_piece` is the real driver; `step` needs an embedding gather and the RoPE/attention-
+        // width writes §3.1 also lists, which land with the embed table wiring in a later stage.
+        Err(EngineError::Unsupported("ResidentForward::step: embedding + full per-piece writes not wired yet (use run_piece)".into()))
     }
 
     fn reset(&mut self) -> Result<CacheState, EngineError> {
@@ -201,13 +354,14 @@ mod tests {
     }
 
     #[test]
-    fn ring_safe_resume_has_zero_slack_when_c_s_equals_w() {
-        // A plain circular cache with no slack is c_s == w, so this formula's slack is 0 and only
-        // an exact, full-ring resume is safe. A related, looser boundary condition
-        // (`reused >= pos_old - 1`) is used elsewhere for the same cache shape; reconciling the
-        // two is deferred -- this test pins only this module's `N - r <= C_s - W` formula.
-        assert_eq!(ring_safe_resume(500, 1025, 1024, 1024), 0);
-        assert_eq!(ring_safe_resume(1025, 1025, 1024, 1024), 1025);
+    fn ring_safe_resume_reproduces_the_oracles_proven_negative_control() {
+        // A host-side ring oracle: W=1024, ring primed to n=1099 (1100 positions), resume at
+        // r=1090 is proven wrong end to end (measured divergence). c_s == w here (a plain circular
+        // cache, no slack), so this function must refuse it too.
+        assert_eq!(ring_safe_resume(1090, 1099, 1024, 1024), 0);
+        // The boundary the oracle's own derivation implies (n - r == 0) is exactly where this
+        // function switches back to accepting the resume.
+        assert_eq!(ring_safe_resume(1099, 1099, 1024, 1024), 1099);
     }
 
     #[test]

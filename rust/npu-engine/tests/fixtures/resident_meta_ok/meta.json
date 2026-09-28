@@ -1,6 +1,10 @@
 {
   "kind": "resident_forward",
   "schema": 1,
+  "elf": "resident.elf",
+  "input_size": 4096,
+  "output_size": 1048576,
+  "scratch_size": 99753984,
   "boot": "boot",
   "classes": [
     {"code": "p1", "nt": 1},
@@ -42,6 +46,12 @@
   },
   "canary": {"bytes_per_memtile": 64, "memtile_addr": 0, "in": "canary_in", "out": "canary_out"},
   "store": {"manifest": "fixture-sha256", "path": "../store_fixture"},
+  "io": {
+    "x_in": {"type": "input", "offset": 0, "len": 3840},
+    "canary_in": {"type": "input", "offset": 3840, "len": 128},
+    "canary_out": {"type": "output", "offset": 0, "len": 128},
+    "logits": {"type": "output", "offset": 128, "len": 1048448}
+  },
   "layout": {
     "layer0.mlp_stream": {"manifest_key": "layer0.mlp_stream", "scratch_off": 0, "len": 99753984, "layout": "chain_resident_v1_mlp"}
   }

@@ -15,6 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::api::EngineError;
+use crate::llm::artifact::BufLoc;
 
 /// One `classes` entry: a control code that carries `nt` row-blocks (K035 stopgap -- see the spec).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +92,11 @@ pub struct WeightRegion {
 #[derive(Debug, Clone)]
 pub struct ResidentArtifact {
     pub schema: u64,
+    /// Directory this was loaded from -- ELF and store paths (`store.path`) resolve relative to it.
+    pub dir: PathBuf,
+    /// `meta.json`'s `elf` field (the file's basename inside `dir`), mirroring
+    /// `LlmArtifact::elf_name`/`elf_path`.
+    pub elf_name: String,
     pub boot: String,
     pub classes: Vec<ResidentClass>,
     pub segments: Vec<ResidentSegment>,
@@ -100,6 +106,16 @@ pub struct ResidentArtifact {
     pub canary_bytes_per_memtile: usize,
     pub store: StoreRef,
     pub weights: HashMap<String, WeightRegion>,
+    /// The three `FusedArena` sizes ([`npu_xrt::FusedArena::new`]'s `input_size`/`output_size`/
+    /// `scratch_size`), same top-level fields `LlmArtifact::load` reads.
+    pub input_size: usize,
+    pub output_size: usize,
+    pub scratch_size: usize,
+    /// Non-weight input/output buffers (`x_in`, the RoPE tables, the canary halves, the logits
+    /// output) by name, in [`crate::llm::artifact::BufLoc`]'s arena/offset/length shape -- the same
+    /// buffer-location convention `LlmArtifact` uses, so a resident driver addresses them the same
+    /// way `NpuDecodeStep` addresses `x`/`logits`.
+    pub io: HashMap<String, BufLoc>,
 }
 
 impl ResidentArtifact {
@@ -122,6 +138,13 @@ impl ResidentArtifact {
         }
         let schema = meta.get("schema").and_then(|v| v.as_u64()).ok_or_else(|| ctx("missing `schema`".into()))?;
         let boot = meta.get("boot").and_then(|v| v.as_str()).ok_or_else(|| ctx("missing `boot`".into()))?.to_string();
+        let elf_name = meta.get("elf").and_then(|v| v.as_str()).ok_or_else(|| ctx("missing `elf`".into()))?.to_string();
+        let usz_top = |k: &str| -> Result<usize, EngineError> {
+            meta.get(k).and_then(|v| v.as_u64()).map(|v| v as usize).ok_or_else(|| ctx(format!("missing/non-numeric top-level `{k}`")))
+        };
+        let input_size = usz_top("input_size")?;
+        let output_size = usz_top("output_size")?;
+        let scratch_size = usz_top("scratch_size")?;
 
         let classes = parse_classes(&meta, &ctx)?;
         check_classes_no_gap(&classes).map_err(&ctx)?;
@@ -147,9 +170,12 @@ impl ResidentArtifact {
 
         let store = parse_store(&meta, dir, &ctx)?;
         let weights = parse_weight_layout(&meta, &ctx)?;
+        let io = parse_io(&meta, &ctx)?;
 
         Ok(ResidentArtifact {
             schema,
+            dir: dir.to_path_buf(),
+            elf_name,
             boot,
             classes,
             segments,
@@ -159,7 +185,21 @@ impl ResidentArtifact {
             canary_bytes_per_memtile,
             store,
             weights,
+            input_size,
+            output_size,
+            scratch_size,
+            io,
         })
+    }
+
+    /// `dir/<elf>` (or `<elf>.zst`, via the shared free function), mirroring
+    /// `LlmArtifact::elf_path`/`read_elf_bytes`.
+    pub fn elf_path(&self) -> PathBuf {
+        self.dir.join(&self.elf_name)
+    }
+
+    pub fn read_elf_bytes(&self) -> Result<Vec<u8>, EngineError> {
+        crate::llm::artifact::read_elf_bytes(&self.elf_path())
     }
 
     /// Check every `layout` region against the store manifest it names: a region whose manifest
@@ -326,6 +366,29 @@ fn parse_store(
     Ok(StoreRef { manifest_sha256, path: dir.join(path_str) })
 }
 
+/// `meta.json`'s `io` object: non-weight buffers (`x_in`, RoPE tables, canary halves, `logits`),
+/// same `{"type": "input"|"output"|"scratch", "offset", "len"}` shape `LlmArtifact::load` uses for
+/// its `layout` map (`artifact.rs` around its own `layout_obj` loop).
+fn parse_io(
+    meta: &serde_json::Value, ctx: &impl Fn(String) -> EngineError,
+) -> Result<HashMap<String, BufLoc>, EngineError> {
+    use npu_xrt::Arena;
+    let obj = meta.get("io").and_then(|v| v.as_object()).ok_or_else(|| ctx("missing/non-object `io`".into()))?;
+    let mut out = HashMap::new();
+    for (name, e) in obj {
+        let arena = match e.get("type").and_then(|v| v.as_str()) {
+            Some("input") => Arena::Input,
+            Some("output") => Arena::Output,
+            Some("scratch") => Arena::Scratch,
+            other => return Err(ctx(format!("io[{name}].type = {other:?}, want input/output/scratch"))),
+        };
+        let off = e.get("offset").and_then(|v| v.as_u64()).ok_or_else(|| ctx(format!("io[{name}]: missing `offset`")))? as usize;
+        let len = e.get("len").and_then(|v| v.as_u64()).ok_or_else(|| ctx(format!("io[{name}]: missing `len`")))? as usize;
+        out.insert(name.clone(), BufLoc { arena, off, len });
+    }
+    Ok(out)
+}
+
 fn parse_weight_layout(
     meta: &serde_json::Value, ctx: &impl Fn(String) -> EngineError,
 ) -> Result<HashMap<String, WeightRegion>, EngineError> {
@@ -359,6 +422,8 @@ pub struct StoreEntry {
 pub struct StoreManifest {
     pub model: String,
     pub num_layers: usize,
+    /// The store directory this was loaded from -- [`Self::blob_path`] resolves a blob against it.
+    dir: PathBuf,
     entries: HashMap<String, StoreEntry>,
 }
 
@@ -400,11 +465,16 @@ impl StoreManifest {
             entries.insert("final_norm".to_string(), e);
         }
 
-        Ok(StoreManifest { model, num_layers, entries })
+        Ok(StoreManifest { model, num_layers, dir: dir.to_path_buf(), entries })
     }
 
     pub fn resolve(&self, key: &str) -> Option<&StoreEntry> {
         self.entries.get(key)
+    }
+
+    /// `dir/blobs/<entry.blob>.bin` -- where an entry's bytes actually live on disk.
+    pub fn blob_path(&self, entry: &StoreEntry) -> PathBuf {
+        self.dir.join("blobs").join(format!("{}.bin", entry.blob))
     }
 
     pub fn len(&self) -> usize {
@@ -466,6 +536,10 @@ mod tests {
         assert_eq!(a.classes.len(), 2);
         assert_eq!(a.dims.layers, 2);
         assert_eq!(a.segments.len(), 1);
+        assert_eq!(a.elf_name, "resident.elf");
+        assert_eq!(a.input_size, 4096);
+        assert!(a.io.contains_key("x_in"));
+        assert!(a.io.contains_key("logits"));
     }
 
     // Negative tests (a seeded gap in `classes`, a seeded gap in `segments`, an `assumed`
