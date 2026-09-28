@@ -37,6 +37,8 @@ fi
 WT_GITDIR="$(git -C "$WT_PATH" rev-parse --git-dir 2>/dev/null)" || { echo "not a git worktree: $WT_PATH" >&2; exit 2; }
 case "$WT_GITDIR" in /*) : ;; *) WT_GITDIR="$(cd "$WT_PATH" && cd "$(dirname "$WT_GITDIR")" && pwd)/$(basename "$WT_GITDIR")" ;; esac
 
+WT_ABS="$(cd "$WT_PATH" && pwd -P)"
+
 [ -d "$INSTROOT" ] || { echo "[check_worktree_toolchain_anchor] no instances root at $INSTROOT -- nothing to check, safe"; exit 0; }
 
 hits=()
@@ -44,8 +46,16 @@ for gitfile in "$INSTROOT"/*/src/.git; do
   [ -f "$gitfile" ] || continue   # only the gitdir-pointer form; a real .git dir here is not a worktree
   target="$(sed -n 's/^gitdir: //p' "$gitfile")"
   case "$target" in
-    "$WT_GITDIR"/*|"$WT_GITDIR")
+    "$WT_GITDIR"/*|"$WT_GITDIR"|"$WT_ABS"/*)
       hits+=("$(basename "$(dirname "$(dirname "$gitfile")")")  ->  $target") ;;
+  esac
+done
+# toolchain_up.sh symlinks the instance's nested submodules (aie_api, aie-rt, bootgen, cmake modules)
+# to whichever checkout built it, so the worktree can be load-bearing without owning the gitdir.
+for link in "$INSTROOT"/*/src/third_party/* "$INSTROOT"/*/src/cmake/*; do
+  [ -L "$link" ] || continue
+  case "$(readlink "$link")" in
+    "$WT_ABS"/*) hits+=("${link#"$INSTROOT"/}  ->  $(readlink "$link")") ;;
   esac
 done
 
