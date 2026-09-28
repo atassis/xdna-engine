@@ -79,7 +79,7 @@ def run_step(model, cache, next_tok, sliding_window, capture_layers):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="unsloth/gemma-4-12b-it")
+    ap.add_argument("--model", default="google/gemma-4-12B-it-qat-q4_0-unquantized")
     ap.add_argument("--layers", type=int, default=6,
                     help="truncated depth -- 6 gives 5 sliding + 1 global (layer 5), the minimal "
                          "pair per sw_pattern=6. Matches tests/refs/gemma4-12b/bf16_oracle_l6.json")
