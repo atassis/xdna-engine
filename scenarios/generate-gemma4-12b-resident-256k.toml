@@ -2,28 +2,24 @@
 kind = "generate"
 name = "gemma4-12b-resident-256k"
 
-# rf48L: the 256k-context rung ladder (rf-engine-integration, superseding rf48s's fixed 2048-row
-# linear cache). Landed 2026-09-29 as gemma4-12b's served path on fast tests only; the full gates are
-# deferred (see the epic). About 5% of f1 dispatches at 6k context come back non-finite (cause open,
-# rf-forward-intermittent-nonfinite); LadderResidentForward re-runs such a dispatch.
+# rf48C: the 256k-context rung ladder with one blocked sliding ring per layer (rf-ring-write-
+# overruns-into-next-layer-weights, design C), replacing rf48L, whose mirrored ring wrote past its
+# region into the next layer's weights from ring row 1265. Caches live in their own BO; every
+# runtime-offset BD is bounded by meta.json's s_ring_layout (K059, `resident_ladder::ring_fits`).
+# Intermittent non-finite f1 dispatches remain (rf-forward-intermittent-nonfinite);
+# LadderResidentForward re-runs such a dispatch.
 #
 # `artifacts.resident`'s meta.json (`kind = "resident_forward_ladder"`) is what routes
-# registry.rs to `llm::LadderResidentForward` instead of `llm::OneCommandResidentForward` -- the
-# two share this same `[artifacts] resident = ...` convention, dispatched on the artifact's own
-# declared kind, not a second config field.
+# registry.rs to `llm::LadderResidentForward` instead of `llm::OneCommandResidentForward`.
 #
 # Build: rlayer_design m g h arena seg=64,256,1024,4096 fseg=64,256,1024 split=128,256,512,1024,2048,4096
-# gcap=262144 sring=1280 s64 fwd=0-47+h nbw=20 1 2 (RF_ATTN_H=1, RF_FAST=1, RF_TEXT_MARGIN=128).
+# gcap=262144 sring=1280 s64 fwd=0-47+h nbw=20 1 2 (RF_ATTN_H=1, RF_FAST=1, RF_TEXT_MARGIN=128) --
+# rf48L's flags; the ring layout is the generator's (kvring.py), not a flag.
 # Decode rungs (f1..f1s4096) reach 8192..262144 keys; prefill rungs (f2, f2w256, f2w1024) reach
 # 4096..65536 -- past that, `LadderResidentForward::prefill` declines and the generator's
-# per-token loop finishes priming through the f1 ladder alone (see resident_ladder.rs's module
-# doc for why the per-layer p2/g2w4096 fallback is not implemented here).
-#
-# max_context() = 262144 (the largest decode rung, `LadderMeta::largest_keys(1)`), NOT a hard
-# write-safety cap -- the sliding cache is now a wrapping ring, safe at any position; the
-# no-crossing rule is enforced by piece-cutting (`resident_ladder::max_piece`), not by a bound.
+# per-token loop finishes priming through the f1 ladder alone.
 [artifacts]
-resident = "/mnt/data/xdna/artifacts/gemma4-12b/resident_rf48L_p7148a7"
+resident = "/mnt/data/xdna/artifacts/gemma4-12b/resident_rf48C_p7148a7"
 tokenizer_dir = "artifacts/gemma4-12b/tokenizer"
 
 [generation]
