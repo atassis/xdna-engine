@@ -1358,6 +1358,36 @@ mod tests {
         assert_eq!(reason, FinishReason::Stop);
     }
 
+    #[test]
+    fn a_request_past_the_resident_forwards_real_bound_is_refused_before_any_device_call() {
+        // The real gemma4-12b-resident bound (rf-engine-integration): rf48s's sliding cache is a
+        // linear 2048-row buffer, but its prefill code (f2) is compiled for a FIXED nt=2 (32-row)
+        // K/V write regardless of a piece's real length, so the safe bound is s_cap - pmax, not
+        // s_cap itself -- see `resident_onecmd::max_context_bound`'s own doc for the derivation.
+        let max_ctx = crate::llm::resident_onecmd::max_context_bound(2048, 32);
+        assert_eq!(max_ctx, 2016, "the bound this test exercises must be the real one, not a stand-in");
+
+        let cfg = build_cfg(None);
+        // Empty script: `ScriptedDecodeStep::step` returns Err("scripted decode exhausted") if
+        // ever called -- so an accidental dispatch surfaces as a DIFFERENT error, not a silent
+        // pass. The window check itself runs before `reset()`/`prefill()` too (this test's real
+        // guarantee comes from reading that ordering in `prime_to_last_logits`, not from this
+        // black-box error-message check alone, which only catches a `step()` call).
+        let decode = ScriptedDecodeStep::new(vec![]).with_max_context(max_ctx);
+        let mut gen = LlmGenerator::new(cfg, decode);
+        let params = GenerateParams { max_tokens: Some(1), temperature: Some(0.0), ..GenerateParams::default() };
+        // 2049 tokens: one past `max_ctx` (2016) AND one past the plain `s_cap` (2048) this
+        // bound was deliberately set below -- refused either way, but named 2049 per the ask.
+        let prompt = "hello ".repeat(2049);
+        let err = gen
+            .generate_to_string(&Prompt::Raw(prompt), &params)
+            .expect_err("a prompt past the real context window must not run");
+        let msg = err.to_string();
+        assert!(msg.contains("2049"), "must name the prompt length: {msg}");
+        assert!(msg.contains("2016"), "must name the real window, not a rounder number: {msg}");
+        assert!(!msg.contains("exhausted"), "must be the context-window refusal, not an accidental dispatch: {msg}");
+    }
+
     // ------------------------------------------------------------------------------------
     // Batched prefill wiring. The batched path returns no logits, so nothing about it is visible
     // in the generated text -- these assert on the script the per-token loop still consumes and on

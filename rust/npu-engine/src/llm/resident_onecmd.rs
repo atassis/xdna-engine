@@ -406,14 +406,44 @@ impl DecodeStep for OneCommandResidentForward {
     }
 
     fn max_context(&self) -> Option<usize> {
-        // The sliding layers' cache is a LINEAR (non-wrapping) buffer of `s_cap` rows
-        // (`rld_run.py`'s own docstring: "the cache is one host buffer", addressed at
-        // `n_past * KVROW * 2` with no modulo anywhere in that module or `rforward.py`'s scratchpad
-        // writes) -- confirmed from source, not assumed. `kvw_s` grows unboundedly with position,
-        // so a position >= s_cap writes past that layer's own allocated kv region. This is the
-        // binding bound regardless of how wide the global layers' split-lane window reaches
-        // (open past 8192 keys, per the device lane) -- the global side being wider does not help
-        // once the sliding side is already out of room.
-        Some(self.meta.s_cap)
+        Some(max_context_bound(self.meta.s_cap, self.meta.pmax))
+    }
+}
+
+/// The hard, tight bound `max_context()` reports: the largest position at which a dispatch is
+/// still guaranteed to keep every K/V write inside the sliding cache's allocated `s_cap` rows.
+///
+/// The sliding layers' cache is a LINEAR (non-wrapping) buffer of `s_cap` rows (`rld_run.py`'s
+/// own docstring: "the cache is one host buffer", addressed at `n_past * KVROW * 2` with no
+/// modulo anywhere in that module or `rforward.py`'s scratchpad writes) -- confirmed from
+/// source, not assumed.
+///
+/// `s_cap` alone is NOT the safe bound: `f2` (prefill) is compiled for a FIXED `nt=2`
+/// (`rlayer_design.emit`'s naming -- "f1"/"f2" name the compiled `nt`, not a step index), so
+/// its K/V write BD length is a COMPILE-TIME constant of `2 * 16 * 256` elements per head
+/// (`rlayer_design.py`'s `len = {2 * 16 * nt * 256}`), i.e. exactly `pmax` (32) rows, for EVERY
+/// `f2` dispatch regardless of the piece's real row count -- a 5-row piece still writes 32 rows
+/// of (finite, zero-padded) K/V starting at its own position. So the last piece dispatched at
+/// position `at < max_context` writes through `at + pmax`, and that must not exceed `s_cap`.
+/// Subtracting `pmax` up front makes every `at < max_context` satisfy `at + pmax <= s_cap` by
+/// construction, with no separate per-dispatch check needed -- and covers decode (`f1`, a fixed
+/// single-row write) with room to spare, since it needs only 1 row of slack, not `pmax`.
+pub fn max_context_bound(s_cap: usize, pmax: usize) -> usize {
+    s_cap.saturating_sub(pmax)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn max_context_bound_is_s_cap_minus_the_largest_piece() {
+        // rf48s: s_cap=2048, pmax=32 -- the real gemma4-12b-resident numbers.
+        assert_eq!(max_context_bound(2048, 32), 2016);
+    }
+
+    #[test]
+    fn max_context_bound_never_underflows_a_tiny_cache() {
+        assert_eq!(max_context_bound(16, 32), 0);
     }
 }
