@@ -383,8 +383,10 @@ impl LadderResidentForward {
             if byte_value % unit != 0 {
                 return Err(EngineError::Device(format!("{name}: byte offset {byte_value} not a multiple of param_unit_bytes {unit}")));
             }
-            let word = (byte_value / unit) as u64;
-            kern.write_scratchpad(idx * unit, &word.to_le_bytes()[..unit.min(8)]).map_err(|e| EngineError::Device(format!("write scratchpad {name}: {e}")))
+            // Each slot is an i32 (params.txt); `unit` is only the scale of the value it holds.
+            let word = u32::try_from(byte_value / unit)
+                .map_err(|_| EngineError::Device(format!("{name}: {byte_value} / {unit} does not fit an i32 slot")))?;
+            kern.write_scratchpad(idx * 4, &word.to_le_bytes()).map_err(|e| EngineError::Device(format!("write scratchpad {name}: {e}")))
         };
         let ring_s = ring_pos(s, self.meta.s_ring);
         let ring_first = ring_pos(first, self.meta.s_ring);
