@@ -84,7 +84,7 @@ def main():
 
     def step(tok, pos, times):
         with xin.overwrite() as b:
-            b[:] = np.asarray(embed[tok] + pos_tab[pos], BF16)
+            b[:] = np.asarray(embed[tok].astype(BF16).astype(np.float32) + pos_tab[pos], BF16)
         params.write(slot, int(kvl.kv_off(pos)))
         params.write(mask_slot, pos + 1)
         params.sync()

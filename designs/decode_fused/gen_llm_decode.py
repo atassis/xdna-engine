@@ -3094,7 +3094,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             weights[p + key] = np.zeros(g.hkv * g.capacity * g.hd, BF16)
         for key in ("kx", "vx"):
             weights[p + key] = np.zeros(Hq * TP * HD, BF16)
-        cache_names.extend(p + k for k in ("kc", "vc", "kx", "vx"))
+        cache_names.extend((p + "kc", p + "vc"))
+        cross_names.extend((p + "kx", p + "vx"))
 
         qkvb, kb, vb = p + "qkv", g.qd * 2, (g.qd + g.kvd) * 2
         ref_q, ref_k, ref_v = (f"{qkvb}[0:{kb}]", f"{qkvb}[{kb}:{vb}]",
@@ -3144,6 +3145,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
 
     weights, bufsz, cache_names, rl = {}, {}, [], []
     recurrent_names = []   # the cache buffers a position mask cannot hide; see npu_decode.rs reset()
+    cross_names = []       # host-written once per utterance: neither weights nor reset by a new prompt
     if sp.v_norm:
         # The gainless v-norm's gain, one per head_dim and shared by EVERY layer -- a true constant,
         # unlike the per-layer learned gains beside it, so it is registered once here rather than in
@@ -4035,6 +4037,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         head.compile()
     return sp, fused, weights, dict(NL=NL, S=S, T=T, inputs=inputs, cache_names=cache_names,
                                         recurrent_names=recurrent_names,
+                                        cross_names=cross_names,
                                         final_hidden=final_hidden,
                                         decode_layer_active=op_decode_layer is not None,
                                         # getattr, not attribute access: a spec whose fused
@@ -4138,7 +4141,7 @@ def main():
         # A cache buffer's blob is always zero (the host zeroes it at load, never trusts the
         # disk) -- ship no `.bin` at all rather than 4.63 GB of holes. `layout` still declares
         # it, so the loader zero-fills by name+length instead of an unfilled scratch buffer.
-        if n_ in cache_names:
+        if n_ in cache_names or n_ in md["cross_names"]:
             continue
         write_blob(os.path.join(bdir, f"{n_}.bin"), b)
     if embed_blob != "W_head":
@@ -4146,6 +4149,9 @@ def main():
         write_blob(os.path.join(bdir, f"{embed_blob}.bin"), weight_bytes(host_embed))
     if md["logit_bias"] is not None:
         write_blob(os.path.join(bdir, "logit_bias.bin"), md["logit_bias"].tobytes())
+    if sp.pos_embed == "learned":
+        pos_tab = np.load(os.path.join(a.weights, f"{sp.weight_prefix}embed_positions.weight.npy"))
+        write_blob(os.path.join(bdir, "W_pos.bin"), np.asarray(pos_tab, np.float32).tobytes())
     elf_prov = write_elf(os.path.join(a.out, "decode.elf"), elf)
 
     meta = {
@@ -4161,7 +4167,8 @@ def main():
         # Cache buffers are excluded here (they carry no blob -- see the write loop above) but
         # stay in `layout` and `cache_buffers` below, so an old consumer that only reads `weights`
         # simply uploads fewer names and the loader's own `cache_buffers` pass still zeroes them.
-        "inputs": inputs, "weights": [n for n in wnames if n not in cache_names], "output": "logits",
+        "inputs": inputs, "weights": [n for n in wnames if n not in cache_names and n not in md["cross_names"]],
+        "output": "logits",
         # Which blob the HOST gathers embed[token] from. Always bf16 [vocab, d_model]; it is
         # W_head itself unless the lm-head was quantised, in which case W_head is packed and this
         # names the bf16 sidecar. Absent in older artifacts -- consumers default to "W_head".
@@ -4255,9 +4262,11 @@ def main():
                           "pos_embed": sp.pos_embed, "vocab_padded": sp.padded_vocab(COLS, TSI),
                           **({"logit_bias_blob": "logit_bias", "cross_len": sp.cross_len,
                               "cross_capacity": sp.cross_len_padded()}
-                             if md["logit_bias"] is not None else {})},
+                             if md["logit_bias"] is not None else {}),
+                          **({"pos_blob": "W_pos"} if sp.pos_embed == "learned" else {})},
         "layer_types": ["global" if sp.is_global(l) else "sliding" for l in range(NL)],
         "cache_buffers": cache_names,
+        **({"cross_buffers": md["cross_names"]} if md["cross_names"] else {}),
         "recurrent_buffers": md["recurrent_names"],
         # `plan` is the whole per-site truth and `projected_mb_per_token` is what it was priced
         # at; the flat keys beside them are the shape npu_decode.rs::provenance_extras reads.
