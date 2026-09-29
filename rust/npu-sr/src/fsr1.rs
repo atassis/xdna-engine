@@ -125,17 +125,27 @@ impl Fsr1Engine {
             return Err(SrError::Frame(format!(
                 "{}: exported for {}x{}, got {w}x{h}", self.cfg.name, self.cfg.in_w, self.cfg.in_h)));
         }
+        let t0 = std::time::Instant::now();
         self.pack(rgb);
+        let t1 = std::time::Instant::now();
         self.bo_in.write_bytes(&self.inbuf).map_err(SrError::Device)?;
         self.bo_in.sync_to_device().map_err(SrError::Device)?;
+        let t2 = std::time::Instant::now();
         self.kern
             .run_kernel(OPCODE, &self.instr, self.n_instr, &[&self.bo_in, &self.bo_out])
             .map_err(SrError::Device)?;
+        let t3 = std::time::Instant::now();
         self.bo_out.sync_from_device().map_err(SrError::Device)?;
         self.bo_out.read_bytes(&mut self.outbuf).map_err(SrError::Device)?;
+        let t4 = std::time::Instant::now();
         let (ow, oh) = (w * 3, h * 3);
         let mut out = vec![0u8; ow * oh * 3];
         self.unpack(&mut out, ow);
+        if std::env::var_os("NPU_SR_TIMING").is_some() {
+            let ms = |a: std::time::Instant, b: std::time::Instant| (b - a).as_secs_f64() * 1e3;
+            eprintln!("[fsr1] pack {:.2} upload {:.2} dispatch {:.2} readback {:.2} unpack {:.2} ms",
+                      ms(t0, t1), ms(t1, t2), ms(t2, t3), ms(t3, t4), ms(t4, std::time::Instant::now()));
+        }
         Ok((out, ow, oh))
     }
 
