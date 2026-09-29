@@ -18,7 +18,13 @@ name = "gemma3-270m"
 #   elide-pm + packet-channel-sharing repin), AIECC_ELIDE_IDENTICAL_PM=1: same recipe, L=18 oracle
 #   parity 8/8 against tests/refs/gemma3-270m/bf16_oracle.json. Rollback: point decode= back at
 #   `decode_p8c684` and reinstall.
-[artifacts]
-decode = "artifacts/gemma3-270m/decode_p6924def"
+# REBUILT 2026-09-29 (`decode_p8e3958`) at toolchain pin 8e3958b596a, instance 3ce32a1d7465, same
+#   recipe, IRON=wt-iron-integ. decode.elf BYTE-IDENTICAL to decode_p6924def (md5
+#   f44bd72dd6dd5b97c43f3286bff62f3d, sequence_name/scratch_size identical) -- no re-gate needed,
+#   same bytes already carry the 8/8 oracle parity above. NOTE for the next rebuilder: passing OUT
+#   as a RELATIVE 3rd arg to build_llm_decode.sh silently miscompiles the artifact into a phantom
+#   nested dir under the shared $WORK cache (the script cd's into $WORK before invoking the
+#   generator, so a relative --out resolves against the wrong cwd) -- always pass an ABSOLUTE OUT.
+decode = "artifacts/gemma3-270m/decode_p8e3958"
 weights = "artifacts/gemma3-270m/weights"
 tokenizer_dir = "artifacts/gemma3-270m/tokenizer"
