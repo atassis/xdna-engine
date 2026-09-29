@@ -675,18 +675,22 @@ impl DecodeStep for NpuDecodeStep {
     /// decision that reads the gap between two of them. None on an artifact that does not publish
     /// `xf`.
     fn option_logits(&mut self, ids: &[u32]) -> Result<Option<Vec<f32>>, EngineError> {
-        let Some(loc) = self.artifact.layout.get("xf").copied() else { return Ok(None) };
-        let mut bytes = vec![0u8; loc.len];
-        self.arena
-            .read_at(loc.arena, loc.off, &mut bytes)
-            .map_err(|e| EngineError::Device(format!("read xf: {e}")))?;
-        let xf = unpack_bf16_bytes(&bytes);
+        let Some(xf) = self.final_hidden()? else { return Ok(None) };
         let mut out = ids.iter()
             .map(|&t| self.embed.head_row(t)
                 .map(|r| r.iter().zip(&xf).map(|(a, b)| *a as f64 * *b as f64).sum::<f64>() as f32))
             .collect::<Result<Vec<f32>, _>>()?;
         apply_logit_softcap(&mut out, self.artifact.logit_softcap);
         Ok(Some(out))
+    }
+
+    fn final_hidden(&mut self) -> Result<Option<Vec<f32>>, EngineError> {
+        let Some(loc) = self.artifact.layout.get("xf").copied() else { return Ok(None) };
+        let mut bytes = vec![0u8; loc.len];
+        self.arena
+            .read_at(loc.arena, loc.off, &mut bytes)
+            .map_err(|e| EngineError::Device(format!("read xf: {e}")))?;
+        Ok(Some(unpack_bf16_bytes(&bytes)))
     }
 
     /// The artifact's own `dims.S`. This is what makes the generator's bound real: without it the

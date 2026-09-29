@@ -57,7 +57,12 @@ class Ckpt:
         self.int4_group = int4_group
         self.int4_kw = {"clip_search": clip_search, "full_range": full_range}
         self.cfg = json.load(open(os.path.join(root, "config.json")))["text_config"]
-        wm = json.load(open(os.path.join(root, "model.safetensors.index.json")))["weight_map"]
+        idx = os.path.join(root, "model.safetensors.index.json")
+        if os.path.exists(idx):
+            wm = json.load(open(idx))["weight_map"]
+        else:
+            with safe_open(os.path.join(root, "model.safetensors"), framework="pt") as f:
+                wm = {k: "model.safetensors" for k in f.keys()}
         self.shard = wm
         self._open = {}
         self._memo = {}

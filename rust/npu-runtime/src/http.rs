@@ -269,6 +269,8 @@ pub fn route(req: &Request, handle: &Handle, cfg_path: &Path) -> Response {
         ("POST", "/v1/completions") => completions(req, handle),
         ("POST", "/v1/embeddings") => embeddings(req, handle),
         ("POST", "/v1/systemone") => systemone(req, handle),
+        ("POST", "/predict") => predict(req, handle),
+        ("POST", "/rerank") => rerank(req, handle),
         // The Ollama surface. Same models, same engine -- a second wire, because OpenAI's has no
         // field for a capability or a context length and every client therefore asks the user.
         ("GET", "/api/version") => (200, crate::ollama::version_json().into()),
@@ -646,6 +648,66 @@ fn answer_json(a: npu_engine::DecideAnswer) -> (String, serde_json::Value) {
             (id, serde_json::json!({"type": "score", "score": score, "probabilities": p, "confidence": confidence}))
         }
     }
+}
+
+fn serve_nli(body: &serde_json::Value, handle: &Handle, pairs: Vec<(String, String)>)
+    -> Result<npu_engine::NliScores, Response> {
+    let model = body.get("model").and_then(|v| v.as_str());
+    let served = handle.serve(Capability::GENERATE, model, EngineReq::Nli(npu_engine::NliRequest { pairs }))
+        .map_err(|e| engine_err(&e))?;
+    match served.value {
+        EngineResp::NliScores(s) => Ok(s),
+        other => Err(engine_err(&npu_engine::EngineError::Device(format!("nli returned a {} response", other.shape())))),
+    }
+}
+
+/// TEI's `/predict` for a pair classifier: `{"inputs": [a, b]}` or `{"inputs": [[a, b], ...]}`,
+/// each answered with every label's probability, highest first.
+fn predict(req: &Request, handle: &Handle) -> Response {
+    let bad = |m: &str| -> Response { (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(m)).into()) };
+    let body: serde_json::Value = match serde_json::from_slice(&req.body) { Ok(v) => v, Err(_) => return bad("body is not JSON") };
+    let pair = |v: &serde_json::Value| -> Option<(String, String)> {
+        let a = v.as_array().filter(|a| a.len() == 2)?;
+        Some((a[0].as_str()?.to_string(), a[1].as_str()?.to_string()))
+    };
+    let inputs = body.get("inputs");
+    let (single, pairs) = match inputs.and_then(pair) {
+        Some(p) => (true, vec![p]),
+        None => match inputs.and_then(|v| v.as_array()).map(|a| a.iter().map(pair).collect::<Option<Vec<_>>>()) {
+            Some(Some(ps)) if !ps.is_empty() => (false, ps),
+            _ => return bad("`inputs` must be a [premise, hypothesis] pair or a non-empty array of them"),
+        },
+    };
+    let s = match serve_nli(&body, handle, pairs) { Ok(s) => s, Err(r) => return r };
+    let one = |p: &Vec<f64>| {
+        let mut v: Vec<(&String, f64)> = s.labels.iter().zip(p.iter().copied()).collect();
+        v.sort_by(|a, b| b.1.total_cmp(&a.1));
+        serde_json::Value::Array(v.into_iter().map(|(l, x)| serde_json::json!({"label": l, "score": x})).collect())
+    };
+    let out = match single {
+        true => one(&s.probs[0]),
+        false => serde_json::Value::Array(s.probs.iter().map(one).collect()),
+    };
+    (200, out.to_string().into())
+}
+
+/// TEI's `/rerank`: each text scored by P(entailment) of openjev's answer hypothesis over the query.
+fn rerank(req: &Request, handle: &Handle) -> Response {
+    let bad = |m: &str| -> Response { (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(m)).into()) };
+    let body: serde_json::Value = match serde_json::from_slice(&req.body) { Ok(v) => v, Err(_) => return bad("body is not JSON") };
+    let Some(query) = body.get("query").and_then(|v| v.as_str()) else { return bad("missing `query`") };
+    let texts: Vec<String> = match body.get("texts").and_then(|v| v.as_array())
+        .map(|a| a.iter().map(|t| t.as_str().map(str::to_string)).collect::<Option<Vec<_>>>()) {
+        Some(Some(t)) if !t.is_empty() => t,
+        _ => return bad("`texts` must be a non-empty array of strings"),
+    };
+    let pairs = texts.iter().map(|t| (query.to_string(), npu_engine::nli::RERANK_HYPOTHESIS.replacen("{text}", t, 1))).collect();
+    let s = match serve_nli(&body, handle, pairs) { Ok(s) => s, Err(r) => return r };
+    let e = s.labels.iter().position(|l| l == "entailment").unwrap_or(1);
+    let mut ranked: Vec<(usize, f64)> = s.probs.iter().map(|p| p[e]).enumerate().collect();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let out: Vec<serde_json::Value> = ranked.into_iter().map(|(i, x)| serde_json::json!({"index": i, "score": x})).collect();
+    (200, serde_json::Value::Array(out).to_string().into())
 }
 
 fn parse_systemone(body: &serde_json::Value) -> Result<npu_engine::DecideRequest, String> {
@@ -2918,6 +2980,75 @@ pub(crate) mod generate_tests {
         cfg.save(&p).unwrap();
         let (h, j) = start(cfg, Box::new(DecideLoader)).unwrap();
         (h, j, dir, p)
+    }
+
+    /// Entailment grows with the hypothesis length, so a caller can see ordering and batching.
+    struct NliModel;
+    impl Servable for NliModel {
+        fn capabilities(&self) -> Capability { Capability::GENERATE }
+        fn run(&mut self, req: EngineReq) -> Result<EngineResp, EngineError> {
+            let r = match req {
+                EngineReq::Nli(r) => r,
+                other => return Err(EngineError::Unsupported(format!("NliModel cannot serve {}", other.shape()))),
+            };
+            let probs = r.pairs.iter().map(|(_, h)| {
+                let e = (h.len() as f64 / 100.0).min(0.9);
+                vec![(1.0 - e) / 2.0, e, (1.0 - e) / 2.0]
+            }).collect();
+            Ok(EngineResp::NliScores(npu_engine::NliScores {
+                labels: vec!["contradiction".into(), "entailment".into(), "neutral".into()],
+                windows: vec![1; r.pairs.len()], probs, stats: Default::default() }))
+        }
+    }
+    impl StreamServable for NliModel {}
+    struct NliLoader;
+    impl ModelLoader for NliLoader {
+        fn load(&self, _cfg: &ModelCfg) -> Result<Box<dyn StreamServable>, EngineError> { Ok(Box::new(NliModel)) }
+        fn declared_capability(&self, _cfg: &ModelCfg) -> Option<Capability> { Some(Capability::GENERATE) }
+    }
+    fn nli_handle() -> (Handle, std::thread::JoinHandle<()>, tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("engine.toml");
+        let cfg = Config {
+            server: ServerCfg { idle_unload_s: 0, ..Default::default() },
+            models: vec![ModelCfg { name: "jev".into(), scenario: "x".into(), resident: false }],
+            ..Default::default()
+        };
+        cfg.save(&p).unwrap();
+        let (h, j) = start(cfg, Box::new(NliLoader)).unwrap();
+        (h, j, dir, p)
+    }
+
+    #[test]
+    fn predict_takes_one_pair_or_a_batch_in_teis_shape() {
+        let (h, j, _d, p) = nli_handle();
+        // NliModel's e = (hyp.len()/100).min(0.9); entailment beats contradiction/neutral's tied
+        // (1-e)/2 only once e > 1/3, i.e. a hypothesis over ~34 chars -- the plan's own 10-char
+        // "bbbbbbbbbb" scores e=0.1 and contradiction/neutral would win the sort instead.
+        let (code, body) = route(&post("/predict",
+            r#"{"inputs":["a","bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]}"#), &h, &p);
+        assert_eq!(code, 200, "{}", body.text());
+        let v: serde_json::Value = serde_json::from_str(body.text()).unwrap();
+        assert_eq!(v[0]["label"], "entailment", "sorted by score, highest first");
+        let (code, body) = route(&post("/predict", r#"{"inputs":[["a","b"],["c","dd"]]}"#), &h, &p);
+        assert_eq!(code, 200);
+        let v: serde_json::Value = serde_json::from_str(body.text()).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 2);
+        assert_eq!(v[1].as_array().unwrap().len(), 3);
+        assert_eq!(route(&post("/predict", r#"{"inputs":[]}"#), &h, &p).0, 400);
+        h.shutdown(); let _ = j.join();
+    }
+
+    #[test]
+    fn rerank_returns_indices_by_entailment() {
+        let (h, j, _d, p) = nli_handle();
+        let (code, body) = route(&post("/rerank", r#"{"query":"q","texts":["x","xxxxxxxxxxxxxxxxxxxx","xxx"]}"#), &h, &p);
+        assert_eq!(code, 200, "{}", body.text());
+        let v: serde_json::Value = serde_json::from_str(body.text()).unwrap();
+        let order: Vec<u64> = v.as_array().unwrap().iter().map(|r| r["index"].as_u64().unwrap()).collect();
+        assert_eq!(order, vec![1, 2, 0]);
+        assert_eq!(route(&post("/rerank", r#"{"query":"q","texts":[]}"#), &h, &p).0, 400);
+        h.shutdown(); let _ = j.join();
     }
 
     /// A buffered response carries its own measurements, always. This is the surface a human hits

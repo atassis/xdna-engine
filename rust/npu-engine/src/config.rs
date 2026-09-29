@@ -278,6 +278,10 @@ pub struct Artifacts {
     /// model instead of the fused-decode-ELF rail `decode` selects -- never both from one scenario.
     #[serde(default)]
     pub resident: String,
+    /// `kind = "generate"` only: a sequence-classification head (`scripts/extract_nli_head.py`).
+    /// Naming one switches `decide` to openjev's rule and serves `/predict` and `/rerank`.
+    #[serde(default)]
+    pub nli_head: String,
     /// Declarative weight source: `"hf:<repo>[@rev]"` or `"path:/abs"`. When set, the engine
     /// resolves + bakes (on missing) a `npu-weights` checkpoint via this spec instead of reading the
     /// legacy npy `weights` dir. Optional and additive: omit it and the npy path is unchanged.
@@ -425,6 +429,21 @@ manifest = "artifacts/pyannote/diarize.json"
             assert!(!p.starts_with('/'), "artifact path must be root-relative, got {p:?}");
             assert!(p.starts_with("artifacts/qwen3-0.6b/"), "unexpected artifact path {p:?}");
         }
+    }
+
+    #[test]
+    fn the_openjev_scenario_names_its_head() {
+        let c = ScenarioConfig::from_str(&std::fs::read_to_string("../../scenarios/nli-openjev-4b.toml").unwrap()).unwrap();
+        assert_eq!(c.artifacts.nli_head, "artifacts/openjev-4b/nli_head");
+        assert!(!c.artifacts.prefill.is_empty());
+    }
+
+    #[test]
+    fn a_generate_scenario_can_name_an_nli_head() {
+        let c = ScenarioConfig::from_str(
+            "[scenario]\nkind = \"generate\"\nname = \"m\"\n[artifacts]\ndecode = \"d\"\nweights = \"w\"\ntokenizer_dir = \"t\"\nnli_head = \"h\"\n",
+        ).unwrap();
+        assert_eq!(c.artifacts.nli_head, "h");
     }
 
     #[test]

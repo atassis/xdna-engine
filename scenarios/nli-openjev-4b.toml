@@ -1,0 +1,14 @@
+[scenario]
+kind = "generate"
+# AlexWortega/openjev qwen3.5-4b-nli-v5 (MIT, rev 552759da): Qwen3.5-4B fine-tuned as a 3-way NLI
+# cross-encoder. Same dims as Qwen/Qwen3.5-4B, so both artifacts are generate-qwen3.5-4b.toml's
+# recipe over this checkpoint's f32 dump; the head is read on the host off `xf`
+# (scripts/extract_nli_head.py). Serves /predict, /rerank and /v1/systemone (openjev's rule).
+name = "openjev-4b"
+
+[artifacts]
+decode = "artifacts/openjev-4b/decode_s4096_gdrl"
+weights = "artifacts/openjev-4b/decode_s4096_gdrl/buffers"
+tokenizer_dir = "artifacts/openjev-4b/tokenizer"
+prefill = "artifacts/openjev-4b/prefill_m256f_s4096"
+nli_head = "artifacts/openjev-4b/nli_head"

@@ -99,6 +99,7 @@ impl Servable for EngineModel {
             Request::Image { .. } => Err(EngineError::WrongKind {
                 wanted: Capability::IMAGE_SR, got: self.model.kind().capability() }),
             Request::Decide(r) => self.model.decide(&r).map(Response::Decisions),
+            Request::Nli(r) => self.model.nli(&r).map(Response::NliScores),
         }
     }
 }
