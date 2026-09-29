@@ -28,7 +28,7 @@ use npu_xrt::{unpack_bf16_to_f32, Bo, Device, ElfResident, FLAG_HOST_ONLY};
 
 use crate::api::EngineError;
 use crate::llm::generator::{CacheState, DecodeStep};
-use crate::llm::npu_decode::{pack_bf16_bytes, unpack_bf16_bytes};
+use crate::llm::npu_decode::unpack_bf16_bytes;
 
 // ---------------------------------------------------------------------------------------------
 // Embedding + head weights: int4 dequant, ported from head_ref.py (unplanar_chunk/dequant_f64/
@@ -631,34 +631,71 @@ impl RawResidentForward {
         Ok(unpack_bf16_bytes(&row0))
     }
 
-    /// `rms_norm_f64` (head_ref.py), computed once here rather than on-device -- the final norm is
-    /// a single 3840-wide reduction, cheap on the host and the same precision the device path
-    /// itself does not name a lower one for.
+    /// `rms_norm_f64` (head_ref.py: "Gemma4RMSNorm: normed * weight, no +1" -- this checkpoint's
+    /// `final_norm` weights run mean ~20, max ~604, not the near-1 range a `(1+w)` convention
+    /// implies; this formula is what `hrun.py`'s own device smoke test validates against, not just
+    /// what the docstring claims). Computed once here rather than on-device -- a single 3840-wide
+    /// reduction, cheap on the host and the same precision the device path itself does not name a
+    /// lower one for.
     fn rms_norm(&self, h: &[f32]) -> Vec<f32> {
         let n = h.len() as f64;
         let ms: f64 = h.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>() / n + self.meta.rms_norm_eps;
         let scale = ms.powf(-0.5);
         h.iter().zip(&self.fnorm).map(|(&x, &w)| ((x as f64) * scale * (w as f64)) as f32).collect()
     }
-}
 
-impl DecodeStep for RawResidentForward {
-    fn step(&mut self, token: u32, pos: usize) -> Result<Vec<f32>, EngineError> {
+    /// Diagnostic (S2 head-isolation): forward one token/position through the 48-layer stack ONLY,
+    /// returning the raw (pre-norm) hidden row's bf16 bits -- the exact value `step()` hands to
+    /// `head_logits`. Lets a caller capture this row once and feed the identical bytes to both the
+    /// on-device head (`debug_raw_head_from_hidden`) and a host oracle, instead of re-running the
+    /// (already S1-proven-correct) 48-layer stack twice to compare the two heads.
+    pub fn debug_forward_hidden(&mut self, token: u32, pos: usize) -> Result<Vec<u16>, EngineError> {
         let x_bits = self.embed.embed_row_bf16(token)?;
-        let out = self.forward(&x_bits, pos, 1)?;
-        let mut hidden_f32 = vec![0f32; self.meta.d_model];
-        unpack_bf16_to_f32(&out, &mut hidden_f32);
-        let normed = self.rms_norm(&hidden_f32);
-        let normed_bits = pack_bf16_bytes(&normed);
-        let normed_u16 = le_bytes_to_u16s(&normed_bits);
-        let mut logits = self.head_logits(&normed_u16)?;
+        self.forward(&x_bits, pos, 1)
+    }
+
+    /// Diagnostic: the on-device head on a RAW (pre-norm) hidden row's bf16 bits, without softcap
+    /// -- `step()`'s own path from `debug_forward_hidden`'s output, exposed so a captured row can
+    /// be replayed here instead of re-forwarding. Do NOT pre-normalize the row before calling this
+    /// -- `h1` applies its own RMSNorm + `final_norm` gain internally (see `step()`'s doc); the S2
+    /// head-isolation bug was exactly a caller (this one, originally) doing that host-side first.
+    pub fn debug_raw_head_from_hidden(&mut self, hidden_bits: &[u16]) -> Result<Vec<f32>, EngineError> {
+        self.head_logits(hidden_bits)
+    }
+
+    /// Diagnostic: the HOST-SIDE `rms_norm_f64` oracle computation on a raw hidden row -- never
+    /// fed to the device (see `step()`'s doc) -- so its stats can be diffed against the bridge
+    /// oracle's `head_debug` command's `xn_stats` as a norm-math cross-check independent of `h1`.
+    pub fn debug_host_rms_norm(&self, hidden_f32: &[f32]) -> Vec<f32> {
+        self.rms_norm(hidden_f32)
+    }
+
+    fn apply_softcap(&self, mut logits: Vec<f32>) -> Vec<f32> {
         if let Some(cap) = self.meta.logit_softcap {
             let cap = cap as f32;
             for v in &mut logits {
                 *v = (*v / cap).tanh() * cap;
             }
         }
-        Ok(logits)
+        logits
+    }
+}
+
+impl DecodeStep for RawResidentForward {
+    fn step(&mut self, token: u32, pos: usize) -> Result<Vec<f32>, EngineError> {
+        let hidden = self.debug_forward_hidden(token, pos)?;
+        // The RAW (un-normalized) hidden row, not `debug_head_from_hidden`'s host-normed one:
+        // `h1` applies its OWN RMSNorm + `final_norm` gain internally (`rhead.py`'s `NORM_PRE`/
+        // `GAINS` phases, the gain baked into `head_stream()`'s weight pack). `hrun.py`'s own
+        // reference confirms this -- `head(h)` feeds the device the raw row; `rms_norm_f64(h, ...)`
+        // is applied only on the HOST SIDE for comparison, never sent to the device. Feeding an
+        // already-normed row here double-applies the norm, which is exactly the S2 bug this
+        // comment exists to prevent reintroducing: measured device logits ~12x the host oracle's
+        // magnitude (316 vs 26.5 raw) before this fix, with `debug_rms_norm`'s own output otherwise
+        // bit-identical to the host oracle's `xn_stats` -- i.e. the norm math was right, only
+        // applying it twice was wrong.
+        let raw = self.head_logits(&hidden)?;
+        Ok(self.apply_softcap(raw))
     }
 
     fn reset(&mut self) -> Result<CacheState, EngineError> {
