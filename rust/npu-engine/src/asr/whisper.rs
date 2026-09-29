@@ -974,6 +974,8 @@ impl WhisperAsr {
             let ms_per_tok = dec_ms / n_tok as f64;
             let (backend, disp_per_tok) = if self.npu_fused.is_some() {
                 ("FUSED", 1.0) // whole 12-layer decode = ONE dispatch/token by construction
+            } else if self.npu_rail.is_some() {
+                ("RAIL", 1.0)
             } else if let Some(dec) = &self.npu_decoder {
                 ("NPU", dec.borrow().npu_dispatches() as f64 / n_tok as f64)
             } else {

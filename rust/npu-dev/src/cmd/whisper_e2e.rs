@@ -8,7 +8,9 @@
 //! Backend select: default = ONNX decoder; `NPU_DECODE=1` = on-NPU decoder. Both use the NPU encoder
 //! (single-tenant — stop npu-asr.service / voxd.service first).
 //!
-//! Usage: WHISPER_TIMING=1 [NPU_DECODE=1] whisper_e2e_timing <clip.wav>
+//! Usage: WHISPER_TIMING=1 [NPU_DECODE=1] whisper_e2e_timing <clip.wav>...
+//!
+//! Several clips share one model load and run back to back, each with its own warmup.
 
 use std::path::Path;
 
@@ -32,8 +34,21 @@ fn uj_delta(b: u128, a: u128, max: u128) -> u128 {
 }
 
 pub fn run(argv: Vec<String>) {
-    let wav_path = argv.get(1).cloned().expect("usage: whisper_e2e_timing <clip.wav>");
+    let clips: Vec<String> = argv.iter().skip(1).cloned().collect();
+    assert!(!clips.is_empty(), "usage: whisper_e2e_timing <clip.wav>...");
+    let scenario = std::env::var("WHISPER_SCENARIO").unwrap_or_else(|_| SCENARIO_DEFAULT.into());
+    eprintln!("[e2e] scenario = {scenario}");
+    let scen = registry::build(Path::new(&scenario), Path::new("."));
+    let pipe = match scen {
+        Scenario::Asr(p) => p,
+        _ => panic!("scenario is not ASR"),
+    };
+    for wav_path in &clips {
+        bench_clip(pipe.as_ref(), wav_path);
+    }
+}
 
+fn bench_clip(pipe: &dyn npu_engine::pipeline::AsrModel, wav_path: &str) {
     let bytes = std::fs::read(&wav_path).unwrap_or_else(|e| panic!("read {wav_path}: {e}"));
     let samples = parse_wav_i16(&bytes).expect("parse 16k/mono/16-bit WAV");
     let dur_s = samples.len() as f64 / 16_000.0;
@@ -48,14 +63,6 @@ pub fn run(argv: Vec<String>) {
         "[bench] clip={wav_path} samples={} duration_s={dur_s:.3} backend={backend} passes={PASSES}",
         samples.len()
     );
-
-    let scenario = std::env::var("WHISPER_SCENARIO").unwrap_or_else(|_| SCENARIO_DEFAULT.into());
-    eprintln!("[e2e] scenario = {scenario}");
-    let scen = registry::build(Path::new(&scenario), Path::new("."));
-    let pipe = match scen {
-        Scenario::Asr(p) => p,
-        _ => panic!("scenario is not ASR"),
-    };
 
     // Warmup pass (not counted): primes ONNX session arenas, NPU kernels, governor, page-ins.
     eprintln!("[bench] --- warmup pass (untimed) ---");
