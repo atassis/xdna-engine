@@ -5,6 +5,7 @@ pub mod schedule;
 pub mod color;
 pub mod frontier;
 pub mod pipeline;
+pub mod fsr1;
 
 use std::path::Path;
 
@@ -32,9 +33,11 @@ pub struct Plane {
 }
 
 /// The SR engine. Holds device resources -> NOT Send/Sync; the caller serializes (NPU single-tenant).
-pub struct SrEngine {
-    sched: schedule::Schedule,
-    frontier: frontier::Frontier,
+/// The schedule JSON's `kind` picks the backend: a conv net over the brick vocabulary (the
+/// default, ESPCN/EDSR) or `fsr1`, a fixed-function exported design.
+pub enum SrEngine {
+    Net { sched: schedule::Schedule, frontier: frontier::Frontier },
+    Fsr1(fsr1::Fsr1Engine),
 }
 
 /// Paths [`SrEngine::load_with`] resolves itself, replacing the schedule's own CWD-relative
@@ -62,17 +65,34 @@ impl SrEngine {
     /// (CWD-relative, dev-checkout-only) paths. See [`LoadOverrides`].
     pub fn load_with(schedule_path: impl AsRef<Path>, use_npu: bool, overrides: LoadOverrides)
         -> Result<SrEngine, SrError> {
-        let mut sched = schedule::Schedule::load(schedule_path.as_ref())?;
+        let path = schedule_path.as_ref();
+        if schedule::kind(path)? == schedule::Kind::Fsr1 {
+            if !use_npu {
+                return Err(SrError::Load("fsr1 has no CPU backend".into()));
+            }
+            let cfg: fsr1::Fsr1Config = schedule::load_json(path)?;
+            let dir = path.parent().unwrap_or(Path::new("."));
+            return Ok(SrEngine::Fsr1(fsr1::Fsr1Engine::load(cfg, dir)?));
+        }
+        let mut sched = schedule::Schedule::load(path)?;
         if let Some(ckpt) = overrides.checkpoint {
             sched.checkpoint = ckpt.to_string_lossy().into_owned();
         }
         let frontier = frontier::Frontier::build(&sched, use_npu, overrides.wa_dir)?;
-        Ok(SrEngine { sched, frontier })
+        Ok(SrEngine::Net { sched, frontier })
+    }
+
+    fn net(&mut self) -> Result<(&schedule::Schedule, &mut frontier::Frontier), SrError> {
+        match self {
+            SrEngine::Net { sched, frontier } => Ok((sched, frontier)),
+            SrEngine::Fsr1(_) => Err(SrError::Frame("fsr1 takes RGB8 frames only".into())),
+        }
     }
 
     /// Upscale one luma plane by the schedule's scale factor. The per-frame ABI (the ffmpeg filter uses this).
     pub fn upscale_plane(&mut self, y: &Plane) -> Result<Plane, SrError> {
-        self.frontier.run(&self.sched, y)
+        let (sched, frontier) = self.net()?;
+        frontier.run(sched, y)
     }
 
     /// Upscale an interleaved RGB8 image. Y-only nets (ESPCN): SR the luma + bicubic chroma. RGB nets
@@ -82,10 +102,14 @@ impl SrEngine {
         if rgb.len() != w * h * 3 {
             return Err(SrError::Frame(format!("rgb len {} != {}*{}*3", rgb.len(), w, h)));
         }
-        match self.sched.input {
+        let (sched, frontier) = match self {
+            SrEngine::Fsr1(f) => return f.upscale_rgb8(rgb, w, h),
+            SrEngine::Net { sched, frontier } => (&*sched, frontier),
+        };
+        match sched.input {
             schedule::InputMode::Y => {
                 let (y, cb, cr) = color::rgb8_to_ycbcr(rgb, w, h);
-                let sr_y = self.upscale_plane(&y)?;
+                let sr_y = frontier.run(sched, &y)?;
                 let (ow, oh) = (sr_y.w, sr_y.h);
                 let sr_cb = color::bicubic(&cb, ow, oh);
                 let sr_cr = color::bicubic(&cr, ow, oh);
@@ -99,7 +123,7 @@ impl SrEngine {
                     planar[w * h + i] = rgb[3 * i + 1] as f32 / 255.0;
                     planar[2 * w * h + i] = rgb[3 * i + 2] as f32 / 255.0;
                 }
-                let out = self.frontier.run_feat_planar(&self.sched, planar, 3, h, w)?;
+                let out = frontier.run_feat_planar(sched, planar, 3, h, w)?;
                 let (oc, oh, ow, data) = out;
                 if oc != 3 {
                     return Err(SrError::Frame(format!("rgb net produced {oc} channels, want 3")));
@@ -118,7 +142,10 @@ impl SrEngine {
 
     /// The schedule's integer scale factor (e.g. 3 for ESPCN x3).
     pub fn scale(&self) -> usize {
-        self.sched.scale
+        match self {
+            SrEngine::Net { sched, .. } => sched.scale,
+            SrEngine::Fsr1(f) => f.scale(),
+        }
     }
 
     /// RGB f32 planar path: [3,H,W] row-major in [0,1] -> ([3,oH,oW], oW, oH). For RGB nets (EDSR);
@@ -128,7 +155,8 @@ impl SrEngine {
         if planar.len() != 3 * w * h {
             return Err(SrError::Frame(format!("planar len {} != 3*{}*{}", planar.len(), w, h)));
         }
-        let (oc, oh, ow, data) = self.frontier.run_feat_planar(&self.sched, planar.to_vec(), 3, h, w)?;
+        let (sched, frontier) = self.net()?;
+        let (oc, oh, ow, data) = frontier.run_feat_planar(sched, planar.to_vec(), 3, h, w)?;
         if oc != 3 {
             return Err(SrError::Frame(format!("rgb net produced {oc} channels, want 3")));
         }

@@ -53,11 +53,33 @@ pub struct Schedule {
     pub ops: Vec<Op>,
 }
 
+/// Which backend a schedule JSON describes; absent means a conv net.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    #[default]
+    Net,
+    Fsr1,
+}
+
+pub fn load_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, SrError> {
+    let s = std::fs::read_to_string(path)
+        .map_err(|e| SrError::Load(format!("read {}: {e}", path.display())))?;
+    serde_json::from_str(&s).map_err(|e| SrError::Load(format!("parse {}: {e}", path.display())))
+}
+
+pub fn kind(path: &Path) -> Result<Kind, SrError> {
+    #[derive(Deserialize)]
+    struct K {
+        #[serde(default)]
+        kind: Kind,
+    }
+    Ok(load_json::<K>(path)?.kind)
+}
+
 impl Schedule {
     pub fn load(path: &Path) -> Result<Schedule, SrError> {
-        let s = std::fs::read_to_string(path)
-            .map_err(|e| SrError::Load(format!("read {}: {e}", path.display())))?;
-        serde_json::from_str(&s).map_err(|e| SrError::Load(format!("parse {}: {e}", path.display())))
+        load_json(path)
     }
 }
 
