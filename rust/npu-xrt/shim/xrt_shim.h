@@ -43,6 +43,7 @@ ShimBo*     shim_bo_subbuffer(ShimBo* parent, size_t size, size_t offset);
 void        shim_bo_free(ShimBo*);
 int         shim_bo_write(ShimBo*, const void* src, size_t nbytes, size_t offset); /* 0 ok */
 int         shim_bo_read (ShimBo*, void* dst, size_t nbytes, size_t offset);
+void*       shim_bo_map  (ShimBo*);  /* host mapping, lives as long as the BO; NULL on error */
 int         shim_bo_sync_to_device(ShimBo*);
 int         shim_bo_sync_from_device(ShimBo*);
 

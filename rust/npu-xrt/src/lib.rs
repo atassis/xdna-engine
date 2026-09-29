@@ -504,6 +504,7 @@ extern "C" {
     fn shim_bo_free(b: *mut CBo);
     fn shim_bo_write(b: *mut CBo, src: *const c_void, n: usize, off: usize) -> c_int;
     fn shim_bo_read(b: *mut CBo, dst: *mut c_void, n: usize, off: usize) -> c_int;
+    fn shim_bo_map(b: *mut CBo) -> *mut c_void;
     fn shim_bo_sync_to_device(b: *mut CBo) -> c_int;
     fn shim_bo_sync_from_device(b: *mut CBo) -> c_int;
     #[allow(clippy::too_many_arguments)]
@@ -1626,6 +1627,16 @@ impl Bo {
         }
     }
 
+    /// The BO's host mapping, `nbytes()` long and valid for the BO's lifetime. Writes still need
+    /// `sync_to_device`, reads `sync_from_device`, exactly as with `write_bytes`/`read_bytes`.
+    pub fn map(&self) -> Result<*mut u8> {
+        let p = unsafe { shim_bo_map(self.ptr) };
+        if p.is_null() {
+            Err(format!("bo_map: {}", last_error()))
+        } else {
+            Ok(p as *mut u8)
+        }
+    }
     pub fn sync_to_device(&self) -> Result<()> {
         let r = unsafe { shim_bo_sync_to_device(self.ptr) };
         if r != 0 {
