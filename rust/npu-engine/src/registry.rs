@@ -65,13 +65,34 @@ pub fn try_build(cfg_path: &Path, root: &Path) -> Result<Scenario, EngineError> 
             let dev = open_dev()?;
             let tokenizer_dir = root.join(&cfg.artifacts.tokenizer_dir);
             let model_cfg = crate::llm::ModelConfig::load(&tokenizer_dir)?;
-            // `artifacts.resident` selects the resident-forward layer-stack backend (opt-in,
-            // side-by-side with the fused-decode-ELF rail below); mutually exclusive with `decode`.
+            // `artifacts.resident` selects a resident-forward backend (opt-in, side-by-side with
+            // the fused-decode-ELF rail below); mutually exclusive with `decode`. Which driver
+            // constructs it is read from the artifact's OWN `meta.json` (`kind`), not a second
+            // config field -- `rf48s` (`resident_forward_onecmd`, one fixed sliding-cache window)
+            // and `rf48L` (`resident_forward_ladder`, the 256k rung ladder + mirrored ring) are
+            // different meta.json shapes under the same `artifacts.resident` directory convention.
             if !cfg.artifacts.resident.is_empty() {
                 let resident_dir = root.join(&cfg.artifacts.resident);
-                let decode = crate::llm::OneCommandResidentForward::open(&dev, &resident_dir)?;
-                Scenario::Generate(Box::new(crate::llm::LlmGenerator::new(model_cfg, decode)
-                    .with_scenario_defaults(cfg.generation.to_defaults())))
+                let meta_path = resident_dir.join("meta.json");
+                let meta_bytes = std::fs::read(&meta_path)
+                    .map_err(|e| EngineError::Load(format!("read {}: {e}", meta_path.display())))?;
+                let meta_v: serde_json::Value = serde_json::from_slice(&meta_bytes)
+                    .map_err(|e| EngineError::Load(format!("parse {}: {e}", meta_path.display())))?;
+                let kind = meta_v.get("kind").and_then(|x| x.as_str()).unwrap_or_default();
+                match kind {
+                    "resident_forward_ladder" => {
+                        let decode = crate::llm::LadderResidentForward::open(&dev, &resident_dir)?;
+                        Scenario::Generate(Box::new(crate::llm::LlmGenerator::new(model_cfg, decode)
+                            .with_scenario_defaults(cfg.generation.to_defaults())))
+                    }
+                    "resident_forward_onecmd" => {
+                        let decode = crate::llm::OneCommandResidentForward::open(&dev, &resident_dir)?;
+                        Scenario::Generate(Box::new(crate::llm::LlmGenerator::new(model_cfg, decode)
+                            .with_scenario_defaults(cfg.generation.to_defaults())))
+                    }
+                    other => return Err(EngineError::Load(format!(
+                        "{}: unknown resident-forward kind {other:?}", meta_path.display()))),
+                }
             } else {
                 let decode_dir = root.join(&cfg.artifacts.decode);
                 // A scenario naming `artifacts.prefill` gets the batched priming path; the two ELFs

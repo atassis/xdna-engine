@@ -209,6 +209,23 @@ impl ModelLoader for EngineLoader {
             }
             return Some(total);
         }
+        // `artifacts.resident` (the resident-forward rail, `rf48s`/`rf48L`) leaves `weights`
+        // empty, and `self.root.join("")` resolves to `self.root` itself -- summing that would
+        // walk and total the WHOLE repo root, not this model. Its real device footprint (the
+        // number that matters for `memory_ceiling_mb`, since the whole scratch/xbuf/obuf arena is
+        // resident for the model's lifetime) is in its own `meta.json`, read cheaply, no device --
+        // the same three fields `LadderResidentForward::bo_bytes`/`OneCommandResidentForward`'s
+        // live counter report once loaded, so a not-yet-resident load and an already-resident one
+        // are weighed by the same number.
+        if !sc.artifacts.resident.is_empty() {
+            let dir = self.root.join(&sc.artifacts.resident);
+            let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("meta.json")).ok()?).ok()?;
+            let field = |k: &str| meta.get(k).and_then(|v| v.as_u64());
+            let xbuf = field("xbuf")?;
+            let obuf = field("obuf_f1").unwrap_or(0).max(field("obuf_f2").unwrap_or(0));
+            let scratch = field("scratch_bytes")?;
+            return Some(xbuf + obuf + scratch);
+        }
         // `checkpoint` is an ADDITIONAL artifact next to `weights`, not an alternative to it (see
         // image-sr's scenario, whose `weights` is a tiny schedule JSON and whose `checkpoint` is
         // the actual baked net) -- so this sums both when a scenario sets one, rather than picking.

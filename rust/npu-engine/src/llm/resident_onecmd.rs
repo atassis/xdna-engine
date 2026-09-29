@@ -408,6 +408,13 @@ impl DecodeStep for OneCommandResidentForward {
     fn max_context(&self) -> Option<usize> {
         Some(max_context_bound(self.meta.s_cap, self.meta.pmax))
     }
+
+    /// Real device BO bytes (`%x`+`%o`+`%s`) -- see `resident_ladder::LadderResidentForward::bo_bytes`
+    /// for why this exists: the default `0` let this model's ~7.6 GB scratch look free to the
+    /// `memory_ceiling_mb` accountant, which is exactly the residency conflict rf48L raised.
+    fn bo_bytes(&self) -> u64 {
+        (self.meta.xbuf + self.meta.obuf_f1.max(self.meta.obuf_f2) + self.meta.scratch_bytes) as u64
+    }
 }
 
 /// The hard, tight bound `max_context()` reports: the largest position at which a dispatch is
