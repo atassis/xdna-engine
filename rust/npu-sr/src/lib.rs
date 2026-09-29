@@ -140,6 +140,36 @@ impl SrEngine {
         }
     }
 
+    /// Upscale a BGRA8 frame (DRM ARGB8888 byte order) with row strides, writing dst alpha 0xff.
+    /// FSR1 packs and unpacks BGRA directly; conv nets go through `upscale_rgb8`.
+    pub fn upscale_bgra8(&mut self, src: &[u8], w: usize, h: usize, src_stride: usize,
+                         dst: &mut [u8], dst_stride: usize) -> Result<(usize, usize), SrError> {
+        if let SrEngine::Fsr1(f) = self {
+            return f.upscale_bgra8(src, w, h, src_stride, dst, dst_stride);
+        }
+        if src.len() < (h.max(1) - 1) * src_stride + w * 4 {
+            return Err(SrError::Frame(format!("src: {} bytes for {w}x{h} at stride {src_stride}", src.len())));
+        }
+        let mut rgb = vec![0u8; w * h * 3];
+        for y in 0..h {
+            for x in 0..w {
+                let s = &src[y * src_stride + 4 * x..];
+                rgb[3 * (y * w + x)..3 * (y * w + x) + 3].copy_from_slice(&[s[2], s[1], s[0]]);
+            }
+        }
+        let (out, ow, oh) = self.upscale_rgb8(&rgb, w, h)?;
+        if dst.len() < (oh.max(1) - 1) * dst_stride + ow * 4 {
+            return Err(SrError::Frame(format!("dst: {} bytes for {ow}x{oh} at stride {dst_stride}", dst.len())));
+        }
+        for y in 0..oh {
+            for x in 0..ow {
+                let p = &out[3 * (y * ow + x)..];
+                dst[y * dst_stride + 4 * x..y * dst_stride + 4 * x + 4].copy_from_slice(&[p[2], p[1], p[0], 0xff]);
+            }
+        }
+        Ok((ow, oh))
+    }
+
     /// The schedule's integer scale factor (e.g. 3 for ESPCN x3).
     pub fn scale(&self) -> usize {
         match self {

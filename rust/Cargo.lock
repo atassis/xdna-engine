@@ -1188,6 +1188,7 @@ dependencies = [
  "npu-engine",
  "npu-weights",
  "npu-xrt",
+ "rayon",
  "serde",
  "serde_json",
  "tempfile",

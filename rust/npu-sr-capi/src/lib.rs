@@ -116,6 +116,57 @@ pub unsafe extern "C" fn xdna_sr_process_rgb8(
     })
 }
 
+/// Upscale one BGRA8 frame (DRM ARGB8888 byte order: B, G, R, A in memory). Rows are `in_stride`
+/// / `out_stride` bytes apart; `out_rgba` holds at least (h*scale-1)*out_stride + w*scale*4 bytes
+/// (`out_cap`). Output alpha is 0xff. Returns 0 on success (writing out_w/out_h if non-null).
+#[no_mangle]
+pub unsafe extern "C" fn xdna_sr_process_bgra8(
+    h: *mut XdnaSr,
+    in_bgra: *const u8,
+    w: usize,
+    height: usize,
+    in_stride: usize,
+    out_bgra: *mut u8,
+    out_stride: usize,
+    out_cap: usize,
+    out_w: *mut usize,
+    out_h: *mut usize,
+) -> c_int {
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        let Some(h) = (unsafe { h.as_mut() }) else {
+            set_error("handle is null");
+            return -1;
+        };
+        if in_bgra.is_null() || out_bgra.is_null() || w == 0 || height == 0 || in_stride < w * 4 {
+            set_error("null buffer, empty frame, or in_stride < w*4");
+            return -1;
+        }
+        let src = unsafe { std::slice::from_raw_parts(in_bgra, (height - 1) * in_stride + w * 4) };
+        let dst = unsafe { std::slice::from_raw_parts_mut(out_bgra, out_cap) };
+        match h.0.upscale_bgra8(src, w, height, in_stride, dst, out_stride) {
+            Ok((ow, oh)) => {
+                unsafe {
+                    if !out_w.is_null() {
+                        *out_w = ow;
+                    }
+                    if !out_h.is_null() {
+                        *out_h = oh;
+                    }
+                }
+                0
+            }
+            Err(e) => {
+                set_error(e.to_string());
+                -1
+            }
+        }
+    }));
+    r.unwrap_or_else(|_| {
+        set_error("panic in xdna_sr_process_bgra8");
+        -1
+    })
+}
+
 /// Free an engine handle.
 #[no_mangle]
 pub unsafe extern "C" fn xdna_sr_free(h: *mut XdnaSr) {

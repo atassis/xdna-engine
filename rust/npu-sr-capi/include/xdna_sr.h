@@ -47,6 +47,22 @@ int xdna_sr_process_rgb8(struct XdnaSr *h,
                          uintptr_t *out_h);
 
 /**
+ * Upscale one BGRA8 frame (DRM ARGB8888 byte order: B, G, R, A in memory). Rows are `in_stride`
+ * / `out_stride` bytes apart; `out_rgba` holds at least (h*scale-1)*out_stride + w*scale*4 bytes
+ * (`out_cap`). Output alpha is 0xff. Returns 0 on success (writing out_w/out_h if non-null).
+ */
+int xdna_sr_process_bgra8(struct XdnaSr *h,
+                          const uint8_t *in_bgra,
+                          uintptr_t w,
+                          uintptr_t height,
+                          uintptr_t in_stride,
+                          uint8_t *out_bgra,
+                          uintptr_t out_stride,
+                          uintptr_t out_cap,
+                          uintptr_t *out_w,
+                          uintptr_t *out_h);
+
+/**
  * Free an engine handle.
  */
 void xdna_sr_free(struct XdnaSr *h);

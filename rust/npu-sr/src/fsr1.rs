@@ -4,6 +4,7 @@
 //! the tiling mirrors `fsr1_frame.py`'s `plan`/`pack`/`unpack`.
 use crate::SrError;
 use npu_xrt::{Bo, Device, Kernel, FLAG_CACHEABLE, FLAG_HOST_ONLY};
+use rayon::prelude::*;
 use serde::Deserialize;
 use std::path::Path;
 use std::rc::Rc;
@@ -80,6 +81,9 @@ pub struct Fsr1Engine {
     bo_out: Bo,
     inbuf: Vec<u8>,
     outbuf: Vec<u8>,
+    /// Pack/unpack threads (NPU_SR_THREADS, default 4): kept small, the embedder is often a
+    /// compositor sharing the CPU with a game.
+    pool: rayon::ThreadPool,
     _dev: Device,
 }
 
@@ -115,6 +119,11 @@ impl Fsr1Engine {
             bo_out,
             inbuf: vec![0; in_len],
             outbuf: vec![0; out_len],
+            pool: rayon::ThreadPoolBuilder::new()
+                .num_threads(std::env::var("NPU_SR_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4))
+                .thread_name(|i| format!("npu-sr-{i}"))
+                .build()
+                .map_err(|e| SrError::Load(format!("thread pool: {e}")))?,
             _dev: dev,
             cfg,
         })
@@ -126,12 +135,35 @@ impl Fsr1Engine {
 
     pub fn upscale_rgb8(&mut self, rgb: &[u8], w: usize, h: usize)
         -> Result<(Vec<u8>, usize, usize), SrError> {
+        let (ow, oh) = (w * 3, h * 3);
+        let mut out = vec![0u8; ow * oh * 3];
+        self.run(rgb, w, h, w * 3, Layout::RGB, &mut out, ow * 3, Layout::RGB)?;
+        Ok((out, ow, oh))
+    }
+
+    /// `src`/`dst` rows are `*_stride` bytes apart; dst alpha is written 0xff.
+    pub fn upscale_bgra8(&mut self, src: &[u8], w: usize, h: usize, src_stride: usize,
+                         dst: &mut [u8], dst_stride: usize) -> Result<(usize, usize), SrError> {
+        self.run(src, w, h, src_stride, Layout::BGRA, dst, dst_stride, Layout::BGRA)?;
+        Ok((w * 3, h * 3))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run(&mut self, src: &[u8], w: usize, h: usize, src_stride: usize, src_l: Layout,
+           dst: &mut [u8], dst_stride: usize, dst_l: Layout) -> Result<(), SrError> {
         if (w, h) != (self.cfg.in_w, self.cfg.in_h) {
             return Err(SrError::Frame(format!(
                 "{}: exported for {}x{}, got {w}x{h}", self.cfg.name, self.cfg.in_w, self.cfg.in_h)));
         }
+        if src.len() < (h - 1) * src_stride + w * src_l.bpp {
+            return Err(SrError::Frame(format!("src: {} bytes for {w}x{h} at stride {src_stride}", src.len())));
+        }
+        if dst.len() < (3 * h - 1) * dst_stride + 3 * w * dst_l.bpp {
+            return Err(SrError::Frame(format!("dst: {} bytes for {}x{} at stride {dst_stride}",
+                                              dst.len(), 3 * w, 3 * h)));
+        }
         let t0 = std::time::Instant::now();
-        self.pack(rgb);
+        self.pack(src, src_stride, src_l);
         let t1 = std::time::Instant::now();
         self.bo_in.write_bytes(&self.inbuf).map_err(SrError::Device)?;
         self.bo_in.sync_to_device().map_err(SrError::Device)?;
@@ -143,35 +175,37 @@ impl Fsr1Engine {
         self.bo_out.sync_from_device().map_err(SrError::Device)?;
         self.bo_out.read_bytes(&mut self.outbuf).map_err(SrError::Device)?;
         let t4 = std::time::Instant::now();
-        let (ow, oh) = (w * 3, h * 3);
-        let mut out = vec![0u8; ow * oh * 3];
-        self.unpack(&mut out, ow);
+        self.unpack(dst, dst_stride, dst_l);
         if std::env::var_os("NPU_SR_TIMING").is_some() {
             let ms = |a: std::time::Instant, b: std::time::Instant| (b - a).as_secs_f64() * 1e3;
             eprintln!("[fsr1] pack {:.2} upload {:.2} dispatch {:.2} readback {:.2} unpack {:.2} ms",
                       ms(t0, t1), ms(t1, t2), ms(t2, t3), ms(t3, t4), ms(t4, std::time::Instant::now()));
         }
-        Ok((out, ow, oh))
+        Ok(())
     }
 
     /// Tile i = 3 planes x (th+2*pad) rows x rs, column x0-pad.. clamped to the frame, then the
     /// flags byte.
-    fn pack(&mut self, rgb: &[u8]) {
+    fn pack(&mut self, src: &[u8], stride: usize, l: Layout) {
         let (w, h, g) = (self.cfg.in_w, self.cfg.in_h, &self.cfg.tile);
         let rows = g.th + 2 * g.pad;
-        for (t, buf) in self.tiles.iter().zip(self.inbuf.chunks_exact_mut(g.in_bytes)) {
-            for r in 0..rows {
-                let y = (t.y0 + r).saturating_sub(g.pad).min(h - 1);
-                for i in 0..g.tw + 2 * g.pad {
-                    let x = (t.x0 + i).saturating_sub(g.pad).min(w - 1);
-                    let px = &rgb[3 * (y * w + x)..3 * (y * w + x) + 3];
-                    for c in 0..3 {
-                        buf[(c * rows + r) * g.rs + i] = px[c];
+        let (tiles, inbuf) = (&self.tiles, &mut self.inbuf);
+        self.pool.install(|| {
+            inbuf.par_chunks_exact_mut(g.in_bytes).zip(tiles.par_iter()).for_each(|(buf, t)| {
+                for r in 0..rows {
+                    let y = (t.y0 + r).saturating_sub(g.pad).min(h - 1);
+                    let row = &src[y * stride..];
+                    for i in 0..g.tw + 2 * g.pad {
+                        let x = (t.x0 + i).saturating_sub(g.pad).min(w - 1);
+                        let px = &row[x * l.bpp..];
+                        for c in 0..3 {
+                            buf[(c * rows + r) * g.rs + i] = px[l.rgb[c]];
+                        }
                     }
                 }
-            }
-            buf[3 * rows * g.rs] = t.flags;
-        }
+                buf[3 * rows * g.rs] = t.flags;
+            });
+        });
         let used = self.tiles.len() * g.in_bytes;
         let (head, pad) = self.inbuf.split_at_mut(used);
         for chunk in pad.chunks_exact_mut(g.in_bytes) {
@@ -179,24 +213,51 @@ impl Fsr1Engine {
         }
     }
 
-    /// Tile output is phase-planar u8 [c][oy][px][t]; output column 3t+px.
-    fn unpack(&self, out: &mut [u8], ow: usize) {
+    /// Tile output is phase-planar u8 [c][oy][px][t]; output column 3t+px. Tile rows own disjoint
+    /// bands of 3*th output rows, which is the unit of parallelism.
+    fn unpack(&self, dst: &mut [u8], stride: usize, l: Layout) {
         let g = &self.cfg.tile;
         let oh_t = 3 * g.th;
-        for (t, buf) in self.tiles.iter().zip(self.outbuf.chunks_exact(g.out_bytes)) {
-            for oy in 0..oh_t {
-                let row = (3 * t.y0 + oy) * ow;
-                for lane in t.lo..=t.hi {
-                    for px in 0..3 {
-                        let o = 3 * (row + 3 * (t.x0 + lane) + px);
-                        for c in 0..3 {
-                            out[o + c] = buf[((c * oh_t + oy) * 3 + px) * g.tw + lane];
+        let per_row = self.tiles.iter().filter(|t| t.y0 == 0).count();
+        let band = oh_t * stride;
+        let (all, outbuf) = (&self.tiles, &self.outbuf);
+        self.pool.install(|| {
+            dst.par_chunks_mut(band).enumerate().for_each(|(k, dst)| {
+                let tiles = all.iter().zip(outbuf.chunks_exact(g.out_bytes))
+                    .skip(k * per_row).take(per_row);
+                for (t, buf) in tiles {
+                    for oy in 0..oh_t {
+                        let row = oy * stride;
+                        for lane in t.lo..=t.hi {
+                            for px in 0..3 {
+                                let o = row + (3 * (t.x0 + lane) + px) * l.bpp;
+                                for c in 0..3 {
+                                    dst[o + l.rgb[c]] = buf[((c * oh_t + oy) * 3 + px) * g.tw + lane];
+                                }
+                                if let Some(a) = l.alpha {
+                                    dst[o + a] = 0xff;
+                                }
+                            }
                         }
                     }
                 }
-            }
-        }
+            });
+        });
     }
+}
+
+/// Byte layout of one pixel: size, where R, G, B sit, and alpha if any.
+#[derive(Clone, Copy)]
+struct Layout {
+    bpp: usize,
+    rgb: [usize; 3],
+    alpha: Option<usize>,
+}
+
+impl Layout {
+    const RGB: Layout = Layout { bpp: 3, rgb: [0, 1, 2], alpha: None };
+    /// DRM ARGB8888 / Vulkan B8G8R8A8: B, G, R, A in memory.
+    const BGRA: Layout = Layout { bpp: 4, rgb: [2, 1, 0], alpha: Some(3) };
 }
 
 #[cfg(test)]
