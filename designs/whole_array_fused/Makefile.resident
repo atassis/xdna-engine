@@ -61,7 +61,6 @@ use_iron=1
 aie_py_src=whole_array_iron.py
 
 # Linear buffer allocation (the wide fast tile does not pack bank-aware).
-buffer_aloc_flag=basic-sequential
 
 # mm.cc combo/dim defines (mm.cc names symbols by the bf16->f32 combo; DIM_* default
 # to 64 if unset, so they MUST be passed to match the tile). Mirrors Makefile.modal.
@@ -80,6 +79,6 @@ include ${srcdir}/../../../../../designs/whole_array_fused/design_override.mk
 # matmul object: bf16 in, f32 acc. KERNEL_DEFINES carries the emulate/BFP16_IREE
 # flags from design_override.mk (fast tile) -- without it a fast-flagged build
 # silently compiles the native kernel.
-build/mm_${m}x${k}x${n}.o: ${kernels_dir}/mm.cc
+build/mm_${m}x${k}x${n}.o: ${lib_kernels_dir}/mm-zero/mm_zero.cc ${kernels_dir}/mm.cc
 	mkdir -p ${@D}
 	cd ${@D} && ${KERNEL_CC} ${KERNEL_CFLAGS} ${MM_DEFINES} ${KERNEL_DEFINES} -c $< -o ${@F}

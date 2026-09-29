@@ -268,8 +268,8 @@ $(_peano_remedy)" >&2
   # (mm_silu_epilogue.cc et al) of ${lib_kernels_dir}. Which namespace a file is declared through
   # is now itself checked -- a our kernel reached via kernels_dir only resolves because
   # something copied it into the toolchain store, which is the mutation this split removes.
-  mapfile -t declared_v  < <(grep -oP '\$\{kernels_dir\}/\K[A-Za-z0-9_./]+\.cc' "$mkpath" | sort -u)
-  mapfile -t declared_rb < <(grep -oP '\$\{lib_kernels_dir\}/\K[A-Za-z0-9_./]+\.cc' "$mkpath" | sort -u)
+  mapfile -t declared_v  < <(grep -oP '\$\{kernels_dir\}/\K[A-Za-z0-9_./-]+\.cc' "$mkpath" | sort -u)
+  mapfile -t declared_rb < <(grep -oP '\$\{lib_kernels_dir\}/\K[A-Za-z0-9_./-]+\.cc' "$mkpath" | sort -u)
   if [ $(( ${#declared_v[@]} + ${#declared_rb[@]} )) -eq 0 ]; then
     echo "[verify_kernel_source] FAIL: $mk declares no \${kernels_dir}/*.cc or \${lib_kernels_dir}/*.cc prerequisite -- Makefile shape changed, nothing to verify against" >&2
     fail=1; continue

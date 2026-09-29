@@ -19,7 +19,7 @@
 # generator -> .mlir -> aiecc flow so the modal generators keep working.
 #
 # HOW TO USE: `include` this AFTER `include ${srcdir}/../makefile-common`, once the
-# per-Makefile has set target_suffix, xclbin_target, aie_py_src, kernels, buffer_aloc_flag
+# per-Makefile has set target_suffix, xclbin_target, aie_py_src, kernels
 # and the MM/EPI defines. Every variable used below is supplied by makefile-common or the
 # per-Makefile, so this block is generic for the whole_array family.
 # Do NOT reuse for ctxln/mstat -- those are different kernels.
@@ -189,6 +189,6 @@ build/.toolchain.stamp: FORCE
 # target" / "ignoring old recipe for target") -- do NOT try to "fix" them.
 ${xclbin_target} ${insts_target} &: ${mlir_target} ${kernels:%=build/%.o} build/.toolchain.stamp
 	mkdir -p ${@D}
-	cd ${@D} && ${AIECC} --alloc-scheme=${buffer_aloc_flag} --get-xclbin \
+	cd ${@D} && ${AIECC} --get-xclbin \
 	    --xclbin-name=$(notdir ${xclbin_target}) ${aiecc_peano_flags} \
 	    --get-npu-insts --npu-insts-name=$(notdir ${insts_target}) $(notdir ${mlir_target})
