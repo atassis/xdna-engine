@@ -1,6 +1,0 @@
-[scenario]
-kind = "asr"
-name = "parakeet-tdt"
-
-[artifacts]
-weights = "artifacts/parakeet"
