@@ -19,6 +19,7 @@ WS="$(cd "$REPO/.." && pwd)"
 SPEC="${1:?usage: build_llm_decode.sh <spec> [LAYERS] [OUT]}"
 LAYERS="${2:-}"
 OUT="${3:-$REPO/artifacts/$SPEC/decode${LAYERS:+_l$LAYERS}}"
+OUT="$(realpath -m "$OUT")"
 . "$REPO/scripts/require_disk_backed.sh"
 require_disk_backed "$OUT" "OUT (the built artifact)" || exit 1
 VENV_IRON="${VENV_IRON:-$REPO/.venv-iron}"

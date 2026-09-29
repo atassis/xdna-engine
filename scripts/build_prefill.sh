@@ -14,6 +14,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WS="$(cd "$REPO/.." && pwd)"
 LAYERS="${1:-1}"; BATCH="${2:-256}"; SEQ="${3:-2048}"
 OUT="${4:-/mnt/data/xdna/scratch/prefill/full_l${LAYERS}_m${BATCH}_s${SEQ}}"
+OUT="$(realpath -m "$OUT")"
 CAUSAL="${CAUSAL:-rows}"
 SPEC="${SPEC:-qwen3-0.6b}"   # override for a non-qwen3 spec (e.g. gemma4-12b)
 VENV_IRON="${VENV_IRON:-$REPO/.venv-iron}"
