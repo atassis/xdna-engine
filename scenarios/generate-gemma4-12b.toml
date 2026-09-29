@@ -532,3 +532,22 @@ tokenizer_dir = "artifacts/gemma4-12b/tokenizer"
 
 [generation]
 max_tokens = 512
+
+# Vision/audio host towers (multimodal-serving-surface-request-fields). The served DECODE artifact
+# above knows nothing about media -- media only ever enters as a substituted embedding row (see
+# `rust/npu-engine/src/llm/multimodal.rs`). This checkpoint dir is the QAT checkpoint's own
+# `model.safetensors` (11 named tower tensors read directly, NOT the baked int4 `weights=` above and
+# NOT `artifacts/gemma4-12b/towers/*.npy`, which is dumped from a DIFFERENT checkpoint -- see
+# `gemma4_media.rs`'s module doc). Loaded lazily, only on a request that actually attaches media.
+#
+# GATED (CPU-only, no device -- `cargo test -p npu-engine --test gemma4_media_gate`): audio tower
+# end-to-end and the known-bad control both PASS at <=1e-4 rel-L2 against a real transformers 5.17.0
+# oracle wired from this checkpoint's own tensor names. The vision tower's math (patchify/merge/pad/
+# LayerNorm/RMSNorm/projection) matches at the same gate; the RESIZE stage (aspect-ratio-preserving
+# bicubic, needed only when an image exceeds the 280-soft-token budget) does NOT -- measured 6.8e-3
+# rel-L2 against torchvision's antialiased kernel, 9.6e-3 end to end, both honestly above the 1e-4
+# gate rather than silently loosened. Device end-to-end (a real image/audio request through
+# `npu serve`) is UNRUN: parked when the NPU driver wedged (amdxdna oops, unrelated to this task)
+# before it was reached.
+[multimodal]
+tower_checkpoint = "artifacts/gemma4-12b-qat/checkpoint"

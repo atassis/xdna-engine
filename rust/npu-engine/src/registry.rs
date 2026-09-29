@@ -71,6 +71,7 @@ pub fn try_build(cfg_path: &Path, root: &Path) -> Result<Scenario, EngineError> 
             // config field -- `rf48s` (`resident_forward_onecmd`, one fixed sliding-cache window)
             // and `rf48L` (`resident_forward_ladder`, the 256k rung ladder + mirrored ring) are
             // different meta.json shapes under the same `artifacts.resident` directory convention.
+            let tower_checkpoint = cfg.multimodal.tower_checkpoint.as_ref().map(|p| root.join(p));
             if !cfg.artifacts.resident.is_empty() {
                 let resident_dir = root.join(&cfg.artifacts.resident);
                 let meta_path = resident_dir.join("meta.json");
@@ -83,12 +84,14 @@ pub fn try_build(cfg_path: &Path, root: &Path) -> Result<Scenario, EngineError> 
                     "resident_forward_ladder" => {
                         let decode = crate::llm::LadderResidentForward::open(&dev, &resident_dir)?;
                         Scenario::Generate(Box::new(crate::llm::LlmGenerator::new(model_cfg, decode)
-                            .with_scenario_defaults(cfg.generation.to_defaults())))
+                            .with_scenario_defaults(cfg.generation.to_defaults())
+                            .with_tower_checkpoint(tower_checkpoint)))
                     }
                     "resident_forward_onecmd" => {
                         let decode = crate::llm::OneCommandResidentForward::open(&dev, &resident_dir)?;
                         Scenario::Generate(Box::new(crate::llm::LlmGenerator::new(model_cfg, decode)
-                            .with_scenario_defaults(cfg.generation.to_defaults())))
+                            .with_scenario_defaults(cfg.generation.to_defaults())
+                            .with_tower_checkpoint(tower_checkpoint)))
                     }
                     other => return Err(EngineError::Load(format!(
                         "{}: unknown resident-forward kind {other:?}", meta_path.display()))),
@@ -105,7 +108,8 @@ pub fn try_build(cfg_path: &Path, root: &Path) -> Result<Scenario, EngineError> 
                     Some(p) => crate::llm::NpuDecodeStep::with_prefill(&dev, &decode_dir, &p)?,
                 };
                 Scenario::Generate(Box::new(crate::llm::LlmGenerator::new(model_cfg, decode)
-                    .with_scenario_defaults(cfg.generation.to_defaults())))
+                    .with_scenario_defaults(cfg.generation.to_defaults())
+                    .with_tower_checkpoint(tower_checkpoint)))
             }
         }
         // NO open_dev(): nothing here composes onto the device yet (see `tts::TtsPipeline`), so a

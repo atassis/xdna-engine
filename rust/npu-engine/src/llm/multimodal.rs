@@ -54,6 +54,70 @@ pub const EOI_TOKEN_ID: u32 = 258_882;
 /// `config.json`'s `boa_token_id`, wrapping an audio run. Literal text, as [`BOI_TOKEN_ID`].
 pub const BOA_TOKEN_ID: u32 = 256_000;
 
+/// The literal marker the chat template emits for one media item (`chat_template.jinja:305-308`,
+/// `{{- '<|image|>' -}}` / `{{- '<|audio|>' -}}`) -- which is ALSO the checkpoint's own
+/// `image_token`/`audio_token` spelling. HF's processor expands each occurrence in prompt order
+/// into `boi/boa + token*N + eoi/eoa`; [`expand_media_placeholders`] does the same substitution
+/// host-side so the rendered string, once tokenized, matches HF's `input_ids` exactly.
+const IMAGE_TOKEN_STR: &str = "<|image|>";
+const BOI_STR: &str = "<|image>";
+const EOI_STR: &str = "<image|>";
+const AUDIO_TOKEN_STR: &str = "<|audio|>";
+const BOA_STR: &str = "<|audio>";
+const EOA_STR: &str = "<audio|>";
+
+/// Expand each `<|image|>`/`<|audio|>` marker the chat template left in `rendered`, in the order
+/// they appear (images and audio interleave freely -- `image_soft_tokens[i]` is the i-th `<|image|>`
+/// marker's count, independent of `audio_soft_tokens`' own counter), into
+/// `boi + image_token*N + eoi` / `boa + audio_token*N + eoa`. `N` must be known BEFORE this runs
+/// (it depends on the actual image's resized patch count / the actual audio's sample count), which
+/// is why this is a separate pass over the chat template's own output rather than template logic.
+///
+/// Refuses, rather than truncating or leaving a literal marker in the prompt, on a count mismatch
+/// either way -- the same failure mode [`scatter_media_rows`] refuses on the scatter side.
+pub fn expand_media_placeholders(
+    rendered: &str, image_soft_tokens: &[usize], audio_soft_tokens: &[usize],
+) -> Result<String, EngineError> {
+    let mut out = String::with_capacity(rendered.len());
+    let mut rest = rendered;
+    let (mut img_i, mut aud_i) = (0usize, 0usize);
+    loop {
+        let img_pos = rest.find(IMAGE_TOKEN_STR);
+        let aud_pos = rest.find(AUDIO_TOKEN_STR);
+        match (img_pos, aud_pos) {
+            (None, None) => { out.push_str(rest); break; }
+            (Some(ip), aud) if aud.is_none_or(|ap| ip < ap) => {
+                out.push_str(&rest[..ip]);
+                let n = *image_soft_tokens.get(img_i).ok_or_else(|| EngineError::Unsupported(
+                    "prompt has more <|image|> placeholders than images attached".to_string()))?;
+                out.push_str(BOI_STR);
+                out.push_str(&IMAGE_TOKEN_STR.repeat(n));
+                out.push_str(EOI_STR);
+                img_i += 1;
+                rest = &rest[ip + IMAGE_TOKEN_STR.len()..];
+            }
+            (_, Some(ap)) => {
+                out.push_str(&rest[..ap]);
+                let n = *audio_soft_tokens.get(aud_i).ok_or_else(|| EngineError::Unsupported(
+                    "prompt has more <|audio|> placeholders than audio clips attached".to_string()))?;
+                out.push_str(BOA_STR);
+                out.push_str(&AUDIO_TOKEN_STR.repeat(n));
+                out.push_str(EOA_STR);
+                aud_i += 1;
+                rest = &rest[ap + AUDIO_TOKEN_STR.len()..];
+            }
+            (Some(_), None) => unreachable!("guard above takes this case whenever aud_pos is None"),
+        }
+    }
+    if img_i != image_soft_tokens.len() || aud_i != audio_soft_tokens.len() {
+        return Err(EngineError::Unsupported(format!(
+            "prompt has {img_i} <|image|> and {aud_i} <|audio|> placeholder(s) but \
+             {} image(s) and {} audio clip(s) were attached",
+            image_soft_tokens.len(), audio_soft_tokens.len())));
+    }
+    Ok(out)
+}
+
 /// One media attachment's tower output, ready to scatter: `rows[i]` is soft-token `i`'s
 /// `[d_model]` f32 vector, in prompt order, with the tower's own padding tail ALREADY dropped
 /// (see the module doc) and NOT scaled by `embed_scale`.
@@ -135,6 +199,34 @@ pub(crate) fn embed_row<'a>(
 mod tests {
     use super::*;
     use crate::llm::npu_decode::unpack_bf16_bytes;
+
+    #[test]
+    fn expand_media_placeholders_wraps_boi_eoi_and_boa_eoa() {
+        let rendered = "look at <|image|> and listen to <|audio|> please";
+        let out = expand_media_placeholders(rendered, &[3], &[2]).unwrap();
+        assert_eq!(out, "look at <|image><|image|><|image|><|image|><image|> and listen to \
+                          <|audio><|audio|><|audio|><audio|> please");
+    }
+
+    #[test]
+    fn expand_media_placeholders_handles_two_images_independently() {
+        let rendered = "<|image|> then <|image|>";
+        let out = expand_media_placeholders(rendered, &[1, 2], &[]).unwrap();
+        assert_eq!(out, "<|image><|image|><image|> then <|image><|image|><|image|><image|>");
+    }
+
+    #[test]
+    fn expand_media_placeholders_refuses_a_count_mismatch() {
+        let err = expand_media_placeholders("<|image|> <|image|>", &[1], &[]).unwrap_err();
+        assert!(format!("{err}").contains("more <|image|>"), "{err}");
+        let err = expand_media_placeholders("<|image|>", &[1, 1], &[]).unwrap_err();
+        assert!(format!("{err}").contains("placeholder(s)"), "{err}");
+    }
+
+    #[test]
+    fn expand_media_placeholders_is_a_no_op_on_plain_text() {
+        assert_eq!(expand_media_placeholders("hello world", &[], &[]).unwrap(), "hello world");
+    }
 
     fn attach(token_id: u32, rows: &[[f32; 2]]) -> MediaAttachment {
         MediaAttachment { token_id, rows: rows.iter().map(|r| r.to_vec()).collect() }

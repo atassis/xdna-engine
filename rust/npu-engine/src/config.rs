@@ -28,6 +28,26 @@ pub struct ScenarioConfig {
     /// `kind = "tts"` only: the three artifact directories a synthesis pipeline composes.
     #[serde(default)]
     pub tts: TtsCfg,
+    /// `kind = "generate"` only, and only for a checkpoint with vision/audio towers (Gemma-4-12B
+    /// today). Absent means this model 400s on any request carrying media -- see
+    /// `MultimodalCfg`'s own doc.
+    #[serde(default)]
+    pub multimodal: MultimodalCfg,
+}
+
+/// Where to find the vision/audio tower weights for THIS model, if it has any. Deliberately a
+/// separate checkpoint directory rather than `artifacts.weights` (the baked int4 decode blobs):
+/// the towers must come from the served model's own HF checkpoint
+/// (`model.safetensors` + `config.json`), which the decode-artifact bake pipeline does not carry
+/// forward at all -- see `gemma4_media.rs`'s module doc for why `artifacts/*/towers/*.npy` dumps
+/// are the wrong source.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct MultimodalCfg {
+    /// Directory containing `model.safetensors` + `config.json` for the tower weights. `None`
+    /// (the default) means this model declares no multimodal support: a request with an
+    /// `image_url`/`input_audio` content part is a 400, not a silent drop.
+    #[serde(default)]
+    pub tower_checkpoint: Option<String>,
 }
 
 /// Per-model generation defaults. Empty block = the engine's own defaults, which is what every
@@ -348,6 +368,24 @@ normalize = true
         assert_eq!(c.model.as_ref().unwrap().hidden, 768);
         assert_eq!(c.model.as_ref().unwrap().precision, "bf16"); // default applied
         assert!(c.embeddings.normalize);
+    }
+
+    #[test]
+    fn multimodal_tower_checkpoint_defaults_absent_and_parses_when_given() {
+        let toml = r#"
+[scenario]
+kind = "generate"
+name = "gemma4-12b"
+[artifacts]
+decode = "artifacts/gemma4-12b/decode"
+tokenizer_dir = "artifacts/gemma4-12b/tokenizer"
+"#;
+        let c = ScenarioConfig::from_str(toml).expect("parse");
+        assert!(c.multimodal.tower_checkpoint.is_none(), "absent by default -- media is a 400");
+
+        let toml_mm = format!("{toml}\n[multimodal]\ntower_checkpoint = \"artifacts/gemma4-12b-qat/checkpoint\"\n");
+        let c = ScenarioConfig::from_str(&toml_mm).expect("parse");
+        assert_eq!(c.multimodal.tower_checkpoint.as_deref(), Some("artifacts/gemma4-12b-qat/checkpoint"));
     }
 
     #[test]
