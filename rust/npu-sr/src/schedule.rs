@@ -77,6 +77,16 @@ pub fn kind(path: &Path) -> Result<Kind, SrError> {
     Ok(load_json::<K>(path)?.kind)
 }
 
+/// An fsr1 schedule's `layout` field: absent for host-packed tiles, `"frame"` for the DMA-fed design.
+pub fn layout(path: &Path) -> Result<Option<String>, SrError> {
+    #[derive(Deserialize)]
+    struct L {
+        #[serde(default)]
+        layout: Option<String>,
+    }
+    Ok(load_json::<L>(path)?.layout)
+}
+
 impl Schedule {
     pub fn load(path: &Path) -> Result<Schedule, SrError> {
         load_json(path)

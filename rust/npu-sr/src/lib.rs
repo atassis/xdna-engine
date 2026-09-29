@@ -6,6 +6,7 @@ pub mod color;
 pub mod frontier;
 pub mod pipeline;
 pub mod fsr1;
+pub mod fsr1_frame;
 
 use std::path::Path;
 
@@ -38,6 +39,7 @@ pub struct Plane {
 pub enum SrEngine {
     Net { sched: schedule::Schedule, frontier: frontier::Frontier },
     Fsr1(fsr1::Fsr1Engine),
+    Fsr1Frame(fsr1_frame::Fsr1FrameEngine),
 }
 
 /// Paths [`SrEngine::load_with`] resolves itself, replacing the schedule's own CWD-relative
@@ -70,8 +72,12 @@ impl SrEngine {
             if !use_npu {
                 return Err(SrError::Load("fsr1 has no CPU backend".into()));
             }
-            let cfg: fsr1::Fsr1Config = schedule::load_json(path)?;
             let dir = path.parent().unwrap_or(Path::new("."));
+            if schedule::layout(path)?.as_deref() == Some("frame") {
+                let cfg: fsr1_frame::Fsr1FrameConfig = schedule::load_json(path)?;
+                return Ok(SrEngine::Fsr1Frame(fsr1_frame::Fsr1FrameEngine::load(cfg, dir)?));
+            }
+            let cfg: fsr1::Fsr1Config = schedule::load_json(path)?;
             return Ok(SrEngine::Fsr1(fsr1::Fsr1Engine::load(cfg, dir)?));
         }
         let mut sched = schedule::Schedule::load(path)?;
@@ -85,7 +91,7 @@ impl SrEngine {
     fn net(&mut self) -> Result<(&schedule::Schedule, &mut frontier::Frontier), SrError> {
         match self {
             SrEngine::Net { sched, frontier } => Ok((sched, frontier)),
-            SrEngine::Fsr1(_) => Err(SrError::Frame("fsr1 takes RGB8 frames only".into())),
+            SrEngine::Fsr1(_) | SrEngine::Fsr1Frame(_) => Err(SrError::Frame("fsr1 takes RGB8/BGRA8 frames only".into())),
         }
     }
 
@@ -104,6 +110,7 @@ impl SrEngine {
         }
         let (sched, frontier) = match self {
             SrEngine::Fsr1(f) => return f.upscale_rgb8(rgb, w, h),
+            SrEngine::Fsr1Frame(f) => return f.upscale_rgb8(rgb, w, h),
             SrEngine::Net { sched, frontier } => (&*sched, frontier),
         };
         match sched.input {
@@ -144,8 +151,10 @@ impl SrEngine {
     /// FSR1 packs and unpacks BGRA directly; conv nets go through `upscale_rgb8`.
     pub fn upscale_bgra8(&mut self, src: &[u8], w: usize, h: usize, src_stride: usize,
                          dst: &mut [u8], dst_stride: usize) -> Result<(usize, usize), SrError> {
-        if let SrEngine::Fsr1(f) = self {
-            return f.upscale_bgra8(src, w, h, src_stride, dst, dst_stride);
+        match self {
+            SrEngine::Fsr1(f) => return f.upscale_bgra8(src, w, h, src_stride, dst, dst_stride),
+            SrEngine::Fsr1Frame(f) => return f.upscale_bgra8(src, w, h, src_stride, dst, dst_stride),
+            SrEngine::Net { .. } => {}
         }
         if src.len() < (h.max(1) - 1) * src_stride + w * 4 {
             return Err(SrError::Frame(format!("src: {} bytes for {w}x{h} at stride {src_stride}", src.len())));
@@ -175,6 +184,7 @@ impl SrEngine {
         match self {
             SrEngine::Net { sched, .. } => sched.scale,
             SrEngine::Fsr1(f) => f.scale(),
+            SrEngine::Fsr1Frame(f) => f.scale(),
         }
     }
 
