@@ -44,6 +44,8 @@ use crate::llm::generator::{CacheState, DecodeStep};
 use crate::llm::npu_decode::unpack_bf16_bytes;
 use crate::llm::resident_raw::{global_widths_record, piece_nt, rope_row_global, rope_row_sliding, sliding_widths_record, EmbedHeadPack};
 
+const NONFINITE_RETRIES: usize = 4;
+
 /// One entry of `fwd_layout.json`'s `rungs` array / `meta.json`'s copy of it: a compiled control
 /// code and the window it covers. `kind` is `"split"` (f1-family, decode, carries the split-lane
 /// per-column overlay) or `"seg"` (f2-family, prefill, no overlay) -- `fwd_host.command`'s own
@@ -397,6 +399,28 @@ impl LadderResidentForward {
         Ok(first)
     }
 
+    /// Whether the last layer's output rows are finite. A dispatch that goes non-finite has
+    /// written NaN only into its own new K/V rows, which re-running it at the same position
+    /// overwrites (rf-forward-intermittent-nonfinite: ~5% of f1 dispatches at 6k, both pins).
+    fn out_rows_finite(&self, p_len: usize) -> Result<bool, EngineError> {
+        let mut bytes = vec![0u8; p_len * self.meta.d_model * 2];
+        let slot = (self.meta.nlayer % 2) * self.meta.hidden_slot_bytes;
+        self.ob.read_bytes_at(slot, &mut bytes).map_err(|e| EngineError::Device(format!("read x_out: {e}")))?;
+        Ok(unpack_bf16_bytes(&bytes).iter().all(|v| v.is_finite()))
+    }
+
+    /// `dispatch`, repeated while its output comes back non-finite.
+    fn dispatch_finite(&mut self, rung_name: &str, split_nb: Option<usize>, x_bits: &[u16], s: usize, p_len: usize) -> Result<(), EngineError> {
+        for attempt in 1..=NONFINITE_RETRIES {
+            self.dispatch(rung_name, split_nb, x_bits, s, p_len)?;
+            if self.out_rows_finite(p_len)? {
+                return Ok(());
+            }
+            eprintln!("[resident] {rung_name} at {s}: non-finite output, attempt {attempt}/{NONFINITE_RETRIES}");
+        }
+        Err(EngineError::Device(format!("{rung_name} at {s}: output non-finite after {NONFINITE_RETRIES} attempts")))
+    }
+
     fn read_logits(&self) -> Result<Vec<f32>, EngineError> {
         let mut bytes = vec![0u8; self.meta.vocab * 2];
         self.ob.read_bytes_at(self.meta.logits_off, &mut bytes).map_err(|e| EngineError::Device(format!("read logits: {e}")))?;
@@ -409,7 +433,7 @@ impl DecodeStep for LadderResidentForward {
         let rung = rung_for(&self.meta.rungs, 1, pos + 1)?;
         let (name, blocks) = (rung.name.clone(), rung.blocks);
         let x_bits = self.embed.embed_row_bf16(token)?;
-        self.dispatch(&name, Some(blocks), &x_bits, pos, 1)?;
+        self.dispatch_finite(&name, Some(blocks), &x_bits, pos, 1)?;
         let mut logits = self.read_logits()?;
         if let Some(cap) = self.meta.logit_softcap {
             let cap = cap as f32;
@@ -444,7 +468,7 @@ impl DecodeStep for LadderResidentForward {
             for &tok in piece {
                 x_bits.extend_from_slice(&self.embed.embed_row_bf16(tok)?);
             }
-            self.dispatch(&rung_name, None, &x_bits, at, p_len)?;
+            self.dispatch_finite(&rung_name, None, &x_bits, at, p_len)?;
             at = end;
         }
         Ok(at)
