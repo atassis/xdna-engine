@@ -43,11 +43,21 @@ name = "qwen3.5-4b"
 #   this repo (see above); gated with a smoke prompt ("The capital of France is" -> "Paris."),
 #   byte-identical generated ids across two runs. Rollback: point decode=/weights=/prefill= back at
 #   the _p8c684 set and reinstall.
+# REBUILT 2026-09-29 (`decode_s4096_gdrl_p8e3958`, prefill `prefill_m256f_s4096_p8e3958`) at
+#   toolchain pin 8e3958b596a, instance 3ce32a1d7465, same recipe, IRON=wt-iron-integ. Both ELFs
+#   BYTE-IDENTICAL to the p6924def pair (decode md5 8daaa9d43e28f4c6e3d6e87283dff12b, prefill md5
+#   437cb9628fec598ad289bb4eb23f064d); pairing metadata correct. Gated by loading through a real
+#   `npu serve` instance against these artifacts (XRT_INI_PATH is required for a manual `npu serve`
+#   -- omitting it makes prefill's 16-segment resident open fail at `seg13` with a driver-level
+#   DRM_IOCTL_AMDXDNA_CREATE_BO EAGAIN that has nothing to do with the artifact): coherent output,
+#   byte-identical generated ids across two temp=0 runs, artifact_hash/prefill_artifact_hash in the
+#   response provenance match the p6924def pair's (same bytes). Rollback: point
+#   decode=/weights=/prefill= back at the _p6924def set and reinstall.
 [artifacts]
-decode = "artifacts/qwen3.5-4b/decode_s4096_gdrl_p6924def"
-weights = "artifacts/qwen3.5-4b/decode_s4096_gdrl_p6924def/buffers"
+decode = "artifacts/qwen3.5-4b/decode_s4096_gdrl_p8e3958"
+weights = "artifacts/qwen3.5-4b/decode_s4096_gdrl_p8e3958/buffers"
 tokenizer_dir = "artifacts/qwen3.5-4b/tokenizer"
-prefill = "artifacts/qwen3.5-4b/prefill_m256f_s4096_p6924def"
+prefill = "artifacts/qwen3.5-4b/prefill_m256f_s4096_p8e3958"
 
 [generation]
 max_tokens = 1024
