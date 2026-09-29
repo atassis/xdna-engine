@@ -453,19 +453,18 @@ manifest = "artifacts/pyannote/diarize.json"
     }
 
     #[test]
-    fn a_scenario_with_no_decode_field_parses_as_none_and_the_shipped_whisper_scenarios_declare_none() {
+    fn a_scenario_with_no_decode_field_parses_as_none_and_whisper_small_declares_rail() {
         let c = ScenarioConfig::from_str(
             "[scenario]\nkind = \"asr\"\nname = \"m\"\n[artifacts]\nweights = \"w\"\n",
         )
         .expect("a scenario with no [decode] block must parse");
         assert_eq!(c.decode.backend, None);
 
-        // Backwards compatibility is a hard requirement: neither shipped Whisper scenario needs
-        // touching for this field to exist.
-        for f in ["../../scenarios/asr-whisper-small.toml", "../../scenarios/asr-whisper-turbo.toml"] {
-            let s = ScenarioConfig::from_str(&std::fs::read_to_string(f).unwrap()).unwrap();
-            assert_eq!(s.decode.backend, None, "{f} must not need updating for this field to exist");
-        }
+        let load = |f: &str| ScenarioConfig::from_str(&std::fs::read_to_string(f).unwrap()).unwrap();
+        let small = load("../../scenarios/asr-whisper-small.toml");
+        assert_eq!(small.decode.backend, Some(DecodeTier::Rail));
+        assert!(!small.artifacts.decode.is_empty(), "the rail tier needs [artifacts] decode");
+        assert_eq!(load("../../scenarios/asr-whisper-turbo.toml").decode.backend, None);
     }
 
     /// Env-var mutation is process-global; every case touching `NPU_DECODE_FUSED`/`NPU_DECODE` lives
