@@ -69,7 +69,7 @@ pub fn try_build(cfg_path: &Path, root: &Path) -> Result<Scenario, EngineError> 
             // side-by-side with the fused-decode-ELF rail below); mutually exclusive with `decode`.
             if !cfg.artifacts.resident.is_empty() {
                 let resident_dir = root.join(&cfg.artifacts.resident);
-                let decode = crate::llm::RawResidentForward::open(&dev, &resident_dir)?;
+                let decode = crate::llm::OneCommandResidentForward::open(&dev, &resident_dir)?;
                 Scenario::Generate(Box::new(crate::llm::LlmGenerator::new(model_cfg, decode)
                     .with_scenario_defaults(cfg.generation.to_defaults())))
             } else {

@@ -2,19 +2,27 @@
 kind = "generate"
 name = "gemma4-12b-resident"
 
-# The resident-forward layer-stack backend (rf-engine-integration S2), opt-in and side-by-side
-# with the shipped `generate-gemma4-12b.toml` (unchanged): every layer's weights stream through
-# MemTile per dispatch instead of a fused decode ELF's single-pass GEMV, driven by
-# `llm::RawResidentForward` against the raw build named below. No default flip; select this
+# The resident-forward one-command backend (rf-engine-integration S2), opt-in and side-by-side
+# with the shipped `generate-gemma4-12b.toml` (unchanged): the whole 48-layer stack (+ the LM
+# head, decode only) runs as ONE dispatch a token, every layer's weights and K/V cache resident
+# in one ~7.6 GB scratch arena for the model's whole lifetime, driven by
+# `llm::OneCommandResidentForward` against the build named below. No default flip; select this
 # model explicitly (`model: "gemma4-12b-resident"`) to compare it against the shipped arm.
 #
-# Build: rlayer_design m g h arena seg=64,128 nbw=20 1 2 7 (RF_ATTN_H=1), tracked as `rls1` in
-# the private repo's rf-engine-integration task. `artifacts.resident` is this build's directory,
-# which carries `meta.json` (this module's own schema, `llm::resident_raw::RawResidentMeta` --
-# NOT the S0/S1 content-addressed-store schema `llm::ResidentArtifact` reads) and `w_head.npy`
-# (the on-device LM head's weight stream, packed once by `rhead.head_stream()`).
+# Build: rlayer_design m g h arena seg=64 split=128 fwd=0-47+h nbw=20 1 2 (RF_ATTN_H=1, RF_FAST=1),
+# tracked as `rf48s` in the private repo's rf-whole-forward-dispatch/rf-engine-integration tasks --
+# the device lane's replacement for the per-layer `rls1` build S2 originally shipped against.
+# `artifacts.resident` is this build's directory, carrying `meta.json` (this module's own schema,
+# `llm::resident_onecmd::OneCmdMeta` -- distinct from both `llm::ResidentArtifact`'s
+# content-addressed-store schema and `llm::resident_raw::RawResidentMeta`'s per-layer one) and
+# `w_head.npy` (the on-device LM head's weight stream, packed once by `rhead.head_stream()`).
+#
+# Known limit: the sliding layers' K/V cache is a LINEAR (non-wrapping) 2048-row buffer
+# (`rld_run.py`'s own doc), so `max_context()` reports 2048 regardless of how far the global
+# layers' key-range split reaches (open past 8192 keys, per the device lane). A session past
+# ~2048 total positions is refused by the generator's own bound, not attempted here.
 [artifacts]
-resident = "/mnt/data/xdna/scratch/rf/build/rls1"
+resident = "/mnt/data/xdna/scratch/rf/build/rf48s"
 tokenizer_dir = "artifacts/gemma4-12b/tokenizer"
 
 [generation]
