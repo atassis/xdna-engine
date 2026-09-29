@@ -9,7 +9,9 @@ use std::time::Instant;
 use npu_engine::pipeline::Scenario;
 use npu_engine::registry;
 
-const SCENARIO_DEFAULT: &str = "scenarios/asr-parakeet-tdt.toml";
+// Reuses the shipped scenario (name "parakeet-tdt-0.6b-v3") -- do not add a second Parakeet
+// scenario file; `registry::try_build` dispatches on the name containing "parakeet".
+const SCENARIO_DEFAULT: &str = "scenarios/asr.toml";
 
 pub fn run(argv: Vec<String>) {
     let wav_path = argv.get(1).cloned().expect("usage: parakeet_e2e <clip.wav> [scenario.toml]");
