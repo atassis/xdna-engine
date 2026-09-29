@@ -197,17 +197,23 @@ pub struct LlmArtifact {
     /// `meta.json`'s `embed_blob`; see [`Self::embed_blob`]. `None` in pre-2026-09-08 artifacts.
     pub embed_blob: Option<String>,
     pub kv_off: ScratchpadParam,
-    /// Every KV-append offset slot the artifact declares, paired with the head_dim its layers use.
+    /// Every KV-append offset slot the artifact declares, paired with the head_dim its layers use
+    /// and whether this geometry writes a V slot.
     ///
     /// One entry on a uniform model, which is every model shipped today -- and then this is exactly
-    /// `[(kv_off, head_dim)]`, so nothing changes. It is a LIST because Gemma-4-12B's attention
+    /// `[(kv_off, head_dim, true)]`, so nothing changes. It is a LIST because Gemma-4-12B's attention
     /// geometry is per-layer (sliding head_dim 256, global 512), and `kv_off = pos * head_dim` is
     /// therefore two different byte offsets for the same logical position. One slot cannot carry
     /// both; the host must write one value per distinct head_dim.
     ///
+    /// The third field, `has_v`, is `false` for a KV_SKIP_V build's `attention_k_eq_v` geometry --
+    /// V is derived from K at consumption time and never appended to a cache, so there is no V
+    /// slot to write. Absent from `kv_params` on every artifact built before KV_SKIP_V existed,
+    /// defaulting `true` so those keep loading unchanged.
+    ///
     /// Populated from `meta.json`'s `scratchpad.kv_params` when present, else derived from the
     /// single `kv_param` + `dims.head_dim` so every existing artifact keeps loading unchanged.
-    pub kv_offs: Vec<(ScratchpadParam, usize)>,
+    pub kv_offs: Vec<(ScratchpadParam, usize, bool)>,
     /// One entry per attention geometry: `(kv_off slot, head_dim, capacity, mask slot)`.
     /// `capacity` is this geometry's own KV-cache size -- `max_seq` on every geometry that isn't
     /// narrowed, or `sliding_window` on one that is (SLIDING_KV_CIRCULAR). `step()` writes
@@ -737,11 +743,12 @@ impl LlmArtifact {
                     let hd = e.get("head_dim").and_then(|v| v.as_u64()).ok_or_else(|| {
                         ctx(format!("scratchpad.kv_params entry `{nm}` missing numeric `head_dim`"))
                     })? as usize;
-                    out.push((read_param(nm)?, hd));
+                    let has_v = e.get("has_v").and_then(|v| v.as_bool()).unwrap_or(true);
+                    out.push((read_param(nm)?, hd, has_v));
                 }
                 out
             }
-            _ => vec![(kv_off.clone(), head_dim)],
+            _ => vec![(kv_off.clone(), head_dim, true)],
         };
         let sm_mask = mask_param_name.map(read_param).transpose()?;
         // `scratchpad.kv_windows`: [{"kv_param", "head_dim", "window", "mask_param"}, ...], one
@@ -807,7 +814,7 @@ impl LlmArtifact {
             // as "one flat slot, full capacity" exactly as those artifacts were built.
             _ => match sm_mask {
                 Some(sm) => kv_offs.iter()
-                    .map(|&(p, hd)| (p, hd, max_seq, sm, kv_block.min(max_seq), kv_heads))
+                    .map(|&(p, hd, _)| (p, hd, max_seq, sm, kv_block.min(max_seq), kv_heads))
                     .collect(),
                 None => Vec::new(),
             },
@@ -1021,7 +1028,7 @@ impl LlmArtifact {
         // gated on `kv_offs.len() == 1`, so it did nothing in exactly the non-uniform case it was
         // for. It is tautological for a compat-shimmed `rope_global`, whose width this function
         // manufactured from `head_dim` a few lines above; there is nothing there to disagree.
-        let mut declared: Vec<usize> = kv_offs.iter().map(|&(_, hd)| hd).collect();
+        let mut declared: Vec<usize> = kv_offs.iter().map(|&(_, hd, _)| hd).collect();
         declared.sort_unstable();
         declared.dedup();
         let mut rope_widths: Vec<usize> =
@@ -1965,6 +1972,23 @@ mod tests {
         assert_eq!(art.loc("rope_local").len / 2, 4);
     }
 
+    /// KV_SKIP_V: a geometry whose `kv_params` entry declares `has_v: false` (the generator's
+    /// V-skip marker for `attention_k_eq_v` layers) must round-trip that flag into `kv_offs`.
+    #[test]
+    fn kv_offs_entry_with_has_v_false_carries_no_v_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = two_geometry_meta();
+        meta["scratchpad"]["kv_params"] = serde_json::json!([
+            {"param": "kv_off",  "head_dim": 8, "has_v": false},
+            {"param": "kv_off1", "head_dim": 4},
+        ]);
+        write_meta(dir.path(), &meta);
+        let art = LlmArtifact::load(dir.path()).expect("has_v: false must still parse");
+        assert_eq!(art.kv_offs.len(), 2);
+        assert!(!art.kv_offs[0].2, "has_v flag must round-trip false");
+        assert!(art.kv_offs[1].2, "has_v defaults true when the key is absent");
+    }
+
     /// SLIDING_KV_CIRCULAR's contract: `scratchpad.kv_windows` (`{kv_param, head_dim, window,
     /// mask_param}` per geometry) carries a NARROWER capacity than `dims.S` for the sliding
     /// geometry, with its own mask slot -- the pairing `step()` needs to write a wraparound
@@ -2185,7 +2209,7 @@ mod tests {
         let art = LlmArtifact::load(&dir).expect("a built artifact must load");
         // The cross-check in `load` already ran; restate what it guarantees so a failure here says
         // WHICH half broke rather than only that loading failed.
-        let mut declared: Vec<usize> = art.kv_offs.iter().map(|&(_, hd)| hd).collect();
+        let mut declared: Vec<usize> = art.kv_offs.iter().map(|&(_, hd, _)| hd).collect();
         declared.sort_unstable();
         declared.dedup();
         assert!(declared.contains(&art.head_dim), "dims.head_dim {} not in {declared:?}", art.head_dim);

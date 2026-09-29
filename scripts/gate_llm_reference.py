@@ -71,9 +71,75 @@ def topk(logits, k):
 # ------------------------------------------------------------------------------------------------
 # numpy backend: float32 arithmetic on the bf16 weights the device holds.
 # ------------------------------------------------------------------------------------------------
-def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k):
+def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k, v_mode="store_at_write",
+             kv_dtype="bf16", capture_derived_v=None, rope_impl="exact",
+             capture_forward_k=None):
+    """`v_mode` governs WHEN attention_k_eq_v's gainless RMSNorm on V runs, not what it computes:
+
+      store_at_write     today's behaviour -- V is derived from the raw k projection and cached
+                          the moment K is written, same as every other spec's V.
+      recompute_at_read  V is never cached; the identical RMSNorm is applied to the cached raw k
+                          projection at the point attention CONSUMES it. Ablation for the planned
+                          V-slab removal from the KV cache -- must match store_at_write bit-for-bit,
+                          since it is the same arithmetic relocated, not a different computation.
+      recompute_from_kc  the actual zero-storage mechanism the kernels implement: no raw-K array
+                          at all, V is derived at read time from the already-cached ROTATED kc via
+                          RoPE-inversion (calling rope_for with the negated position) and a divide
+                          by qk-norm's gain -- RMSNorm's scale invariance means this reproduces
+                          recompute_at_read's result up to eps-order, not bit-for-bit.
+
+    Only layers with no v_proj (attention_k_eq_v) are affected; a layer with a real v_proj caches
+    its projected V regardless of v_mode, since there is no K it could be recomputed from.
+
+    `kv_dtype` ("bf16" default, or "int8") governs what kc itself is stored as. "int8" round-trips
+    every position's kc THROUGH the real int8 packer (iron/common/quant.py, one group per row at
+    group_size=head_dim, matching the "kv" site's own axis -- a row is one cached position) the
+    moment K is written, mimicking the device holding an int8 K cache. Every later read of that
+    position -- both the attention score and, under v_mode="recompute_from_kc", the RoPE-inversion
+    V-derivation -- then sees the quantized-and-dequantized value, not the true float one. This is
+    the composition a sibling int8-KV task never numerically validated: int8 noise flowing through
+    RoPE-inversion and a gain-divide before landing in V, a different propagation path than a
+    plain stored-int8-V read.
+
+    `capture_derived_v`, if given a dict, is filled `{layer: {position: [kv_heads, head_dim]}}`
+    with the RoPE-inversion V derivation for every position at every layer where
+    v_mode="recompute_from_kc" is active -- for measuring how much kv_dtype="int8" moves V,
+    independent of how far that moves the eventual token.
+
+    `rope_impl` ("exact" default, or "poly") governs ONLY the RoPE-INVERSION call inside
+    recompute_from_kc's V derivation (`rope_for(l, kc_l[..., pos], -pos)`, the 4 call sites below
+    guarded by `derive_v_from_kc`) -- never forward Q/K RoPE, which the real device always applies
+    from the host's float64->bf16 cos/sin LUT. This mirrors the actual kernel split: forward RoPE
+    stays the existing LUT, only kv_skip_v's on-chip inverse rotation is a candidate for an
+    on-chip poly (scripts/rope_int_phase.py's int_phase -- chosen scheme, see
+    scripts/measure_rope_poly.py for why; reused here as the reference oracle for that mechanism).
+
+    `capture_forward_k`, if given a dict, is filled `{layer: {position: [kv_heads, head_dim]}}`
+    with the post-forward-RoPE K row at write time (before any kv_dtype quantization) -- proof
+    that `rope_impl` left forward K untouched: this must be bit-identical between an "exact" and
+    a "poly" run.
+    """
     import ml_dtypes
+    import rope_int_phase as rp
     BF16 = ml_dtypes.bfloat16
+    if v_mode not in ("store_at_write", "recompute_at_read", "recompute_from_kc"):
+        raise ValueError(f"v_mode must be 'store_at_write', 'recompute_at_read' or "
+                         f"'recompute_from_kc', got {v_mode!r}")
+    if kv_dtype not in ("bf16", "int8"):
+        raise ValueError(f"kv_dtype must be 'bf16' or 'int8', got {kv_dtype!r}")
+    if rope_impl not in ("exact", "poly"):
+        raise ValueError(f"rope_impl must be 'exact' or 'poly', got {rope_impl!r}")
+
+    def quant_dequant_kc(rows):
+        """rows: [M, head_dim] float32, one row per (kv_head, position). Round-trips through the
+        real int8 packer at one group per row -- see the kv_dtype docstring above."""
+        try:
+            from iron.common.quant import quantize_weight, dequantize_weight
+        except ModuleNotFoundError:
+            from iron.operators.gemv.quant import quantize_weight, dequantize_weight
+        M, K = rows.shape
+        packed = quantize_weight(np.ascontiguousarray(rows, dtype=np.float32), K, "int8")
+        return dequantize_weight(packed, M, K, K, "int8")
 
     # Refuse rather than approximate: an axis this reference does not know the shape of (a rope_type
     # other than the one Gemma-4 actually uses) is exactly the same-name-different-meaning trap the
@@ -117,11 +183,17 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k):
         across every row instead of P separate GEMVs. See layer_step_batch()."""
         return X @ w_f32.T
 
+    def norm_gain(w):
+        """The checkpoint's own RMSNorm gain convention -- shared by `rms()` and by
+        `recompute_from_kc`'s RoPE-inversion, which needs this same gain to divide by, not
+        `rms()`'s output (see the module docstring's scale-invariance derivation)."""
+        return (1.0 + w) if sp.norm_gain == "one_plus_w" else w
+
     def rms(x, w=None):
         """`w=None` is the v_norm case: gainless (with_scale=False in the checkpoint, so there is no
         weight tensor to load -- multiplying by 1.0 is the operator's own definition, not a stand-in
         for a missing one)."""
-        g = 1.0 if w is None else ((1.0 + w) if sp.norm_gain == "one_plus_w" else w)
+        g = 1.0 if w is None else norm_gain(w)
         return x / np.sqrt((x * x).mean(-1, keepdims=True) + sp.eps) * g
 
     def act(x):
@@ -129,30 +201,42 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k):
             return x / (1.0 + np.exp(-np.clip(x, -60, 60)))
         return 0.5 * x * (1.0 + np.tanh(0.7978845608 * (x + 0.044715 * x ** 3)))
 
-    def rope(v, pos, hd, theta, partial):
+    def rope(v, pos, hd, theta, partial, poly=False):
         """`partial` zeroes the inverse frequency past `int(partial*hd//2)` pairs -- a zero
         frequency is the identity rotation -- matching gen_llm_prefill.rope_table's "proportional"
-        rule exactly (same derivation, one position instead of a row per chunk)."""
+        rule exactly (same derivation, one position instead of a row per chunk).
+
+        `poly=True` replaces exact float64 cos/sin with the chosen on-chip scheme (int_phase,
+        scripts/rope_int_phase.py): F = round(inv/2pi * 2**32) per component, phase = (pos*F) mod
+        2**32 via 64-bit reinterpretation of `pos` (correct for the negative `pos` an inversion
+        call passes -- two's-complement wraparound mod 2**32 gives the same residue as `-pos`
+        wrapped, which is what an on-chip accumulator would produce)."""
         inv = 1.0 / (theta ** (np.arange(0, hd, 2, dtype=np.float64)[:hd // 2] / hd))
         if partial is not None:
             inv[int(partial * hd // 2):] = 0.0
-        c, s = np.cos(pos * inv).astype(np.float32), np.sin(pos * inv).astype(np.float32)
+        if poly:
+            F = rp.inv_freq_to_turns_u32(inv)
+            pos_u64 = np.array(pos, dtype=np.int64).view(np.uint64)
+            ph = (pos_u64 * F.astype(np.uint64)) & rp.U32_MASK
+            s, c = rp.phase_cs(ph)
+        else:
+            c, s = np.cos(pos * inv).astype(np.float32), np.sin(pos * inv).astype(np.float32)
         v = v.reshape(-1, hd)
         x1, x2 = v[:, :hd // 2], v[:, hd // 2:]
         return np.concatenate([x1 * c - x2 * s, x2 * c + x1 * s], -1).reshape(-1)
 
-    def rope_for(l, v, pos):
+    def rope_for(l, v, pos, poly=False):
         """Dual-theta: the global geometry rotates its OWN head_dim (which may differ from the
         sliding one -- 512 vs 256 on Gemma-4) and, on Gemma-4, only a fraction of it; the sliding
         geometry always rotates its full head_dim at the local theta. Single-theta specs get
         rope_theta_global everywhere and no partial rotary, matching gen_llm_prefill's non-dual arm."""
         hd = sp.head_dim_for(l)
         if not dual_rope:
-            return rope(v, pos, hd, sp.rope_theta_global, None)
+            return rope(v, pos, hd, sp.rope_theta_global, None, poly=poly)
         g = sp.is_global(l)
         theta = sp.rope_theta_global if g else sp.rope_theta_local
         partial = sp.rope_partial_rotary if g else None
-        return rope(v, pos, hd, theta, partial)
+        return rope(v, pos, hd, theta, partial, poly=poly)
 
     def rope_batch(v, positions, hd, theta, partial):
         """Batched form of rope(): `v` is (P, n_heads*hd), `positions` is (P,) absolute positions
@@ -213,30 +297,50 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k):
                 w[key] = cast_weight(w[key])
         return w
 
-    def layer_step(l, w, xi, pos, kc_l, vc_l):
+    def layer_step(l, w, xi, pos, kc_l, vc_l, vr_l=None):
         """Layer `l`'s attention+MLP block on residual `xi` at absolute position `pos`, against
         this layer's own KV cache slices. Same ops regardless of whether the caller is sweeping a
         batch of known positions or a single free-running one -- see the two call sites below."""
         hd, kvh = sp.head_dim_for(l), sp.n_kv_heads_for(l)
         grp, has_v, is_glob = sp.n_q_heads // kvh, sp.has_v_proj(l), sp.is_global(l)
         window = None if (sp.sliding_window is None or is_glob) else sp.sliding_window
+        derive_v_at_read = sp.v_norm and not has_v and v_mode == "recompute_at_read"
+        derive_v_from_kc = sp.v_norm and not has_v and v_mode == "recompute_from_kc"
+        use_poly = rope_impl == "poly"
 
         h = rms(xi, w["n_in"])
         q, k_ = mm(w["Wq"], h), mm(w["Wk"], h)
         v = mm(w["Wv"], h) if has_v else None
+        v_raw = None
         if sp.v_norm:
             # attention_k_eq_v: v_norm reads the RAW k projection -- before qk-norm and RoPE,
             # which mutate q/k_ below -- and its output IS v; mirrors gen_llm_prefill.py's
             # ordering exactly (op_vn runs before qn_runs/op_kn in the emitted op list).
             src = k_ if not has_v else v
-            v = np.concatenate([rms(src.reshape(kvh, hd)[i]) for i in range(kvh)])
+            if derive_v_at_read:
+                v_raw = src  # see v_mode docstring
+            elif not derive_v_from_kc:
+                v = np.concatenate([rms(src.reshape(kvh, hd)[i]) for i in range(kvh)])
+            # derive_v_from_kc: nothing computed at write time -- V is recovered from kc_l below.
         if sp.qk_norm:
             q = np.concatenate([rms(q.reshape(sp.n_q_heads, hd)[i], w["n_qn"])
                                 for i in range(sp.n_q_heads)])
             k_ = np.concatenate([rms(k_.reshape(kvh, hd)[i], w["n_kn"]) for i in range(kvh)])
         q, k_ = rope_for(l, q, pos), rope_for(l, k_, pos)
-        kc_l[:, pos, :] = k_.reshape(kvh, hd)
-        vc_l[:, pos, :] = v.reshape(kvh, hd)
+        k_rows = k_.reshape(kvh, hd)
+        if capture_forward_k is not None:
+            capture_forward_k.setdefault(l, {})[pos] = k_rows.copy()
+        if kv_dtype == "int8":
+            k_rows = quant_dequant_kc(k_rows)
+        kc_l[:, pos, :] = k_rows
+        if derive_v_at_read:
+            vr_l[:, pos, :] = v_raw.reshape(kvh, hd)
+        elif not derive_v_from_kc:
+            vc_l[:, pos, :] = v.reshape(kvh, hd)
+        if derive_v_from_kc and capture_derived_v is not None:
+            g = norm_gain(w["n_kn"]) if sp.qk_norm else 1.0
+            capture_derived_v.setdefault(l, {})[pos] = np.stack(
+                [rms(rope_for(l, kc_l[kvi, pos], -pos, poly=use_poly) / g) for kvi in range(kvh)])
         qh = q.reshape(sp.n_q_heads, hd)
         ctx = np.empty((sp.n_q_heads, hd), np.float32)
         lo = 0 if window is None else max(0, pos - window + 1)
@@ -244,7 +348,15 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k):
             kvi = hh // grp
             sc = (kc_l[kvi, lo:pos + 1] @ qh[hh]) * attn_scale
             sc = np.exp(sc - sc.max())
-            ctx[hh] = (sc / sc.sum()) @ vc_l[kvi, lo:pos + 1]
+            if derive_v_at_read:
+                v_win = np.stack([rms(vr_l[kvi, p]) for p in range(lo, pos + 1)])
+            elif derive_v_from_kc:
+                g = norm_gain(w["n_kn"]) if sp.qk_norm else 1.0
+                v_win = np.stack([rms(rope_for(l, kc_l[kvi, p], -p, poly=use_poly) / g)
+                                  for p in range(lo, pos + 1)])
+            else:
+                v_win = vc_l[kvi, lo:pos + 1]
+            ctx[hh] = (sc / sc.sum()) @ v_win
         a_out = mm(w["Wo"], ctx.reshape(-1))
         if sp.sandwich_norms:
             a_out = rms(a_out, w["n_pa"])
@@ -258,7 +370,7 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k):
             xi = xi * w["ls"]
         return xi
 
-    def layer_step_batch(l, w, X, positions, kc_l, vc_l):
+    def layer_step_batch(l, w, X, positions, kc_l, vc_l, vr_l=None):
         """Batched form of layer_step(): `X` is (P, D) for a KNOWN batch of `positions`. Every
         projection and the MLP run as ONE GEMM across all P rows instead of P separate GEMVs --
         this is the actual fix for the cost mm() showed under profiling (80% of runtime, 21980
@@ -271,13 +383,20 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k):
         hd, kvh = sp.head_dim_for(l), sp.n_kv_heads_for(l)
         grp, has_v, is_glob = sp.n_q_heads // kvh, sp.has_v_proj(l), sp.is_global(l)
         window = None if (sp.sliding_window is None or is_glob) else sp.sliding_window
+        derive_v_at_read = sp.v_norm and not has_v and v_mode == "recompute_at_read"
+        derive_v_from_kc = sp.v_norm and not has_v and v_mode == "recompute_from_kc"
+        use_poly = rope_impl == "poly"
 
         H = rms(X, w["n_in"])
         Q, K = mm_batch(w["Wq"], H), mm_batch(w["Wk"], H)
         V = mm_batch(w["Wv"], H) if has_v else None
+        V_raw = None
         if sp.v_norm:
             src = (K if not has_v else V).reshape(P_, kvh, hd)
-            V = np.stack([rms(src[:, i, :]) for i in range(kvh)], axis=1).reshape(P_, kvh * hd)
+            if derive_v_at_read:
+                V_raw = src  # see v_mode docstring
+            elif not derive_v_from_kc:
+                V = np.stack([rms(src[:, i, :]) for i in range(kvh)], axis=1).reshape(P_, kvh * hd)
         if sp.qk_norm:
             Qh = Q.reshape(P_, sp.n_q_heads, hd)
             Q = np.stack([rms(Qh[:, i, :], w["n_qn"]) for i in range(sp.n_q_heads)],
@@ -286,8 +405,22 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k):
             K = np.stack([rms(Kh[:, i, :], w["n_kn"]) for i in range(kvh)],
                         axis=1).reshape(P_, kvh * hd)
         Q, K = rope_for_batch(l, Q, positions), rope_for_batch(l, K, positions)
-        kc_l[:, positions, :] = K.reshape(P_, kvh, hd).transpose(1, 0, 2)
-        vc_l[:, positions, :] = V.reshape(P_, kvh, hd).transpose(1, 0, 2)
+        K_rows = K.reshape(P_, kvh, hd)
+        if capture_forward_k is not None:
+            for i, pos in enumerate(positions):
+                capture_forward_k.setdefault(l, {})[pos] = K_rows[i].copy()
+        if kv_dtype == "int8":
+            K_rows = quant_dequant_kc(K_rows.reshape(P_ * kvh, hd)).reshape(P_, kvh, hd)
+        kc_l[:, positions, :] = K_rows.transpose(1, 0, 2)
+        if derive_v_at_read:
+            vr_l[:, positions, :] = V_raw.transpose(1, 0, 2)
+        elif not derive_v_from_kc:
+            vc_l[:, positions, :] = V.reshape(P_, kvh, hd).transpose(1, 0, 2)
+        if derive_v_from_kc and capture_derived_v is not None:
+            g = norm_gain(w["n_kn"]) if sp.qk_norm else 1.0
+            for i, pos in enumerate(positions):
+                capture_derived_v.setdefault(l, {})[pos] = np.stack(
+                    [rms(rope_for(l, kc_l[kvi, pos], -pos, poly=use_poly) / g) for kvi in range(kvh)])
         Qh = Q.reshape(P_, sp.n_q_heads, hd)
         Ctx = np.empty((P_, sp.n_q_heads, hd), np.float32)
         for i, pos in enumerate(positions):
@@ -296,7 +429,15 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k):
                 kvi = hh // grp
                 sc = (kc_l[kvi, lo:pos + 1] @ Qh[i, hh]) * attn_scale
                 sc = np.exp(sc - sc.max())
-                Ctx[i, hh] = (sc / sc.sum()) @ vc_l[kvi, lo:pos + 1]
+                if derive_v_at_read:
+                    v_win = np.stack([rms(vr_l[kvi, p]) for p in range(lo, pos + 1)])
+                elif derive_v_from_kc:
+                    g = norm_gain(w["n_kn"]) if sp.qk_norm else 1.0
+                    v_win = np.stack([rms(rope_for(l, kc_l[kvi, p], -p, poly=use_poly) / g)
+                                      for p in range(lo, pos + 1)])
+                else:
+                    v_win = vc_l[kvi, lo:pos + 1]
+                Ctx[i, hh] = (sc / sc.sum()) @ v_win
         A_out = mm_batch(w["Wo"], Ctx.reshape(P_, -1))
         if sp.sandwich_norms:
             A_out = rms(A_out, w["n_pa"])
@@ -314,6 +455,9 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k):
     S = P + n_tokens + 1
     kc = [np.zeros((sp.n_kv_heads_for(l), S, sp.head_dim_for(l)), np.float32) for l in range(NL)]
     vc = [np.zeros((sp.n_kv_heads_for(l), S, sp.head_dim_for(l)), np.float32) for l in range(NL)]
+    # Only allocated/written under v_mode="recompute_at_read": the raw (pre-qk-norm, pre-RoPE) k
+    # projection that attention_k_eq_v's V is derived from, cached in place of V itself.
+    vr = [np.zeros((sp.n_kv_heads_for(l), S, sp.head_dim_for(l)), np.float32) for l in range(NL)]
     scale = np.sqrt(D) if sp.embed_scale == "sqrt_d_model" else 1.0
     attn_scale = sp.attn_scale
 
@@ -323,10 +467,13 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k):
     # this box has 30GB RAM against a 45GB dump, so re-reading the whole model per position (the
     # position-outer form still below, for the tail) thrashes rather than merely being slow. This
     # is the batched half of "batched prefill"; the free-running tail cannot be, see below.
+    # vr_l is only ever touched inside derive_v_at_read-gated branches, so None is inert for
+    # both store_at_write and recompute_from_kc -- only recompute_at_read needs real storage.
+    vr_arg = vr if v_mode == "recompute_at_read" else [None] * NL
     x = embed_f32[np.asarray(prompt_ids)] * scale
     positions = np.arange(P)
     for l in range(NL):
-        x = layer_step_batch(l, materialized_layer_weights(l), x, positions, kc[l], vc[l])
+        x = layer_step_batch(l, materialized_layer_weights(l), x, positions, kc[l], vc[l], vr_arg[l])
 
     lg = mm(embed_f32, rms(x[P - 1], n_final))     # tied lm head, only the transition position
     if sp.logit_softcap is not None:
@@ -343,7 +490,7 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k):
             break
         xi = embed_f32[tok] * scale
         for l in range(NL):
-            xi = layer_step(l, materialized_layer_weights(l), xi, pos, kc[l], vc[l])
+            xi = layer_step(l, materialized_layer_weights(l), xi, pos, kc[l], vc[l], vr_arg[l])
         lg = mm(embed_f32, rms(xi, n_final))
         if sp.logit_softcap is not None:
             c = sp.logit_softcap

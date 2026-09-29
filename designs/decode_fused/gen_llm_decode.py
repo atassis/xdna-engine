@@ -40,10 +40,13 @@ import numpy as np
 import ml_dtypes
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, os.pardir,
+                                "scripts"))
 from buffer_blob import write_blob  # noqa: E402
 from elf_zst import write_elf  # noqa: E402
 from llm_decode_spec import (SPECS, C_TILE_GRANULE, L1_BYTES, L1_RESERVE,  # noqa: E402,F401
                              gemv_fits, gemv_tile_output, k_chunks_for, operator_rejects)
+from rope_int_phase import inv_freq_to_turns_u32  # noqa: E402
 
 # Dataflow switches, read ONCE at module scope. They are consumed in three different functions
 # (graph construction, the runlist, and the meta writer), and defining them next to their first
@@ -525,6 +528,14 @@ KV_ALLOC = int(os.environ.get("KV_ALLOC", "0"))
 # flag. A build with this on is NOT safe to serve from `npu generate` -- it will write past the
 # smaller buffer the moment n_past exceeds W. Default 0 = today's graph, byte-for-byte unchanged.
 SLIDING_KV_CIRCULAR = os.environ.get("SLIDING_KV_CIRCULAR", "0") == "1"
+# KV_SKIP_V -- for attention_k_eq_v layers (sp.v_norm and not g.has_v: no v_proj, V is the
+# RMSNorm'd K), stop appending derived V to a V cache slab. Task 1.1 (scripts/gate_llm_reference.py
+# v_mode) proved recomputing this norm at read time is numerically identical to writing it at
+# K-cache-write time; this flag drops the write and the cache buffer's allocation on the generator
+# side only -- the kernel still needs a consumer that recomputes V (Task 1.3). Default 0 = today's
+# graph, byte-for-byte unchanged. Only applies where has_v is already False; other geometries are
+# unaffected.
+KV_SKIP_V = os.environ.get("KV_SKIP_V", "0") == "1"
 # Pin the persistent buffers (weights + KV cache) to the FRONT of the scratch arena so window
 # buckets present ONE layout for everything that survives a bucket crossing. Without it the
 # window-sized softmax scratch (sc/sw, Hq*S) sits ahead of them and shifts every later offset:
@@ -884,6 +895,20 @@ def _attn_global_flash_why(sp, g):
             "needs FUSE_QKV_GEMV=1 for the concatenated qkv buffer ref_q slices"
             if not FUSE_QKV_GEMV else
             None)
+
+
+def rope_f_for_geometry(hd, theta, partial):
+    """Resident RoPE turn-frequency constant for AttnGlobalFlash's on-chip inverse rotation
+    (kv_skip_v): the SAME inv_freq the forward RoPE uses (verify_llm_decode.py's `rope_row`,
+    rust/npu-engine/src/llm/npu_decode.rs::rope_row), converted to the uint32 0.32 turn fraction
+    `taccum_rows_kv_skip_v_bf16_f32` expects -- HD/2 values, byte-reinterpreted into an
+    HD-element bf16 buffer (get_arg_spec's declared size).
+    """
+    half = hd // 2
+    inv = 1.0 / (theta ** (np.arange(0, hd, 2, dtype=np.float64)[:half] / hd))
+    if partial is not None:
+        inv[int(partial * hd // 2):] = 0.0
+    return inv_freq_to_turns_u32(inv).astype(np.uint32).view(BF16)
 
 
 def flash_name_token(fused, hpc, rpe=1):
@@ -2515,7 +2540,10 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # The FIRST geometry keeps the bare name "kv_off": it is baked into the design, and the
         # host's pre-list fallback reads that spelling.
         slot = "kv_off" if not kv_slots else f"kv_off{len(kv_slots)}"
-        kv_slots.append((slot, hd))
+        # Recorded here, not re-derived from `has_v` at every kv_slots reader -- see KV_SKIP_V's
+        # own comment for the condition.
+        kv_slot_has_v = has_v or not (KV_SKIP_V and sp.v_norm)
+        kv_slots.append((slot, hd, kv_slot_has_v))
         # CAPACITY, not window -- the host wraps `pos % capacity` and reads the cache at
         # `kv_block`, and under KV_ALLOC a global geometry's capacity exceeds its window while a
         # circular sliding one's does not. Both are per geometry; emitting `w` here was the same
@@ -2656,6 +2684,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # head_stride (iron/common/kv_layout.py), so the blocked layout is flat's position-major
         # order for any T; hkv>1 interleaves heads per block and is out of scope, as for A_g.
         op_attn_global_flash = None
+        rope_f = None
         if attn_global_flash_why[(hd, hkv, has_v)] is None:
             if T_g != KVA_g and hkv != 1:
                 raise NotImplementedError(
@@ -2665,9 +2694,11 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 )
             from iron.operators.attn_global_dp.op import AttnGlobalFlash
             gi = len(flash_slots)
+            # kv_skip_v (attention_k_eq_v): V has no cache -- exactly the geometries kv_slots
+            # already marks `not kv_slot_has_v` for (KV_SKIP_V's own condition, above).
             op_attn_global_flash = AttnGlobalFlash(
                 HD=hd, Hq=Hq, capacity=KVA_g, heads_per_core=GLOBAL_FLASH_HPC,
-                rows_per_element=GLOBAL_FLASH_RPE,
+                rows_per_element=GLOBAL_FLASH_RPE, kv_skip_v=not kv_slot_has_v,
                 mask_parameter=mask_slot, len_parameter=f"gf_len{gi}",
                 loop_parameter=f"gf_loop{gi}", context=ctx)
             flash_slots.append({
@@ -2678,17 +2709,24 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 "columns": op_attn_global_flash.num_aie_columns,
                 "capacity": KVA_g,
             })
+            # get_arg_spec() declares `rope_f` at HD regardless of kv_skip_v (design.py's own
+            # docstring: "always part of the signature ... only tapped and consumed when kv_skip_v
+            # is set") -- so every flash geometry needs this buffer, not only a kv_skip_v one, or
+            # the arg spec and the runlist buffer disagree in size. One resident constant per
+            # geometry (RoPE's frequency depends on hd/theta, not on layer or position); the
+            # kernel derives cos/sin on chip from the row's own cache position.
+            rope_f = f"rope_f{gi}"
         g = SimpleNamespace(
             hd=hd, hkv=hkv, qd=qd, kvd=kvd, gqa=gqa, kv_slot=slot, o_chunks=o_chunks,
             op_qk_norm=op_qk_norm, op_qk_norm_b=op_qk_norm_b, qkn=_qkn, op_qkv=op_qkv, op_q=op_q,
             op_kv=op_kv, op_o=op_o, op_rope_qk=op_rope_qk, op_qkv_dp=op_qkv_dp,
             op_rope_q=op_rope_q, op_rope_k=op_rope_k, op_sck=op_sck, op_scv=op_scv,
             op_rep_k=op_rep_k, op_rep_v=op_rep_v, op_scores=op_scores, op_trv=op_trv,
-            op_ctx=op_ctx, op_v_norm=op_v_norm, has_v=has_v, kv_parts=kv_parts,
+            op_ctx=op_ctx, op_v_norm=op_v_norm, has_v=has_v, cache_v=kv_slot_has_v, kv_parts=kv_parts,
             uses_tmv_ctx=uses_tmv, scores_groups=scores_groups, scores_block=T_k,
             tmv_groups=tmv_groups, op_softmax=op_softmax, op_scale=op_scale, mask_slot=mask_slot, window=w,
             capacity=KVA_g, kv_block=T_g, op_attn_weightless=op_attn_weightless,
-            op_attn_global_flash=op_attn_global_flash,
+            op_attn_global_flash=op_attn_global_flash, rope_f=rope_f,
             op_attn_block=op_attn_block, circular=(w != S))
         _attn_cache[(hd, hkv, has_v)] = g
         return g
@@ -3465,9 +3503,24 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         if not lin:
             _kvl = KVLayout(Hkv=g.hkv, S=g.capacity, HD=g.hd, T=g.kv_block)
             weights[p + "kc"] = np.zeros(_kvl.total_elems, BF16)
-            weights[p + "vc"] = np.zeros(_kvl.total_elems, BF16)
-            cache_names += [p + "kc", p + "vc"]
+            cache_names.append(p + "kc")
+            if g.cache_v:
+                weights[p + "vc"] = np.zeros(_kvl.total_elems, BF16)
+                cache_names.append(p + "vc")
             ang = "rope_global" if sp.is_global(l) else "rope_local"
+            # Declared once per geometry -- see rope_f's construction site, above. AttnGlobalFlash
+            # only ever claims the GLOBAL geometry (_attn_global_flash_why), so the global theta/
+            # partial-rotary axes are always the right ones here regardless of layer index.
+            if g.rope_f is not None and g.rope_f not in weights:
+                if g.op_attn_global_flash.kv_skip_v and sp.rope_rotary_dim is not None:
+                    raise NotImplementedError(
+                        f"kv_skip_v's on-chip inversion assumes Gemma-4's proportional partial "
+                        f"rotary (rope_partial_rotary/rope_type_global); this spec also sets "
+                        f"rope_rotary_dim={sp.rope_rotary_dim} (the ORDINARY partial-rotary axis), "
+                        f"which rope_f_for_geometry does not undo")
+                partial = (sp.rope_partial_rotary if sp.rope_type_global == "proportional"
+                          else None)
+                weights[g.rope_f] = rope_f_for_geometry(g.hd, sp.rope_theta_global, partial)
 
             # q/k/v are byte slices of ONE `qkv` buffer in the fused arm -- op_qkv writes all three in
             # one pass, and q|k adjacency is what lets a single RoPE cover both. Declared with an
@@ -3512,7 +3565,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             # because bufsz is EXPLICIT it wins the arena layout, so the append then declared 32x
             # what the arena provided. One geometry owns both numbers; read them off it.
             p + "kc": g.hkv * g.capacity * g.hd * 2,
-            p + "vc": g.hkv * g.capacity * g.hd * 2,
+            **({p + "vc": g.hkv * g.capacity * g.hd * 2} if g.cache_v else {}),
             p + "sc": Hq * g.window * 2, p + "sw": Hq * g.window * 2,
             p + "cx": g.qd * 2,
             p + "g": FF * 2, p + "u": FF * 2, p + "gh": FF * 2, p + "d": D * 2,
@@ -3526,7 +3579,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         })
         if lin:
             for k in ("kc", "vc", "sc", "sw"):
-                del bufsz[p + k]
+                # `vc` may already be absent (KV_SKIP_V, g.cache_v False) -- pop, not del.
+                bufsz.pop(p + k, None)
         if not GROUPED_K and not lin:
             bufsz[p + "kr"] = Hq * g.window * g.hd * 2
         if not (GROUPED_V or g.uses_tmv_ctx or lin):
@@ -3615,7 +3669,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                                 [f"{b}[{o + h * g.hd * 2}:{o + h * g.hd * 2 + rb}]"
                                  for b, o, n in ((qhb, qho, Hq), (khb, kho, g.hkv))
                                  for h in range(n)]]
-                    if g.op_v_norm is not None:
+                    if g.op_v_norm is not None and g.cache_v:
                         # Per kv head over head_dim, NOT rotated -- RoPE is a q/k-only step. Three args:
                         # this is the qk-norm design, so it takes a gain, and `ones` is what makes it
                         # gainless (see the construction site).
@@ -3627,6 +3681,11 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                         #
                         # ORDER is load-bearing in the second case and free in the first, so it is placed
                         # for the second: BEFORE the qk-norm and RoPE entries, which mutate k in place.
+                        #
+                        # `g.cache_v` (not a fresh has_v/KV_SKIP_V check): under KV_SKIP_V=1 a
+                        # has_v=False layer's V is recomputed from `kc` at read time (the oracle's
+                        # recompute_from_kc mode, Task 1.1b) -- building this norm here would compute
+                        # a value nothing downstream reads once Task 1.3's kernel-side swap lands.
                         hv = [f"{vhb}[{vho + h*g.hd*2}:{vho + (h+1)*g.hd*2}]" for h in range(g.hkv)]
                         src = ([f"{khb}[{kho + h*g.hd*2}:{kho + (h+1)*g.hd*2}]" for h in range(g.hkv)]
                                if not g.has_v else hv)
@@ -3645,12 +3704,21 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                         if g.op_qkv_dp is not None else
                         [*([] if G4_W_PROLOGUE else [(op_norm, cur, p + "n_in", p + "hn")]),
                          *proj, *vnorm, *qk, *rope,
-                         (g.op_sck, ref_k, p + "kc"), (g.op_scv, ref_v, p + "vc")])
+                         (g.op_sck, ref_k, p + "kc"),
+                         # KV_SKIP_V: attention_k_eq_v (g.op_v_norm ran above, no v_proj) skips the
+                         # V-cache append -- the norm still runs into `ref_v`, a per-layer scratch
+                         # buffer, it is just never drained to `vc`. Downstream ops that still read
+                         # `p+"vc"` (op_rep_v, op_ctx, AttnGlobalFlash) are not yet updated to read
+                         # `ref_v` instead -- that consumer swap is Task 1.3's kernel-side work.
+                         *([(g.op_scv, ref_v, p + "vc")] if g.cache_v else [])])
                 if g.op_attn_global_flash is not None:
                     # AttnGlobalFlash: the input norm, Wqkv, per-head norm/RoPE/v-norm and the K/V
                     # append (`head`, above) stay exactly as they are -- only the scores/softmax/
                     # context chain is replaced, by one design.
-                    attn_rl = [*head, (g.op_attn_global_flash, ref_q, p + "kc", p + "vc", p + "cx")]
+                    #
+                    attn_rl = [*head,
+                               (g.op_attn_global_flash, ref_q, p + "n_kn", g.rope_f,
+                                p + "kc", p + "vc", p + "cx")]
                 else:
                     attn_rl = [
                         *head,
@@ -4002,7 +4070,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # source the names were assigned from, rather than by probing the scratchpad -- a probe
         # would silently skip a slot that SHOULD have been there.
         seg_hds = {sp.head_dim_for(l) for l in range(la, lb)}
-        seg_kv_slots = [(n, hd) for n, hd in kv_slots if hd in seg_hds]
+        seg_kv_slots = [(n, hd, hv) for n, hd, hv in kv_slots if hd in seg_hds]
         seg_geom_slots = [t for t in geom_slots if t[1] in seg_hds]
         seg_flash_slots = [d for d in flash_slots if d["head_dim"] in seg_hds]
         # Same reasoning as seg_kv_slots, one axis over: a segment whose layers are all one
@@ -4185,7 +4253,11 @@ def main():
         # itself, which is already in scratchpad_params read generically off params.txt.
         "scratchpad": {"params": scratchpad_params, "kv_param": "kv_off",
                        "mask_param": "sm_mask",
-                       "kv_params": [{"param": n, "head_dim": hd} for n, hd in md["kv_slots"]],
+                       # has_v omitted (not False) when true, so every non-KV_SKIP_V artifact's
+                       # kv_params is byte-identical to before this key existed.
+                       "kv_params": [{"param": n, "head_dim": hd,
+                                      **({} if hv else {"has_v": False})}
+                                     for n, hd, hv in md["kv_slots"]],
                        # mask_params mirrors kv_params one axis over: one entry per DISTINCT
                        # window this build actually declared a Softmax for. A single entry here
                        # (today's default, and every artifact before SLIDING_KV_CIRCULAR) means

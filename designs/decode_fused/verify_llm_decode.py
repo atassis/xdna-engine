@@ -342,8 +342,8 @@ def main():
     declared = set(md["inputs"])
     # ONE SLOT PER DISTINCT head_dim, from the graph metadata build_graph returns -- NOT from a
     # meta.json, which this harness never reads: it rebuilds the graph rather than loading an
-    # artifact. `md["kv_slots"]` is [(param_name, head_dim)], the same list the generator turns into
-    # meta.json's `scratchpad.kv_params`.
+    # artifact. `md["kv_slots"]` is [(param_name, head_dim, has_v)], the same list the generator
+    # turns into meta.json's `scratchpad.kv_params`.
     kv_slots = md["kv_slots"]
     rope_buf = stack[0]["rope_g"]
     rope_loc_buf = stack[0]["rope_l"]

@@ -105,7 +105,7 @@ def main():
     scale = np.sqrt(D) if sp.embed_scale == "sqrt_d_model" else 1.0
     with c.get_buffer("x").overwrite() as _buf:
         _buf[:] = np.asarray(embed[a.token].astype(np.float32) * scale, BF16).reshape(-1)
-    for slot_name, _ in md["kv_slots"]:
+    for slot_name, _, _ in md["kv_slots"]:
         params.write(slot_name, 0)
     for ang_name in ("rope_global", "rope_local"):
         if ang_name in md["inputs"]:
