@@ -36,3 +36,16 @@ pub use resident_raw::{RawResidentForward, RawResidentMeta};
 pub use sampling::{LogitView, SampleOutcome, SamplingConfig, SampleTimings};
 pub use tool_parse::{parse_completion, ParseOut, ParsedCompletion, StreamingToolParser};
 pub use tool_syntax::{PayloadFormat, ProbeReason, ToolProbe, ToolSyntax};
+
+/// The context a resident-forward build serves, dispatched on its `meta.json` kind the same way
+/// the registry picks its driver; `None` for anything that is not one.
+pub fn resident_max_context(dir: &std::path::Path) -> Option<usize> {
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("meta.json")).ok()?).ok()?;
+    match v.get("kind")?.as_str()? {
+        "resident_forward_ladder" => resident_ladder::LadderMeta::load(dir).ok().map(|m| m.largest_keys(1)),
+        "resident_forward_onecmd" => resident_onecmd::OneCmdMeta::load(dir)
+            .ok()
+            .map(|m| resident_onecmd::max_context_bound(m.s_cap, m.pmax, m.nbw, m.sliding_window)),
+        _ => None,
+    }
+}

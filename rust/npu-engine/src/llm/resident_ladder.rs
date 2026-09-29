@@ -237,7 +237,7 @@ impl LadderMeta {
     }
 
     /// The largest key range any implemented rung reaches, for a given `nt` -- 0 if none.
-    fn largest_keys(&self, nt: usize) -> usize {
+    pub(crate) fn largest_keys(&self, nt: usize) -> usize {
         self.rungs.iter().filter(|r| r.nt == nt).map(|r| r.keys).max().unwrap_or(0)
     }
 }

@@ -1204,7 +1204,11 @@ fn declared(root: Option<&PathBuf>, scenario: &str) -> Declared {
         .filter(|c| !c.artifacts.decode.is_empty())
         .and_then(|c| root.map(|r| r.join(&c.artifacts.decode)))
         .and_then(|d| npu_engine::llm::LlmArtifact::load(&d).ok())
-        .map(|a| a.max_seq);
+        .map(|a| a.max_seq)
+        .or_else(|| {
+            let c = sc.as_ref().filter(|c| !c.artifacts.resident.is_empty())?;
+            npu_engine::llm::resident_max_context(&root?.join(&c.artifacts.resident))
+        });
     Declared {
         // Through the canonical mapping, not the raw string: a scenario says `kind = "embeddings"`
         // while the capability -- and the live status, and every other surface -- says `embed`.
