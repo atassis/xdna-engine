@@ -6,10 +6,13 @@
 //!   compiled sequence (`rlayer_design.emit`'s naming), so each reach (8192..262144 keys for
 //!   decode, 4096..65536 for prefill) is its own control code. The host picks the smallest rung
 //!   whose window holds `n_past + P` keys -- `fwd_host.Forward.rung`, ported verbatim below.
-//! - **A mirrored sliding-cache ring (`s_ring` = 1280).** The device writes a new row at BOTH
-//!   `pos % C` and `pos % C + C`; the host only ever computes `pos % C` (`fwd_host.Forward.ring`).
-//!   Context can now pass the old 2048-row linear cap. A prefill piece must not cross a multiple
-//!   of `C` -- `fwd_host.Forward.max_piece` -- so pieces are cut there, not just at a family's rows (`prefill_piece`).
+//! - **One sliding-cache ring per layer (`s_ring` = 1280) in 64-row blocks** (prototype `kvring.py`).
+//!   Each command writes its rows and reads its window in two spans, each a runtime offset plus a
+//!   runtime granule count; a write span never crosses a block, so never the ring end. The span
+//!   rule is `ring_params`; `ring_fits` bounds every span by `meta.json`'s `s_ring_layout`, which the
+//!   generator wrote from the same region size it built against.
+//! - **Two scratch BOs**: `%s` holds the weights (static BDs only), `%k` the caches (every BD whose
+//!   address moves with the position), so a runtime-offset transfer cannot reach a weight byte.
 //!
 //! Layout is read from `meta.json` (`kind: "resident_forward_ladder"`), itself generated from
 //! `fwd_layout.json` (the build's own authority) plus the architecture-constant `%x`/`%o` offsets
@@ -69,37 +72,119 @@ pub fn rung_for<'a>(rungs: &'a [Rung], nt: usize, keys_needed: usize) -> Result<
     })
 }
 
-/// `fwd_host.Forward.ring`: a sliding-cache row's index in the mirrored ring's first copy.
+/// `fwd_host.Forward.ring`: a sliding-cache position's ring slot.
 pub fn ring_pos(pos: usize, c: usize) -> usize {
     pos % c
 }
 
-/// `fwd_host.Forward.max_piece`: the rows of a piece starting at `s` that do not cross a multiple
-/// of the ring size `c` -- `min(p, c - s % c)`. A caller cuts a longer piece at this boundary.
-pub fn max_piece(s: usize, p: usize, c: usize) -> usize {
-    p.min(c - s % c)
-}
-
 /// `fwd_host.Forward.piece` + `family`: the next prefill piece at `at` with `left` rows to go. Its
 /// rows come from the largest family whose windows reach past `at`: `row_block * nt`, cut at that
-/// family's largest window and at the ring's wrap. Its rung is the smallest family covering those
-/// rows, then that family's smallest window. `None` past every prefill rung's window.
-pub fn prefill_piece(rungs: &[Rung], at: usize, left: usize, s_ring: usize, row_block: usize) -> Option<(usize, &Rung)> {
+/// family's largest window. Its rung is the smallest family covering those rows, then that
+/// family's smallest window. `None` past every prefill rung's window.
+pub fn prefill_piece(rungs: &[Rung], at: usize, left: usize, row_block: usize) -> Option<(usize, &Rung)> {
     let seg = || rungs.iter().filter(|r| r.kind == "seg");
     let reach = |nt: usize| seg().filter(|r| r.nt == nt).map(|r| r.keys).max().unwrap_or(0);
     let mut nts: Vec<usize> = seg().map(|r| r.nt).collect();
     nts.sort_unstable();
     nts.dedup();
     let big = *nts.iter().rev().find(|&&nt| reach(nt) > at)?;
-    let p = max_piece(at, left.min(row_block * big).min(reach(big) - at), s_ring);
+    let p = left.min(row_block * big).min(reach(big) - at);
     let nt = *nts.iter().find(|&&nt| row_block * nt >= p && reach(nt) >= at + p)?;
     rung_for(rungs, nt, at + p).ok().map(|r| (p, r))
 }
 
-/// K059: a command writes all `rows` rows of its blocks at `ring_s` and again at `ring_s + c`, so the
-/// second copy must end inside the sliding cache's `s_rows` (a padded ring leaves room past `2c`).
-pub fn ring_write_fits(ring_s: usize, rows: usize, c: usize, s_rows: usize) -> bool {
-    ring_s + c + rows <= s_rows
+/// One ring BD family of `s_ring_layout` (`kvring.describe`), in bytes: the static offsets of its
+/// BDs, the extent one granule touches, and the step between granules.
+#[derive(Debug, Clone)]
+pub struct RingBd {
+    pub min_off: usize,
+    pub max_off: usize,
+    pub extent: usize,
+    pub granule_stride: usize,
+}
+
+/// `meta.json`'s `s_ring_layout` (`kvring.describe`): the blocked ring the generator built.
+#[derive(Debug, Clone)]
+pub struct RingLayout {
+    pub block_rows: usize,
+    pub blocks: usize,
+    pub window_blocks: usize,
+    pub slab_bytes: usize,
+    pub block_bytes: usize,
+    pub row_bytes: usize,
+    pub region_bytes: usize,
+    pub write: RingBd,
+    pub read: RingBd,
+}
+
+/// `kvring.write_spans`: (first slot, rows) of span A (to the end of `s`'s block, at most
+/// `rows - 1`) and span B (the rest, from the next position's slot).
+pub fn write_spans(s: usize, rows: usize, c: usize, blk: usize) -> [(usize, usize); 2] {
+    let r = s % c;
+    let a = (rows - 1).min(blk - r % blk);
+    [(r, a), ((s + a) % c, rows - a)]
+}
+
+/// `kvring.read_spans`: (first block, blocks) of span A (to the ring end, at most `nbw - 1`) and
+/// span B (the rest, from block 0) of the `nbw`-block window from `first`.
+pub fn read_spans(first: usize, nbw: usize, c: usize, blk: usize) -> [(usize, usize); 2] {
+    let (nb, b0) = (c / blk, first % c / blk);
+    let na = nbw.min(nb - b0);
+    if na == nbw {
+        return [(b0, nbw - 1), ((b0 + nbw - 1) % nb, 1)];
+    }
+    [(b0, na), (0, nbw - na)]
+}
+
+/// One scratchpad parameter's value: a byte offset (written as `bytes / param_unit_bytes`) or a
+/// count of granules past the BD's static one (written raw).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RingParam {
+    Bytes(usize),
+    Count(usize),
+}
+
+/// `kvring.params`: every ring parameter of a command writing `rows` rows at `s` and reading the
+/// window from `first`, in `layout`'s bytes.
+pub fn ring_params(l: &RingLayout, s: usize, rows: usize, first: usize) -> Vec<(&'static str, RingParam)> {
+    let c = l.blocks * l.block_rows;
+    let slot = |t: usize| t / l.block_rows * l.block_bytes + t % l.block_rows * l.row_bytes;
+    let [(wa, na), (wb, nb)] = write_spans(s, rows, c, l.block_rows);
+    let [(ra, ma), (rb, mb)] = read_spans(first, l.window_blocks, c, l.block_rows);
+    vec![
+        ("kvw_a", RingParam::Bytes(slot(wa))),
+        ("kvw_an", RingParam::Count(na - 1)),
+        ("kvw_b", RingParam::Bytes(slot(wb))),
+        ("kvw_bn", RingParam::Count(nb - 1)),
+        ("kvr_a", RingParam::Bytes(ra * l.block_bytes)),
+        ("kvr_an", RingParam::Count(ma - 1)),
+        ("kvr_b", RingParam::Bytes(rb * l.block_bytes)),
+        ("kvr_bn", RingParam::Count(mb - 1)),
+    ]
+}
+
+/// K059 (`kvring.fits`): every span of `p` inside the ring region, a write span inside one slab,
+/// a read span on whole blocks -- bounded by the layout the generator recorded, not re-derived.
+pub fn ring_fits(l: &RingLayout, p: &[(&str, RingParam)]) -> Result<(), String> {
+    let get = |k: &str| p.iter().find(|(n, _)| *n == k).map(|(_, v)| *v);
+    for (bd, pre, write) in [(&l.write, "kvw", true), (&l.read, "kvr", false)] {
+        for sp in ["a", "b"] {
+            let (Some(RingParam::Bytes(off)), Some(RingParam::Count(n))) = (get(&format!("{pre}_{sp}")), get(&format!("{pre}_{sp}n"))) else {
+                return Err(format!("{pre}_{sp}: missing or mistyped parameter"));
+            };
+            let hi = bd.max_off + off + n * bd.granule_stride + bd.extent;
+            if hi > l.region_bytes {
+                return Err(format!("{pre}_{sp}: [{}, {hi}) outside the {}-byte ring region", bd.min_off + off, l.region_bytes));
+            }
+            if write && off % l.slab_bytes + n * bd.granule_stride + bd.extent > l.slab_bytes {
+                return Err(format!("{pre}_{sp}: {} rows from byte {off} cross a slab", n + 1));
+            }
+            if !write && (off % l.block_bytes != 0 || n + 1 > l.blocks) {
+                return Err(format!("{pre}_{sp}: {} blocks from byte {off} are not whole blocks of the ring", n + 1));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `rf48L/meta.json`'s schema (`kind: "resident_forward_ladder"`). See module doc for provenance.
@@ -140,6 +225,8 @@ pub struct LadderMeta {
     pub layer_kv_off: HashMap<usize, usize>,
     pub head_off: usize,
     pub scratch_bytes: usize,
+    pub cache_bytes: usize,
+    pub s_ring_layout: RingLayout,
     pub vocab: usize,
     pub logit_softcap: Option<f64>,
     pub scratchpad_params: HashMap<String, usize>,
@@ -195,6 +282,25 @@ impl LadderMeta {
             .iter()
             .map(|x| x.as_u64().unwrap() as usize)
             .collect();
+        let rl = v.get("s_ring_layout").ok_or_else(|| ctx("missing `s_ring_layout` (a mirrored-ring artifact predates the single ring)".into()))?;
+        let ru = |o: &serde_json::Value, k: &str| -> Result<usize, EngineError> {
+            o.get(k).and_then(|x| x.as_u64()).map(|x| x as usize).ok_or_else(|| ctx(format!("s_ring_layout: missing/non-numeric `{k}`")))
+        };
+        let ring_bd = |k: &str| -> Result<RingBd, EngineError> {
+            let o = rl.get(k).ok_or_else(|| ctx(format!("s_ring_layout: missing `{k}`")))?;
+            Ok(RingBd { min_off: ru(o, "min_off")?, max_off: ru(o, "max_off")?, extent: ru(o, "extent")?, granule_stride: ru(o, "granule_stride")? })
+        };
+        let s_ring_layout = RingLayout {
+            block_rows: ru(rl, "block_rows")?,
+            blocks: ru(rl, "blocks")?,
+            window_blocks: ru(rl, "window_blocks")?,
+            slab_bytes: ru(rl, "slab_bytes")?,
+            block_bytes: ru(rl, "block_bytes")?,
+            row_bytes: ru(rl, "row_bytes")?,
+            region_bytes: ru(rl, "region_bytes")?,
+            write: ring_bd("write")?,
+            read: ring_bd("read")?,
+        };
         let rungs: Vec<Rung> = v
             .get("rungs")
             .and_then(|x| x.as_array())
@@ -211,6 +317,10 @@ impl LadderMeta {
             })
             .collect::<Result<_, _>>()?;
 
+        let (c, rl) = (u("s_ring")?, &s_ring_layout);
+        if rl.blocks * rl.block_rows != c || rl.region_bytes != u("s_rows")? * u("kvrow_s")? * 2 {
+            return Err(ctx(format!("s_ring_layout ({} blocks of {} rows, {} bytes) is not the ring s_ring/s_rows/kvrow_s size", rl.blocks, rl.block_rows, rl.region_bytes)));
+        }
         Ok(LadderMeta {
             dir: dir.to_path_buf(),
             elf_name: s("elf")?,
@@ -247,6 +357,8 @@ impl LadderMeta {
             layer_kv_off: usize_map("layer_kv_off")?,
             head_off: u("head_off")?,
             scratch_bytes: u("scratch_bytes")?,
+            cache_bytes: u("cache_bytes")?,
+            s_ring_layout,
             vocab: u("vocab")?,
             logit_softcap: v.get("logit_softcap").and_then(|x| x.as_f64()),
             scratchpad_params,
@@ -289,6 +401,7 @@ pub struct LadderResidentForward {
     ob: Bo,
     #[allow(dead_code)] // kept alive: %s is referenced only through the bound rung kernels
     sb: Bo,
+    kb: Bo,
     boot: ElfResident,
     rungs: HashMap<String, ElfResident>,
     n_written: usize,
@@ -302,12 +415,11 @@ impl LadderResidentForward {
         let xb = dev.alloc_bo_raw(meta.xbuf, FLAG_HOST_ONLY, 0).map_err(|e| EngineError::Load(format!("alloc xb: {e}")))?;
         let ob_size = meta.obuf_f1.max(meta.obuf_f2);
         let ob = dev.alloc_bo_raw(ob_size, FLAG_HOST_ONLY, 0).map_err(|e| EngineError::Load(format!("alloc ob: {e}")))?;
-        let sb = dev.alloc_bo_raw(meta.scratch_bytes, FLAG_HOST_ONLY, 0).map_err(|e| EngineError::Load(format!("alloc scratch ({} bytes): {e}", meta.scratch_bytes)))?;
+        let sb = dev.alloc_bo_raw(meta.scratch_bytes, FLAG_HOST_ONLY, 0).map_err(|e| EngineError::Load(format!("alloc weights ({} bytes): {e}", meta.scratch_bytes)))?;
+        let kb = dev.alloc_bo_raw(meta.cache_bytes, FLAG_HOST_ONLY, 0).map_err(|e| EngineError::Load(format!("alloc caches ({} bytes): {e}", meta.cache_bytes)))?;
 
-        // Every layer's weight stream and its K/V cache (zeroed), plus the head's weight stream,
-        // go into %s ONCE here -- resident for the model's whole lifetime. Same as
-        // `resident_onecmd.rs::open`; ring rows and global rows share this one region regardless
-        // of which rung's dispatch touches them.
+        // Every layer's weight stream, then the head's, go into %s ONCE here -- resident for the
+        // model's whole lifetime; every cache starts zeroed in %k.
         for li in 0..meta.nlayer {
             let weight_path = meta.weight_dir.join(format!("w{li}.npy"));
             let wbytes: Array1<u8> = read_npy(&weight_path).map_err(|e| EngineError::Load(format!("read {}: {e}", weight_path.display())))?;
@@ -315,17 +427,9 @@ impl LadderResidentForward {
             let woff = *meta.layer_weight_off.get(&li).ok_or_else(|| EngineError::Load(format!("meta.json: no layer_weight_off for layer {li}")))?;
             sb.sub(woff, wbytes.len()).map_err(|e| EngineError::Load(format!("sb.sub weight[{li}]: {e}")))?
                 .write_bytes(&wbytes).map_err(|e| EngineError::Load(format!("write weight[{li}]: {e}")))?;
-
-            let kv_off = *meta.layer_kv_off.get(&li).ok_or_else(|| EngineError::Load(format!("meta.json: no layer_kv_off for layer {li}")))?;
-            let next_off = if li + 1 < meta.nlayer {
-                *meta.layer_weight_off.get(&(li + 1)).ok_or_else(|| EngineError::Load(format!("meta.json: no layer_weight_off for layer {}", li + 1)))?
-            } else {
-                meta.head_off
-            };
-            let kv_size = next_off - kv_off;
-            sb.sub(kv_off, kv_size).map_err(|e| EngineError::Load(format!("sb.sub kv[{li}]: {e}")))?
-                .write_bytes(&vec![0u8; kv_size]).map_err(|e| EngineError::Load(format!("zero kv[{li}]: {e}")))?;
         }
+        kb.write_bytes(&vec![0u8; meta.cache_bytes]).map_err(|e| EngineError::Load(format!("zero caches: {e}")))?;
+        kb.sync_to_device().map_err(|e| EngineError::Load(format!("sync caches: {e}")))?;
 
         let head_weight_path = meta.dir.join("w_head.npy");
         let head_weight: ndarray::ArrayD<u8> = read_npy(&head_weight_path).map_err(|e| EngineError::Load(format!("read {}: {e}", head_weight_path.display())))?;
@@ -342,16 +446,16 @@ impl LadderResidentForward {
         let mut rungs = HashMap::new();
         for r in &meta.rungs {
             let kern = boot.open_named(&format!("main:{}", r.name)).map_err(|e| EngineError::Load(format!("open_named {}: {e}", r.name)))?;
-            kern.bind(&[&xb, &ob, &sb]).map_err(|e| EngineError::Load(format!("bind {}: {e}", r.name)))?;
+            kern.bind(&[&xb, &ob, &sb, &kb]).map_err(|e| EngineError::Load(format!("bind {}: {e}", r.name)))?;
             rungs.insert(r.name.clone(), kern);
         }
 
-        Ok(LadderResidentForward { meta, embed, xb, ob, sb, boot, rungs, n_written: 0 })
+        Ok(LadderResidentForward { meta, embed, xb, ob, sb, kb, boot, rungs, n_written: 0 })
     }
 
     /// Build `%x` for a piece of `p_len` rows at position `s` and dispatch the rung named
-    /// `rung_name` (already selected by the caller), returning `first` (the sliding ring's
-    /// read-window start, needed for `kvr_s`).
+    /// `rung_name` (already selected by the caller), returning `first` (the sliding window's
+    /// first key, 64-aligned).
     fn dispatch(&mut self, rung_name: &str, split_nb: Option<usize>, x_bits: &[u16], s: usize, p_len: usize) -> Result<usize, EngineError> {
         let nt = piece_nt(p_len, self.meta.row_block);
         let first = s.saturating_sub(self.meta.sliding_window.saturating_sub(1)) / 64 * 64;
@@ -400,28 +504,27 @@ impl LadderResidentForward {
 
         let kern = self.rungs.get(rung_name).ok_or_else(|| EngineError::Load(format!("no rung `{rung_name}` bound")))?;
         let unit = self.meta.param_unit_bytes;
-        let write_param = |name: &str, byte_value: usize| -> Result<(), EngineError> {
+        let write_param = |name: &str, byte_value: RingParam| -> Result<(), EngineError> {
             let idx = *self.meta.scratchpad_params.get(name).ok_or_else(|| EngineError::Load(format!("meta.json: no scratchpad param `{name}`")))?;
-            if byte_value % unit != 0 {
-                return Err(EngineError::Device(format!("{name}: byte offset {byte_value} not a multiple of param_unit_bytes {unit}")));
-            }
-            // Each slot is an i32 (params.txt); `unit` is only the scale of the value it holds.
-            let word = u32::try_from(byte_value / unit)
-                .map_err(|_| EngineError::Device(format!("{name}: {byte_value} / {unit} does not fit an i32 slot")))?;
+            let value = match byte_value {
+                RingParam::Bytes(b) if b % unit != 0 => {
+                    return Err(EngineError::Device(format!("{name}: byte offset {b} not a multiple of param_unit_bytes {unit}")));
+                }
+                RingParam::Bytes(b) => b / unit,
+                RingParam::Count(n) => n,
+            };
+            // Each slot is an i32 (params.txt); `unit` is only the scale of an offset it holds.
+            let word = u32::try_from(value).map_err(|_| EngineError::Device(format!("{name}: {value} does not fit an i32 slot")))?;
             kern.write_scratchpad(idx * 4, &word.to_le_bytes()).map_err(|e| EngineError::Device(format!("write scratchpad {name}: {e}")))
         };
-        let ring_s = ring_pos(s, self.meta.s_ring);
-        let ring_first = ring_pos(first, self.meta.s_ring);
         let rung_nt = self.meta.rungs.iter().find(|r| r.name == rung_name).map(|r| r.nt)
             .ok_or_else(|| EngineError::Load(format!("meta.json: no rung `{rung_name}`")))?;
-        if !ring_write_fits(ring_s, rung_nt * self.meta.row_block, self.meta.s_ring, self.meta.s_rows) {
-            return Err(EngineError::Device(format!(
-                "{rung_name} at {s}: its {} cache rows from ring row {ring_s} pass the sliding cache ({} rows); the artifact needs a padded ring",
-                rung_nt * self.meta.row_block, self.meta.s_rows)));
+        let ring = ring_params(&self.meta.s_ring_layout, s, rung_nt * self.meta.row_block, first);
+        ring_fits(&self.meta.s_ring_layout, &ring).map_err(|e| EngineError::Device(format!("{rung_name} at {s}: {e}")))?;
+        write_param("kvw_g", RingParam::Bytes(s * self.meta.kvrow_g * 2))?;
+        for (name, v) in ring {
+            write_param(name, v)?;
         }
-        write_param("kvw_s", ring_s * self.meta.kvrow_s * 2)?;
-        write_param("kvw_g", s * self.meta.kvrow_g * 2)?;
-        write_param("kvr_s", ring_first * self.meta.kvrow_s * 2)?;
 
         kern.dispatch().map_err(EngineError::Device)?;
         self.ob.sync_from_device().map_err(|e| EngineError::Device(format!("sync ob: {e}")))?;
@@ -482,7 +585,7 @@ impl DecodeStep for LadderResidentForward {
             // Past every prefill rung: decline here (return `at`, unchanged progress for this call)
             // and let the generator's per-token loop finish via `step()`'s f1 ladder, which reaches
             // 262144 -- see module doc.
-            let Some((p_len, rung)) = prefill_piece(&self.meta.rungs, at, batchable - at, self.meta.s_ring, self.meta.row_block) else {
+            let Some((p_len, rung)) = prefill_piece(&self.meta.rungs, at, batchable - at, self.meta.row_block) else {
                 break;
             };
             let end = at + p_len;
@@ -503,14 +606,8 @@ impl DecodeStep for LadderResidentForward {
     }
 
     fn reset(&mut self) -> Result<CacheState, EngineError> {
-        for li in 0..self.meta.nlayer {
-            let kv_off = self.meta.layer_kv_off[&li];
-            let next_off = if li + 1 < self.meta.nlayer { self.meta.layer_weight_off[&(li + 1)] } else { self.meta.head_off };
-            let size = next_off - kv_off;
-            self.sb.sub(kv_off, size).map_err(|e| EngineError::Device(format!("sb.sub kv[{li}] on reset: {e}")))?
-                .write_bytes(&vec![0u8; size]).map_err(|e| EngineError::Device(format!("zero kv[{li}] on reset: {e}")))?;
-        }
-        self.sb.sync_to_device().map_err(|e| EngineError::Device(format!("sync scratch on reset: {e}")))?;
+        self.kb.write_bytes(&vec![0u8; self.meta.cache_bytes]).map_err(|e| EngineError::Device(format!("zero caches on reset: {e}")))?;
+        self.kb.sync_to_device().map_err(|e| EngineError::Device(format!("sync caches on reset: {e}")))?;
         self.n_written = 0;
         Ok(CacheState::Cleared)
     }
@@ -519,13 +616,13 @@ impl DecodeStep for LadderResidentForward {
         Some(self.meta.largest_keys(1))
     }
 
-    /// Real device BO bytes: `%x` + `%o` + `%s`, so the generic `memory_ceiling_mb` accounting
+    /// Real device BO bytes: `%x` + `%o` + `%s` + `%k`, so the generic `memory_ceiling_mb` accounting
     /// (`npu-runtime::loader::EngineLoader`/`registry::ensure_resident`) can evict THIS model or
     /// evict the shipped `gemma4-12b` to make room, instead of reporting the default 0 and letting
     /// both look free to load at once -- the residency conflict the coordinator flagged for
     /// `rf48L`'s ~11.8 GB scratch.
     fn bo_bytes(&self) -> u64 {
-        (self.meta.xbuf + self.meta.obuf_f1.max(self.meta.obuf_f2) + self.meta.scratch_bytes) as u64
+        (self.meta.xbuf + self.meta.obuf_f1.max(self.meta.obuf_f2) + self.meta.scratch_bytes + self.meta.cache_bytes) as u64
     }
 }
 
@@ -583,31 +680,6 @@ mod tests {
         assert_eq!(ring_pos(6083, 1280), 6083 % 1280);
     }
 
-    #[test]
-    fn max_piece_is_uncut_away_from_a_boundary() {
-        // A 32-row piece starting well clear of the next multiple of 1280 fits whole.
-        assert_eq!(max_piece(0, 32, 1280), 32);
-        assert_eq!(max_piece(100, 32, 1280), 32);
-    }
-
-    #[test]
-    fn max_piece_cuts_a_piece_that_would_cross_a_ring_multiple() {
-        // Starting 10 rows before the 1280 boundary, only 10 rows fit before it.
-        assert_eq!(max_piece(1270, 32, 1280), 10);
-        // Starting exactly on a boundary: the ring's own multiple, not the previous one.
-        assert_eq!(max_piece(1280, 32, 1280), 32);
-        // Two ring widths in, same shape.
-        assert_eq!(max_piece(2556, 32, 1280), 4);
-    }
-
-    #[test]
-    fn max_piece_never_returns_zero() {
-        // s % c is always < c, so c - s % c is always >= 1: a piece always makes SOME progress.
-        for s in [0usize, 1, 1279, 1280, 2559, 1_000_000] {
-            assert!(max_piece(s, 32, 1280) >= 1, "s={s}");
-        }
-    }
-
     fn f7_rungs() -> Vec<Rung> {
         let seg = |name: &str, nt: usize, blocks: usize| Rung { name: name.into(), nt, blocks, keys: blocks * 64, kind: "seg".into() };
         let mut r = rf48l_rungs();
@@ -618,10 +690,10 @@ mod tests {
     #[test]
     fn prefill_piece_takes_the_largest_family_its_window_allows() {
         let r = f7_rungs();
-        let pick = |at, left| prefill_piece(&r, at, left, 1280, 16).map(|(p, g)| (p, g.name.clone()));
+        let pick = |at, left| prefill_piece(&r, at, left, 16).map(|(p, g)| (p, g.name.clone()));
         assert_eq!(pick(0, 5440), Some((112, "f7".into())));
         assert_eq!(pick(4032, 5440), Some((112, "f7w256".into())), "the piece's end picks the window");
-        assert_eq!(pick(1232, 5440), Some((48, "f7".into())), "cut at the ring's wrap, still one command");
+        assert_eq!(pick(1232, 5440), Some((112, "f7".into())), "the ring's wrap does not cut a piece");
         assert_eq!(pick(0, 20), Some((20, "f2".into())), "a short tail runs on the smallest family");
         assert_eq!(pick(16320, 5440), Some((64, "f7w256".into())), "cut at f7's largest window");
         assert_eq!(pick(16384, 5440), Some((32, "f2w1024".into())), "past f7's windows only f2 holds the end");
@@ -629,21 +701,64 @@ mod tests {
     }
 
     #[test]
-    fn prefill_piece_on_the_f2_only_ladder_is_the_old_32_row_cut() {
+    fn prefill_piece_on_the_f2_only_ladder_is_32_rows() {
         let r = rf48l_rungs();
         for at in [0usize, 100, 1270, 4090, 60000] {
-            let (p, g) = prefill_piece(&r, at, 5440, 1280, 16).unwrap();
-            assert_eq!(p, max_piece(at, 32, 1280), "at {at}");
+            let (p, g) = prefill_piece(&r, at, 5440, 16).unwrap();
+            assert_eq!(p, 32, "at {at}");
             assert_eq!(g.name, rung_for(&r, 2, at + p).unwrap().name, "at {at}");
         }
     }
 
+    /// rf48L's ring: `kvring.describe(1280, 20, 1280 * 4096)`.
+    fn rf_ring() -> RingLayout {
+        RingLayout {
+            block_rows: 64,
+            blocks: 20,
+            window_blocks: 20,
+            slab_bytes: 32768,
+            block_bytes: 524288,
+            row_bytes: 128,
+            region_bytes: 10485760,
+            write: RingBd { min_off: 0, max_off: 491520, extent: 24704, granule_stride: 128 },
+            read: RingBd { min_off: 0, max_off: 491520, extent: 32768, granule_stride: 524288 },
+        }
+    }
+
     #[test]
-    fn ring_write_fits_needs_the_pad_near_the_wrap() {
-        assert!(ring_write_fits(1264, 16, 1280, 2560));
-        assert!(!ring_write_fits(1265, 16, 1280, 2560), "decode's 16-row write passes 2C from ring row 1265");
-        assert!(!ring_write_fits(1270, 32, 1280, 2560));
-        assert!(ring_write_fits(1279, 112, 1280, 2560 + 112));
+    fn ring_spans_match_kvring() {
+        // kvring.write_spans / read_spans on the same inputs (python, 2026-09-29).
+        assert_eq!(write_spans(1279, 16, 1280, 64), [(1279, 1), (0, 15)]);
+        assert_eq!(write_spans(0, 16, 1280, 64), [(0, 15), (15, 1)]);
+        assert_eq!(write_spans(60, 32, 1280, 64), [(60, 4), (64, 28)]);
+        assert_eq!(read_spans(0, 20, 1280, 64), [(0, 19), (19, 1)]);
+        assert_eq!(read_spans(64 * 7, 20, 1280, 64), [(7, 13), (0, 7)]);
+        let p = ring_params(&rf_ring(), 1279, 16, 0);
+        assert_eq!(p[0], ("kvw_a", RingParam::Bytes(4984768 * 2)));
+        assert_eq!(p[3], ("kvw_bn", RingParam::Count(14)));
+        assert_eq!(p[6], ("kvr_b", RingParam::Bytes(4980736 * 2)));
+    }
+
+    #[test]
+    fn ring_params_fit_at_every_slot_and_the_check_can_fail() {
+        let l = rf_ring();
+        for s in 0usize..3 * 1280 {
+            for rows in [16, 32] {
+                let first = s.saturating_sub(1023) / 64 * 64;
+                ring_fits(&l, &ring_params(&l, s, rows, first)).unwrap_or_else(|e| panic!("s {s} rows {rows}: {e}"));
+            }
+        }
+        // the unsplit 16-row write from slot 1279 (the mirrored ring's overrun) must not pass
+        let mut p = ring_params(&l, 1279, 16, 0);
+        p[1] = ("kvw_an", RingParam::Count(15));
+        assert!(ring_fits(&l, &p).unwrap_err().contains("outside"));
+        // nor may a span that stays in the region but runs into the next slab
+        let mut p = ring_params(&l, 100, 16, 0);
+        p[1] = ("kvw_an", RingParam::Count(40));
+        assert!(ring_fits(&l, &p).unwrap_err().contains("cross a slab"));
+        let mut p = ring_params(&l, 0, 16, 0);
+        p[4] = ("kvr_a", RingParam::Bytes(2 * l.block_bytes));
+        assert!(ring_fits(&l, &p).unwrap_err().contains("outside"));
     }
 
     #[test]
