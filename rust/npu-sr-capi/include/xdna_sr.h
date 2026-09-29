@@ -86,6 +86,12 @@ int xdna_sr_frame_layout(const struct XdnaSr *h, struct XdnaSrFrameLayout *out);
 
 /**
  * Zero-copy dispatch: `in_fd`/`out_fd` are dma-buf fds of BGRA8 buffers laid out per
+ * Bytes per pixel of the frame layout's planes: 4 for BGRA, 1 for the NV12 Y plane (the caller
+ * fills the chroma plane of its output buffer itself). <0 without a frame-layout backend.
+ */
+int xdna_sr_frame_bytes_per_px(const struct XdnaSr *h);
+
+/**
  * `xdna_sr_frame_layout` (in: producer-filled INCLUDING the edge-replicated padding; out: the full
  * padded output). Imports and caches each fd (by the dma-buf's inode). Blocking: returns after the
  * NPU finished. `*out_fence_fd` is set to -1 (reserved for an async version). <0 on error.

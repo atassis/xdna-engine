@@ -73,7 +73,7 @@ impl SrEngine {
                 return Err(SrError::Load("fsr1 has no CPU backend".into()));
             }
             let dir = path.parent().unwrap_or(Path::new("."));
-            if schedule::layout(path)?.as_deref() == Some("frame") {
+            if matches!(schedule::layout(path)?.as_deref(), Some("frame" | "frame_y")) {
                 let cfg: fsr1_frame::Fsr1FrameConfig = schedule::load_json(path)?;
                 return Ok(SrEngine::Fsr1Frame(fsr1_frame::Fsr1FrameEngine::load(cfg, dir)?));
             }
@@ -184,6 +184,14 @@ impl SrEngine {
     pub fn frame_layout(&self) -> Result<fsr1_frame::FrameLayout, SrError> {
         match self {
             SrEngine::Fsr1Frame(f) => Ok(f.frame_layout()),
+            _ => Err(SrError::Frame("dma-buf zero-copy needs the fsr1 frame-layout backend".into())),
+        }
+    }
+
+    /// Bytes per pixel of the frame-layout backend's planes: 4 (BGRA) or 1 (the NV12 Y plane).
+    pub fn frame_bytes_per_px(&self) -> Result<usize, SrError> {
+        match self {
+            SrEngine::Fsr1Frame(f) => Ok(f.bytes_per_px()),
             _ => Err(SrError::Frame("dma-buf zero-copy needs the fsr1 frame-layout backend".into())),
         }
     }
