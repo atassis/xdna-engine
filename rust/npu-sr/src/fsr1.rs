@@ -31,6 +31,10 @@ pub struct Fsr1Config {
     pub in_h: usize,
     pub tile: TileGeom,
     pub n_tiles: usize,
+    /// Tiles the design streams: n_tiles rounded up to a multiple of the worker count. The extra
+    /// tiles repeat the last one and are never unpacked. Absent for single-worker exports.
+    #[serde(default)]
+    pub n_tiles_padded: Option<usize>,
     pub xclbin: String,
     pub insts: String,
 }
@@ -97,8 +101,9 @@ impl Fsr1Engine {
         let instr = dev.alloc_bo(&kern, insts.len(), FLAG_CACHEABLE, g(1)?).map_err(SrError::Device)?;
         instr.write_bytes(&insts).map_err(SrError::Device)?;
         instr.sync_to_device().map_err(SrError::Device)?;
-        let in_len = cfg.n_tiles * cfg.tile.in_bytes;
-        let out_len = cfg.n_tiles * cfg.tile.out_bytes;
+        let n_pad = cfg.n_tiles_padded.unwrap_or(cfg.n_tiles);
+        let in_len = n_pad * cfg.tile.in_bytes;
+        let out_len = n_pad * cfg.tile.out_bytes;
         let bo_in = dev.alloc_bo(&kern, in_len, FLAG_HOST_ONLY, g(3)?).map_err(SrError::Device)?;
         let bo_out = dev.alloc_bo(&kern, out_len, FLAG_HOST_ONLY, g(4)?).map_err(SrError::Device)?;
         Ok(Fsr1Engine {
@@ -166,6 +171,11 @@ impl Fsr1Engine {
                 }
             }
             buf[3 * rows * g.rs] = t.flags;
+        }
+        let used = self.tiles.len() * g.in_bytes;
+        let (head, pad) = self.inbuf.split_at_mut(used);
+        for chunk in pad.chunks_exact_mut(g.in_bytes) {
+            chunk.copy_from_slice(&head[used - g.in_bytes..]);
         }
     }
 
