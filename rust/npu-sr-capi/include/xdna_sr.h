@@ -13,6 +13,22 @@
  */
 typedef struct XdnaSr XdnaSr;
 
+/**
+ * Padded-frame geometry a `layout: "frame"` fsr1 backend expects, for a zero-copy dma-buf caller
+ * that builds its own buffers. See [`xdna_sr_frame_layout`].
+ */
+typedef struct XdnaSrFrameLayout {
+  uintptr_t in_w;
+  uintptr_t in_h;
+  uintptr_t in_pad_w;
+  uintptr_t in_pad_h;
+  uintptr_t in_pad_x;
+  uintptr_t in_pad_y;
+  uintptr_t out_pad_w;
+  uintptr_t out_pad_h;
+  uintptr_t scale;
+} XdnaSrFrameLayout;
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -61,6 +77,20 @@ int xdna_sr_process_bgra8(struct XdnaSr *h,
                           uintptr_t out_cap,
                           uintptr_t *out_w,
                           uintptr_t *out_h);
+
+/**
+ * Fills `*out` with the loaded backend's padded-frame geometry and returns 0 if it takes padded
+ * BGRA frames (fsr1 frame layout); <0 (e.g. a conv-net or tiled-fsr1 schedule) otherwise.
+ */
+int xdna_sr_frame_layout(const struct XdnaSr *h, struct XdnaSrFrameLayout *out);
+
+/**
+ * Zero-copy dispatch: `in_fd`/`out_fd` are dma-buf fds of BGRA8 buffers laid out per
+ * `xdna_sr_frame_layout` (in: producer-filled INCLUDING the edge-replicated padding; out: the full
+ * padded output). Imports and caches each fd (by the dma-buf's inode). Blocking: returns after the
+ * NPU finished. `*out_fence_fd` is set to -1 (reserved for an async version). <0 on error.
+ */
+int xdna_sr_process_dmabuf(struct XdnaSr *h, int in_fd, int out_fd, int *out_fence_fd);
 
 /**
  * Free an engine handle.

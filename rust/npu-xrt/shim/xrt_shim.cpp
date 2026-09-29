@@ -256,6 +256,14 @@ int shim_bo_sync_from_device(ShimBo* b) {
   GUARD_INT( b->bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE); return 0; )
 }
 
+ShimBo* shim_bo_import(ShimDevice* d, int fd) {
+  GUARD_PTR( return new ShimBo{ xrt::bo(d->dev, fd) }; )
+}
+
+size_t shim_bo_size(ShimBo* b) {
+  try { return b->bo.size(); } catch (...) { return 0; }
+}
+
 int shim_run_matmul8(ShimKernel* k, unsigned int opcode, ShimBo* instr, size_t instr_count,
                      ShimBo* a, ShimBo* b, ShimBo* c, ShimBo* tmp, ShimBo* trace) {
   GUARD_INT(

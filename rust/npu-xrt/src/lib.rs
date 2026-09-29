@@ -507,6 +507,8 @@ extern "C" {
     fn shim_bo_map(b: *mut CBo) -> *mut c_void;
     fn shim_bo_sync_to_device(b: *mut CBo) -> c_int;
     fn shim_bo_sync_from_device(b: *mut CBo) -> c_int;
+    fn shim_bo_import(d: *mut CDevice, fd: c_int) -> *mut CBo;
+    fn shim_bo_size(b: *mut CBo) -> usize;
     #[allow(clippy::too_many_arguments)]
     fn shim_run_matmul8(
         k: *mut CKernel,
@@ -971,6 +973,21 @@ impl Device {
         } else {
             self.bo_bytes.set(self.bo_bytes.get() + nbytes as u64);
             Ok(Bo { ptr, nbytes, counted: Some(self.bo_bytes.clone()) })
+        }
+    }
+
+    /// Import a dma-buf fd as a device BO for zero-copy dispatch -- `xrt::bo(device, fd)`, the
+    /// amdxdna `is_import_bo()` path proven by the GPU<->NPU probes
+    /// (`import_bo_dispatch.cpp`, `gpu_npu_roundtrip.cpp`). Not counted against
+    /// [`Device::resident_bo_bytes`]: the memory belongs to whoever exported the fd, not to this
+    /// device. `fd` is not consumed or closed (XRT dup()s it internally).
+    pub fn import_bo(&self, fd: c_int) -> Result<Bo> {
+        let ptr = unsafe { shim_bo_import(self.ptr, fd) };
+        if ptr.is_null() {
+            Err(format!("import_bo(fd={fd}): {}", last_error()))
+        } else {
+            let nbytes = unsafe { shim_bo_size(ptr) };
+            Ok(Bo { ptr, nbytes, counted: None })
         }
     }
 

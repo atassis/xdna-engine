@@ -179,6 +179,24 @@ impl SrEngine {
         Ok((ow, oh))
     }
 
+    /// Padded-frame geometry for a zero-copy dma-buf caller. Only the `Fsr1Frame` backend supports
+    /// this (see [`fsr1_frame::FrameLayout`]).
+    pub fn frame_layout(&self) -> Result<fsr1_frame::FrameLayout, SrError> {
+        match self {
+            SrEngine::Fsr1Frame(f) => Ok(f.frame_layout()),
+            _ => Err(SrError::Frame("dma-buf zero-copy needs the fsr1 frame-layout backend".into())),
+        }
+    }
+
+    /// Zero-copy dispatch over dma-buf fds; see [`fsr1_frame::Fsr1FrameEngine::process_dmabuf`].
+    pub fn process_dmabuf(&mut self, in_fd: std::os::raw::c_int, out_fd: std::os::raw::c_int)
+        -> Result<(), SrError> {
+        match self {
+            SrEngine::Fsr1Frame(f) => f.process_dmabuf(in_fd, out_fd),
+            _ => Err(SrError::Frame("dma-buf zero-copy needs the fsr1 frame-layout backend".into())),
+        }
+    }
+
     /// The schedule's integer scale factor (e.g. 3 for ESPCN x3).
     pub fn scale(&self) -> usize {
         match self {
