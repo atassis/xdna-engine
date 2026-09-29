@@ -97,6 +97,50 @@ pub mod phase {
     /// Clear the accumulator. Call before each measured pass.
     pub fn reset() {
         ACC.with(|a| a.borrow_mut().clear());
+        CLIP_START.with(|c| *c.borrow_mut() = None);
+        FIRST_TOKEN_MS.with(|c| *c.borrow_mut() = None);
+    }
+
+    thread_local!(static CLIP_START: RefCell<Option<Instant>> = const { RefCell::new(None) });
+    thread_local!(static FIRST_TOKEN_MS: RefCell<Option<f64>> = const { RefCell::new(None) });
+
+    /// Mark "audio in": call once at the top of a clip's transcribe. TTFT below is measured from
+    /// here. No-op when timing is off.
+    pub fn mark_clip_start() {
+        if timing_on() {
+            CLIP_START.with(|c| *c.borrow_mut() = Some(Instant::now()));
+        }
+    }
+
+    /// Record the first real (non-blank) token emission, once per clip (subsequent calls no-op).
+    /// Called from the TDT decode loop; a no-op if `mark_clip_start` was never called or timing
+    /// is off.
+    pub fn note_first_token() {
+        if !timing_on() {
+            return;
+        }
+        FIRST_TOKEN_MS.with(|c| {
+            let mut c = c.borrow_mut();
+            if c.is_some() {
+                return;
+            }
+            if let Some(start) = CLIP_START.with(|s| *s.borrow()) {
+                *c = Some(start.elapsed().as_secs_f64() * 1000.0);
+            }
+        });
+    }
+
+    /// Time-to-first-token in ms, if a clip was marked and a token was emitted.
+    pub fn first_token_ms() -> Option<f64> {
+        FIRST_TOKEN_MS.with(|c| *c.borrow())
+    }
+
+    /// Zero-duration event counter (e.g. "one real token emitted"), reusing the same accumulator
+    /// so it resets and reports alongside every timed stage. No-op when timing is off.
+    pub fn count_event(stage: &'static str) {
+        if timing_on() {
+            record_raw(stage, Bucket::Host, Duration::ZERO, 1);
+        }
     }
 
     thread_local!(static STAGE: std::cell::Cell<&'static str> = const { std::cell::Cell::new("mm") });

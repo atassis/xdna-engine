@@ -35,7 +35,6 @@ target_suffix=mstat_${M}x${K}x${N}_${m}x${k}x${n}_${n_aie_cols}c
 use_iron=1
 aie_py_src=m_stationary_iron.py
 
-buffer_aloc_flag=basic-sequential
 
 # matmul object: bf16 in, f32 acc, native (NO bfp16 flags). KERNEL_DEFINES carries any fast flags
 # from makefile-common (none here -> native 32x32-style kernel).
@@ -52,6 +51,6 @@ include ${srcdir}/../makefile-common
 # KERNEL_CFLAGS come from. Without it every build dies at "unrecognized arguments".
 include ${srcdir}/../../../../../designs/whole_array_fused/design_override.mk
 
-build/mm_${m}x${k}x${n}.o: ${kernels_dir}/mm.cc
+build/mm_${m}x${k}x${n}.o: ${lib_kernels_dir}/mm-zero/mm_zero.cc ${kernels_dir}/mm.cc
 	mkdir -p ${@D}
 	cd ${@D} && ${KERNEL_CC} ${KERNEL_CFLAGS} ${MM_DEFINES} ${KERNEL_DEFINES} -c $< -o ${@F}

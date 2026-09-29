@@ -290,6 +290,21 @@ pub struct NpuDecodeStep {
     /// (every construction path and every generation that never calls the setter), which keeps
     /// applying the softcap -- the pre-existing behaviour.
     greedy: bool,
+    /// `[positions * d_model]` learned position rows, added to the embedding (`pos_blob`).
+    pos_rows: Option<Vec<f32>>,
+    /// `[vocab]` constant added to the trimmed logits (`logit_bias_blob`).
+    logit_bias: Option<Vec<f32>>,
+}
+
+/// An f32 host blob whose length must be a whole number of `row` elements.
+fn read_f32_blob(artifact: &LlmArtifact, name: &str, row: usize) -> Result<Vec<f32>, EngineError> {
+    let path = artifact.weight_blob_path(name);
+    let bytes = std::fs::read(&path).map_err(|e| EngineError::Load(format!("read {}: {e}", path.display())))?;
+    if bytes.len() % (row * 4) != 0 {
+        return Err(EngineError::Load(format!(
+            "{} is {} bytes, not a whole number of {row}-wide f32 rows", path.display(), bytes.len())));
+    }
+    Ok(bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
 }
 
 /// The host embedding gather, shared verbatim by the per-token and the batched path. Sharing the
@@ -482,7 +497,7 @@ impl NpuDecodeStep {
         // starts at zero can never hold anything else -- every value in it afterwards was
         // written by the model. Load-time, so it costs one memset per load rather than one per
         // request.
-        for name in &artifact.cache_buffers {
+        for name in artifact.cache_buffers.iter().chain(&artifact.cross_buffers) {
             let loc = artifact.loc(name);
             arena
                 .write_at(loc.arena, loc.off, &vec![0u8; loc.len])
@@ -514,12 +529,27 @@ impl NpuDecodeStep {
         // already refused a pair whose prefill half declares a different one.
         let prefill = pre_art.map(|a| NpuPrefill::open(dev, a, &artifact, &arena)).transpose()?;
         let embed = EmbedTable::open(&artifact)?;
+        let pos_rows = artifact.pos_blob.as_deref()
+            .map(|n| read_f32_blob(&artifact, n, artifact.d_model)).transpose()?;
+        let logit_bias = artifact.logit_bias_blob.as_deref()
+            .map(|n| read_f32_blob(&artifact, n, embed.vocab())).transpose()?;
+        if logit_bias.as_ref().is_some_and(|b| b.len() != embed.vocab()) {
+            return Err(EngineError::Load(format!("logit bias is not one vocab ({}) wide", embed.vocab())));
+        }
 
+        let (prefill_artifact_path, prefill_artifact_hash, prefill_toolchain_pin_hash) =
+            match prefill.as_ref().map(NpuPrefill::identity) {
+                Some((path, hash, tc)) => (Some(path), Some(hash), tc),
+                None => (None, None, None),
+            };
         let provenance = ArmProvenance {
             artifact_path: Some(artifact.decode_dir.display().to_string()),
             artifact_hash: Some(artifact_hash),
             toolchain_pin_hash: artifact.toolchain_hash.clone(),
             max_seq: Some(artifact.max_seq as u32),
+            prefill_artifact_path,
+            prefill_artifact_hash,
+            prefill_toolchain_pin_hash,
             ..provenance_extras(&artifact.decode_dir)
         };
 
@@ -548,8 +578,29 @@ impl NpuDecodeStep {
 
         Ok(NpuDecodeStep {
             artifact, arena, buckets, embed, rope_writes, prefill, provenance,
-            media: MediaEmbeds::default(), greedy: false,
+            media: MediaEmbeds::default(), greedy: false, pos_rows, logit_bias,
         })
+    }
+
+    /// Write one of the artifact's `cross_buffers` (bf16 bytes, its full declared length). Call
+    /// [`Self::sync_scratch`] once after the last one.
+    pub fn write_cross(&self, name: &str, bytes: &[u8]) -> Result<(), EngineError> {
+        if !self.artifact.cross_buffers.iter().any(|n| n == name) {
+            return Err(EngineError::Unsupported(format!("`{name}` is not a cross buffer of this artifact")));
+        }
+        let loc = self.artifact.loc(name);
+        if bytes.len() != loc.len {
+            return Err(EngineError::Device(format!("{name}: {} bytes, layout declares {}", bytes.len(), loc.len)));
+        }
+        self.arena.write_at(loc.arena, loc.off, bytes).map_err(|e| EngineError::Device(format!("write {name}: {e}")))
+    }
+
+    pub fn sync_scratch(&self) -> Result<(), EngineError> {
+        self.arena.sync_to_device().map_err(|e| EngineError::Device(format!("sync scratch: {e}")))
+    }
+
+    pub fn artifact(&self) -> &LlmArtifact {
+        &self.artifact
     }
 
     /// `(window, kernel name)` for every bucket, ascending by window. The kernel name is what
@@ -781,7 +832,16 @@ impl DecodeStep for NpuDecodeStep {
     }
 
     fn step(&mut self, token: u32, pos: usize) -> Result<Vec<f32>, EngineError> {
-        let x_bytes = multimodal::embed_row(&self.embed, &self.media, token, pos)?;
+        let mut x_bytes = multimodal::embed_row(&self.embed, &self.media, token, pos)?;
+        if let Some(t) = &self.pos_rows {
+            let d = self.embed.d_model();
+            let row = t.get(pos * d..(pos + 1) * d).ok_or_else(|| {
+                EngineError::Unsupported(format!("position {pos} is past the {}-row position table", t.len() / d))
+            })?;
+            let mut v = unpack_bf16_bytes(&x_bytes);
+            v.iter_mut().zip(row).for_each(|(a, b)| *a += b);
+            x_bytes = Cow::Owned(pack_bf16_bytes(&v));
+        }
         let x_loc = self.artifact.loc("x");
         self.arena
             .write_at(x_loc.arena, x_loc.off, &x_bytes)
@@ -898,6 +958,9 @@ impl DecodeStep for NpuDecodeStep {
             .map_err(|e| EngineError::Device(format!("read {out_name}: {e}")))?;
         let mut logits = unpack_bf16_bytes(&bytes);
         logits.truncate(self.embed.vocab());
+        if let Some(b) = &self.logit_bias {
+            logits.iter_mut().zip(b).for_each(|(l, b)| *l += b);
+        }
         // Strictly monotonic, so a greedy (argmax) step gets the same token either way -- skip it.
         if !self.greedy {
             apply_logit_softcap(&mut logits, self.artifact.logit_softcap);

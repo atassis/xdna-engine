@@ -39,7 +39,6 @@ target_suffix=${m}x${k}x${n}_${mode}
 use_iron=1
 aie_py_src=phase_probe_iron.py
 
-buffer_aloc_flag=basic-sequential
 
 # mm.cc bf16->f32 single-tile matmul (same defines the Step-B halfprobe uses)
 MM_DEFINES=-Dbf16_f32_ONLY -DDIM_M=${m} -DDIM_K=${k} -DDIM_N=${n} -DVECTORIZED_ONLY

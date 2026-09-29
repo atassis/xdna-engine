@@ -55,7 +55,6 @@ use_iron=1
 aie_py_src=whole_array_silu_iron.py
 
 # Linear buffer allocation (bank-aware tends to overflow with the extra acc bufs)
-buffer_aloc_flag=basic-sequential
 
 # matmul object needs the bf16_f32 combo defines (mm.cc names symbols by combo).
 MM_DEFINES=-Dbf16_f32_ONLY -DDIM_M=${m} -DDIM_K=${k} -DDIM_N=${n} -DVECTORIZED_ONLY
@@ -74,7 +73,7 @@ include ${srcdir}/../makefile-common
 include ${srcdir}/../../../../../designs/whole_array_fused/design_override.mk
 
 # matmul object: bf16 in, f32 acc.
-build/mm_${m}x${k}x${n}.o: ${kernels_dir}/mm.cc
+build/mm_${m}x${k}x${n}.o: ${lib_kernels_dir}/mm-zero/mm_zero.cc ${kernels_dir}/mm.cc
 	mkdir -p ${@D}
 	cd ${@D} && ${KERNEL_CC} ${KERNEL_CFLAGS} ${MM_DEFINES} -c $< -o ${@F}
 

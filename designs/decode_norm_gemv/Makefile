@@ -78,9 +78,9 @@ MM_DEFINES = -Dbf16_f32_ONLY -DDIM_M=${m} -DDIM_K=${k} -DDIM_N=${n} -DVECTORIZED
 .PHONY: all clean sweep help
 all: ${xclbin}
 
-build/mm_${m}x${k}x${n}.o: ${kernels_dir}/mm.cc
+build/mm_${m}x${k}x${n}.o: ${srcdir}/../../aie_kernels/mm-zero/mm_zero.cc ${kernels_dir}/mm.cc
 	mkdir -p ${@D}
-	cd ${@D} && ${KERNEL_CC} ${PEANOWRAP2P_FLAGS} ${MM_DEFINES} -c $< -o ${@F}
+	cd ${@D} && ${KERNEL_CC} ${PEANOWRAP2P_FLAGS} -I${kernels_dir} ${MM_DEFINES} -c $< -o ${@F}
 
 build/kernels_${m}x${k}x${n}.a: build/mm_${m}x${k}x${n}.o
 	ar rvs $@ $+
@@ -94,7 +94,7 @@ ${mlir}: ${srcdir}/norm_gemv_iron.py
 # `make .../insts_*.txt` resolves instead of treating it as an untracked side effect.
 ${xclbin} ${insts} &: ${mlir} build/kernels_${m}x${k}x${n}.a
 	mkdir -p ${@D}
-	cd ${@D} && ${AIECC} --alloc-scheme=basic-sequential --get-xclbin \
+	cd ${@D} && ${AIECC} --get-xclbin \
 	  --xclbin-name=$(notdir ${xclbin}) \
 	  --peano ${PEANO_INSTALL_DIR} \
 	  --get-npu-insts --npu-insts-name=$(notdir ${insts}) $(notdir ${mlir})

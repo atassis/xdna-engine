@@ -1,8 +1,8 @@
 # aie_kernels/ index
 
-One row per kernel directory (48). Dtypes and shape contract are read from each
+One row per kernel directory (50). Dtypes and shape contract are read from each
 kernel's own `.cc` header and, where present, its `golden.py` -- not inferred from the
-directory name. `golden.py` is a straight yes/no: 31 of 48 dirs have one, 17 do not
+directory name. `golden.py` is a straight yes/no: 33 of 50 dirs have one, 17 do not
 (the 17 were built and verified only through the designs that consume them, never
 independently -- see the `golden.py` column). Covering harness comes from
 `aie_kernels/_test/` after the family-harness rename (see `_test/README.md`).
@@ -29,6 +29,8 @@ unpopulated placeholder (`ignore = all`), so it cannot answer this question.
 | cast-quant-bf16-int8 | yes | bf16<->int8 (per-tensor scale), bf16<->f32 | 1 row of `cols`, cols%N==0; 4 entry points | `verify_cast_quant.py` | unverified in this index |
 | census-coresident-body | no | f32 | 1 row of `cols`; measurement-only, "not a shipped path" per header | none found | unverified in this index |
 | conformer-epilogues | yes | f32 accumulator in -> bf16 out (SiLU/GLU/BatchNorm/residual-add) | per-tile, N=1024 lanes (d_model); GLU pairs col j with col N+j (layout-dependent) | `conf_epi_silu_design.py` (own dir, not `_test/`; SiLU node only; IRON build harness, no golden-comparison logic in the file) | unverified in this index |
+| conv2d-1x1-cat | yes | int8 x int8 -> int32, same per-channel requant as conv2d-3x3-u8 | 1x1 over up to 4 source rows read by pointer (no concat copy), each source's scale folded into its weight slice; same row layout | `verify_conv1x1_cat.py` | GREEN 2/2 bit-exact on device, 2026-09-27 |
+| conv2d-3x3-u8 | yes | int8 weights x uint8/int8/int16 activations -> int32 acc; per-channel requant `sat16(acc>>pre)*mult>>shift`; out uint8/int8/int16 | one output row per call, rows channel-blocked `[C/8][W+16][8]` with 8-px zero margins; width%16, CIN%8, COUT%16; epilogues: int8 LUT, int8->int16 LUT, SPAN gate; compiled-in tables (`CONV3X3_LUT_INC`) | `verify_conv3x3_u8.py` | GREEN 20/20 bit-exact on device, 2026-09-27 (branch feat/fused-espcn) |
 | conv-1d | yes | f32 | ONE output channel per call; x:[c_in,t], w_row:[c_in*k]; causal, dilation-aware | `verify_conv_1d.py` | unverified in this index |
 | conv-transpose-1d | yes | f32 | ONE output channel per call, scalar (avoids unaligned vector stores at strides 8/8/4/2) | `verify_conv_transpose_1d.py` | GREEN, rel-L2 3.894e-08 (cited in `verify_sin.py`'s 2026-07-31 docstring) |
 | dequant-int4-group | yes | int4 (packed 2/byte) -> bf16; scale f32; zero-point int8 (optional) | 1 row of `cols` int4-packed values; GROUP granularity, GROUP%N==0, cols%GROUP==0 | `verify_dequant_int4_group.py` | unverified in this index |

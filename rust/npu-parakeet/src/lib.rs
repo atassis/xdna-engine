@@ -17,8 +17,10 @@ pub mod decoder;
 pub mod encoder;
 pub mod errors;
 pub mod ffn_rail;
+pub mod mel;
 #[cfg(feature = "npu")]
 pub mod npu;
+pub mod onnx_init;
 pub mod ops;
 pub mod pos;
 pub mod prof;

@@ -42,7 +42,7 @@ CXXFLAGS := -O2 -std=c++20 --target=aie2p-none-unknown-elf \
   -Wno-parentheses -Wno-attributes -Wno-macro-redefined -Wno-empty-body \
   -Wno-missing-template-arg-list-after-template-kw -DNDEBUG -I $(INC)
 
-AIECC := aiecc --alloc-scheme=basic-sequential --get-xclbin \
+AIECC := aiecc --get-xclbin \
   --peano $(PEANO_INSTALL_DIR) \
   --get-npu-insts
 
@@ -54,9 +54,9 @@ all: onecol
 #     kernels tree, so we compile it from a temp copy placed there). ---
 kernels: $(BUILD)/mm_$(m)x$(k)x$(n).o $(BUILD)/mm_silu_epilogue_$(m)x$(k)x$(n).o
 
-$(BUILD)/mm_$(m)x$(k)x$(n).o: $(KDIR)/mm.cc
+$(BUILD)/mm_$(m)x$(k)x$(n).o: $(REPO)/aie_kernels/mm-zero/mm_zero.cc $(KDIR)/mm.cc
 	@mkdir -p $(BUILD)
-	$(CXX) $(CXXFLAGS) -DDIM_M=$(m) -DDIM_K=$(k) -DDIM_N=$(n) -c $< -o $@
+	$(CXX) $(CXXFLAGS) -I$(KDIR) -DDIM_M=$(m) -DDIM_K=$(k) -DDIM_N=$(n) -c $< -o $@
 
 $(BUILD)/mm_silu_epilogue_$(m)x$(k)x$(n).o: $(EPISRC)
 	@mkdir -p $(BUILD)

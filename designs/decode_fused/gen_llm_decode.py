@@ -132,6 +132,7 @@ except ModuleNotFoundError:                                                     
 import precision  # noqa: E402
 import pack_cache  # noqa: E402
 from iron.operators.rms_norm.op import RMSNorm  # noqa: E402
+from iron.operators.layer_norm.op import LayerNorm  # noqa: E402
 from iron.operators.rope.op import RoPE  # noqa: E402
 from iron.operators.elementwise_add.op import ElementwiseAdd  # noqa: E402
 from iron.operators.elementwise_mul.op import ElementwiseMul  # noqa: E402
@@ -1687,6 +1688,13 @@ def _swiglu_default_tile_rows_gu():
     return _swiglu_design.TSI_GU
 
 
+def tmv_column_groups(n_matrices):
+    """How many TMatVec calls one context step takes. TMatVec places one matrix per column, so a
+    head count above COLS runs as equal groups over byte slices of a flat cache."""
+    return next(g for g in range(1, n_matrices + 1)
+                if n_matrices % g == 0 and n_matrices // g <= COLS)
+
+
 def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_plan=None):
     """Construct the fused decode graph + its weight dict for a spec.
 
@@ -1818,7 +1826,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # ...and no geometry may be OUTPUT-CHUNKED: blocked A and m_chunk both want all four of
     # TMatVec's access-pattern dims, which the operator asserts against. This gate has to agree, or
     # enabling the global geometry flips the cache to a layout that cannot be built.
-    KV_BLOCK_ELIGIBLE = GROUPED_K and TMV_CTX and not _tmv_declined and not _tmv_chunked
+    KV_BLOCK_ELIGIBLE = (GROUPED_K and TMV_CTX and not _tmv_declined and not _tmv_chunked
+                         and all(_hkv <= COLS for _, _hkv, _ in geoms))
     _kv_block_env = os.environ.get("KV_BLOCK_T")
     if _kv_block_env is not None:
         T = int(_kv_block_env)
@@ -1970,6 +1979,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # have run and been quietly wrong.
     op_norm = RMSNorm(size=D, num_aie_columns=1, num_channels=1, tile_size=D,
                       weighted=True, epsilon=sp.eps, bf16_scale=RMS_BF16_SCALE, context=ctx)
+    # Normalise-only: its gain and bias are folded into the projection it feeds (see encdec_rl).
+    op_ln = (LayerNorm(size=D, num_aie_columns=1, num_channels=1, tile_size=D, context=ctx)
+             if sp.norm_kind == "layer" else None)
     # Wo weight-stream dtype axis (see QUANT_ATTN_DTYPE above). bf16 (default) is byte-for-byte the
     # pre-existing path.
     attn_quant_kw = _quant_kw("attn_o")
@@ -2562,6 +2574,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # SOFTMAX_SEGMENT chunking) have nothing to gate for an op nobody dispatches.
         op_rep_k = op_rep_v = op_scores = op_trv = op_ctx = None
         uses_tmv = False
+        tmv_groups = tmv_column_groups(hkv)
         if not is_flash_geom:
             op_rep_k = (Repeat(rows=hkv, cols=w * hd, repeat=gqa, transfer_size=hd, context=ctx)
                         if not GROUPED_K else None)
@@ -2605,8 +2618,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             uses_tmv = _tmv is not None
             if uses_tmv:
                 rpc, mc = _tmv
-                op_ctx = TMatVec(M=hd, K=w, num_aie_columns=hkv, num_batches=Hq, batch_group=gqa,
-                                     alloc_K=None if KVA_g == w else KVA_g, block_size=T_g,
+                op_ctx = TMatVec(M=hd, K=w, num_aie_columns=hkv // tmv_groups,
+                                 num_batches=Hq // tmv_groups, batch_group=gqa,
+                                 alloc_K=None if KVA_g == w else KVA_g, block_size=T_g,
                                  rows_per_chunk=rpc, m_chunk=mc, context=ctx, **rtp_extent)
             else:
                 # The fallback reduces along K, and GEMV's runtime extent is its M. Left at the
@@ -2672,7 +2686,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             op_rep_k=op_rep_k, op_rep_v=op_rep_v, op_scores=op_scores, op_trv=op_trv,
             op_ctx=op_ctx, op_v_norm=op_v_norm, has_v=has_v, kv_parts=kv_parts,
             uses_tmv_ctx=uses_tmv, scores_groups=scores_groups, scores_block=T_k,
-            op_softmax=op_softmax, op_scale=op_scale, mask_slot=mask_slot, window=w,
+            tmv_groups=tmv_groups, op_softmax=op_softmax, op_scale=op_scale, mask_slot=mask_slot, window=w,
             capacity=KVA_g, kv_block=T_g, op_attn_weightless=op_attn_weightless,
             op_attn_global_flash=op_attn_global_flash,
             op_attn_block=op_attn_block, circular=(w != S))
@@ -2868,6 +2882,37 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # anyway, so plain "none" (no _w_prologue call) is both correct and inert here.
         op_down = gemv(D, FF, ctx, **mlp_quant_kw)
     op_add = ElementwiseAdd(size=D, tile_size=D // COLS, num_aie_columns=COLS, context=ctx)
+    _bias_ops = {D: op_add}
+
+    def op_bias(n):
+        """The add that applies an n-wide projection bias; one design per width."""
+        if n not in _bias_ops:
+            _bias_ops[n] = ElementwiseAdd(size=n, tile_size=n // COLS, num_aie_columns=COLS,
+                                          context=ctx)
+        return _bias_ops[n]
+
+    xg = None
+    if sp.cross_len is not None:
+        if not (FUSE_QKV_GEMV and TMV_CTX and HD in tmv_rpc and tmv_rpc[HD] is not None):
+            raise SystemExit(f"{sp.name}: the encoder-decoder block is built on the FUSE_QKV_GEMV "
+                             f"+ TMV_CTX arm only")
+        # Cross-attention is the self-attention step over a pre-filled window: TP rows allocated,
+        # the first cross_len valid, so the softmax extent is a build-time constant and nothing
+        # appends. Zero pad rows are masked to zero weight.
+        TP = sp.cross_len_padded()
+        _xr = TMV_RPC
+        from iron.operators.tmatvec.design import check_l1_fits
+        while _xr > 1 and (TP % _xr or check_l1_fits(HD, TP, 1, _xr) is not None):
+            _xr //= 2
+        _xn = tmv_column_groups(Hq)
+        xg = SimpleNamespace(
+            hd=HD, hkv=Hq, capacity=TP, window=TP, tmv_groups=_xn,
+            op_scores=gemv(TP, HD, ctx, num_batches=Hq),
+            op_softmax=Softmax(rows=Hq, cols=TP, num_aie_columns=sp.softmax_cols(COLS),
+                               num_channels=1, rtp_vector_size=sp.cross_len,
+                               segment=softmax_segment(TP), context=ctx),
+            op_ctx=TMatVec(M=HD, K=TP, num_aie_columns=Hq // _xn, num_batches=Hq // _xn,
+                           rows_per_chunk=_xr, context=ctx))
     # Gated DeltaNet (linear attention) op vocabulary, shared by every such layer. A layer of this
     # kind produces `cx` like attention does, and out_proj takes Wo's slot, so everything from o_proj
     # on is the attention path's own. Imported lazily: only IRON trees carrying the two ops need them.
@@ -3001,13 +3046,106 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
              f"{p}sc[{i*n*g.window*2}:{(i+1)*n*g.window*2}]")
             for i in range(g.scores_groups)
         ]
+    def ctx_runlist(g, v, sw, cx):
+        """The context step, as g.tmv_groups TMatVec calls over head slices of a flat cache."""
+        n = g.tmv_groups
+        if n == 1:
+            return [(g.op_ctx, v, sw, cx)]
+        vb, sb, cb = (g.hkv // n) * g.capacity * g.hd * 2, (Hq // n) * g.window * 2, \
+            (Hq // n) * g.hd * 2
+        return [(g.op_ctx, f"{v}[{i * vb}:{(i + 1) * vb}]", f"{sw}[{i * sb}:{(i + 1) * sb}]",
+                 f"{cx}[{i * cb}:{(i + 1) * cb}]") for i in range(n)]
+
+    def encdec_rl(l, g, p, cur, nxt):
+        """One Whisper decoder layer: self-attention, cross-attention, ungated MLP, each
+        pre-LayerNorm with a residual add. Loads and folds the layer's weights as it goes.
+
+        LayerNorm affine is folded into the projection it feeds -- W*g and W@beta + b -- and the
+        attention scale into q, so every norm on the device is normalise-only and there is no
+        scale op."""
+        t = {k: npy(v[0]) for k, v in sp.encdec_tensors(l).items()}
+
+        def fold(w, b, nk, scale=1.0):
+            return (w * t[nk][None, :] * scale,
+                    ((w @ t[nk + "_b"]) + (0.0 if b is None else b)) * scale)
+
+        s_ = sp.attn_scale
+        wq, bq = fold(t["Wq"], t["bq"], "n_in", s_)
+        wk, bk = fold(t["Wk"], None, "n_in")
+        wv, bv = fold(t["Wv"], t["bv"], "n_in")
+        weights[p + "Wqkv"] = np.concatenate([_pack(w, "qkv") for w in (wq, wk, wv)])
+        weights[p + "bqkv"] = bf16(np.concatenate([bq, bk, bv]))
+        wxq, bxq = fold(t["xWq"], t["xbq"], "n_x", s_)
+        weights[p + "Wxq"] = _pack(wxq, "qkv")
+        wu, bu = fold(t["Wu"], t["bu"], "n_pf")
+        weights[p + "Wu"] = _pack(wu, "mlp")
+        for key, w, n in (("Wo", t["Wo"], g.o_chunks), ("Wxo", t["xWo"], g.o_chunks),
+                          ("Wd", t["Wd"], down_chunks)):
+            parts = np.split(w, n, axis=1) if n > 1 else [w]
+            for i, part in enumerate(parts):
+                site = "mlp" if key == "Wd" else "attn_o"
+                weights[p + key + (f"k{i}" if n > 1 else "")] = _pack(
+                    np.ascontiguousarray(part), site)
+        for key, b in (("bo", t["bo"]), ("bxq", bxq), ("bxo", t["xbo"]), ("bu", bu),
+                       ("bd", t["bd"])):
+            weights[p + key] = bf16(b)
+        TP = xg.capacity
+        for key in ("kc", "vc"):
+            weights[p + key] = np.zeros(g.hkv * g.capacity * g.hd, BF16)
+        for key in ("kx", "vx"):
+            weights[p + key] = np.zeros(Hq * TP * HD, BF16)
+        cache_names.extend((p + "kc", p + "vc"))
+        cross_names.extend((p + "kx", p + "vx"))
+
+        qkvb, kb, vb = p + "qkv", g.qd * 2, (g.qd + g.kvd) * 2
+        ref_q, ref_k, ref_v = (f"{qkvb}[0:{kb}]", f"{qkvb}[{kb}:{vb}]",
+                               f"{qkvb}[{vb}:{vb + g.kvd * 2}]")
+        o_self = split_over_k(g.op_o, p + "Wo", p + "cx", p + "a", g.o_chunks, g.qd, p + "a")
+        o_cross = split_over_k(g.op_o, p + "Wxo", p + "cxx", p + "ax", g.o_chunks, g.qd, p + "ax")
+        bufsz.update({
+            qkvb: (g.qd + 2 * g.kvd) * 2, p + "kc": g.hkv * g.capacity * g.hd * 2,
+            p + "vc": g.hkv * g.capacity * g.hd * 2, p + "kx": Hq * TP * HD * 2,
+            p + "vx": Hq * TP * HD * 2, p + "sc": Hq * g.window * 2, p + "sw": Hq * g.window * 2,
+            p + "scx": Hq * TP * 2, p + "swx": Hq * TP * 2, p + "g": FF * 2, p + "gh": FF * 2,
+            **{p + k: D * 2 for k in ("hn", "hx", "hf", "a", "ax", "x1", "x2", "d")},
+            **{p + k: g.qd * 2 for k in ("cx", "cxx", "qx")},
+            **{step[-1]: D * 2 for step in (*o_self, *o_cross, *down_runlist(p))},
+        })
+        return [
+            (op_ln, cur, p + "hn"),
+            (g.op_qkv, p + "Wqkv", p + "hn", qkvb),
+            (op_bias(g.qd + 2 * g.kvd), qkvb, p + "bqkv", qkvb),
+            (g.op_sck, ref_k, p + "kc"), (g.op_scv, ref_v, p + "vc"),
+            *scores_runlist(p, g, ref_q),
+            (g.op_softmax, p + "sc", p + "sw"),
+            *ctx_runlist(g, p + "vc", p + "sw", p + "cx"),
+            *o_self, (op_add, p + "a", p + "bo", p + "a"),
+            (op_add, cur, p + "a", p + "x1"),
+            (op_ln, p + "x1", p + "hx"),
+            (g.op_q, p + "Wxq", p + "hx", p + "qx"),
+            (op_bias(g.qd), p + "qx", p + "bxq", p + "qx"),
+            (xg.op_scores, p + "kx", p + "qx", p + "scx"),
+            (xg.op_softmax, p + "scx", p + "swx"),
+            *ctx_runlist(xg, p + "vx", p + "swx", p + "cxx"),
+            *o_cross, (op_add, p + "ax", p + "bxo", p + "ax"),
+            (op_add, p + "x1", p + "ax", p + "x2"),
+            (op_ln, p + "x2", p + "hf"),
+            (op_gate, p + "Wu", p + "hf", p + "g"),
+            (op_bias(FF), p + "g", p + "bu", p + "g"),
+            (op_act, p + "g", p + "gh"),
+            *down_runlist(p), (op_add, p + "d", p + "bd", p + "d"),
+            (op_add, p + "x2", p + "d", nxt),
+        ]
+
     # W_head weight-stream dtype axis (see QUANT_HEAD_DTYPE above -- READ THE TIED-EMBEDDING NOTE
     # before turning this on).
     head_quant_kw = _quant_kw("head")
-    op_head = gemv(VOCAB, D, ctx, **head_quant_kw, **_w_prologue("on"))
+    VOCAB_M = sp.padded_vocab(COLS, TSI)
+    op_head = gemv(VOCAB_M, D, ctx, **head_quant_kw, **_w_prologue("on"))
 
     weights, bufsz, cache_names, rl = {}, {}, [], []
     recurrent_names = []   # the cache buffers a position mask cannot hide; see npu_decode.rs reset()
+    cross_names = []       # host-written once per utterance: neither weights nor reset by a new prompt
     if sp.v_norm:
         # The gainless v-norm's gain, one per head_dim and shared by EVERY layer -- a true constant,
         # unlike the per-layer learned gains beside it, so it is registered once here rather than in
@@ -3114,6 +3252,10 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # were module-level; Gemma-4-12B is where it starts returning two.
         g = attn_ops(sp.head_dim_for(l), sp.n_kv_heads_for(l), sp.has_v_proj(l))
         p = f"L{l}_"
+        if xg is not None:
+            rl += encdec_rl(l, g, p, cur, f"x{l + 1}")
+            cur = f"x{l + 1}"
+            continue
         nm = sp.norm_weight_names(l)
         for key, tensor in nm.items():
             w = load_norm(tensor)
@@ -3521,7 +3663,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                         (g.op_softmax, p + "sc", p + "sw"),
                         *([] if g.uses_tmv_ctx else
                           [(g.op_trv, p + ("vc" if GROUPED_V else "vr"), p + "vt")]),
-                        (g.op_ctx, p + ("vc" if g.uses_tmv_ctx else "vt"), p + "sw", p + "cx"),
+                        *(ctx_runlist(g, p + "vc", p + "sw", p + "cx") if g.uses_tmv_ctx else
+                          [(g.op_ctx, p + "vt", p + "sw", p + "cx")]),
                     ]
             if sp.attn_output_gate and not lin:
                 # cx *= sigmoid(gate), gate = Wgate @ hn -- `hn` is the head's own normed input.
@@ -3606,7 +3749,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         if fuse_o or op_decode_layer is not None:
             bufsz["mlp_a_scratch"] = D * 2   # a's own all-gather round-trip buffer, same idiom
 
-    weights["n_final"] = load_norm(f"{sp.weight_prefix}norm.weight")
+    if sp.norm_kind == "rms":
+        weights["n_final"] = load_norm(f"{sp.weight_prefix}norm.weight")
     # The DEVICE's lm-head stream and the HOST's embedding-gather table. One tensor on a tied
     # spec, two on an untied one (s1-mini ships `output.weight`), which is why the head is asked
     # for by name rather than assumed to be the table.
@@ -3635,7 +3779,16 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         host_embed = bf16(embed_f32).reshape(-1)
     else:
         weights["W_head"] = bf16(head_f32).reshape(-1)
-    if not scale_in_qnorm:
+    logit_bias = None
+    if sp.norm_kind == "layer":
+        # The final LayerNorm folds into the head like every other one: the device streams
+        # E*g, and E@beta -- a per-vocab constant -- is added by the host with the trim.
+        g_f, b_f = npy(f"{sp.weight_prefix}layer_norm.weight"), npy(f"{sp.weight_prefix}layer_norm.bias")
+        weights["W_head"] = _pack(np.pad(head_f32 * g_f[None, :], ((0, VOCAB_M - VOCAB), (0, 0))),
+                                  "head")
+        embed_blob, host_embed = "W_embed", bf16(embed_f32).reshape(-1)
+        logit_bias = np.asarray(head_f32 @ b_f, np.float32)
+    if not scale_in_qnorm and xg is None:
         weights["attn_scale"] = np.full(Hq * S, sp.attn_scale, BF16)
     if G4_W_PROLOGUE and not SPLIT_LM_HEAD:
         # Folds the final RMSNorm into op_head's own prologue (same mechanism as Wqkv's, above):
@@ -3643,11 +3796,12 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # shares it), the configure too.
         rl += [(op_head, "W_head", cur, "n_final", "logits")]
     else:
-        rl += [(op_norm, cur, "n_final", "xf")]
+        rl += [(op_ln, cur, "xf") if op_ln is not None else (op_norm, cur, "n_final", "xf")]
         if not SPLIT_LM_HEAD:
             rl += [(op_head, "W_head", "xf", "logits")]
         bufsz["xf"] = D * 2
-    bufsz["logits"] = VOCAB * 2
+    bufsz["logits"] = VOCAB_M * 2
+    final_hidden = "xf" if "xf" in bufsz else None
 
     if os.environ.get("DUMP_OPS"):
         from collections import Counter
@@ -3665,7 +3819,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # rope_global not found in runlist buffers" -- because no op consumes it. Same rule as
     # the per-layer `ang` selection above, read over the range that was emitted.
     angs = {"rope_global" if sp.is_global(l) else "rope_local" for l in range(NL)
-            if sp.mixer_for(l) == "full_attention"}
+            if sp.mixer_for(l) == "full_attention" and sp.pos_embed == "rope"}
     inputs = ["x"] + [n for n in ("rope_global", "rope_local") if n in angs]
     # cores-per-col=1 spreads each operator's workers one per column instead of stacking them four
     # deep in two columns, which is what the default column-major SequentialPlacer does. Every op
@@ -3802,7 +3956,10 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                   f"{len(_extra) + 1} named control codes in one ELF")
         _scratch_order_kw = {}
         if BUCKET_SCRATCH_ORDER:
-            _scratch_order_kw = {"scratch_order": list(weights.keys())}
+            # The host reads final_hidden by offset, so it must sit ahead of the window-sized
+            # scratch with the weights, or it moves between buckets.
+            _scratch_order_kw = {"scratch_order": list(weights.keys())
+                                 + ([final_hidden] if final_hidden in seg_bufsz else [])}
         elif SCRATCH_ORDER_FROM:
             _ref_order, _ref_lens = _reference_scratch_layout(_SCRATCH_ORDER_ENTRIES)
             _candidates = set(weights) | set(seg_bufsz)
@@ -3875,12 +4032,13 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         head = OperatorSequence(
             f"{sequence_name(sp, NL, S, placer_flags, tmv_declined=_tmv_declined, tmv_chunked=_tmv_chunked, mlp_dp_active=op_mlp_dp is not None, mlp_o_active=fuse_o)}_lmhead", head_rl,
                                 input_args=["xf"], output_args=["logits"],
-                                buffer_sizes={"xf": D * 2, "logits": VOCAB * 2},
+                                buffer_sizes={"xf": D * 2, "logits": VOCAB_M * 2},
                                 context=ctx, extra_flags=placer_flags, share_designs=share)
         head.compile()
     return sp, fused, weights, dict(NL=NL, S=S, T=T, inputs=inputs, cache_names=cache_names,
                                         recurrent_names=recurrent_names,
-                                        final_hidden="xf" if "xf" in bufsz else None,
+                                        cross_names=cross_names,
+                                        final_hidden=final_hidden,
                                         decode_layer_active=op_decode_layer is not None,
                                         # getattr, not attribute access: a spec whose fused
                                         # layer did not build has no such attribute.
@@ -3895,6 +4053,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                                     head=head, split_lm_head=SPLIT_LM_HEAD,
                                     segments=segments, layer_marks=layer_marks,
                                     embed_blob=embed_blob, host_embed=host_embed,
+                                    logit_bias=logit_bias,
                                     kv_slots=kv_slots, mask_slots=mask_slots,
                                     geom_slots=geom_slots, flash_slots=flash_slots)
 
@@ -3982,12 +4141,17 @@ def main():
         # A cache buffer's blob is always zero (the host zeroes it at load, never trusts the
         # disk) -- ship no `.bin` at all rather than 4.63 GB of holes. `layout` still declares
         # it, so the loader zero-fills by name+length instead of an unfilled scratch buffer.
-        if n_ in cache_names:
+        if n_ in cache_names or n_ in md["cross_names"]:
             continue
         write_blob(os.path.join(bdir, f"{n_}.bin"), b)
     if embed_blob != "W_head":
         # Host-only, deliberately not in `wnames`: see the tied-embedding note at its build site.
         write_blob(os.path.join(bdir, f"{embed_blob}.bin"), weight_bytes(host_embed))
+    if md["logit_bias"] is not None:
+        write_blob(os.path.join(bdir, "logit_bias.bin"), md["logit_bias"].tobytes())
+    if sp.pos_embed == "learned":
+        pos_tab = np.load(os.path.join(a.weights, f"{sp.weight_prefix}embed_positions.weight.npy"))
+        write_blob(os.path.join(bdir, "W_pos.bin"), np.asarray(pos_tab, np.float32).tobytes())
     elf_prov = write_elf(os.path.join(a.out, "decode.elf"), elf)
 
     meta = {
@@ -4003,7 +4167,8 @@ def main():
         # Cache buffers are excluded here (they carry no blob -- see the write loop above) but
         # stay in `layout` and `cache_buffers` below, so an old consumer that only reads `weights`
         # simply uploads fewer names and the loader's own `cache_buffers` pass still zeroes them.
-        "inputs": inputs, "weights": [n for n in wnames if n not in cache_names], "output": "logits",
+        "inputs": inputs, "weights": [n for n in wnames if n not in cache_names and n not in md["cross_names"]],
+        "output": "logits",
         # Which blob the HOST gathers embed[token] from. Always bf16 [vocab, d_model]; it is
         # W_head itself unless the lm-head was quantised, in which case W_head is packed and this
         # names the bf16 sidecar. Absent in older artifacts -- consumers default to "W_head".
@@ -4093,9 +4258,15 @@ def main():
                           "rope_rotary_dim": sp.rope_rotary_dim,
                           # final_logit_softcapping: tanh(logits/c)*c, applied by the host after
                           # the logits cross back. Null unless the checkpoint sets it.
-                          "logit_softcap": sp.logit_softcap},
+                          "logit_softcap": sp.logit_softcap,
+                          "pos_embed": sp.pos_embed, "vocab_padded": sp.padded_vocab(COLS, TSI),
+                          **({"logit_bias_blob": "logit_bias", "cross_len": sp.cross_len,
+                              "cross_capacity": sp.cross_len_padded()}
+                             if md["logit_bias"] is not None else {}),
+                          **({"pos_blob": "W_pos"} if sp.pos_embed == "learned" else {})},
         "layer_types": ["global" if sp.is_global(l) else "sliding" for l in range(NL)],
         "cache_buffers": cache_names,
+        **({"cross_buffers": md["cross_names"]} if md["cross_names"] else {}),
         "recurrent_buffers": md["recurrent_names"],
         # `plan` is the whole per-site truth and `projected_mb_per_token` is what it was priced
         # at; the flat keys beside them are the shape npu_decode.rs::provenance_extras reads.

@@ -14,7 +14,7 @@ transformers 5.17.0 nn.Module ops) and reports rel-L2 = ||host-oracle||_2 / ||or
 -- localizing any mismatch to a stage instead of reporting "the tower is wrong".
 
   python scripts/gemma4_towers_host_ref.py \\
-      --weights-dir artifacts/gemma4-12b/towers --oracle-dir <oracle out dir>
+      --weights-dir artifacts/gemma4-12b/towers_qat --oracle-dir <oracle out dir>
 """
 import argparse
 import math

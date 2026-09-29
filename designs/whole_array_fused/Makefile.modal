@@ -339,7 +339,6 @@ use_iron=1
 aie_py_src=whole_array_modal_iron.py
 
 # Linear buffer allocation (bank-aware tends to overflow with the extra acc bufs)
-buffer_aloc_flag=basic-sequential
 
 # matmul object needs the bf16_f32 combo defines (mm.cc names symbols by combo).
 MM_DEFINES=-Dbf16_f32_ONLY -DDIM_M=${m} -DDIM_K=${k} -DDIM_N=${n} -DVECTORIZED_ONLY
@@ -365,7 +364,7 @@ build/.mm_defines.stamp: FORCE
 	@echo '${MM_DEFINES} emu=${emulate_bfloat16_mmul_with_bfp16} iree=${bfp16_iree} bcm=${b_col_maj}' | cmp -s - $@ \
 	  || echo '${MM_DEFINES} emu=${emulate_bfloat16_mmul_with_bfp16} iree=${bfp16_iree} bcm=${b_col_maj}' > $@
 
-build/mm_${m}x${k}x${n}.o: ${kernels_dir}/mm.cc build/.mm_defines.stamp
+build/mm_${m}x${k}x${n}.o: ${lib_kernels_dir}/mm-zero/mm_zero.cc ${kernels_dir}/mm.cc build/.mm_defines.stamp
 	mkdir -p ${@D}
 	cd ${@D} && ${KERNEL_CC} ${KERNEL_CFLAGS} ${MM_DEFINES} ${KERNEL_DEFINES} -c $< -o ${@F}
 

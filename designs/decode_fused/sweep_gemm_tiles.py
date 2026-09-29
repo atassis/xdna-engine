@@ -243,7 +243,8 @@ def run_build(args, shapes, registry_path):
                 "budget": meta.get("budget"), "bytes": meta.get("bytes"),
                 "macs": meta.get("macs"),
                 "key": key_of(shape["M"], shape["K"], shape["N"],
-                              emulate=not args.no_emulate, prio_accuracy=args.prio_accuracy),
+                              emulate=not args.no_emulate, prio_accuracy=args.prio_accuracy,
+                              b_col_maj=shape["b_col_maj"]),
             }
             if entry["elf_md5"]:
                 if entry["elf_md5"] in md5s:
@@ -479,6 +480,7 @@ def run_seed_current(args, registry_path):
 
 def run_seed_one(args, registry_path):
     shape = parse_shape(args.seed)
+    shape["b_col_maj"] = not args.b_row_major
     tm, tk, tn = (int(v) for v in args.tile.split(","))
     reg = Registry.load(registry_path) if Path(registry_path).is_file() else Registry({}, Path(registry_path))
     key = reg.record(shape["M"], shape["K"], shape["N"], tm, tk, tn, args.seed_cols,
@@ -536,6 +538,7 @@ def main():
                     help="winner rule at ingest")
     ap.add_argument("--seed", default=None, help="MxKxN[:label] -- write ONE unmeasured entry")
     ap.add_argument("--tile", default="64,64,64", help="tile_m,tile_k,tile_n for --seed")
+    ap.add_argument("--b-row-major", action="store_true", help="--seed a b_col_maj=False entry")
     ap.add_argument("--seed-cols", type=int, default=8, help="cols for --seed")
     ap.add_argument("--source", default="assumed", choices=("seed", "assumed"),
                     help="provenance for --seed and --seed-current. 'seed' claims the entry "

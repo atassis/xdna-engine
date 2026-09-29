@@ -96,12 +96,14 @@ pub struct TtsCfg {
 
 /// Decode-backend tier: how far onto the device the decoder runs, not an implementation name, so
 /// a kernel rename or a new artifact dir under an existing tier never touches a scenario file.
-/// Named after the three backends `WhisperAsr::build` already has: `FusedDecoder` (whole-decoder
-/// ELF, one dispatch/token), the per-op `NPU_DECODE` NPU path (~72 dispatches/token), and the host
-/// ONNX decoder graphs -- the one tier that never reaches the device at all.
+/// `Rail` is the decoder built by the LLM decode rail (`gen_llm_decode.py`, `artifacts.decode`), one
+/// dispatch per token including the lm-head; `Fused` the older bespoke whole-decoder ELF; the per-op
+/// `NPU_DECODE` path (~72 dispatches/token); and the host ONNX decoder graphs, the one tier that
+/// never reaches the device at all.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DecodeTier {
+    Rail,
     Fused,
     Dispatched,
     Host,
@@ -110,6 +112,7 @@ pub enum DecodeTier {
 impl DecodeTier {
     pub fn as_str(self) -> &'static str {
         match self {
+            DecodeTier::Rail => "rail",
             DecodeTier::Fused => "fused",
             DecodeTier::Dispatched => "dispatched",
             DecodeTier::Host => "host",
@@ -436,7 +439,8 @@ manifest = "artifacts/pyannote/diarize.json"
     #[test]
     fn decode_backend_field_parses_each_tier_and_rejects_unknown_values() {
         for (word, want) in
-            [("fused", DecodeTier::Fused), ("dispatched", DecodeTier::Dispatched), ("host", DecodeTier::Host)]
+            [("rail", DecodeTier::Rail), ("fused", DecodeTier::Fused), ("dispatched", DecodeTier::Dispatched),
+             ("host", DecodeTier::Host)]
         {
             let toml = format!(
                 "[scenario]\nkind = \"asr\"\nname = \"m\"\n[artifacts]\nweights = \"w\"\n[decode]\nbackend = \"{word}\"\n"
@@ -455,19 +459,18 @@ manifest = "artifacts/pyannote/diarize.json"
     }
 
     #[test]
-    fn a_scenario_with_no_decode_field_parses_as_none_and_the_shipped_whisper_scenarios_declare_none() {
+    fn a_scenario_with_no_decode_field_parses_as_none_and_whisper_small_declares_rail() {
         let c = ScenarioConfig::from_str(
             "[scenario]\nkind = \"asr\"\nname = \"m\"\n[artifacts]\nweights = \"w\"\n",
         )
         .expect("a scenario with no [decode] block must parse");
         assert_eq!(c.decode.backend, None);
 
-        // Backwards compatibility is a hard requirement: neither shipped Whisper scenario needs
-        // touching for this field to exist.
-        for f in ["../../scenarios/asr-whisper-small.toml", "../../scenarios/asr-whisper-turbo.toml"] {
-            let s = ScenarioConfig::from_str(&std::fs::read_to_string(f).unwrap()).unwrap();
-            assert_eq!(s.decode.backend, None, "{f} must not need updating for this field to exist");
-        }
+        let load = |f: &str| ScenarioConfig::from_str(&std::fs::read_to_string(f).unwrap()).unwrap();
+        let small = load("../../scenarios/asr-whisper-small.toml");
+        assert_eq!(small.decode.backend, Some(DecodeTier::Rail));
+        assert!(!small.artifacts.decode.is_empty(), "the rail tier needs [artifacts] decode");
+        assert_eq!(load("../../scenarios/asr-whisper-turbo.toml").decode.backend, None);
     }
 
     /// Env-var mutation is process-global; every case touching `NPU_DECODE_FUSED`/`NPU_DECODE` lives

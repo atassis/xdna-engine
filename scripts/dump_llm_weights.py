@@ -30,7 +30,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
 from llm_decode_spec import SPECS, k_chunks_for  # noqa: E402
 
 HF_REPO = {"qwen3-0.6b": "Qwen/Qwen3-0.6B", "gemma3-270m": "unsloth/gemma-3-270m-it",
-           "gemma4-12b": "unsloth/gemma-4-12b-it", "qwen3.5-4b": "Qwen/Qwen3.5-4B"}
+           "gemma4-12b": "google/gemma-4-12B-it-qat-q4_0-unquantized", "qwen3.5-4b": "Qwen/Qwen3.5-4B",
+           "whisper-small": "openai/whisper-small",
+           "whisper-turbo": "openai/whisper-large-v3-turbo"}
 
 # The projection leaves, i.e. everything that is a [out, in] matrix rather than a norm gain or the
 # embedding table. Only these are packable.
@@ -159,6 +161,11 @@ def main():
     want = {}
     exp_per_key = {}   # key -> expected [out, in], since the two geometries do not share one
     for l in range(NL):
+        if sp.cross_len is not None:
+            for key, shape in sp.encdec_tensors(l).values():
+                want[key] = None
+                exp_per_key[key] = shape
+            continue
         want.update({v: None for v in sp.norm_weight_names(l).values()})
         # Per-layer, not per-spec: Gemma-4-12B's global layers are head_dim 512 / 1 kv head where
         # its sliding layers are 256 / 8, so q_proj is [8192, D] on one and [4096, D] on the other.
@@ -188,8 +195,12 @@ def main():
             # A register_buffer -- in the checkpoint, absent from config.json, and scalar-shaped, so
             # it gets no shape assertion beyond "it is there".
             want[sp.layer_scalar_name(l)] = None
-    want[f"{sp.weight_prefix}norm.weight"] = None
-    exp_per_key[f"{sp.weight_prefix}norm.weight"] = (D_,)
+    for leaf in (("layer_norm.weight", "layer_norm.bias") if sp.norm_kind == "layer"
+                 else ("norm.weight",)):
+        want[sp.weight_prefix + leaf] = None
+        exp_per_key[sp.weight_prefix + leaf] = (D_,)
+    if sp.pos_embed == "learned":
+        want[f"{sp.weight_prefix}embed_positions.weight"] = None
     want[f"{sp.weight_prefix}embed_tokens.weight"] = None
     exp_per_key[f"{sp.weight_prefix}embed_tokens.weight"] = (V_, D_)
 

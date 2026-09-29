@@ -52,12 +52,12 @@ all: ${xclbin_target}
 .PHONY: FORCE
 ${kobj1} ${kobj2}: FORCE
 
-build/mm_%.o: ${kernels_dir}/mm.cc
+build/mm_%.o: ${srcdir}/../../../../../aie_kernels/mm-zero/mm_zero.cc ${kernels_dir}/mm.cc
 	@mkdir -p build
 	@set -e; dims=$*; \
 	  a=$${dims%%x*}; rest=$${dims#*x}; b=$${rest%%x*}; c=$${rest#*x}; \
 	  echo "[kernel] mm.cc DIM_M=$$a DIM_K=$$b DIM_N=$$c -> $@"; \
-	  ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} \
+	  ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} -I${kernels_dir} \
 	    -DDIM_M=$$a -DDIM_K=$$b -DDIM_N=$$c -c $< -o $@
 
 ${mlir_target}: ${srcdir}/ffn_gemm2_iron.py
@@ -67,7 +67,7 @@ ${mlir_target}: ${srcdir}/ffn_gemm2_iron.py
 	   --h_dtype ${h_dtype} > $@
 
 ${xclbin_target}: ${mlir_target} ${kobj1} ${kobj2}
-	cd build && aiecc --alloc-scheme=basic-sequential --get-xclbin \
+	cd build && aiecc --get-xclbin \
 	   --xclbin-name=$(notdir $@) \
 	   --peano ${PEANO_INSTALL_DIR} \
 	   --get-npu-insts --npu-insts-name=$(notdir ${insts_target}) \

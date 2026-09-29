@@ -14,3 +14,14 @@ kernel = "zeropad"
 
 [artifacts]
 weights = "artifacts/whisper-small"
+# Decoder built on the LLM decode rail (gen_llm_decode.py --spec whisper-small), toolchain pin
+# MLIR_AIE_FORK_COMMIT 79c1952912, IRON wt-iron-integ @ b6b0945:
+#   bash scripts/build_whisper_rail.sh whisper-small $PWD/artifacts/whisper-small/decode_rail_p79c1952
+#   decode.elf sha256 0f58a4be9928fd691dd716a9fc9e50e12d69d946432d52a9c9a6d47745308b8a
+# Gated 2026-09-29 (scripts/whisper_decode_ab.sh, 4 alternated rounds x 17 WER clips): token ids
+# identical across all 16 transcriptions of every clip; pooled WER 0.1245 vs host ONNX 0.1282;
+# decode 44.89 ms per emitted token vs host 68.39 and the old fused ELF 60.53.
+decode = "artifacts/whisper-small/decode_rail_p79c1952"
+
+[decode]
+backend = "rail"

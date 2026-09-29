@@ -121,7 +121,13 @@ impl ParakeetAsr {
         while t < t_stop {
             let frame = encoded.row(t).to_vec(); // [1024]
             let last = last_token as i32;
-            let (out, nst1, nst2) = self.run_dj(&frame, last, &st1, &st2)?;
+            let (out, nst1, nst2) = {
+                // tdt_run_dj: one decoder_joint.onnx call per encoder frame visited. Distinct
+                // stage from the enclosing "tdt_decode" span so joint-call cost is separable from
+                // the loop's own argmax/bookkeeping.
+                let _j = PhaseScope::new("tdt_run_dj", Bucket::Host);
+                self.run_dj(&frame, last, &st1, &st2)?
+            };
             let token = argmax(&out[..VOCAB]); // 8193 token logits
             let step = argmax(&out[VOCAB..VOCAB + N_DUR]) as usize; // duration 0..4
             if token != BLANK {
@@ -130,6 +136,8 @@ impl ParakeetAsr {
                 last_token = token;
                 tokens.push(token);
                 emitted += 1;
+                npu_parakeet::prof::phase::note_first_token();
+                npu_parakeet::prof::phase::count_event("tdt_token_emitted");
             }
             if step > 0 {
                 t += step;
@@ -187,6 +195,7 @@ impl AsrModel for ParakeetAsr {
         // and no mm() call. Still holds with windowing (below): `encode()` stays unwrapped on
         // every window's call, and `preproc`/`tdt_decode` still contain neither an encoder scope
         // nor an `mm()` call.
+        npu_parakeet::prof::phase::mark_clip_start(); // TTFT zero point: audio in.
         let (t, feats) = {
             // preproc: mel-frontend (preprocessor.onnx run) + host marshal into an owned flat
             // channel-major buffer. Run ONCE for the whole input regardless of length -- the ONNX
