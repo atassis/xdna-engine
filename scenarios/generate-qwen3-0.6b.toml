@@ -36,7 +36,15 @@ name = "qwen3-0.6b"
 #   GEN_EXTRA='--max-seq 4096'), IRON=wt-iron-integ (b6b0945). Pairing PASS (255 shared scratch
 #   buffers). gate_llm.sh --tier2-prefill PASS 14/14 (7 prompt lengths x pertok/batched arms).
 #   Rollback: point decode=/prefill= back at the _p8c684 pair and reinstall.
-decode = "artifacts/qwen3-0.6b/decode_p6924def"
+# REBUILT 2026-09-29 (`decode_p8e3958`, prefill `prefill_p8e3958`) at toolchain pin 8e3958b596a,
+#   instance 3ce32a1d7465, same recipe (WINDOW_RUNGS=256,512,1024,2048 KV_BLOCK_T=128
+#   GEN_EXTRA='--max-seq 4096'), IRON=wt-iron-integ. decode.elf BYTE-IDENTICAL to decode_p6924def
+#   (md5 a7d8e780cdd8bf3357893782855d1cf5); prefill.elf BYTE-IDENTICAL to prefill_p6924def (md5
+#   7e9eb2d93fe20c833b8bcf98a28ca837). Pairing confirmed via meta.json decode_artifact. gate_llm.sh
+#   --tier2-prefill PASS 14/14 (7 prompt lengths x pertok/batched arms; the weights symlink had gone
+#   dangling from a since-pruned /mnt/data path and was regenerated from the cached HF checkpoint
+#   before this build, no effect on the byte-identical result).
+decode = "artifacts/qwen3-0.6b/decode_p8e3958"
 # Batched prefill, S=4096 to pair with the rung ladder's own window (scripts/build_prefill.sh 28
 # 256 4096; the pair is checked at load, so a mismatch refuses to bind rather than mis-binding).
 # Closes the gap the ladder's own result note named: stepwise priming runs 27.6-28.5 ms/prompt-token
@@ -62,7 +70,7 @@ decode = "artifacts/qwen3-0.6b/decode_p6924def"
 # rollback net; deleted 2026-09-13 along with dynwindow4096/fusedbuckets/decode/prefill (S2048),
 # all confirmed superseded and unwired from engine.toml -- see log/2026-09-11-the-rung-ladder-is-
 # the-only-qwen3-model-now.
-prefill = "artifacts/qwen3-0.6b/prefill_p6924def"
+prefill = "artifacts/qwen3-0.6b/prefill_p8e3958"
 weights = "artifacts/qwen3-0.6b/weights"
 tokenizer_dir = "artifacts/qwen3-0.6b/tokenizer"
 
