@@ -25,6 +25,7 @@ name = "gemma3-270m"
 #   as a RELATIVE 3rd arg to build_llm_decode.sh silently miscompiles the artifact into a phantom
 #   nested dir under the shared $WORK cache (the script cd's into $WORK before invoking the
 #   generator, so a relative --out resolves against the wrong cwd) -- always pass an ABSOLUTE OUT.
+[artifacts]
 decode = "artifacts/gemma3-270m/decode_p8e3958"
 weights = "artifacts/gemma3-270m/weights"
 tokenizer_dir = "artifacts/gemma3-270m/tokenizer"
