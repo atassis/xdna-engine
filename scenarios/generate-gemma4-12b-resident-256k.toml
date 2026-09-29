@@ -1,0 +1,30 @@
+[scenario]
+kind = "generate"
+name = "gemma4-12b-resident-256k"
+
+# rf48L: the 256k-context rung ladder (rf-engine-integration, superseding rf48s's fixed 2048-row
+# linear cache). NOT device-smoke-gated -- the device lane's rf-forward-intermittent-nonfinite is
+# open (an intermittent non-finite around 6k context). Do not select this model until that closes;
+# `generate-gemma4-12b-resident.toml` (rf48s) is the smoke-gated arm.
+#
+# `artifacts.resident`'s meta.json (`kind = "resident_forward_ladder"`) is what routes
+# registry.rs to `llm::LadderResidentForward` instead of `llm::OneCommandResidentForward` -- the
+# two share this same `[artifacts] resident = ...` convention, dispatched on the artifact's own
+# declared kind, not a second config field.
+#
+# Build: rlayer_design m g h arena seg=64,256,1024,4096 fseg=64,256,1024 split=128,256,512,1024,2048,4096
+# gcap=262144 sring=1280 s64 fwd=0-47+h nbw=20 1 2 (RF_ATTN_H=1, RF_FAST=1, RF_TEXT_MARGIN=128).
+# Decode rungs (f1..f1s4096) reach 8192..262144 keys; prefill rungs (f2, f2w256, f2w1024) reach
+# 4096..65536 -- past that, `LadderResidentForward::prefill` declines and the generator's
+# per-token loop finishes priming through the f1 ladder alone (see resident_ladder.rs's module
+# doc for why the per-layer p2/g2w4096 fallback is not implemented here).
+#
+# max_context() = 262144 (the largest decode rung, `LadderMeta::largest_keys(1)`), NOT a hard
+# write-safety cap -- the sliding cache is now a wrapping ring, safe at any position; the
+# no-crossing rule is enforced by piece-cutting (`resident_ladder::max_piece`), not by a bound.
+[artifacts]
+resident = "/mnt/data/xdna/scratch/rf/build/rf48L"
+tokenizer_dir = "artifacts/gemma4-12b/tokenizer"
+
+[generation]
+max_tokens = 64
