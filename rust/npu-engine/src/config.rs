@@ -249,6 +249,12 @@ pub struct Artifacts {
     /// `tokenizer.json` file rather than its containing directory.
     #[serde(default)]
     pub tokenizer_dir: String,
+    /// `kind = "generate"`, optional and mutually exclusive with `decode`: a resident-forward
+    /// layer-stack build directory (`meta.json` in `llm::resident_raw::RawResidentMeta`'s schema),
+    /// read through `llm::RawResidentForward`. Set it to serve the resident backend as an OPT-IN
+    /// model instead of the fused-decode-ELF rail `decode` selects -- never both from one scenario.
+    #[serde(default)]
+    pub resident: String,
     /// Declarative weight source: `"hf:<repo>[@rev]"` or `"path:/abs"`. When set, the engine
     /// resolves + bakes (on missing) a `npu-weights` checkpoint via this spec instead of reading the
     /// legacy npy `weights` dir. Optional and additive: omit it and the npy path is unchanged.

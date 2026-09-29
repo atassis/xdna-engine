@@ -63,20 +63,29 @@ pub fn try_build(cfg_path: &Path, root: &Path) -> Result<Scenario, EngineError> 
         // ASR/embed arms above).
         Some(crate::ModelKind::Generate) => {
             let dev = open_dev()?;
-            let decode_dir = root.join(&cfg.artifacts.decode);
             let tokenizer_dir = root.join(&cfg.artifacts.tokenizer_dir);
             let model_cfg = crate::llm::ModelConfig::load(&tokenizer_dir)?;
-            // A scenario naming `artifacts.prefill` gets the batched priming path; the two ELFs
-            // share one arena and one weight upload, so this costs no extra device memory. Absent
-            // (the default) is byte-for-byte the per-token rail.
-            let prefill_dir =
-                (!cfg.artifacts.prefill.is_empty()).then(|| root.join(&cfg.artifacts.prefill));
-            let decode = match prefill_dir {
-                None => crate::llm::NpuDecodeStep::new(&dev, &decode_dir)?,
-                Some(p) => crate::llm::NpuDecodeStep::with_prefill(&dev, &decode_dir, &p)?,
-            };
-            Scenario::Generate(Box::new(crate::llm::LlmGenerator::new(model_cfg, decode)
-                .with_scenario_defaults(cfg.generation.to_defaults())))
+            // `artifacts.resident` selects the resident-forward layer-stack backend (opt-in,
+            // side-by-side with the fused-decode-ELF rail below); mutually exclusive with `decode`.
+            if !cfg.artifacts.resident.is_empty() {
+                let resident_dir = root.join(&cfg.artifacts.resident);
+                let decode = crate::llm::RawResidentForward::open(&dev, &resident_dir)?;
+                Scenario::Generate(Box::new(crate::llm::LlmGenerator::new(model_cfg, decode)
+                    .with_scenario_defaults(cfg.generation.to_defaults())))
+            } else {
+                let decode_dir = root.join(&cfg.artifacts.decode);
+                // A scenario naming `artifacts.prefill` gets the batched priming path; the two ELFs
+                // share one arena and one weight upload, so this costs no extra device memory. Absent
+                // (the default) is byte-for-byte the per-token rail.
+                let prefill_dir =
+                    (!cfg.artifacts.prefill.is_empty()).then(|| root.join(&cfg.artifacts.prefill));
+                let decode = match prefill_dir {
+                    None => crate::llm::NpuDecodeStep::new(&dev, &decode_dir)?,
+                    Some(p) => crate::llm::NpuDecodeStep::with_prefill(&dev, &decode_dir, &p)?,
+                };
+                Scenario::Generate(Box::new(crate::llm::LlmGenerator::new(model_cfg, decode)
+                    .with_scenario_defaults(cfg.generation.to_defaults())))
+            }
         }
         // NO open_dev(): nothing here composes onto the device yet (see `tts::TtsPipeline`), so a
         // `tts` scenario must not take a hardware context away from a model that coexists with it.

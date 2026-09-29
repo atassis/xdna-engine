@@ -1,0 +1,21 @@
+[scenario]
+kind = "generate"
+name = "gemma4-12b-resident"
+
+# The resident-forward layer-stack backend (rf-engine-integration S2), opt-in and side-by-side
+# with the shipped `generate-gemma4-12b.toml` (unchanged): every layer's weights stream through
+# MemTile per dispatch instead of a fused decode ELF's single-pass GEMV, driven by
+# `llm::RawResidentForward` against the raw build named below. No default flip; select this
+# model explicitly (`model: "gemma4-12b-resident"`) to compare it against the shipped arm.
+#
+# Build: rlayer_design m g h arena seg=64,128 nbw=20 1 2 7 (RF_ATTN_H=1), tracked as `rls1` in
+# the private repo's rf-engine-integration task. `artifacts.resident` is this build's directory,
+# which carries `meta.json` (this module's own schema, `llm::resident_raw::RawResidentMeta` --
+# NOT the S0/S1 content-addressed-store schema `llm::ResidentArtifact` reads) and `w_head.npy`
+# (the on-device LM head's weight stream, packed once by `rhead.head_stream()`).
+[artifacts]
+resident = "/mnt/data/xdna/scratch/rf/build/rls1"
+tokenizer_dir = "artifacts/gemma4-12b/tokenizer"
+
+[generation]
+max_tokens = 64
