@@ -24,7 +24,7 @@ use npu_whisper::encoder::WhisperEncoder;
 use tokenizers::Tokenizer;
 
 use crate::api::EngineError;
-use crate::asr::whisper_decoder::{BatchedFusedDecoder, FusedDecoder, HostDecoder, WhisperDecoderWeights};
+use crate::asr::whisper_decoder::{BatchedFusedDecoder, FusedDecoder, HostDecoder, RailDecoder, WhisperDecoderWeights};
 use crate::config::{self, DecodeSource, DecodeTier, ScenarioConfig};
 use crate::pipeline::AsrModel;
 
@@ -273,6 +273,9 @@ pub struct WhisperAsr {
     /// Whole-decode fused-ELF backend (env `NPU_DECODE_FUSED`): the ENTIRE 12-layer decoder in one
     /// fused-ELF dispatch/token (vs `npu_decoder`'s ~72). Takes precedence over `npu_decoder`.
     npu_fused: Option<RefCell<FusedDecoder>>,
+    /// `DecodeTier::Rail`: the decoder built by the LLM decode rail (`artifacts.decode`), one
+    /// dispatch per token with the lm-head on the device.
+    npu_rail: Option<RefCell<RailDecoder>>,
     /// Subsystem B (env `NPU_DECODE_FUSED_BATCH` + `NPU_DECODE_FUSED_BATCH_DIR`): batched decode over B
     /// streams in one dispatch/step. Driven by `transcribe_batch` (offline bulk), not the serve path.
     npu_fused_batch: Option<RefCell<BatchedFusedDecoder>>,
@@ -281,6 +284,35 @@ pub struct WhisperAsr {
     /// Independent of `npu_fused_batch`, which stays purely `NPU_DECODE_FUSED_BATCH`-gated.
     decode_backend: (DecodeTier, DecodeSource),
     _env: Rc<Env>,
+}
+
+/// A decoder that runs the whole stack in one dispatch per token: the `fused` and `rail` tiers.
+trait OneDispatchDecoder {
+    fn precompute_cross(&mut self, enc: &Array2<f32>) -> Result<(), EngineError>;
+    fn reset(&mut self) -> Result<(), EngineError>;
+    fn step(&mut self, tok: i64, pos: usize) -> Result<Vec<f32>, EngineError>;
+    fn step_token(&mut self, tok: i64, pos: usize) -> Result<i64, EngineError> {
+        Ok(argmax(&self.step(tok, pos)?))
+    }
+    fn has_npu_argmax(&self) -> bool {
+        false
+    }
+    fn dump_phase_timing(&self) {}
+}
+
+impl OneDispatchDecoder for FusedDecoder {
+    fn precompute_cross(&mut self, enc: &Array2<f32>) -> Result<(), EngineError> { FusedDecoder::precompute_cross(self, enc) }
+    fn reset(&mut self) -> Result<(), EngineError> { FusedDecoder::reset(self) }
+    fn step(&mut self, tok: i64, pos: usize) -> Result<Vec<f32>, EngineError> { FusedDecoder::step(self, tok, pos) }
+    fn step_token(&mut self, tok: i64, pos: usize) -> Result<i64, EngineError> { FusedDecoder::step_token(self, tok, pos) }
+    fn has_npu_argmax(&self) -> bool { FusedDecoder::has_npu_argmax(self) }
+    fn dump_phase_timing(&self) { FusedDecoder::dump_phase_timing(self) }
+}
+
+impl OneDispatchDecoder for RailDecoder {
+    fn precompute_cross(&mut self, enc: &Array2<f32>) -> Result<(), EngineError> { RailDecoder::precompute_cross(self, enc) }
+    fn reset(&mut self) -> Result<(), EngineError> { RailDecoder::reset(self) }
+    fn step(&mut self, tok: i64, pos: usize) -> Result<Vec<f32>, EngineError> { RailDecoder::step(self, tok, pos) }
 }
 
 impl WhisperAsr {
@@ -343,14 +375,24 @@ impl WhisperAsr {
         eprintln!("[whisper] decode backend: {tier} (source: {tier_source})");
         let fused_on = tier == DecodeTier::Fused;
         let npu_on = tier == DecodeTier::Dispatched;
+        let rail_on = tier == DecodeTier::Rail;
         let batch_on = std::env::var("NPU_DECODE_FUSED_BATCH").is_ok();
-        let (npu_decoder, npu_fused, npu_fused_batch) = if fused_on || npu_on || batch_on {
+        let mut npu_rail = None;
+        let (npu_decoder, npu_fused, npu_fused_batch) = if fused_on || npu_on || batch_on || rail_on {
             let dev = enc.device().ok_or_else(|| EngineError::Load(
                 "NPU decode: encoder must hold an open NPU device (built via new_npu)".into()))?;
             let weights = Rc::new(
-                WhisperDecoderWeights::load(&ws.join("whisper_decoder"))
+                WhisperDecoderWeights::load(&ws.join("whisper_decoder"), dec_layers)
                     .map_err(|e| EngineError::Load(format!("load whisper_decoder host weights: {e}")))?,
             );
+            if rail_on {
+                if cfg.artifacts.decode.is_empty() {
+                    return Err(EngineError::Load("decode backend `rail` needs [artifacts] decode".into()));
+                }
+                let rdir = root.join(&cfg.artifacts.decode);
+                eprintln!("[whisper] rail decode artifact: {}", rdir.display());
+                npu_rail = Some(RefCell::new(RailDecoder::new(Rc::clone(&weights), &dev, &rdir, enc.shared())?));
+            }
             // Subsystem B: batched decoder (offline-bulk), independent of the single-stream backend.
             // BatchedFusedDecoder::new still panics internally on failure (whisper_decoder.rs, out of
             // scope for this pass).
@@ -391,7 +433,7 @@ impl WhisperAsr {
 
         Ok(WhisperAsr {
             prep, decoder, decoder_past, enc, tok, cfg: wcfg, dec_layers, tokens,
-            npu_decoder, npu_fused, npu_fused_batch, decode_backend: (tier, tier_source), _env: env,
+            npu_decoder, npu_fused, npu_rail, npu_fused_batch, decode_backend: (tier, tier_source), _env: env,
         })
     }
 
@@ -431,7 +473,9 @@ impl WhisperAsr {
     fn greedy_decode(&self, encoder_hidden: &[f32], lang: Option<i64>)
         -> Result<(Vec<i64>, i64), EngineError> {
         if let Some(fd) = &self.npu_fused {
-            self.greedy_decode_fused(&mut fd.borrow_mut(), encoder_hidden, lang)
+            self.greedy_decode_fused(&mut *fd.borrow_mut(), encoder_hidden, lang)
+        } else if let Some(rd) = &self.npu_rail {
+            self.greedy_decode_fused(&mut *rd.borrow_mut(), encoder_hidden, lang)
         } else if let Some(dec) = &self.npu_decoder {
             self.greedy_decode_npu(&mut dec.borrow_mut(), encoder_hidden, lang)
         } else {
@@ -441,7 +485,7 @@ impl WhisperAsr {
 
     /// Whole-decode fused-ELF greedy decode. IDENTICAL control logic to `greedy_decode_npu` (lang
     /// detect, prompt, argmax, EOT, MAX_DECODE) — only the backend is `FusedDecoder` (1 dispatch/token).
-    fn greedy_decode_fused(&self, dec: &mut FusedDecoder, encoder_hidden: &[f32], lang: Option<i64>)
+    fn greedy_decode_fused<D: OneDispatchDecoder>(&self, dec: &mut D, encoder_hidden: &[f32], lang: Option<i64>)
         -> Result<(Vec<i64>, i64), EngineError> {
         let enc2 = Array2::from_shape_vec((T_ENC, self.cfg.d_model), encoder_hidden.to_vec())
             .expect("encoder_hidden is [T_ENC*D]");
@@ -458,7 +502,7 @@ impl WhisperAsr {
         dec.reset()?;
         let npu_argmax = dec.has_npu_argmax();
         // next token after feeding token `tok` at `pos`: on-NPU argmax (id) when available, else host argmax.
-        let next_tok = |dec: &mut FusedDecoder, tok: i64, pos: usize| -> Result<i64, EngineError> {
+        let next_tok = |dec: &mut D, tok: i64, pos: usize| -> Result<i64, EngineError> {
             if npu_argmax {
                 dec.step_token(tok, pos)
             } else {
@@ -675,7 +719,7 @@ impl WhisperAsr {
     /// Single-stream (M=1) fused greedy decode for one pre-encoded clip → token ids (incl. prompt).
     pub fn decode_m1_ids(&self, enc_flat: &[f32]) -> Result<Vec<i64>, EngineError> {
         let cell = self.npu_fused.as_ref().expect("decode_m1_ids needs NPU_DECODE_FUSED");
-        Ok(self.greedy_decode_fused(&mut cell.borrow_mut(), enc_flat, None)?.0)
+        Ok(self.greedy_decode_fused(&mut *cell.borrow_mut(), enc_flat, None)?.0)
     }
 
     /// Batched (B-stream) fused greedy decode over B pre-encoded clips → per-stream token ids.

@@ -363,6 +363,15 @@ pub struct LlmArtifact {
     /// artifact's own `kernel_name` -- exactly what an unsegmented ELF's single dispatch already
     /// is, so a caller that does not know about segments keeps behaving byte-for-byte.
     pub segments: Vec<PrefillSegment>,
+    /// `cross_buffers`: encoder-decoder cross-attention K/V, written by the host once per
+    /// utterance. Zeroed at load like a cache, never by a per-prompt reset.
+    pub cross_buffers: Vec<String>,
+    /// `host_protocol.pos_blob`: an f32 `[positions, d_model]` table the host adds to the token
+    /// embedding (learned absolute positions). `None` for a RoPE model.
+    pub pos_blob: Option<String>,
+    /// `host_protocol.logit_bias_blob`: an f32 `[vocab]` constant added to the logits -- the final
+    /// LayerNorm's bias folded through the head.
+    pub logit_bias_blob: Option<String>,
 }
 
 /// Verdict from comparing an artifact's [`LlmArtifact::toolchain_hash`] against the currently
@@ -449,6 +458,7 @@ impl LlmArtifact {
             return Err(ctx(format!("recurrent buffer `{n}` is not one of `cache_buffers`")));
         }
         let embed_blob = meta.get("embed_blob").and_then(|v| v.as_str()).map(str::to_owned);
+        let cross_buffers = meta.get("cross_buffers").map(|_| str_list("cross_buffers")).transpose()?.unwrap_or_default();
         let toolchain_hash = meta
             .get("toolchain")
             .and_then(|t| t.get("hash"))
@@ -670,6 +680,8 @@ impl LlmArtifact {
                 .to_string()));
         }
         let logit_softcap = opt_f64("logit_softcap")?;
+        let opt_str = |key: &str| hp.get(key).and_then(|v| v.as_str()).map(str::to_owned);
+        let (pos_blob, logit_bias_blob) = (opt_str("pos_blob"), opt_str("logit_bias_blob"));
         if let Some(c) = logit_softcap {
             if !(c > 0.0) {
                 return Err(ctx(format!("host_protocol.logit_softcap = {c}, want a positive cap")));
@@ -1296,6 +1308,9 @@ impl LlmArtifact {
             kv_dtype,
             prefill_break_even_tokens,
             segments,
+            cross_buffers,
+            pos_blob,
+            logit_bias_blob,
         })
     }
 

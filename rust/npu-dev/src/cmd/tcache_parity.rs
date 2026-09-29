@@ -21,6 +21,7 @@ use std::time::Instant;
 
 use ndarray::Array2;
 use npu_engine::asr::whisper_decoder::{FusedDecoder, WhisperDecoderWeights};
+use npu_engine::config::ScenarioConfig;
 use npu_xrt::Device;
 
 const D: usize = 768;
@@ -110,7 +111,14 @@ pub fn run(argv: Vec<String>) {
     assert!(steps <= 447, "steps {steps} exceeds the 448-column cache / position table");
 
     let wdir = Path::new("artifacts/whisper-small/whisper_decoder");
-    let w = Rc::new(WhisperDecoderWeights::load(wdir).expect("load decoder weights"));
+    let scenario = std::fs::read_to_string("scenarios/asr-whisper-small.toml")
+        .expect("read scenarios/asr-whisper-small.toml");
+    let layers = ScenarioConfig::from_str(&scenario)
+        .expect("parse scenario")
+        .model_or_err()
+        .expect("scenario [model]")
+        .decoder_layers();
+    let w = Rc::new(WhisperDecoderWeights::load(wdir, layers).expect("load decoder weights"));
     let dev = Rc::new(Device::open(0).expect("open NPU (stop xdna-engine + voxd first)"));
     // `shared: None` -> the cross-K/V fold runs on host f32; identical for both arms.
     let mut fd = FusedDecoder::new(w, &dev, &dir, None).expect("build fused decoder");

@@ -120,7 +120,7 @@ pub fn run(argv: Vec<String>) {
     // --- candidate decoder path (host f32 or NPU per-token matmuls) ---
     println!("loading host decoder weights from {} ...", weights_dir.display());
     let weights =
-        Rc::new(WhisperDecoderWeights::load(&weights_dir).expect("load host decoder weights"));
+        Rc::new(WhisperDecoderWeights::load(&weights_dir, DEC_LAYERS).expect("load host decoder weights"));
     // Keep the NPU device alive for the whole run (decoder borrows it).
     let _dev;
     let mut hostdec = if npu {

@@ -29,9 +29,9 @@ use npu_asr_host::gelu;
 use npu_xrt::Device;
 
 use crate::api::EngineError;
+use crate::llm::{DecodeStep, NpuDecodeStep};
 
 const D: usize = 768;
-const N_LAYERS: usize = 12;
 const N_HEADS: usize = 12;
 const HEAD_DIM: usize = 64; // D / N_HEADS
 const FFN: usize = 3072;
@@ -113,10 +113,11 @@ pub struct WhisperDecoderWeights {
 }
 
 impl WhisperDecoderWeights {
-    /// `dir` points at `artifacts/whisper-small/whisper_decoder` (root globals + L0..L11/).
-    pub fn load(dir: &Path) -> std::io::Result<Self> {
+    /// `dir` points at `artifacts/<model>/whisper_decoder` (root globals + `L0..L{n_layers-1}/`);
+    /// `n_layers` is the scenario's decoder depth (`ModelCfg::decoder_layers`).
+    pub fn load(dir: &Path, n_layers: usize) -> std::io::Result<Self> {
         let root = TensorMap { map: load_dir(dir)? };
-        let layers = (0..N_LAYERS)
+        let layers = (0..n_layers)
             .map(|i| {
                 let b = TensorMap {
                     map: load_dir(&dir.join(format!("L{i}"))).expect("load decoder layer dir"),
@@ -281,7 +282,7 @@ fn attend_one(q: &[f32], k_flat: &[f32], v_flat: &[f32], s: usize) -> Vec<f32> {
 
 impl HostDecoder {
     pub fn new(w: Rc<WhisperDecoderWeights>) -> Self {
-        let state = (0..N_LAYERS).map(|_| LayerState::default()).collect();
+        let state = (0..w.layers.len()).map(|_| LayerState::default()).collect();
         HostDecoder { w, state, npu: None, npu_attn: false }
     }
 
@@ -361,7 +362,7 @@ impl HostDecoder {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let state = (0..N_LAYERS).map(|_| LayerState::default()).collect();
+        let state = (0..w.layers.len()).map(|_| LayerState::default()).collect();
         // On-NPU self-attention is opt-in via NPU_DECODE_ATTN (only meaningful with the NPU active).
         let npu_attn = std::env::var("NPU_DECODE_ATTN").is_ok();
         if npu_attn {
@@ -419,8 +420,7 @@ impl HostDecoder {
         let w = w.as_ref();
         let npu = self.npu.as_ref();
 
-        for li in 0..N_LAYERS {
-            let lw = &w.layers[li];
+        for (li, lw) in w.layers.iter().enumerate() {
             let npu_layer = npu.map(|n| &n.layers[li]);
 
             // --- 1. self-attention (pre-norm, causal) ---
@@ -1406,7 +1406,7 @@ impl FusedDecoder {
     /// Fresh self-KV for a new prompt (cross-K/V unchanged for this utterance).
     pub fn reset(&mut self) -> Result<(), EngineError> {
         let sc = LoadScope::begin();
-        for li in 0..N_LAYERS {
+        for li in 0..self.w.layers.len() {
             self.zero_buf(&sc, &format!("L{li}_kcache"))?;
             self.zero_buf(&sc, &format!("L{li}_vcache"))?;
             if self.coalesce_self_tr && !self.vstage_direct {
@@ -1780,7 +1780,7 @@ impl BatchedFusedDecoder {
         let (in_sz, out_sz, scr_sz) = (usz("input_size"), usz("output_size"), usz("scratch_size"));
         let output = meta["output"].as_str().expect("output").to_string();
         let b = meta["dims"]["B"].as_u64().expect("dims.B") as usize;
-        let nl = meta["dims"]["layers"].as_u64().unwrap_or(N_LAYERS as u64) as usize;
+        let nl = meta["dims"]["layers"].as_u64().unwrap_or(w.layers.len() as u64) as usize;
         let t_enc = meta["dims"]["T"].as_u64().expect("dims.T") as usize;
         let t_pad = ((t_enc + 63) / 64) * 64;
 
@@ -2042,9 +2042,83 @@ impl BatchedFusedDecoder {
 /// Apply a K=768→768 ctx2 GEMM op to `x` `[M, 768]` (M may exceed PAD_M), row-tiling into chunks of
 /// ≤PAD_M and stacking the `[M, 768]` result in row order. Mirrors `npu_whisper::npu::apply_tiled`
 /// (inlined here to avoid the cfg-gated dependency). Used for the on-NPU cross-K/V fold (lever #2).
+/// Whisper decode on the LLM decode rail: the artifact `gen_llm_decode.py --spec whisper-*` builds,
+/// stepped through [`NpuDecodeStep`]. The one thing that rail has no notion of is cross-attention
+/// K/V, which this writes into the artifact's `cross_buffers` once per utterance.
+pub struct RailDecoder {
+    step: NpuDecodeStep,
+    w: Rc<WhisperDecoderWeights>,
+    /// NPU ctx2 GEMMs for the cross-K/V fold, one (K, V) pair per layer; `None` folds on the host.
+    cross_ops: Option<Vec<(CtxAOp, CtxAOp)>>,
+    heads: usize,
+    head_dim: usize,
+}
+
+impl RailDecoder {
+    pub fn new(w: Rc<WhisperDecoderWeights>, dev: &Rc<Device>, dir: &Path, shared: Option<Rc<SharedCtxA>>)
+        -> Result<Self, EngineError> {
+        let mut step = NpuDecodeStep::new(dev, dir)?;
+        step.set_greedy(true);
+        let a = step.artifact();
+        let (heads, head_dim) = (a.kv_heads, a.head_dim);
+        if a.cross_buffers.len() != 2 * w.layers.len() {
+            return Err(EngineError::Load(format!(
+                "{}: {} cross buffers for {} decoder layers (want a K and a V per layer)",
+                dir.display(), a.cross_buffers.len(), w.layers.len())));
+        }
+        let d = heads * head_dim;
+        let cross_ops = shared.filter(|sh| sh.shape().ka == d && sh.shape().streams.contains(&d)).map(|sh| {
+            w.layers.iter().map(|lw| (
+                CtxAOp::new(sh.clone(), &lw.cross_k_w, d, Epi::None, &[]),
+                CtxAOp::new(sh.clone(), &lw.cross_v_w, d, Epi::Bias, lw.cross_v_b.as_slice().unwrap()),
+            )).collect()
+        });
+        Ok(RailDecoder { step, w, cross_ops, heads, head_dim })
+    }
+
+    /// Fold the encoder output into every layer's cross K/V, head-major `[H, capacity, HD]` with the
+    /// rows past the encoder length zero (the softmax masks them).
+    pub fn precompute_cross(&mut self, enc: &Array2<f32>) -> Result<(), EngineError> {
+        let (h, hd) = (self.heads, self.head_dim);
+        for (li, lw) in self.w.layers.iter().enumerate() {
+            let (k, v) = match &self.cross_ops {
+                Some(ops) => (apply_tiled_ctxa(&ops[li].0, enc), apply_tiled_ctxa(&ops[li].1, enc)),
+                None => (linear_mat(enc, &lw.cross_k_w, &lw.cross_k_b), linear_mat(enc, &lw.cross_v_w, &lw.cross_v_b)),
+            };
+            for (name, src) in [(format!("L{li}_kx"), &k), (format!("L{li}_vx"), &v)] {
+                let cap = self.step.artifact().loc(&name).len / (2 * h * hd);
+                if enc.nrows() > cap {
+                    return Err(EngineError::Unsupported(format!(
+                        "encoder length {} exceeds the artifact's cross capacity {cap}", enc.nrows())));
+                }
+                let mut padded = vec![0f32; h * cap * hd];
+                for (t, row) in src.rows().into_iter().enumerate() {
+                    for head in 0..h {
+                        let dst = (head * cap + t) * hd;
+                        padded[dst..dst + hd].copy_from_slice(&row.as_slice().unwrap()[head * hd..(head + 1) * hd]);
+                    }
+                }
+                self.step.write_cross(&name, &pack_bf16_bytes(&padded))?;
+            }
+        }
+        self.step.sync_scratch()
+    }
+
+    /// A new prompt over the same utterance. The causal mask hides every cached position past the
+    /// current one, so this only clears state under `NPU_LLM_REUSE_KV=0`.
+    pub fn reset(&mut self) -> Result<(), EngineError> {
+        DecodeStep::reset(&mut self.step).map(|_| ())
+    }
+
+    pub fn step(&mut self, token: i64, pos: usize) -> Result<Vec<f32>, EngineError> {
+        let token = u32::try_from(token).map_err(|_| EngineError::Unsupported(format!("token {token}")))?;
+        DecodeStep::step(&mut self.step, token, pos)
+    }
+}
+
 fn apply_tiled_ctxa(op: &CtxAOp, x: &Array2<f32>) -> Array2<f32> {
     let m = x.nrows();
-    let mut out = Array2::<f32>::zeros((m, D));
+    let mut out = Array2::<f32>::zeros((m, x.ncols()));
     let mut r = 0;
     while r < m {
         let end = (r + PAD_M).min(m);
