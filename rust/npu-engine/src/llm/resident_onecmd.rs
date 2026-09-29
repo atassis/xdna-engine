@@ -406,7 +406,7 @@ impl DecodeStep for OneCommandResidentForward {
     }
 
     fn max_context(&self) -> Option<usize> {
-        Some(max_context_bound(self.meta.s_cap, self.meta.pmax))
+        Some(max_context_bound(self.meta.s_cap, self.meta.pmax, self.meta.nbw, self.meta.sliding_window))
     }
 
     /// Real device BO bytes (`%x`+`%o`+`%s`) -- see `resident_ladder::LadderResidentForward::bo_bytes`
@@ -435,8 +435,17 @@ impl DecodeStep for OneCommandResidentForward {
 /// Subtracting `pmax` up front makes every `at < max_context` satisfy `at + pmax <= s_cap` by
 /// construction, with no separate per-dispatch check needed -- and covers decode (`f1`, a fixed
 /// single-row write) with room to spare, since it needs only 1 row of slack, not `pmax`.
-pub fn max_context_bound(s_cap: usize, pmax: usize) -> usize {
-    s_cap.saturating_sub(pmax)
+///
+/// The window READ is bounded too: each dispatch reads `nbw` 64-row blocks of the sliding
+/// cache from `first` (`rlayer_design.py`'s `sizes = [NBW, 4, 64, 64]`), so `first + nbw * 64`
+/// must stay within `s_cap`. Past it the read takes the next region's bytes as masked keys, and
+/// a non-finite one poisons the x.V MAC (0 x NaN). On device (rfl6, s_cap 2048, nbw 20) the
+/// first non-finite position is exactly 1855, the value this returns for those numbers.
+pub fn max_context_bound(s_cap: usize, pmax: usize, nbw: usize, sliding_window: usize) -> usize {
+    let write_bound = s_cap.saturating_sub(pmax);
+    let Some(last_first) = s_cap.checked_sub(nbw * 64) else { return 0 };
+    let read_bound = last_first / 64 * 64 + 63 + sliding_window;
+    write_bound.min(read_bound)
 }
 
 #[cfg(test)]
@@ -445,12 +454,16 @@ mod tests {
 
     #[test]
     fn max_context_bound_is_s_cap_minus_the_largest_piece() {
-        // rf48s: s_cap=2048, pmax=32 -- the real gemma4-12b-resident numbers.
-        assert_eq!(max_context_bound(2048, 32), 2016);
+        // rf48s: s_cap=2048, pmax=32, nbw=20, window 1024 -- the real gemma4-12b-resident numbers.
+        // The window read binds first: 2016 would read up to 192 rows past the cache.
+        assert_eq!(max_context_bound(2048, 32, 20, 1024), 1855);
+        // A 16-block read never passes the rows the window itself needs; the write bound binds.
+        assert_eq!(max_context_bound(4096, 32, 16, 1024), 4064);
+        assert_eq!(max_context_bound(1024, 32, 20, 1024), 0);
     }
 
     #[test]
     fn max_context_bound_never_underflows_a_tiny_cache() {
-        assert_eq!(max_context_bound(16, 32), 0);
+        assert_eq!(max_context_bound(16, 32, 20, 1024), 0);
     }
 }

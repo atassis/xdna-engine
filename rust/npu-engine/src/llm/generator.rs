@@ -1362,10 +1362,10 @@ mod tests {
     fn a_request_past_the_resident_forwards_real_bound_is_refused_before_any_device_call() {
         // The real gemma4-12b-resident bound (rf-engine-integration): rf48s's sliding cache is a
         // linear 2048-row buffer, but its prefill code (f2) is compiled for a FIXED nt=2 (32-row)
-        // K/V write regardless of a piece's real length, so the safe bound is s_cap - pmax, not
-        // s_cap itself -- see `resident_onecmd::max_context_bound`'s own doc for the derivation.
-        let max_ctx = crate::llm::resident_onecmd::max_context_bound(2048, 32);
-        assert_eq!(max_ctx, 2016, "the bound this test exercises must be the real one, not a stand-in");
+        // K/V write regardless of a piece's real length, and its 20-block window read binds
+        // tighter still -- see `resident_onecmd::max_context_bound`'s own doc for the derivation.
+        let max_ctx = crate::llm::resident_onecmd::max_context_bound(2048, 32, 20, 1024);
+        assert_eq!(max_ctx, 1855, "the bound this test exercises must be the real one, not a stand-in");
 
         let cfg = build_cfg(None);
         // Empty script: `ScriptedDecodeStep::step` returns Err("scripted decode exhausted") if
@@ -1376,15 +1376,15 @@ mod tests {
         let decode = ScriptedDecodeStep::new(vec![]).with_max_context(max_ctx);
         let mut gen = LlmGenerator::new(cfg, decode);
         let params = GenerateParams { max_tokens: Some(1), temperature: Some(0.0), ..GenerateParams::default() };
-        // 2049 tokens: one past `max_ctx` (2016) AND one past the plain `s_cap` (2048) this
-        // bound was deliberately set below -- refused either way, but named 2049 per the ask.
+        // 2049 tokens: past `max_ctx` (1855) AND one past the plain `s_cap` (2048) -- refused
+        // either way, but named 2049 per the ask.
         let prompt = "hello ".repeat(2049);
         let err = gen
             .generate_to_string(&Prompt::Raw(prompt), &params)
             .expect_err("a prompt past the real context window must not run");
         let msg = err.to_string();
         assert!(msg.contains("2049"), "must name the prompt length: {msg}");
-        assert!(msg.contains("2016"), "must name the real window, not a rounder number: {msg}");
+        assert!(msg.contains("1855"), "must name the real window, not a rounder number: {msg}");
         assert!(!msg.contains("exhausted"), "must be the context-window refusal, not an accidental dispatch: {msg}");
     }
 
