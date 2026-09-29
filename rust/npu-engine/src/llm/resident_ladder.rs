@@ -9,7 +9,7 @@
 //! - **A mirrored sliding-cache ring (`s_ring` = 1280).** The device writes a new row at BOTH
 //!   `pos % C` and `pos % C + C`; the host only ever computes `pos % C` (`fwd_host.Forward.ring`).
 //!   Context can now pass the old 2048-row linear cap. A prefill piece must not cross a multiple
-//!   of `C` -- `fwd_host.Forward.max_piece` -- so pieces are cut there, not just at `pmax`.
+//!   of `C` -- `fwd_host.Forward.max_piece` -- so pieces are cut there, not just at a family's rows (`prefill_piece`).
 //!
 //! Layout is read from `meta.json` (`kind: "resident_forward_ladder"`), itself generated from
 //! `fwd_layout.json` (the build's own authority) plus the architecture-constant `%x`/`%o` offsets
@@ -61,7 +61,7 @@ pub struct Rung {
 
 /// `fwd_host.Forward.rung`: the smallest rung of the given `nt` whose window holds `keys_needed`
 /// keys. Ported verbatim (linear scan over an ascending list, first match wins) -- `rungs` is
-/// small (6 f1 + 3 f2) and read once per dispatch, so this is not worth a binary search.
+/// small (rf48L: 6 f1 + 3 f2) and read once per dispatch, so this is not worth a binary search.
 pub fn rung_for<'a>(rungs: &'a [Rung], nt: usize, keys_needed: usize) -> Result<&'a Rung, EngineError> {
     rungs.iter().filter(|r| r.nt == nt).find(|r| r.keys >= keys_needed).ok_or_else(|| {
         let largest = rungs.iter().filter(|r| r.nt == nt).last().map(|r| r.keys).unwrap_or(0);
@@ -78,6 +78,28 @@ pub fn ring_pos(pos: usize, c: usize) -> usize {
 /// of the ring size `c` -- `min(p, c - s % c)`. A caller cuts a longer piece at this boundary.
 pub fn max_piece(s: usize, p: usize, c: usize) -> usize {
     p.min(c - s % c)
+}
+
+/// `fwd_host.Forward.piece` + `family`: the next prefill piece at `at` with `left` rows to go. Its
+/// rows come from the largest family whose windows reach past `at`: `row_block * nt`, cut at that
+/// family's largest window and at the ring's wrap. Its rung is the smallest family covering those
+/// rows, then that family's smallest window. `None` past every prefill rung's window.
+pub fn prefill_piece(rungs: &[Rung], at: usize, left: usize, s_ring: usize, row_block: usize) -> Option<(usize, &Rung)> {
+    let seg = || rungs.iter().filter(|r| r.kind == "seg");
+    let reach = |nt: usize| seg().filter(|r| r.nt == nt).map(|r| r.keys).max().unwrap_or(0);
+    let mut nts: Vec<usize> = seg().map(|r| r.nt).collect();
+    nts.sort_unstable();
+    nts.dedup();
+    let big = *nts.iter().rev().find(|&&nt| reach(nt) > at)?;
+    let p = max_piece(at, left.min(row_block * big).min(reach(big) - at), s_ring);
+    let nt = *nts.iter().find(|&&nt| row_block * nt >= p && reach(nt) >= at + p)?;
+    rung_for(rungs, nt, at + p).ok().map(|r| (p, r))
+}
+
+/// K059: a command writes all `rows` rows of its blocks at `ring_s` and again at `ring_s + c`, so the
+/// second copy must end inside the sliding cache's `s_rows` (a padded ring leaves room past `2c`).
+pub fn ring_write_fits(ring_s: usize, rows: usize, c: usize, s_rows: usize) -> bool {
+    ring_s + c + rows <= s_rows
 }
 
 /// `rf48L/meta.json`'s schema (`kind: "resident_forward_ladder"`). See module doc for provenance.
@@ -390,6 +412,13 @@ impl LadderResidentForward {
         };
         let ring_s = ring_pos(s, self.meta.s_ring);
         let ring_first = ring_pos(first, self.meta.s_ring);
+        let rung_nt = self.meta.rungs.iter().find(|r| r.name == rung_name).map(|r| r.nt)
+            .ok_or_else(|| EngineError::Load(format!("meta.json: no rung `{rung_name}`")))?;
+        if !ring_write_fits(ring_s, rung_nt * self.meta.row_block, self.meta.s_ring, self.meta.s_rows) {
+            return Err(EngineError::Device(format!(
+                "{rung_name} at {s}: its {} cache rows from ring row {ring_s} pass the sliding cache ({} rows); the artifact needs a padded ring",
+                rung_nt * self.meta.row_block, self.meta.s_rows)));
+        }
         write_param("kvw_s", ring_s * self.meta.kvrow_s * 2)?;
         write_param("kvw_g", s * self.meta.kvrow_g * 2)?;
         write_param("kvr_s", ring_first * self.meta.kvrow_s * 2)?;
@@ -448,22 +477,15 @@ impl DecodeStep for LadderResidentForward {
 
     fn prefill(&mut self, tokens: &[u32], from: usize) -> Result<usize, EngineError> {
         let batchable = tokens.len().saturating_sub(1); // the last token always goes through step()
-        let f2_reach = self.meta.largest_keys(2);
         let mut at = from;
         while at < batchable {
-            // Cut the piece at the ring boundary and the fixed row cap, same order fwd_host uses
-            // (max_piece, then pick a rung for the cut piece's own end).
-            let room = max_piece(at, self.meta.pmax, self.meta.s_ring);
-            let end = (at + room).min(batchable);
-            let p_len = end - at;
-            let keys_needed = end;
-            // Past the largest implemented f2 rung: decline here (return `at`, unchanged progress
-            // for this call) and let the generator's per-token loop finish via `step()`'s f1
-            // ladder, which reaches 262144 -- see module doc.
-            if keys_needed > f2_reach {
+            // Past every prefill rung: decline here (return `at`, unchanged progress for this call)
+            // and let the generator's per-token loop finish via `step()`'s f1 ladder, which reaches
+            // 262144 -- see module doc.
+            let Some((p_len, rung)) = prefill_piece(&self.meta.rungs, at, batchable - at, self.meta.s_ring, self.meta.row_block) else {
                 break;
-            }
-            let rung = rung_for(&self.meta.rungs, 2, keys_needed)?;
+            };
+            let end = at + p_len;
             let rung_name = rung.name.clone();
             let piece = &tokens[at..end];
             let mut x_bits = Vec::with_capacity(piece.len() * self.meta.d_model);
@@ -584,6 +606,44 @@ mod tests {
         for s in [0usize, 1, 1279, 1280, 2559, 1_000_000] {
             assert!(max_piece(s, 32, 1280) >= 1, "s={s}");
         }
+    }
+
+    fn f7_rungs() -> Vec<Rung> {
+        let seg = |name: &str, nt: usize, blocks: usize| Rung { name: name.into(), nt, blocks, keys: blocks * 64, kind: "seg".into() };
+        let mut r = rf48l_rungs();
+        r.extend([seg("f7", 7, 64), seg("f7w256", 7, 256)]);
+        r
+    }
+
+    #[test]
+    fn prefill_piece_takes_the_largest_family_its_window_allows() {
+        let r = f7_rungs();
+        let pick = |at, left| prefill_piece(&r, at, left, 1280, 16).map(|(p, g)| (p, g.name.clone()));
+        assert_eq!(pick(0, 5440), Some((112, "f7".into())));
+        assert_eq!(pick(4032, 5440), Some((112, "f7w256".into())), "the piece's end picks the window");
+        assert_eq!(pick(1232, 5440), Some((48, "f7".into())), "cut at the ring's wrap, still one command");
+        assert_eq!(pick(0, 20), Some((20, "f2".into())), "a short tail runs on the smallest family");
+        assert_eq!(pick(16320, 5440), Some((64, "f7w256".into())), "cut at f7's largest window");
+        assert_eq!(pick(16384, 5440), Some((32, "f2w1024".into())), "past f7's windows only f2 holds the end");
+        assert_eq!(pick(65536, 10), None, "past every prefill window");
+    }
+
+    #[test]
+    fn prefill_piece_on_the_f2_only_ladder_is_the_old_32_row_cut() {
+        let r = rf48l_rungs();
+        for at in [0usize, 100, 1270, 4090, 60000] {
+            let (p, g) = prefill_piece(&r, at, 5440, 1280, 16).unwrap();
+            assert_eq!(p, max_piece(at, 32, 1280), "at {at}");
+            assert_eq!(g.name, rung_for(&r, 2, at + p).unwrap().name, "at {at}");
+        }
+    }
+
+    #[test]
+    fn ring_write_fits_needs_the_pad_near_the_wrap() {
+        assert!(ring_write_fits(1264, 16, 1280, 2560));
+        assert!(!ring_write_fits(1265, 16, 1280, 2560), "decode's 16-row write passes 2C from ring row 1265");
+        assert!(!ring_write_fits(1270, 32, 1280, 2560));
+        assert!(ring_write_fits(1279, 112, 1280, 2560 + 112));
     }
 
     #[test]
