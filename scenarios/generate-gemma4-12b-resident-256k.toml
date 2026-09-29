@@ -3,9 +3,9 @@ kind = "generate"
 name = "gemma4-12b-resident-256k"
 
 # rf48L: the 256k-context rung ladder (rf-engine-integration, superseding rf48s's fixed 2048-row
-# linear cache). NOT device-smoke-gated -- the device lane's rf-forward-intermittent-nonfinite is
-# open (an intermittent non-finite around 6k context). Do not select this model until that closes;
-# `generate-gemma4-12b-resident.toml` (rf48s) is the smoke-gated arm.
+# linear cache). Landed 2026-09-29 as gemma4-12b's served path on fast tests only; the full gates are
+# deferred (see the epic). About 5% of f1 dispatches at 6k context come back non-finite (cause open,
+# rf-forward-intermittent-nonfinite); LadderResidentForward re-runs such a dispatch.
 #
 # `artifacts.resident`'s meta.json (`kind = "resident_forward_ladder"`) is what routes
 # registry.rs to `llm::LadderResidentForward` instead of `llm::OneCommandResidentForward` -- the
@@ -23,7 +23,7 @@ name = "gemma4-12b-resident-256k"
 # write-safety cap -- the sliding cache is now a wrapping ring, safe at any position; the
 # no-crossing rule is enforced by piece-cutting (`resident_ladder::max_piece`), not by a bound.
 [artifacts]
-resident = "/mnt/data/xdna/scratch/rf/build/rf48L"
+resident = "/mnt/data/xdna/artifacts/gemma4-12b/resident_rf48L_p7148a7"
 tokenizer_dir = "artifacts/gemma4-12b/tokenizer"
 
 [generation]
