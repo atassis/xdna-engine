@@ -176,6 +176,16 @@ fn root(cfg: &Config, config_path: &Path) -> Result<PathBuf> {
     if let Ok(p) = std::env::var("XDNA_ENGINE_ROOT") {
         return Ok(PathBuf::from(p));
     }
+    let install = install_root();
+    let cwd = std::env::current_dir().ok();
+    for cand in root_candidates(cfg, config_path, cwd, install) {
+        if cand.join("scenarios").is_dir() { return Ok(cand) }
+    }
+    std::env::current_dir().context("cwd")
+}
+
+/// Where install.sh put the engine root.
+fn install_root() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok().map(PathBuf::from);
     // The prefix install.sh stages and bakes into the unit (`ENGINE_ROOT`, install.sh). If that
     // name changes there, it must change here: these are one constant in two files, and the
@@ -188,18 +198,55 @@ fn root(cfg: &Config, config_path: &Path) -> Result<PathBuf> {
     // resolves instead of silently looking empty.
     let data_home = std::env::var("XDG_DATA_HOME").ok().map(PathBuf::from)
         .or_else(|| home.map(|h| h.join(".local/share")));
-    let install = data_home.map(|d| {
+    data_home.map(|d| {
         let current = d.join("npu");
         if current.is_dir() { return current }
         let legacy = d.join("xdna-engine");
         if legacy.is_dir() { return legacy }
         current
-    });
-    let cwd = std::env::current_dir().ok();
-    for cand in root_candidates(cfg, config_path, cwd, install) {
-        if cand.join("scenarios").is_dir() { return Ok(cand) }
+    })
+}
+
+/// Per-request run logs (`NPU_TELEMETRY_LOG`) go to `<root>/runlogs` unless the caller names a
+/// directory; `npu stats` and `npu replay` read them, and a service without them cannot be audited.
+fn default_run_log(root: &Path) {
+    if std::env::var_os("NPU_TELEMETRY_LOG").is_some() {
+        return;
     }
-    std::env::current_dir().context("cwd")
+    let dir = root.join("runlogs");
+    match std::fs::create_dir_all(&dir) {
+        Ok(()) => std::env::set_var("NPU_TELEMETRY_LOG", &dir),
+        Err(e) => eprintln!("[npu-serve] WARNING: run logs off, cannot create {}: {e}", dir.display()),
+    }
+}
+
+/// `root`, except that the install root wins over the working directory: the service's home is
+/// where install.sh staged it, and a dev tree is named explicitly with `XDNA_ENGINE_ROOT`.
+fn serve_root(cfg: &Config, config_path: &Path) -> Result<PathBuf> {
+    if std::env::var_os("XDNA_ENGINE_ROOT").is_none() {
+        if let Some(r) = install_root().filter(|r| r.join("scenarios").is_dir()) {
+            return Ok(r);
+        }
+    }
+    root(cfg, config_path)
+}
+
+/// XRT reads `num_heap_pages` from `XRT_INI_PATH`; without the staged one any ELF over 64 MiB fails
+/// CREATE_BO with EAGAIN. Set before the first device open, and only when the caller did not.
+fn default_xrt_ini(root: &Path) {
+    if std::env::var_os("XRT_INI_PATH").is_some() {
+        return;
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let found = [Some(root.join("xrt.ini")), home.map(|h| h.join(".config/xrt/xrt.ini"))]
+        .into_iter().flatten().find(|p| p.is_file());
+    match found {
+        Some(p) => {
+            eprintln!("[npu-serve] XRT_INI_PATH unset, using {}", p.display());
+            std::env::set_var("XRT_INI_PATH", p);
+        }
+        None => eprintln!("[npu-serve] WARNING: no xrt.ini found; ELFs over 64 MiB will fail to load"),
+    }
 }
 
 /// The candidate roots, most explicit first. Separate from `root` so the ordering is testable
@@ -331,7 +378,10 @@ fn serve(path: &Path, allow_degraded: bool) -> Result<()> {
     let port = cfg.server.port;
     warn_on_lopsided_endpoint_override(&cfg);
     preflight_serve(&addr)?;
-    let root = root(&cfg, path)?;
+    let root = serve_root(&cfg, path)?;
+    eprintln!("[npu-serve] engine root {}", root.display());
+    default_xrt_ini(&root);
+    default_run_log(&root);
     preflight_artifacts(&cfg, &root)?;
     let (handle, _join) = start(cfg, Box::new(EngineLoader { root }))
         .map_err(|e| Tagged(engine_error(&e), e.to_string()))?;
