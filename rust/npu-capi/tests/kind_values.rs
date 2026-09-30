@@ -4,7 +4,7 @@
 //! makes an edit to the shipped one fail rather than propagate.
 #[test]
 fn kind_discriminants_are_append_only() {
-    use npu_engine::ModelKind;
+    use npu_models::ModelKind;
     let code = |k: ModelKind| match k {
         ModelKind::Asr => 0,
         ModelKind::Embed => 1,

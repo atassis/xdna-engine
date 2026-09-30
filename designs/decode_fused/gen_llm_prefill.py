@@ -228,7 +228,7 @@ def rope_table(base, rows, head_dim, theta, partial=None):
     frequency past `int(partial * head_dim // 2)` pairs, keeping the full head_dim width -- a zero
     frequency is the identity rotation. The exponent's denominator stays head_dim regardless (that
     is what makes it "proportional"). Same rule as verify_llm_decode.rope_row and
-    rust/npu-engine/src/llm/npu_decode.rs::rope_row, batched over rows instead of one position.
+    rust/npu-models/src/llm/npu_decode.rs::rope_row, batched over rows instead of one position.
     """
     half = head_dim // 2
     inv = 1.0 / (theta ** (np.arange(0, head_dim, 2, dtype=np.float64)[:half] / head_dim))
@@ -247,7 +247,7 @@ def ring_mask_rows(base, m, w):
     Row i of a chunk at `base` attends the ring's tail `[hole_lo, hole_hi)` EXCLUDED plus its own
     batch column `[0, width)`. `b0 = base % w`: `hole_lo = b0`; `hole_hi = w` while `base < w`,
     else `b0 + i + 1`; `width = w + i + 1`. Independently derived (never copied) against Rust's
-    `ring_mask_block` (`rust/npu-engine/src/llm/npu_prefill.rs`) -- pin the two against each other.
+    `ring_mask_block` (`rust/npu-models/src/llm/npu_prefill.rs`) -- pin the two against each other.
     """
     b0 = base % w
     i = np.arange(m, dtype=np.int64)
@@ -1303,7 +1303,7 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         `iron.common.quant.repack_gemm_weight`'s whole job is that permutation -- so this packs
         fresh from the same per-tensor `.npy` dump decode's own GEVM reads, into a buffer THIS
         build owns (`buffers/<name>.bin`, uploaded from prefill's own artifact dir as "a
-        prefill-only weight", `rust/npu-engine/src/llm/npu_decode.rs`), never decode's shared
+        prefill-only weight", `rust/npu-models/src/llm/npu_decode.rs`), never decode's shared
         arena. The dump is chunked exactly where decode's own `k_chunks_for` chunks it (down
         always, o only on a global layer) -- Prefill has no L1 reason to re-chunk on its own, but
         the dump does not offer an unchunked K=15360/K=8192 tensor to begin with, so it packs and

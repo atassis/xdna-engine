@@ -165,7 +165,7 @@ pub fn render(utts: &[Utterance], format: &str, source: &str) -> Result<String> 
 /// Split a diarized turn into ASR-sized pieces.
 ///
 /// The Parakeet path silently truncates its input at `WIN_MEL` = 2040 mel frames = 20.4 s
-/// (`npu-engine/src/asr/parakeet.rs:160`, `t.min(WIN_MEL)`): a longer request returns 200 OK with
+/// (`npu-models/src/asr/parakeet.rs:160`, `t.min(WIN_MEL)`): a longer request returns 200 OK with
 /// the tail simply missing, no error and no log. Conversational turns routinely exceed that -- a
 /// 240 s recording measured here contained a single 124 s span -- so transcribing a turn whole
 /// loses most of it.
@@ -221,7 +221,7 @@ mod tests {
     fn write_wav_i16_round_trips_through_the_engine_s_own_parser() {
         let samples: Vec<i16> = (0..1000).map(|i| (i * 7 % 2000 - 1000) as i16).collect();
         let wav = write_wav_i16(&samples, 16_000);
-        let back = npu_runtime::http::parse::parse_wav_i16(&wav).expect("must parse");
+        let back = npu_service::http::parse::parse_wav_i16(&wav).expect("must parse");
         assert_eq!(back, samples);
     }
 

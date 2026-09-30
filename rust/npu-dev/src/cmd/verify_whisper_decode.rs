@@ -6,7 +6,7 @@
 //! Both paths run a fixed 5-token greedy decode (start from `<|startoftranscript|>`, argmax each
 //! step, feed back). We assert per-step logits rel-L2 <= 1e-3 AND identical argmax tokens.
 //!
-//! Run:  cd rust && cargo run -p npu-engine --bin verify_whisper_decode --release -- --host
+//! Run:  cd rust && cargo run -p npu-models --bin verify_whisper_decode --release -- --host
 //!
 //! Paths resolve under `$WHISPER_ROOT` (default `..`, i.e. the worktree root when run from `rust/`):
 //!   $WHISPER_ROOT/artifacts/whisper-small/onnx/decoder_model.onnx (+ decoder_with_past_model.onnx)
@@ -16,8 +16,8 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use ndarray::Array2;
-use npu_engine::asr::whisper::WhisperOnnxDecoder;
-use npu_engine::asr::whisper_decoder::{HostDecoder, WhisperDecoderWeights};
+use npu_models::asr::whisper::WhisperOnnxDecoder;
+use npu_models::asr::whisper_decoder::{HostDecoder, WhisperDecoderWeights};
 use npu_xrt::Device;
 
 const D: usize = 768;

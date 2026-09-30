@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use npu_engine::llm::kv_layout;
+use npu_models::llm::kv_layout;
 use npu_xrt::{unpack_bf16_to_f32, Arena, Device, FusedArena};
 use serde::Deserialize;
 

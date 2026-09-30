@@ -592,7 +592,7 @@ def _reference_scratch_layout(entries):
     {name: byte length}) from a pre-loaded reference entries list (_load_reference_scratch_entries).
 
     A reference meta.json's `layout` only lists buffers the graph DECLARES (weights, caches,
-    inputs, outputs) -- rust/npu-engine/src/llm/artifact.rs's check_shared_layout_agrees documents
+    inputs, outputs) -- rust/npu-models/src/llm/artifact.rs's check_shared_layout_agrees documents
     the same gap reading it: "IRON also packs undeclared launch-to-launch intermediates into
     scratch, and those are invisible here". MEASURED on the served gemma4-12b decode: 641 such
     invisible spans, 16399872 B total (not unexplained alignment, as an earlier version of this
@@ -602,7 +602,7 @@ def _reference_scratch_layout(entries):
     anonymous placeholder reproduces the reference's exact offsets for every buffer this list DOES
     name; this graph's own (unused-here) intermediates just cost extra scratch bytes rather than
     a wrong offset -- harmless, since FusedArena::build_with sizes the shared arena to the max of
-    every bound artifact's scratch_size (rust/npu-engine/src/llm/npu_decode.rs)."""
+    every bound artifact's scratch_size (rust/npu-models/src/llm/npu_decode.rs)."""
     ordered, lens, prev_end, pad_i = [], {}, 0, 0
     for off, length, name in entries:
         if off > prev_end:
@@ -900,7 +900,7 @@ def _attn_global_flash_why(sp, g):
 def rope_f_for_geometry(hd, theta, partial):
     """Resident RoPE turn-frequency constant for AttnGlobalFlash's on-chip inverse rotation
     (kv_skip_v): the SAME inv_freq the forward RoPE uses (verify_llm_decode.py's `rope_row`,
-    rust/npu-engine/src/llm/npu_decode.rs::rope_row), converted to the uint32 0.32 turn fraction
+    rust/npu-models/src/llm/npu_decode.rs::rope_row), converted to the uint32 0.32 turn fraction
     `taccum_rows_kv_skip_v_bf16_f32` expects -- HD/2 values, byte-reinterpreted into an
     HD-element bf16 buffer (get_arg_spec's declared size).
     """
@@ -1307,7 +1307,7 @@ def report_artifact_freshness(weights_dir):
 
     verify_llm_decode.py and bench_llm_decode.py always recompile the graph fresh via build_graph,
     so THIS run never dispatches stale bytes -- but the shipped Rust engine loads decode.elf/
-    meta.json directly (npu-engine::LlmArtifact) and does not rebuild. A stale artifact sitting next
+    meta.json directly (npu-models::LlmArtifact) and does not rebuild. A stale artifact sitting next
     to fresh weights is exactly the silent-wrong-token hole this closes: the decode ELF that
     shipped 2026-09-03 returned a wrong token at one margin step after the 2026-09-04 re-pin, with
     nothing to say so. Never raises and never affects the caller's exit code -- this is a report

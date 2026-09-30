@@ -52,7 +52,7 @@ def rope_row(pos, head_dim, theta, partial=None):
     inverse frequency past `int(f * head_dim // 2)` pairs, keeping the FULL head_dim width, because
     a zero frequency is the identity rotation. The exponent's denominator stays head_dim -- that is
     what makes it "proportional" rather than ordinary partial rotary, which divides by the rotated
-    width. Same rule as rust/npu-engine/src/llm/npu_decode.rs::rope_row.
+    width. Same rule as rust/npu-models/src/llm/npu_decode.rs::rope_row.
 
     THIS IS THE THIRD COPY of this arithmetic (here, the Rust host, and transformers itself). The
     two Python ones cannot merge with the Rust one, and the proportional/default distinction is
@@ -73,7 +73,7 @@ def rope_row(pos, head_dim, theta, partial=None):
 def window_len(pos, granule):
     """The attended length for `pos`: positions the cache holds (pos+1), rounded UP to `granule`.
 
-    Mirrors rust/npu-engine/src/llm/npu_decode.rs::window_len exactly -- same rounding, no clamp
+    Mirrors rust/npu-models/src/llm/npu_decode.rs::window_len exactly -- same rounding, no clamp
     (the caller mins against dims.S, same as the Rust call site does against bucket.window). Two
     implementations of one formula that disagree is precisely what this parity gate exists to
     catch, and it would present as a mismatch blamed on the kernel rather than on the host.
@@ -292,7 +292,7 @@ def main():
         # different token by step 2) and the kv arm at L0_kr by 64 elements = exactly 2 x 64-byte
         # cache lines. With it, both arms are bit-identical across passes and agree token for token.
         # The "kv arm is 0/336" that this defect was localised against was luck, not a property.
-        # The Rust rail has always done this -- rust/npu-engine/src/llm/npu_decode.rs:113, one bulk
+        # The Rust rail has always done this -- rust/npu-models/src/llm/npu_decode.rs:113, one bulk
         # arena.sync_to_device() after the weight load, with the write -> sync_input -> dispatch ->
         # sync_from_device contract in that module's doc. Only the Python path was missing it.
         sc.scratch_buffer.device = "cpu"
@@ -336,7 +336,7 @@ def main():
     # sliding-attention layers rotate at rope_theta_local and the global ones at
     # rope_theta_global, with which layer reads which baked into the ELF. Driving only
     # rope_global leaves every sliding layer rotating against a buffer the host never writes.
-    # The production path already does this (rust/npu-engine/src/llm/npu_decode.rs); this
+    # The production path already does this (rust/npu-models/src/llm/npu_decode.rs); this
     # harness was the half still missing it, so a gate run here would have mis-rotated most
     # layers and presented as a device divergence.
     declared = set(md["inputs"])
@@ -535,7 +535,7 @@ def main():
                 lg[lo:hi] = np.asarray(head_w[lo:hi], np.float32) @ xf
         else:
             lg = np.asarray(out.data[:VOCAB], dtype=np.float32)
-        # final_logit_softcapping, the same transform rust/npu-engine applies after readback. It
+        # final_logit_softcapping, the same transform rust/npu-models applies after readback. It
         # changes the ARGMAX (tanh saturates), so a harness that skips it does not gate the model
         # the engine runs.
         #

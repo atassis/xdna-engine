@@ -33,7 +33,7 @@ log "================ LEVER-3 COALESCE ISOLATION  $TS ================"
 # preflight: encoder xclbin (worktree mlir-aie must symlink a checkout WITH built xclbins)
 ENC="$WT/mlir-aie/programming_examples/basic/matrix_multiplication/whole_array/build/final_512x800x3072_64x32x96_8c_modalsilu.xclbin"
 [ -f "$ENC" ] || { log "[ERR] encoder xclbin missing: $ENC — fix: rm -rf mlir-aie && ln -s <main>/mlir-aie mlir-aie"; exit 1; }
-[ -x "$SERVE" ] || { log "[build] engine_serve missing — building ..."; ( cd "$WT/rust" && cargo build -p npu-engine --release --bin engine_serve ) >>"$LOG" 2>&1 || { log "[ERR] build failed"; exit 1; }; }
+[ -x "$SERVE" ] || { log "[build] engine_serve missing — building ..."; ( cd "$WT/rust" && cargo build -p npu-models --release --bin engine_serve ) >>"$LOG" 2>&1 || { log "[ERR] build failed"; exit 1; }; }
 for d in fused_decode12 fd12_cross fd12_self; do
   [ -f "$WT/artifacts/$d/decode.elf" ] || { log "[ERR] missing ELF: artifacts/$d/decode.elf (build the isolation variants first)"; exit 1; }
 done

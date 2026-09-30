@@ -229,4 +229,4 @@ the same source GGUF -- the manifest's `source_gguf.header_sha256` confirms it i
   tensor), but choosing precision per weight matrix is a separate, gated decision with its own
   accuracy-gate work, out of scope here.
 - **No engine integration.** This is a standalone host tool; it does not touch
-  `designs/`, `rust/npu-engine/`, or any runtime dataflow.
+  `designs/`, `rust/npu-models/`, or any runtime dataflow.

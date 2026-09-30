@@ -1,11 +1,11 @@
 //! engine-open-capability-contract probe instance #2, functional gate (not just a compile check):
-//! `SrEngine` driven ONLY through `npu_engine::capability::Servable` (never `upscale_rgb8` directly)
+//! `SrEngine` driven ONLY through `npu_models::capability::Servable` (never `upscale_rgb8` directly)
 //! must produce byte-identical output to the direct call, on the real CPU frontier -- no NPU touched
 //! (`use_npu=false`), so this runs on any lane, device or not. Checkpoint prereq: bake the schedule's
 //! checkpoint first (`target/test-checkpoints/espcn.safetensors`, matching `espcn.json`'s `checkpoint`
 //! field). It is the SAME baked copy the other npu-sr tests guard on -- `target/test-arenas/` was the
 //! pre-rename path and nothing produces it, which is what made this probe and edsr_gate disagree.
-use npu_engine::capability::{Request, Response, Servable};
+use npu_models::capability::{Request, Response, Servable};
 use npu_sr::SrEngine;
 
 #[test]

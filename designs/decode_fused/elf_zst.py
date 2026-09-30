@@ -1,5 +1,5 @@
 """Write a control-code ELF plus its compressed `.elf.zst` sibling. The host loader
-(`npu-engine::llm::artifact::read_elf_bytes`) reads whichever exists, plain first.
+(`npu-models::llm::artifact::read_elf_bytes`) reads whichever exists, plain first.
 
 `ELF_ZST_ONLY=1` drops the plain file after compressing -- opt-in, so nothing switches format
 silently.
@@ -20,7 +20,7 @@ def write_elf(path, elf_bytes):
 
     `{"sha256": <uncompressed hex>, "elf_zst_sha256": <compressed hex>, "elf_zst_bytes": <int>}`.
     `sha256` is the artifact_hash the host must reproduce from either form -- see
-    `npu-engine::llm::npu_decode::open`'s `artifact_hash` comment.
+    `npu-models::llm::npu_decode::open`'s `artifact_hash` comment.
     """
     with open(path, "wb") as f:
         f.write(elf_bytes)

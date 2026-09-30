@@ -141,7 +141,7 @@ def main():
     # Flush scratch: every weight and both KV caches live there and the callable syncs only the
     # input and output arenas, so without this the device reads whatever the CPU happened to have
     # written back. Same fix as verify_llm_decode.py; the Rust rail has always done it
-    # (rust/npu-engine/src/llm/npu_decode.rs:113, one bulk arena.sync_to_device() after load).
+    # (rust/npu-models/src/llm/npu_decode.rs:113, one bulk arena.sync_to_device() after load).
     # It matters most for the determinism pass below, which zero-fills the KV cache between runs.
     c.scratch_buffer.device = "cpu"
     c.scratch_buffer.to("npu")

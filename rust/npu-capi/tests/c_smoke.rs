@@ -2,7 +2,7 @@
 // npu_available() + npu_last_error() so it needs NO NPU device (host-safe). Proves the C ABI links
 // and is callable from C. Links the cdylib (not the staticlib) so XRT/native deps are already
 // resolved in the .so. Skips cleanly if cc or the cdylib are absent (run `cargo build -p npu-capi`
-// first to produce target/<profile>/libnpu_engine.so).
+// first to produce target/<profile>/libnpu_models.so).
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -14,7 +14,7 @@ fn target_dir() -> PathBuf {
 fn cdylib_dir() -> Option<PathBuf> {
     for profile in ["debug", "release"] {
         let dir = target_dir().join(profile);
-        if dir.join("libnpu_engine.so").exists() { return Some(dir); }
+        if dir.join("libnpu_models.so").exists() { return Some(dir); }
     }
     None
 }
@@ -40,14 +40,14 @@ fn c_program_links_and_calls_npu_available() {
         return;
     }
     let Some(libdir) = cdylib_dir() else {
-        eprintln!("SKIP c_smoke: libnpu_engine.so not built - run `cargo build -p npu-capi` first");
+        eprintln!("SKIP c_smoke: libnpu_models.so not built - run `cargo build -p npu-capi` first");
         return;
     };
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let out = PathBuf::from(env!("OUT_DIR"));
     let src = out.join("smoke.c");
     std::fs::write(&src, r#"
-#include "npu_engine.h"
+#include "npu_models.h"
 #include <stdio.h>
 int main(void) {
     int a = npu_available();
@@ -62,10 +62,10 @@ int main(void) {
         .arg(format!("-I{}", manifest.join("include").display()))
         .arg(format!("-L{}", libdir.display()))
         .arg(format!("-Wl,-rpath,{}", libdir.display()))
-        .arg("-lnpu_engine")
+        .arg("-lnpu_models")
         .arg("-o").arg(&exe)
         .status().expect("cc invocation");
-    assert!(status.success(), "C program failed to compile/link against libnpu_engine.so");
+    assert!(status.success(), "C program failed to compile/link against libnpu_models.so");
     let mut ldpath = libdir.display().to_string();
     if let Some(ort) = onnxruntime_dir() { ldpath = format!("{}:{ldpath}", ort.display()); }
     if let Ok(existing) = std::env::var("LD_LIBRARY_PATH") { ldpath = format!("{ldpath}:{existing}"); }

@@ -1049,8 +1049,8 @@ version = "0.1.0"
 dependencies = [
  "cbindgen",
  "cc",
- "npu-engine",
- "npu-runtime",
+ "npu-models",
+ "npu-service",
 ]
 
 [[package]]
@@ -1064,9 +1064,9 @@ dependencies = [
  "ndarray",
  "ndarray-npy",
  "npu-asr",
- "npu-engine",
+ "npu-models",
  "npu-parakeet",
- "npu-runtime",
+ "npu-service",
  "npu-weights",
  "serde",
  "serde_json",
@@ -1082,7 +1082,7 @@ dependencies = [
  "ndarray-npy",
  "npu-asr",
  "npu-asr-host",
- "npu-engine",
+ "npu-models",
  "npu-onnx",
  "npu-parakeet",
  "npu-s2",
@@ -1099,7 +1099,7 @@ name = "npu-dispatch"
 version = "0.1.0"
 
 [[package]]
-name = "npu-engine"
+name = "npu-models"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1152,22 +1152,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "npu-runtime"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "npu-asr",
- "npu-dispatch",
- "npu-engine",
- "npu-sr",
- "serde",
- "serde_json",
- "tempfile",
- "toml",
- "toml_edit",
-]
-
-[[package]]
 name = "npu-s2"
 version = "0.1.0"
 dependencies = [
@@ -1180,12 +1164,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "npu-service"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "npu-asr",
+ "npu-dispatch",
+ "npu-models",
+ "npu-sr",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+ "toml_edit",
+]
+
+[[package]]
 name = "npu-sr"
 version = "0.1.0"
 dependencies = [
  "ndarray",
  "ndarray-npy",
- "npu-engine",
+ "npu-models",
  "npu-weights",
  "npu-xrt",
  "serde",

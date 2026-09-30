@@ -1,0 +1,35 @@
+//! General multi-model engine over the XDNA2 NPU kernel kit.
+//!
+//! Public API: [`Engine`], [`Model`], [`ModelKind`], [`EngineError`]. Load a model from a scenario
+//! TOML and call [`Model::transcribe`] or [`Model::embed`]. Everything else in this crate is
+//! implementation detail (`#[doc(hidden)]`) and may change without notice.
+
+pub mod api;
+pub mod cancel;
+pub mod decide;
+pub mod nli;
+pub use api::{Engine, EngineError, Model, ModelKind};
+pub use cancel::{Cancel, CancelReason};
+pub use decide::{DecideAnswer, DecideQuestion, DecideRequest, DecideStats, Decisions, QuestionKind, QuestionStats};
+pub use nli::{NliHead, NliRequest, NliScores};
+pub use pipeline::{ChatMedia, ChatMessage, Chunk, ToolCall, DEFAULT_MAX_TOKENS, FinishReason, GenerateParams, GenerateUsage, Prompt,
+                   TextGenerator};
+pub use telemetry::{
+    Bound, GenerationReport, NpuWake, PrefillRecord, RunConditions, StepPhases, StepRecord, Summary,
+};
+
+#[doc(hidden)] pub mod config;
+#[doc(hidden)] pub mod pipeline;
+#[doc(hidden)] pub mod registry;
+#[doc(hidden)] pub mod bert;
+#[doc(hidden)] pub mod esm;
+#[doc(hidden)] pub mod asr;
+#[doc(hidden)] pub mod diarize;
+#[doc(hidden)] pub mod tuning_profile;
+// PROBE (engine-open-capability-contract): the open request-surface trait. `#[doc(hidden)]` for now
+// like the other internals above -- it is a candidate contract validated against two instances, not
+// yet the wired-in replacement for `pipeline::Scenario` / `npu-service`'s closed routing.
+#[doc(hidden)] pub mod capability;
+#[doc(hidden)] pub mod llm;
+#[doc(hidden)] pub mod tts;
+#[doc(hidden)] pub mod telemetry;

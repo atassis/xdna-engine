@@ -147,7 +147,7 @@ residency that does, pin the model.
 
 > **`memory_ceiling_mb` bounds real bytes only for Parakeet today.** It sums `Servable::footprint()`
 > across resident models; Parakeet reports its actual pinned device BO total, and every other shipped
-> model still returns a hardcoded `0` (`npu-engine/src/pipeline.rs`'s trait defaults, unwired for
+> model still returns a hardcoded `0` (`npu-models/src/pipeline.rs`'s trait defaults, unwired for
 > Whisper, the generic GigaAM ASR path, BERT/ESM embed, and text generation). A ceiling with a
 > non-Parakeet model resident is not enforcing anything for that model's share. `npu model start` says which
 > resident models the accountant could not weigh, rather than letting a ceiling you just set look

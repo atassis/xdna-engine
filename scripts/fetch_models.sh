@@ -41,7 +41,7 @@ EXTRA_REPOS=(
 fetch() { echo "[fetch] $1"; "$HF" download "$1" >/dev/null; }
 
 # Assemble the flat, serve-ready Parakeet artifact dir the engine loads
-# (rust/npu-engine/src/asr/parakeet.rs: artifacts/parakeet/{preprocessor.onnx,decoder_joint.onnx,
+# (rust/npu-models/src/asr/parakeet.rs: artifacts/parakeet/{preprocessor.onnx,decoder_joint.onnx,
 # vocab.txt,encoder/}). No HF repo ships this exact layout, so build it here from pinned sources.
 # Idempotent. NOTE: the encoder/ checkpoint is produced separately by extract_parakeet_encoder.py and is
 # NOT assembled here. Two migration bugs this fixes:

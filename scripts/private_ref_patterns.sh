@@ -35,10 +35,10 @@ private_ref_regex="$(IFS='|'; echo "${private_ref_patterns[*]}")"
 #  - markdown `[[TOC]]`-style or link syntax that isn't this slug shape.
 # Verified against a full sweep of this tree (2026-07-30) rather than assumed: the only
 # two NON-slug matches of the slug-shape regex found were Cargo's TOML array-of-tables
-# header (`[[bin]]` in Cargo.toml / rust/npu-runtime/src/config.rs's embedded TOML
+# header (`[[bin]]` in Cargo.toml / rust/npu-service/src/config.rs's embedded TOML
 # example, and prose describing it in bench/test_harness_smoke.py, install.sh) and one
 # ONNX I/O shape example (`input_ids=[[last]]`, a nested-array literal, not a slug) in
-# rust/npu-engine/src/asr/whisper.rs. Both are excluded by exact token, not by a broad
+# rust/npu-models/src/asr/whisper.rs. Both are excluded by exact token, not by a broad
 # heuristic (e.g. "require a hyphen") -- the private KB also has legitimate single-word
 # slugs (`design`, `approaches`), so a hyphen-required pattern would silently stop
 # catching a real single-word slug leak. Grow this allowlist only when a NEW verified

@@ -50,7 +50,7 @@ write("project-docs.txt",
 
 # 4. code -- a fourth genre, from a tree the model never saw as prose.
 src = []
-for pat in ("rust/npu-engine/src/**/*.rs",
+for pat in ("rust/npu-models/src/**/*.rs",
             "designs/**/*.py"):
     for p in sorted(glob.glob(os.path.join(REPO, pat), recursive=True))[:40]:
         try:

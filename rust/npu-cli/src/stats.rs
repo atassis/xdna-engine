@@ -11,8 +11,8 @@
 use std::path::Path;
 
 use anyhow::{anyhow, Result};
-use npu_engine::telemetry::wire;
-use npu_engine::{GenerationReport, Summary};
+use npu_models::telemetry::wire;
+use npu_models::{GenerationReport, Summary};
 
 fn ms(us: u64) -> f64 {
     us as f64 / 1e3
@@ -301,8 +301,8 @@ pub fn diff(a: &Path, b: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use npu_engine::telemetry::DesignCost;
-    use npu_engine::{StepPhases, StepRecord};
+    use npu_models::telemetry::DesignCost;
+    use npu_models::{StepPhases, StepRecord};
 
     fn run(step_us: u64, tokens: &[u32]) -> GenerationReport {
         let steps = tokens.iter().enumerate().map(|(i, t)| StepRecord {
@@ -318,7 +318,7 @@ mod tests {
         GenerationReport {
             steps,
             generate_us: 100_000,
-            usage: npu_engine::GenerateUsage { prompt_tokens: 5, completion_tokens: tokens.len() as u32 },
+            usage: npu_models::GenerateUsage { prompt_tokens: 5, completion_tokens: tokens.len() as u32 },
             ..GenerationReport::default()
         }
     }
@@ -328,7 +328,7 @@ mod tests {
         let mut lines = vec![wire::header_line(&r.conditions, &m).to_string()];
         lines.extend(r.steps.iter().map(|s| wire::chunk_line(s, &m).to_string()));
         lines.push(wire::prefill_line(&r.prefill, &m).to_string());
-        lines.push(wire::summary_line(r, &m, npu_engine::FinishReason::Stop).to_string());
+        lines.push(wire::summary_line(r, &m, npu_models::FinishReason::Stop).to_string());
         let p = dir.join(format!("{name}.jsonl"));
         std::fs::write(&p, lines.join("\n")).unwrap();
         p
@@ -355,7 +355,7 @@ mod tests {
         let mut r = run(18_000, &[1, 2, 3, 4]);
         for s in &mut r.steps {
             s.phases.sample_phases =
-                Some(npu_engine::telemetry::SamplePhases { penalties_us: 10, top_k_us: 20, top_p_us: 30, draw_us: 15 });
+                Some(npu_models::telemetry::SamplePhases { penalties_us: 10, top_k_us: 20, top_p_us: 30, draw_us: 15 });
         }
         let t = table(&r);
         assert!(t.contains("sampling, by stage"), "{t}");
@@ -401,7 +401,7 @@ mod tests {
     #[test]
     fn a_cold_wake_is_called_out_with_the_idle_gap_and_first_dispatch_time() {
         let mut r = run(18_000, &[1, 2, 3]);
-        r.conditions.npu_wake = Some(npu_engine::NpuWake {
+        r.conditions.npu_wake = Some(npu_models::NpuWake {
             cold: true, status: "suspended".into(), idle_ms: Some(6_200), first_dispatch_us: Some(142_300),
         });
         let t = table(&r);
@@ -414,7 +414,7 @@ mod tests {
     fn a_warm_wake_and_an_unreadable_one_render_distinctly() {
         let mut r = run(18_000, &[1, 2, 3]);
         r.conditions.npu_wake =
-            Some(npu_engine::NpuWake { cold: false, status: "active".into(), idle_ms: Some(20), first_dispatch_us: Some(45_700) });
+            Some(npu_models::NpuWake { cold: false, status: "active".into(), idle_ms: Some(20), first_dispatch_us: Some(45_700) });
         assert!(table(&r).contains("warm (device was active)"));
 
         r.conditions.npu_wake = None;

@@ -23,8 +23,8 @@ Three labels, and I use them narrowly:
 
 | Model | Status | Evidence |
 | --- | --- | --- |
-| GigaAM-v3 (Russian) | Supported | `scenarios/asr-gigaam.toml`; encoder is `ConformerEncoder` in `rust/npu-engine/src/asr/mod.rs`, wrapping `npu_asr::encoder::Encoder`, which opens the NPU device |
-| Parakeet-TDT-0.6B-v3 (multilingual) | Supported | `scenarios/asr.toml`; encoder in `rust/npu-engine/src/asr/parakeet.rs`, same NPU-device pattern |
+| GigaAM-v3 (Russian) | Supported | `scenarios/asr-gigaam.toml`; encoder is `ConformerEncoder` in `rust/npu-models/src/asr/mod.rs`, wrapping `npu_asr::encoder::Encoder`, which opens the NPU device |
+| Parakeet-TDT-0.6B-v3 (multilingual) | Supported | `scenarios/asr.toml`; encoder in `rust/npu-models/src/asr/parakeet.rs`, same NPU-device pattern |
 | Whisper-small | Supported | `scenarios/asr-whisper-small.toml`; encoder in `rust/npu-whisper` runs on the NPU unconditionally |
 | Whisper-large-v3-turbo | Supported | `scenarios/asr-whisper-turbo.toml`; same encoder path, 32 encoder / 4 decoder layers |
 
@@ -32,12 +32,12 @@ For all four, only the **encoder** is unconditionally on the NPU. Decode differs
 model and is worth stating precisely:
 
 - GigaAM and Parakeet decode via an RNNT/TDT predictor + joint network run through
-  `onnxruntime` on the host (`rust/npu-engine/src/asr/mod.rs`'s `run_decoder`/`run_joint`,
-  `rust/npu-engine/src/asr/parakeet.rs`). This is not a gap to close -- it is a different
+  `onnxruntime` on the host (`rust/npu-models/src/asr/mod.rs`'s `run_decoder`/`run_joint`,
+  `rust/npu-models/src/asr/parakeet.rs`). This is not a gap to close -- it is a different
   decode algorithm than Whisper's, by necessity (`general-engine.md`: "ASR decode is
   per-model, not merely per-capability").
 - Whisper decodes through `onnxruntime` (`decoder_model.onnx` / `decoder_with_past_model.onnx`)
-  by default. Two environment variables in `rust/npu-engine/src/asr/whisper.rs` route the
+  by default. Two environment variables in `rust/npu-models/src/asr/whisper.rs` route the
   decoder onto the NPU instead: `NPU_DECODE` (per-op matmuls on the NPU, ~72 dispatches
   per token) and `NPU_DECODE_FUSED` (the entire decoder stack fused into **one** ELF
   dispatch per token, which takes precedence over `NPU_DECODE`). Both are real, working
@@ -50,15 +50,15 @@ model and is worth stating precisely:
 
 | Model | Status | Evidence |
 | --- | --- | --- |
-| BGE-base-en-v1.5 | Supported | `scenarios/bge-base.toml`; `BertEncoder` in `rust/npu-engine/src/bert/encoder.rs` ("BERT encoder on the NPU") |
-| ESM2-8M, ESM2-35M (protein) | Supported | `scenarios/esm2-{8m,35m}[-native].toml`; `rust/npu-engine/src/esm/encoder.rs` |
+| BGE-base-en-v1.5 | Supported | `scenarios/bge-base.toml`; `BertEncoder` in `rust/npu-models/src/bert/encoder.rs` ("BERT encoder on the NPU") |
+| ESM2-8M, ESM2-35M (protein) | Supported | `scenarios/esm2-{8m,35m}[-native].toml`; `rust/npu-models/src/esm/encoder.rs` |
 | all-MiniLM-L6-v2, e5-small-v2, multilingual-e5-small | Host-only | weight-conversion parity only, see below |
 | ModernBERT-base | Host-only | weight-conversion parity only, see below |
 
 ESM ships two kernel paths, both on the NPU: the default `zeropad` path
-(`rust/npu-engine/src/esm/encoder.rs`, zero-pads ESM's 320/480-wide hidden state onto the
+(`rust/npu-models/src/esm/encoder.rs`, zero-pads ESM's 320/480-wide hidden state onto the
 kernel's fixed 768-wide matmul shape) and a `native` path
-(`rust/npu-engine/src/esm/native.rs`, its own header calls it a "research/comparison
+(`rust/npu-models/src/esm/native.rs`, its own header calls it a "research/comparison
 path" that runs the real, unpadded K). Both are Supported; `native` is not the default.
 
 **MiniLM / e5 / multilingual-e5 / ModernBERT** have no scenario file, and I could not find
@@ -77,7 +77,7 @@ encoder does not implement.
 
 | Model | Status | Evidence |
 | --- | --- | --- |
-| Qwen3-0.6B | Supported | `scenarios/generate-qwen3-0.6b.toml`; `rust/npu-engine/src/llm/npu_decode.rs`'s `NpuDecodeStep` drives a real `ElfResident`/`FusedArena` device dispatch, one fused ELF per token |
+| Qwen3-0.6B | Supported | `scenarios/generate-qwen3-0.6b.toml`; `rust/npu-models/src/llm/npu_decode.rs`'s `NpuDecodeStep` drives a real `ElfResident`/`FusedArena` device dispatch, one fused ELF per token |
 | Gemma 3-270M | Supported | `scenarios/generate-gemma3-270m.toml`; the same `NpuDecodeStep` dispatch as Qwen3, via `designs/decode_fused/llm_decode_spec.py`'s `GEMMA3_270M` spec |
 | Gemma 4-12B | Supported | `scenarios/generate-gemma4-12b-resident-256k.toml`; the resident forward ladder (weights stay on the device across tokens), not the per-layer `NpuDecodeStep` path |
 | Qwen3.5-4B | Supported (typed decisions) | `scenarios/generate-qwen3.5-4b.toml`; 24 Gated DeltaNet + 8 gated-attention layers, int4 g32 weights, batched prefill M=256 over decode's arena; serves `/v1/systemone` and `npu decide` |
@@ -161,8 +161,8 @@ missing bake is a named `EngineLoader::load` error, not a bare ENOENT). Bake it,
 | pyannote/speaker-diarization-community-1 | Host-only | `scenarios/diarize-pyannote-community-1.toml` |
 
 This one is host-only by design, not by omission, and the tree says so twice:
-`rust/npu-engine/src/registry.rs`'s comment ("v1 diarization is host-only") and
-`rust/npu-engine/src/diarize/mod.rs`'s own doc comment ("Host-only in v1; the NPU
+`rust/npu-models/src/registry.rs`'s comment ("v1 diarization is host-only") and
+`rust/npu-models/src/diarize/mod.rs`'s own doc comment ("Host-only in v1; the NPU
 embedder swaps in behind `SpeakerEmbedder` without touching this file"). `registry::try_build`
 does not even open the NPU device for a diarize scenario, specifically so it cannot take
 a hardware context away from a co-resident ASR model. Segmentation (PyanNet) and speaker
@@ -176,6 +176,6 @@ embedding (WeSpeaker ResNet34) both run through `onnxruntime` on the host.
   conversion -- I found no forward-pass code for any of them.
 - Whether Whisper's `NPU_DECODE_FUSED` path generalizes to Whisper-large-v3-turbo's
   4-layer decoder the same way it does to Whisper-small's 12-layer one -- the mechanism
-  in `rust/npu-engine/src/asr/whisper.rs` is written generically over decoder depth, but
+  in `rust/npu-models/src/asr/whisper.rs` is written generically over decoder depth, but
   I did not find a turbo-specific fused-decode artifact or gate run in this tree, so I
   did not assert it works for turbo specifically.

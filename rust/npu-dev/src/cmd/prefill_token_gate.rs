@@ -32,8 +32,8 @@
 use std::path::Path;
 use std::rc::Rc;
 
-use npu_engine::llm::generator::DecodeStep;
-use npu_engine::llm::npu_decode::NpuDecodeStep;
+use npu_models::llm::generator::DecodeStep;
+use npu_models::llm::npu_decode::NpuDecodeStep;
 use npu_xrt::Device;
 
 /// Top-k indices, highest logit first. Not a full sort: k is 5 and the vocab is 151936.

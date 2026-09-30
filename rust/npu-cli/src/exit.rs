@@ -7,7 +7,7 @@
 //! string. `main` reads the result back exactly once, via [`of`], which is the single place any
 //! error becomes a process exit code.
 
-use npu_engine::EngineError;
+use npu_models::EngineError;
 
 /// One of the six exit codes `npu` can return. Anything not confidently matched to 2-5 stays at
 /// the `Failure` default -- deliberate, not a gap. See `main.rs`'s call sites for what is and is
@@ -75,7 +75,7 @@ pub fn of(e: &anyhow::Error) -> Code {
 mod tests {
     use super::*;
     use anyhow::Context;
-    use npu_engine::capability::Capability;
+    use npu_models::capability::Capability;
 
     #[test]
     fn engine_error_classifies_device_and_no_model() {

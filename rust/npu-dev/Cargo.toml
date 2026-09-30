@@ -21,7 +21,7 @@ npu-xrt = { path = "../npu-xrt" }
 npu-asr = { path = "../npu-asr", features = ["two_ctx"] }
 npu-asr-host = { path = "../npu-asr-host" }
 npu-onnx = { path = "../npu-onnx" }
-npu-engine = { path = "../npu-engine" }
+npu-models = { path = "../npu-models" }
 npu-parakeet = { path = "../npu-parakeet", features = ["npu"] }
 npu-whisper = { path = "../npu-whisper", features = ["npu"] }
 npu-sr = { path = "../npu-sr" }

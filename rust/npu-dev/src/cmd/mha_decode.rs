@@ -1,5 +1,5 @@
 //! mha_decode parity probe (M1 Task 0) — proves the on-chip single-query MHA kernel
-//! matches the host reference `attend_one` (rust/npu-engine/src/asr/whisper_decoder.rs).
+//! matches the host reference `attend_one` (rust/npu-models/src/asr/whisper_decoder.rs).
 //!
 //! For each S in {1,30,64,200,448}: fixed-seed random q[768], K[S,768], V[S,768] (rounded
 //! to bf16 so host and kernel see identical inputs), compute ctx on the host (a port of

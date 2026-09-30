@@ -6,14 +6,14 @@ alongside your own client. Both sit on the same underlying pipeline described in
 -- where a route or field's behavior was unclear from the source, it says so rather than
 guessing.
 
-## Rust: `npu-engine`
+## Rust: `npu-models`
 
-`rust/npu-engine/src/lib.rs` states its own contract: "Public API: `Engine`, `Model`,
+`rust/npu-models/src/lib.rs` states its own contract: "Public API: `Engine`, `Model`,
 `ModelKind`, `EngineError`. ... Everything else in this crate is implementation detail
 (`#[doc(hidden)]`) and may change without notice." That is the surface documented here.
 
 ```rust
-use npu_engine::{Engine, Model, ModelKind, EngineError};
+use npu_models::{Engine, Model, ModelKind, EngineError};
 ```
 
 - `Engine::available() -> bool` -- true if `/dev/accel/accel0` exists. A cheap file check, not
@@ -53,9 +53,9 @@ A `Model` is not `Send`/`Sync` and holds device resources; a single instance mus
 driven concurrently (the NPU is single-tenant, and the control-plane layer below serializes
 for exactly this reason).
 
-Everything under `npu_engine::{pipeline, registry, bert, esm, asr, diarize, llm, capability,
+Everything under `npu_models::{pipeline, registry, bert, esm, asr, diarize, llm, capability,
 config, tuning_profile}` is `#[doc(hidden)]` and, per the crate's own comment, may change
-without notice. `npu_engine::capability::{Capability, Servable, Request, Response}` in
+without notice. `npu_models::capability::{Capability, Servable, Request, Response}` in
 particular is described in its own source comment as a "PROBE, not the finished contract" --
 validated against two model instances, not wired into the registry the HTTP server and CLI
 actually use. It is not part of the stable surface.
@@ -85,19 +85,19 @@ thread-local `npu_last_error()` string rather than unwinding into C.
 
 **Control plane** (multi-model, config-driven, the same actor the HTTP server uses):
 
-- `NpuRuntime *npu_runtime_start(const char *config_path)` -- loads the config and reconciles
+- `NpuRuntime *npu_service_start(const char *config_path)` -- loads the config and reconciles
   its models
-- `char *npu_runtime_transcribe(NpuRuntime *rt, const char *model, const int16_t *pcm, size_t n, uint32_t sample_rate)`
+- `char *npu_service_transcribe(NpuRuntime *rt, const char *model, const int16_t *pcm, size_t n, uint32_t sample_rate)`
   -- `model` NULL selects the configured default for ASR
-- `int npu_runtime_embed(NpuRuntime *rt, const char *model, const char *text, float *out, size_t out_cap)`
-- `int npu_runtime_reload(NpuRuntime *rt)` -- re-reads the config file and reconciles
-- `char *npu_runtime_models_json(NpuRuntime *rt)` -- the same JSON shape as `GET /v1/models`
+- `int npu_service_embed(NpuRuntime *rt, const char *model, const char *text, float *out, size_t out_cap)`
+- `int npu_service_reload(NpuRuntime *rt)` -- re-reads the config file and reconciles
+- `char *npu_service_models_json(NpuRuntime *rt)` -- the same JSON shape as `GET /v1/models`
   below
-- `void npu_runtime_stop(NpuRuntime *rt)`
+- `void npu_service_stop(NpuRuntime *rt)`
 
 ## HTTP server
 
-`rust/npu-runtime/src/http.rs`: a blocking, single-flight HTTP/1.1 server (`npu serve`,
+`rust/npu-service/src/http.rs`: a blocking, single-flight HTTP/1.1 server (`npu serve`,
 default port `11434`, configurable via `[server] port` in `engine.toml`). Single-flight because
 the NPU is single-tenant -- one request is served at a time by the same device actor described
 in [general-engine.md](general-engine.md). Route dispatch is a pure function (`route()`) over a
@@ -241,20 +241,20 @@ so it is worth naming here rather than only in general-engine.md. Shape: `[scena
 `n_layers`, `max_seq`, `precision`, `kernel`; absent for non-transformer models), `[artifacts]`
 (weight/tokenizer/checkpoint paths, or `decode`/`tokenizer_dir` for `kind = "generate"`), and a
 per-kind block (`[embeddings]`: `pooling`, `normalize`; `[diarization]`: `manifest`). See
-`rust/npu-engine/src/config.rs` for the full field list and `scenarios/*.toml` for shipped
+`rust/npu-models/src/config.rs` for the full field list and `scenarios/*.toml` for shipped
 examples across every kind.
 
 `engine.toml` (the control-plane config `npu serve` reads) is a separate, smaller schema:
 `[server]` (`port`, `max_resident`, `idle_unload_s`, `sweep_interval_s`, `idle_release_s`,
 `evict_policy`, `memory_ceiling_mb`), `[defaults]` (capability name -> model name), and
 `[[model]]` entries (`name`, `scenario` path, `resident` bool). See
-`rust/npu-runtime/src/config.rs`.
+`rust/npu-service/src/config.rs`.
 
 ## What is not documented here
 
 `npu-sr-capi` (a C ABI over `npu-sr`'s `SrEngine`, `libxdna_sr.so`, for the ffmpeg `vf_xdna_sr`
-filter) is a real, shipped surface that does not go through `npu-engine` or `npu-runtime` at
-all -- it opens its own device handle in-process, the same shape `npu-engine`'s Rust API above
+filter) is a real, shipped surface that does not go through `npu-models` or `npu-service` at
+all -- it opens its own device handle in-process, the same shape `npu-models`'s Rust API above
 does. `SrEngine` itself is also reachable through the service (`/v1/images/upscale` above,
 `npu upscale`); the filter is a separate integration, not a second route to the same server --
 see [general-engine.md](general-engine.md).

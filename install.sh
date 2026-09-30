@@ -750,7 +750,7 @@ while IFS= read -r scen; do
   # A batched-prefill artifact shares one FusedArena with its decode ELF (prefill emits no
   # weight .bin files of its own -- meta.json's `weights_from` names decode's `buffers/`
   # instead), so every weight/cache buffer must sit at an identical scratch offset in both.
-  # rust/npu-engine/src/llm/artifact.rs::check_shared_layout_agrees re-checks this at LOAD and
+  # rust/npu-models/src/llm/artifact.rs::check_shared_layout_agrees re-checks this at LOAD and
   # refuses to bind a disagreeing pair -- but only a rebuild of prefill exercises that path, so
   # a decode rebuilt without its paired prefill installed clean and crash-looped the service on
   # restart (observed 2026-09-09). Catch it here instead. Scenarios with no `prefill` line (or

@@ -1,0 +1,63 @@
+[package]
+name = "npu-models"
+version = "0.1.0"
+edition = "2021"
+description = "General multi-model engine over the XDNA2 NPU kernel kit (ASR + embeddings via a Frontend/Encoder/Head pipeline)"
+
+[lib]
+name = "npu_models"
+path = "src/lib.rs"
+
+[features]
+# `npu` is accepted on the build line for parity with the other crates; the engine always links the
+# NPU encoders (parakeet/whisper are pinned with their own `npu` feature), so this is a no-op marker.
+npu = []
+
+[dependencies]
+anyhow = "1"
+ndarray = "0.16"
+ndarray-npy = { version = "0.9", default-features = false }
+memmap2 = "0.9"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+# `preserve_order`: a tool schema's key order is the CLIENT's, and it moves the rendered prompt
+# (measured 2026-09-10: reordering one schema's keys shares 74 of 159 tokens). Without this,
+# `Value` is a BTreeMap and every schema comes back alphabetized.
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+thiserror = "1"
+# Loads `<name>.elf.zst` when the plain ELF is absent on disk (llm/artifact.rs); decompression is
+# never on the served hot path -- it happens once at load, before bind_resident.
+zstd = "0.13"
+toml = "0.8"
+tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
+# `preserve_order` here too, and for the same reason: minijinja's own ValueMap is a BTreeMap
+# without it, so a schema that survived serde_json in order would be re-sorted on the way in.
+# `macros` because a chat template may DEFINE its own: Gemma-4's declares five
+# (format_parameters, format_function_declaration, format_argument, strip_thinking, ...)
+# and they carry its tool-call rendering and thinking-channel stripping. Without the
+# feature minijinja parses the file and fails with "unknown statement macro", which reads
+# as a broken template rather than a missing capability on our side.
+minijinja = { version = "2", default-features = false, features = ["builtins", "serde", "preserve_order", "macros"] }
+npu-xrt = { path = "../npu-xrt" }
+npu-asr = { path = "../npu-asr", features = ["two_ctx"] }
+npu-asr-host = { path = "../npu-asr-host" }
+npu-onnx = { path = "../npu-onnx" }
+npu-parakeet = { path = "../npu-parakeet", features = ["npu"] }
+npu-whisper = { path = "../npu-whisper", features = ["npu"] }
+npu-weights = { path = "../npu-weights" }
+# Gemma-4 multimodal host towers: PNG/JPEG decode only, no encoder/transform features needed --
+# resize is our own bicubic port (rust/npu-models/src/llm/gemma4_media.rs), matched against the
+# HF/torchvision oracle rather than delegated to this crate.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# Gemma4Towers::load reads ONLY its 11 named tensors out of the served checkpoint's
+# model.safetensors -- which is the FULL 12B-param file (24 GB) -- via a direct mmap + selective
+# safetensors deserialize. `npu_weights::source::read_safetensors` upcasts EVERY tensor in the file
+# to f32 in one BTreeMap, ~48 GB for this checkpoint on a 30 GB box; measured to swap-thrash for
+# 60-90s per load rather than hard-fail, which is worse; see gemma4_media.rs's load().
+safetensors = "0.4"
+half = "2"
+
+[dev-dependencies]
+tempfile = "3"
+

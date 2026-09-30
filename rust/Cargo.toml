@@ -1,10 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["npu-dispatch", "npu-xrt", "npu-asr-host", "npu-asr", "npu-onnx", "npu-parakeet", "npu-engine", "npu-whisper", "npu-weights", "npu-capi", "npu-runtime", "npu-cli", "npu-sr", "npu-sr-capi", "npu-dev", "npu-s2"]
+members = ["npu-dispatch", "npu-xrt", "npu-asr-host", "npu-asr", "npu-onnx", "npu-parakeet", "npu-models", "npu-whisper", "npu-weights", "npu-capi", "npu-service", "npu-cli", "npu-sr", "npu-sr-capi", "npu-dev", "npu-s2"]
 
 # What `cargo build` at the workspace root builds. `npu-dev` is the single dev binary (probes,
 # parity gates, kernel build tools) -- subcommands, not separate crates or [[bin]] targets.
-default-members = ["npu-dispatch", "npu-xrt", "npu-asr-host", "npu-asr", "npu-onnx", "npu-parakeet", "npu-engine", "npu-whisper", "npu-weights", "npu-capi", "npu-runtime", "npu-cli", "npu-sr", "npu-sr-capi", "npu-dev", "npu-s2"]
+default-members = ["npu-dispatch", "npu-xrt", "npu-asr-host", "npu-asr", "npu-onnx", "npu-parakeet", "npu-models", "npu-whisper", "npu-weights", "npu-capi", "npu-service", "npu-cli", "npu-sr", "npu-sr-capi", "npu-dev", "npu-s2"]
 
 [profile.release]
 opt-level = 3

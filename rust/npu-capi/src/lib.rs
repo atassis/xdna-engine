@@ -1,4 +1,4 @@
-//! C ABI over npu-engine. Handle-based, return-code errors + thread-local last-error. Every entry
+//! C ABI over npu-models. Handle-based, return-code errors + thread-local last-error. Every entry
 //! point catches unwinds (no panic may cross the FFI boundary).
 
 use std::cell::RefCell;
@@ -6,7 +6,7 @@ use std::ffi::{c_char, c_int, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 
-use npu_engine::{Engine, Model, ModelKind};
+use npu_models::{Engine, Model, ModelKind};
 
 thread_local! { static LAST_ERROR: RefCell<CString> = RefCell::new(CString::new("").unwrap()); }
 
@@ -151,18 +151,18 @@ pub extern "C" fn npu_last_error() -> *const c_char {
     LAST_ERROR.with(|e| e.borrow().as_ptr())
 }
 
-// --- Runtime control plane (multi-model, config-driven) over npu-runtime ---
+// --- Runtime control plane (multi-model, config-driven) over npu-service ---
 
-use npu_runtime::actor::Handle as RtHandle;
-use npu_runtime::config::Config;
-use npu_runtime::loader::EngineLoader;
+use npu_service::actor::Handle as RtHandle;
+use npu_service::config::Config;
+use npu_service::loader::EngineLoader;
 
 /// Opaque control-plane handle: a running device actor + its config path.
 pub struct NpuRuntime { handle: RtHandle, join: Option<std::thread::JoinHandle<()>>, cfg_path: std::path::PathBuf }
 
 /// Start the control plane from a config TOML path (reconciles its models). NULL on error.
 #[no_mangle]
-pub unsafe extern "C" fn npu_runtime_start(config_path: *const c_char) -> *mut NpuRuntime {
+pub unsafe extern "C" fn npu_service_start(config_path: *const c_char) -> *mut NpuRuntime {
     let r = catch_unwind(AssertUnwindSafe(|| {
         if config_path.is_null() { set_error("config_path is null"); return ptr::null_mut(); }
         let p = match unsafe { CStr::from_ptr(config_path) }.to_str() {
@@ -171,18 +171,18 @@ pub unsafe extern "C" fn npu_runtime_start(config_path: *const c_char) -> *mut N
         };
         let cfg = match Config::load(&p) { Ok(c) => c, Err(e) => { set_error(e); return ptr::null_mut(); } };
         let root = std::env::current_dir().unwrap_or_else(|_| ".".into());
-        let (handle, join) = match npu_runtime::start(cfg, Box::new(EngineLoader { root })) {
+        let (handle, join) = match npu_service::start(cfg, Box::new(EngineLoader { root })) {
             Ok(hj) => hj,
             Err(e) => { set_error(e.to_string()); return ptr::null_mut(); }
         };
         Box::into_raw(Box::new(NpuRuntime { handle, join: Some(join), cfg_path: p }))
     }));
-    r.unwrap_or_else(|_| { set_error("panic in npu_runtime_start"); ptr::null_mut() })
+    r.unwrap_or_else(|_| { set_error("panic in npu_service_start"); ptr::null_mut() })
 }
 
 /// ASR through the control plane (model name or NULL for the configured default). Caller frees.
 #[no_mangle]
-pub unsafe extern "C" fn npu_runtime_transcribe(rt: *mut NpuRuntime, model: *const c_char,
+pub unsafe extern "C" fn npu_service_transcribe(rt: *mut NpuRuntime, model: *const c_char,
     pcm: *const i16, n: usize, sample_rate: u32) -> *mut c_char {
     let r = catch_unwind(AssertUnwindSafe(|| {
         let Some(rt) = (unsafe { rt.as_ref() }) else { set_error("runtime is null"); return ptr::null_mut(); };
@@ -197,12 +197,12 @@ pub unsafe extern "C" fn npu_runtime_transcribe(rt: *mut NpuRuntime, model: *con
             Err(e) => { set_error(e.to_string()); ptr::null_mut() }
         }
     }));
-    r.unwrap_or_else(|_| { set_error("panic in npu_runtime_transcribe"); ptr::null_mut() })
+    r.unwrap_or_else(|_| { set_error("panic in npu_service_transcribe"); ptr::null_mut() })
 }
 
 /// Embedding through the control plane. Pass a buffer; returns the embedding length (>= written), or -1.
 #[no_mangle]
-pub unsafe extern "C" fn npu_runtime_embed(rt: *mut NpuRuntime, model: *const c_char, text: *const c_char,
+pub unsafe extern "C" fn npu_service_embed(rt: *mut NpuRuntime, model: *const c_char, text: *const c_char,
     out: *mut f32, out_cap: usize) -> c_int {
     let r = catch_unwind(AssertUnwindSafe(|| {
         let Some(rt) = (unsafe { rt.as_ref() }) else { set_error("runtime is null"); return -1; };
@@ -219,12 +219,12 @@ pub unsafe extern "C" fn npu_runtime_embed(rt: *mut NpuRuntime, model: *const c_
             Err(e) => { set_error(e.to_string()); -1 }
         }
     }));
-    r.unwrap_or_else(|_| { set_error("panic in npu_runtime_embed"); -1 })
+    r.unwrap_or_else(|_| { set_error("panic in npu_service_embed"); -1 })
 }
 
 /// Re-read the config file and reconcile. Returns 0 on success, -1 on error.
 #[no_mangle]
-pub unsafe extern "C" fn npu_runtime_reload(rt: *mut NpuRuntime) -> c_int {
+pub unsafe extern "C" fn npu_service_reload(rt: *mut NpuRuntime) -> c_int {
     catch_unwind(AssertUnwindSafe(|| {
         let Some(rt) = (unsafe { rt.as_ref() }) else { set_error("runtime is null"); return -1; };
         let cfg = match Config::load(&rt.cfg_path) { Ok(c) => c, Err(e) => { set_error(e); return -1; } };
@@ -234,18 +234,18 @@ pub unsafe extern "C" fn npu_runtime_reload(rt: *mut NpuRuntime) -> c_int {
 
 /// Model statuses as a JSON list (malloc'd; free with npu_string_free). NULL on error.
 #[no_mangle]
-pub unsafe extern "C" fn npu_runtime_models_json(rt: *mut NpuRuntime) -> *mut c_char {
+pub unsafe extern "C" fn npu_service_models_json(rt: *mut NpuRuntime) -> *mut c_char {
     let r = catch_unwind(AssertUnwindSafe(|| {
         let Some(rt) = (unsafe { rt.as_ref() }) else { set_error("runtime is null"); return ptr::null_mut(); };
-        let json = npu_runtime::http::models_json(&rt.handle.status());
+        let json = npu_service::http::models_json(&rt.handle.status());
         CString::new(json).map(|c| c.into_raw()).unwrap_or(ptr::null_mut())
     }));
-    r.unwrap_or_else(|_| { set_error("panic in npu_runtime_models_json"); ptr::null_mut() })
+    r.unwrap_or_else(|_| { set_error("panic in npu_service_models_json"); ptr::null_mut() })
 }
 
 /// Stop the control plane and free the handle.
 #[no_mangle]
-pub unsafe extern "C" fn npu_runtime_stop(rt: *mut NpuRuntime) {
+pub unsafe extern "C" fn npu_service_stop(rt: *mut NpuRuntime) {
     if rt.is_null() { return; }
     let _ = catch_unwind(AssertUnwindSafe(|| {
         let mut rt = unsafe { Box::from_raw(rt) };

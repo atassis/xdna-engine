@@ -18,7 +18,7 @@ Two behaviors follow directly from being npu4 rather than an earlier generation:
   partition the compute array -- `aie2_ctx.c` ignores a context's requested column list
   and always requests every column, and contexts instead time-slice the whole array.
   A generation without that flag could partition space instead of time; nothing in this
-  engine's device-actor model (`rust/npu-runtime`, one thread serializing all NPU work)
+  engine's device-actor model (`rust/npu-service`, one thread serializing all NPU work)
   assumes or exploits partitioning either way, but it has only ever run under
   time-slicing.
 

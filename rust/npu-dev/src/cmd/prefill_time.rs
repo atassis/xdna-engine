@@ -18,8 +18,8 @@ use std::path::Path;
 use std::rc::Rc;
 use std::time::Instant;
 
-use npu_engine::llm::generator::DecodeStep;
-use npu_engine::llm::npu_decode::NpuDecodeStep;
+use npu_models::llm::generator::DecodeStep;
+use npu_models::llm::npu_decode::NpuDecodeStep;
 use npu_xrt::Device;
 
 fn prompt_ids(len: usize, vocab: u32) -> Vec<u32> {

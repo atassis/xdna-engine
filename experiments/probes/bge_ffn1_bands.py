@@ -29,7 +29,7 @@ ART = "artifacts/bge-base"
 ENC = f"{ART}/encoder"
 HID, DFF, NH, HD, NL = 768, 3072, 12, 64, 12
 KRES, KAUG = 768, 800
-LN_EPS = np.float32(1e-12)          # rust/npu-engine/src/bert/encoder.rs:15
+LN_EPS = np.float32(1e-12)          # rust/npu-models/src/bert/encoder.rs:15
 
 f32 = lambda x: np.asarray(x, np.float32)
 bf = lambda x: f32(x).astype(bfloat16)
@@ -75,7 +75,7 @@ class WordPiece:
         return ids
 
 
-# --- the encoder, numpy, matching rust/npu-engine/src/bert/{frontend,encoder}.rs -----------------
+# --- the encoder, numpy, matching rust/npu-models/src/bert/{frontend,encoder}.rs -----------------
 
 def layer_norm(x, w, b):
     mu = x.mean(-1, keepdims=True)
