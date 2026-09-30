@@ -1157,6 +1157,7 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
         self.resident.clear();
         self.resident_media.clear();
         let mut primed = reused;
+        let mut reused_from = reused;
         // `prefill_batch()` is the CAPABILITY probe -- `Some` means a batched prefill artifact is
         // loaded. Its `M` no longer gates the decision: `prime()` pads a partial chunk itself, and
         // paying for the padding beats paying for the dispatches. The THRESHOLD is a different
@@ -1175,6 +1176,7 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
             // group of dispatches instead of after the whole prompt.
             let stride = batch * PREFILL_CHUNKS_PER_CHECK;
             let mut at = batched_from;
+            reused_from = batched_from;
             while at < batchable {
                 let end = (at + stride).min(batchable);
                 let now = self.decode.prefill(&prompt_ids[..end], at)?;
@@ -1207,7 +1209,8 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
         let (prefill_dispatches, _) = counter_delta(&mut counters, self.decode.counters());
         let prefill = PrefillRecord {
             tokens: prompt_tokens,
-            batched: primed as u32,
+            reused: reused_from as u32,
+            batched: (primed - reused_from) as u32,
             stepwise: (prefilled - primed) as u32,
             us: prefill_us,
             dispatches: prefill_dispatches,

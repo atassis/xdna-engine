@@ -62,6 +62,7 @@ pub fn prefill_line(p: &PrefillRecord, m: &RunMeta) -> Value {
         "object": "npu.prefill",
         "id": m.id,
         "tokens": p.tokens,
+        "reused": p.reused,
         "batched": p.batched,
         "stepwise": p.stepwise,
         "ms": us_f(p.us),
@@ -445,6 +446,7 @@ pub fn parse_run(text: &str) -> Result<Run, String> {
             "npu.prefill" => {
                 run.prefill = PrefillRecord {
                     tokens: v["tokens"].as_u64().unwrap_or(0) as u32,
+                    reused: v["reused"].as_u64().unwrap_or(0) as u32,
                     batched: v["batched"].as_u64().unwrap_or(0) as u32,
                     stepwise: v["stepwise"].as_u64().unwrap_or(0) as u32,
                     us: f64_ms_to_us(v.get("ms")),
@@ -558,7 +560,7 @@ mod tests {
             queue_us: 1_200,
             load_us: 0,
             tokenize_us: 400,
-            prefill: PrefillRecord { tokens: 12, batched: 0, stepwise: 12, us: 4_000, dispatches: Some(12) },
+            prefill: PrefillRecord { tokens: 12, reused: 0, batched: 0, stepwise: 12, us: 4_000, dispatches: Some(12) },
             steps,
             generate_us: 66_000,
             usage: GenerateUsage { prompt_tokens: 12, completion_tokens: 4 },

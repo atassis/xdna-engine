@@ -51,8 +51,8 @@ pub fn table(r: &GenerationReport) -> String {
         "  {} prompt + {} completion tokens  ·  decode {:.0} ms  ·  total {:.0} ms\n",
         s.prompt_tokens, s.completion_tokens, ms(s.decode_us), ms(s.total_us)));
     if let Some(p) = s.prompt_tok_per_s {
-        o.push_str(&format!("  prefill {:.0} tok/s over {} tokens ({} batched, {} stepwise)\n",
-            p, r.prefill.tokens, r.prefill.batched, r.prefill.stepwise));
+        o.push_str(&format!("  prefill {:.0} tok/s over {} tokens ({} reused, {} batched, {} stepwise)\n",
+            p, r.prefill.tokens, r.prefill.reused, r.prefill.batched, r.prefill.stepwise));
     }
 
     o.push_str("  ── where the decode went ─────────────────────────────\n");
