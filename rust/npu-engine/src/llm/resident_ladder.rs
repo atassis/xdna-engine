@@ -45,9 +45,15 @@ use npu_xrt::{Bo, Device, ElfResident, FLAG_HOST_ONLY};
 use crate::api::EngineError;
 use crate::llm::generator::{CacheState, DecodeStep};
 use crate::llm::npu_decode::unpack_bf16_bytes;
+use crate::llm::resident::ring_read_first;
+use crate::telemetry::ArmProvenance;
+use crate::llm::multimodal::MediaEmbeds;
 use crate::llm::resident_raw::{global_widths_record, piece_nt, rope_row_global, rope_row_sliding, sliding_widths_record, EmbedHeadPack};
 
-const NONFINITE_RETRIES: usize = 4;
+/// Pause before each re-run of a non-finite dispatch. A policy, measured 2026-09-30 on rf48C under
+/// desktop load: failures come in bursts, 63% clear on an immediate re-run, and 7 of 8 that failed
+/// four immediate re-runs cleared after a 0.5-4 s pause (rf-forward-intermittent-nonfinite).
+const NONFINITE_BACKOFF_MS: [u64; 8] = [0, 0, 250, 500, 1000, 2000, 4000, 8000];
 
 /// One entry of `fwd_layout.json`'s `rungs` array / `meta.json`'s copy of it: a compiled control
 /// code and the window it covers. `kind` is `"split"` (f1-family, decode, carries the split-lane
@@ -134,6 +140,40 @@ pub fn read_spans(first: usize, nbw: usize, c: usize, blk: usize) -> [(usize, us
         return [(b0, nbw - 1), ((b0 + nbw - 1) % nb, 1)];
     }
     [(b0, na), (0, nbw - na)]
+}
+
+/// `NPU_RESIDENT_REUSE_KV=1`: keep the caches across requests (default off, see the flag's entry).
+fn reuse_kv() -> bool {
+    std::env::var("NPU_RESIDENT_REUSE_KV").is_ok_and(|v| v == "1")
+}
+
+/// Whether a resume at `r` finds every sliding position its window reads, `[first(r), r)`, still in
+/// its ring slot: no row at or past `first(r) + c` has been written over one of them. `high_water`
+/// is one past the furthest row written, padding included.
+pub fn resume_keeps_the_window(r: usize, high_water: usize, window: usize, c: usize) -> bool {
+    r == 0 || high_water <= ring_read_first(r, window) + c
+}
+
+/// What `npu stats` names this build by: the ELF's content hash, the toolchain instance it was built
+/// with (`gen_env.txt`'s `RF_INST`, a directory named by the `toolchain.lock` hash), and its
+/// `rlayer_design` flags (`gen_args.txt`) plus the `RF_*` build environment.
+pub fn build_provenance(dir: &Path, elf: &[u8], max_seq: usize) -> ArmProvenance {
+    use sha2::{Digest, Sha256};
+    let read = |f: &str| fs::read_to_string(dir.join(f)).unwrap_or_default();
+    let env = read("gen_env.txt");
+    let toolchain = env.lines().find_map(|l| l.strip_prefix("RF_INST="))
+        .and_then(|p| Path::new(p.trim()).file_name()).map(|n| n.to_string_lossy().into_owned());
+    let mut flags: Vec<String> = env.lines().map(str::trim)
+        .filter(|l| l.starts_with("RF_") && !l.starts_with("RF_INST=")).map(str::to_string).collect();
+    flags.extend(read("gen_args.txt").split_whitespace().map(str::to_string));
+    ArmProvenance {
+        fusion_flags: flags,
+        max_seq: u32::try_from(max_seq).ok(),
+        artifact_path: Some(dir.display().to_string()),
+        artifact_hash: Some(Sha256::digest(elf).iter().take(6).map(|b| format!("{b:02x}")).collect()),
+        toolchain_pin_hash: toolchain,
+        ..ArmProvenance::default()
+    }
 }
 
 /// One scratchpad parameter's value: a byte offset (written as `bytes / param_unit_bytes`) or a
@@ -404,7 +444,15 @@ pub struct LadderResidentForward {
     kb: Bo,
     boot: ElfResident,
     rungs: HashMap<String, ElfResident>,
-    n_written: usize,
+    /// One past the furthest sliding-ring row any dispatch wrote since the caches were zeroed,
+    /// padding rows included: what [`resume_keeps_the_window`] measures a resume against.
+    high_water: usize,
+    /// A dispatch failed or stayed non-finite, so the caches may hold NaN rows (K034: a masked NaN
+    /// V row still poisons the output). The next `reset` zeroes them.
+    poisoned: bool,
+    provenance: ArmProvenance,
+    /// This generation's tower rows, gathered in place of the text embedding at their positions.
+    media: MediaEmbeds,
 }
 
 impl LadderResidentForward {
@@ -450,7 +498,8 @@ impl LadderResidentForward {
             rungs.insert(r.name.clone(), kern);
         }
 
-        Ok(LadderResidentForward { meta, embed, xb, ob, sb, kb, boot, rungs, n_written: 0 })
+        let provenance = build_provenance(&meta.dir, &elf, meta.largest_keys(1));
+        Ok(LadderResidentForward { meta, embed, xb, ob, sb, kb, boot, rungs, high_water: 0, poisoned: false, provenance, media: MediaEmbeds::default() })
     }
 
     /// Build `%x` for a piece of `p_len` rows at position `s` and dispatch the rung named
@@ -458,7 +507,7 @@ impl LadderResidentForward {
     /// first key, 64-aligned).
     fn dispatch(&mut self, rung_name: &str, split_nb: Option<usize>, x_bits: &[u16], s: usize, p_len: usize) -> Result<usize, EngineError> {
         let nt = piece_nt(p_len, self.meta.row_block);
-        let first = s.saturating_sub(self.meta.sliding_window.saturating_sub(1)) / 64 * 64;
+        let first = ring_read_first(s, self.meta.sliding_window);
 
         let mut buf = vec![0u8; self.meta.xbuf];
         let x_bytes = u16s_to_le_bytes(x_bits);
@@ -529,7 +578,7 @@ impl LadderResidentForward {
         kern.dispatch().map_err(EngineError::Device)?;
         self.ob.sync_from_device().map_err(|e| EngineError::Device(format!("sync ob: {e}")))?;
 
-        self.n_written = s + p_len;
+        self.high_water = self.high_water.max(s + rung_nt * self.meta.row_block);
         Ok(first)
     }
 
@@ -545,14 +594,77 @@ impl LadderResidentForward {
 
     /// `dispatch`, repeated while its output comes back non-finite.
     fn dispatch_finite(&mut self, rung_name: &str, split_nb: Option<usize>, x_bits: &[u16], s: usize, p_len: usize) -> Result<(), EngineError> {
-        for attempt in 1..=NONFINITE_RETRIES {
+        self.poisoned = true;
+        self.dispatch(rung_name, split_nb, x_bits, s, p_len)?;
+        if self.out_rows_finite(p_len)? {
+            self.poisoned = false;
+            return Ok(());
+        }
+        let dump = std::env::var("NPU_RESIDENT_NF_DUMP").ok();
+        for (retry, &pause_ms) in NONFINITE_BACKOFF_MS.iter().enumerate() {
+            eprintln!("[resident] {rung_name} at {s}: non-finite output, retry {}/{} after {pause_ms} ms", retry + 1, NONFINITE_BACKOFF_MS.len());
+            if retry == 2 {
+                if let Some(path) = &dump {
+                    self.dump_nonfinite(path, rung_name, s, p_len);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(pause_ms));
             self.dispatch(rung_name, split_nb, x_bits, s, p_len)?;
             if self.out_rows_finite(p_len)? {
+                self.poisoned = false;
                 return Ok(());
             }
-            eprintln!("[resident] {rung_name} at {s}: non-finite output, attempt {attempt}/{NONFINITE_RETRIES}");
         }
-        Err(EngineError::Device(format!("{rung_name} at {s}: output non-finite after {NONFINITE_RETRIES} attempts")))
+        Err(EngineError::Device(format!("{rung_name} at {s}: output non-finite after {} retries", NONFINITE_BACKOFF_MS.len())))
+    }
+
+    /// `NPU_RESIDENT_NF_DUMP`: every layer's non-finite cache byte ranges (bf16 exponent all ones),
+    /// appended to `path` as one JSON line per burst (written at the third retry).
+    fn dump_nonfinite(&self, path: &str, rung_name: &str, s: usize, p_len: usize) {
+        let _ = self.kb.sync_from_device();
+        let mut layers = serde_json::Map::new();
+        let mut offs: Vec<(usize, usize)> = self.meta.layer_kv_off.iter().map(|(&l, &o)| (l, o)).collect();
+        offs.sort_by_key(|&(_, o)| o);
+        for (i, &(layer, off)) in offs.iter().enumerate() {
+            let end = offs.get(i + 1).map_or(self.meta.cache_bytes, |&(_, o)| o);
+            let mut ranges: Vec<(usize, usize)> = Vec::new();
+            let mut buf = vec![0u8; 1 << 24];
+            let mut at = off;
+            while at < end {
+                let n = buf.len().min(end - at);
+                if self.kb.read_bytes_at(at, &mut buf[..n]).is_err() {
+                    break;
+                }
+                for (j, c) in buf[..n].chunks_exact(2).enumerate() {
+                    if u16::from_le_bytes([c[0], c[1]]) & 0x7f80 == 0x7f80 {
+                        let b = at - off + 2 * j;
+                        match ranges.last_mut() {
+                            Some(r) if r.1 == b => r.1 = b + 2,
+                            _ => ranges.push((b, b + 2)),
+                        }
+                    }
+                }
+                at += n;
+            }
+            if !ranges.is_empty() {
+                let total: usize = ranges.iter().map(|r| r.1 - r.0).sum();
+                ranges.truncate(256);
+                layers.insert(layer.to_string(), serde_json::json!({"bytes": total, "ranges": ranges}));
+            }
+        }
+        let line = serde_json::json!({"rung": rung_name, "s": s, "p_len": p_len, "high_water": self.high_water, "layers": layers});
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            use std::io::Write;
+            let _ = writeln!(f, "{line}");
+        }
+    }
+
+    /// The input row at `pos`: the tower's row where media was scattered, else the text embedding.
+    fn embed_at(&mut self, token: u32, pos: usize) -> Result<Vec<u16>, EngineError> {
+        match self.media.row(pos) {
+            Some(b) => Ok(b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()),
+            None => self.embed.embed_row_bf16(token),
+        }
     }
 
     fn read_logits(&self) -> Result<Vec<f32>, EngineError> {
@@ -566,7 +678,7 @@ impl DecodeStep for LadderResidentForward {
     fn step(&mut self, token: u32, pos: usize) -> Result<Vec<f32>, EngineError> {
         let rung = rung_for(&self.meta.rungs, 1, pos + 1)?;
         let (name, blocks) = (rung.name.clone(), rung.blocks);
-        let x_bits = self.embed.embed_row_bf16(token)?;
+        let x_bits = self.embed_at(token, pos)?;
         self.dispatch_finite(&name, Some(blocks), &x_bits, pos, 1)?;
         let mut logits = self.read_logits()?;
         if let Some(cap) = self.meta.logit_softcap {
@@ -592,8 +704,8 @@ impl DecodeStep for LadderResidentForward {
             let rung_name = rung.name.clone();
             let piece = &tokens[at..end];
             let mut x_bits = Vec::with_capacity(piece.len() * self.meta.d_model);
-            for &tok in piece {
-                x_bits.extend_from_slice(&self.embed.embed_row_bf16(tok)?);
+            for (i, &tok) in piece.iter().enumerate() {
+                x_bits.extend_from_slice(&self.embed_at(tok, at + i)?);
             }
             self.dispatch_finite(&rung_name, None, &x_bits, at, p_len)?;
             at = end;
@@ -605,11 +717,43 @@ impl DecodeStep for LadderResidentForward {
         Some(self.meta.pmax)
     }
 
+    /// With `NPU_RESIDENT_REUSE_KV=1`, keeps the caches across requests: rows past a new write
+    /// position are masked, and a stale finite row there contributes exactly what a zero does. A
+    /// possibly-NaN cache is zeroed either way.
     fn reset(&mut self) -> Result<CacheState, EngineError> {
+        if !self.poisoned && reuse_kv() {
+            return Ok(CacheState::Retained);
+        }
         self.kb.write_bytes(&vec![0u8; self.meta.cache_bytes]).map_err(|e| EngineError::Device(format!("zero caches on reset: {e}")))?;
         self.kb.sync_to_device().map_err(|e| EngineError::Device(format!("sync caches on reset: {e}")))?;
-        self.n_written = 0;
+        self.high_water = 0;
+        self.poisoned = false;
         Ok(CacheState::Cleared)
+    }
+
+    fn resume_limit(&self, reused: usize) -> usize {
+        let c = self.meta.s_ring_layout.blocks * self.meta.s_ring_layout.block_rows;
+        match resume_keeps_the_window(reused, self.high_water, self.meta.sliding_window, c) {
+            true => reused,
+            false => 0,
+        }
+    }
+
+    fn batched_resume_gated(&self) -> bool {
+        reuse_kv()
+    }
+
+    /// A ring write span starts at any position (`write_spans`), as every decode step's does.
+    fn prefill_resume_granule(&self) -> Option<usize> {
+        Some(1)
+    }
+
+    fn provenance(&self) -> ArmProvenance {
+        self.provenance.clone()
+    }
+
+    fn set_media(&mut self, media: MediaEmbeds) {
+        self.media = media;
     }
 
     fn max_context(&self) -> Option<usize> {
@@ -646,6 +790,35 @@ mod tests {
             seg("f2w256", 256, 16384),
             seg("f2w1024", 1024, 65536),
         ]
+    }
+
+    #[test]
+    fn provenance_reads_the_build_flags_and_the_toolchain_instance() {
+        let dir = std::env::temp_dir().join(format!("rf-prov-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("gen_env.txt"), "RF_ATTN_H=1\nRF_INST=/x/instances/259cac5e9ca8\nRF_FAST=1\n").unwrap();
+        fs::write(dir.join("gen_args.txt"), "rlayer_design m g h nbw=20\n").unwrap();
+        let p = build_provenance(&dir, b"elf", 262144);
+        assert_eq!(p.toolchain_pin_hash.as_deref(), Some("259cac5e9ca8"));
+        assert_eq!(p.fusion_flags, ["RF_ATTN_H=1", "RF_FAST=1", "rlayer_design", "m", "g", "h", "nbw=20"]);
+        assert_eq!(p.max_seq, Some(262144));
+        assert_eq!(p.artifact_hash.as_deref().map(str::len), Some(12));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_resume_is_kept_only_while_the_ring_still_holds_its_window() {
+        let (w, c) = (1024, 1280);
+        // Never wrapped: every slot holds its own position.
+        assert!(resume_keeps_the_window(900, 1200, w, c));
+        // r = 2000: first = 960, so rows up to 2240 leave [960, 2000) intact.
+        assert!(resume_keeps_the_window(2000, 2240, w, c));
+        // One row further lands on position 960's slot.
+        assert!(!resume_keeps_the_window(2000, 2241, w, c));
+        // A long divergent tail wraps the whole window.
+        assert!(!resume_keeps_the_window(2000, 4000, w, c));
+        // Nothing to keep at 0.
+        assert!(resume_keeps_the_window(0, 100_000, w, c));
     }
 
     #[test]
