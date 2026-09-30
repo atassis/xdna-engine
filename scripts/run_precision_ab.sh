@@ -17,7 +17,7 @@
 # holding the lock:  bash scripts/run_precision_ab.sh --warm
 set -u
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WS="$(cd "$REPO/.." && pwd)"
+. "$REPO/scripts/lib/data_root.sh"   # -> XDNA_SCRATCH, XDNA_BUILD, XDNA_ARTIFACTS
 # Device serialisation. The NPU is single-tenant, so arms must not overlap. Point NPU_LOCK at a
 # serialiser exposing `<lock> queue -- <cmd...>`; it lives outside this repo, so it is named by
 # env rather than by path. Unset is a hard error and not a silent unlocked run -- two arms
@@ -39,7 +39,7 @@ else
   echo "  or PRECISION_AB_UNLOCKED=1 if nothing else can take this device" >&2
   exit 2
 fi
-OUT="${PRECISION_AB_OUT:-/mnt/data/xdna/scratch/precision/ab}"
+OUT="${PRECISION_AB_OUT:-$XDNA_SCRATCH/precision/ab}"
 ARMS=(bf16 mlp-int4-sym mlp-int8-sym mlp-int8)
 WARM_ONLY=0
 [ "${1:-}" = "--warm" ] && { WARM_ONLY=1; shift; }
@@ -49,7 +49,6 @@ mkdir -p "$OUT"
 cd "$REPO"
 
 VENV_IRON="${VENV_IRON:-$REPO/.venv-iron}"
-[ -x "$VENV_IRON/bin/python" ] || VENV_IRON="$WS/xdna-engine/.venv-iron"
 . "$REPO/scripts/amd_paths.sh"
 IRON="${IRON:-$IRON_DIR}"
 INST="$("$REPO/scripts/toolchain_up.sh")"
@@ -68,7 +67,7 @@ export CUDA_VISIBLE_DEVICES=""
 # same condition build_llm_decode.sh relies on for its own shared cache. Verified per arm before
 # trusting it -- a name that did NOT distinguish would have one arm silently assembling an ELF
 # from another's binaries, which is a deterministic wrong answer, not a crash.
-WORK=/mnt/data/xdna/build/precision-ab
+WORK="$XDNA_BUILD/precision-ab"
 mkdir -p "$WORK"
 
 if [ "$WARM_ONLY" = 1 ]; then
@@ -77,7 +76,7 @@ if [ "$WARM_ONLY" = 1 ]; then
     echo "[warm] $arm"
     PRECISION="$arm" KEEP_WORK="$WORK" GEN_EXTRA="--max-seq 4096" \
       bash scripts/build_llm_decode.sh qwen3-0.6b 28 \
-      "/mnt/data/xdna/artifacts/precision-ab/$tag" || exit 1
+      "$XDNA_ARTIFACTS/precision-ab/$tag" || exit 1
   done
   exit 0
 fi

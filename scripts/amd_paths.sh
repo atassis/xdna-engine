@@ -7,15 +7,11 @@
 #   ... use "$IRON_DIR" / "$XRT_SRC_DIR" / "$MLIR_AIR_DIR" / "$AIEBU_ASM_DIR"
 #
 # No default location: these checkouts sit wherever the caller's box put them, and a
-# public clone of this repo names no such layout. IRON_DIR is REQUIRED -- set it, or
-# pass IRON=<dir> to a caller that reads that instead (planned: IRON as a submodule).
-
-if [ -z "${IRON_DIR:-}" ] && [ -z "${IRON:-}" ]; then
-  echo "ERROR: IRON_DIR is not set. Point it at your IRON/mlir-aie-operators checkout:" >&2
-  echo "  export IRON_DIR=/path/to/IRON" >&2
-  return 1 2>/dev/null || exit 1
-fi
-export IRON_DIR="${IRON_DIR:-$IRON}"
+# public clone of this repo names no such layout. IRON_DIR is REQUIRED by anything that
+# actually touches IRON (iron_require_pin/iron_require_api below fail loud, naming how
+# to set it) -- set it, or pass IRON=<dir> to a caller that reads that instead (planned:
+# IRON as a submodule). A caller that never touches IRON does not need it set.
+export IRON_DIR="${IRON_DIR:-${IRON:-}}"
 
 # The shared IRON checkout sits on whatever branch it was last left on and carries neither
 # iron/operators/tmatvec/ nor iron/common/quant.py -- both imported at module scope by
@@ -89,6 +85,7 @@ export AIEBU_ASM_DIR="${AIEBU_ASM_DIR:-${XRT_SRC_DIR:+$XRT_SRC_DIR/src/runtime_s
 iron_require_api() {
   local label="$1"; shift
   local dir="${IRON:-$IRON_DIR}"
+  [ -n "$dir" ] || { echo "ERROR: IRON_DIR is not set. Point it at your IRON checkout: export IRON_DIR=/path/to/IRON" >&2; return 1; }
   local on spec f sym missing=0
   on="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
   for spec in "$@"; do
@@ -139,6 +136,7 @@ PYEOF
 # An ABSENT pin is not a pass -- a lock that forgot the key must not read as unlocked.
 iron_require_pin() {
   local dir="${IRON:-$IRON_DIR}"
+  [ -n "$dir" ] || { echo "ERROR: IRON_DIR is not set. Point it at your IRON checkout: export IRON_DIR=/path/to/IRON" >&2; return 1; }
   local lock="${IRON_LOCK:-$(dirname "${BASH_SOURCE[0]:-$0}")/../toolchain.lock}"
   local want
   want="$(sed -n 's/^IRON_FORK_COMMIT=\([0-9a-f]\{7,\}\).*/\1/p' "$lock" 2>/dev/null | head -1)"

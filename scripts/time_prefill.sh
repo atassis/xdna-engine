@@ -18,11 +18,11 @@
 # Single-tenant: stop `npu serve` (pkill -x npu, never -f) and run under npu_lock.sh.
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WS="$(cd "$REPO/.." && pwd)"
+. "$REPO/scripts/lib/data_root.sh"   # -> XDNA_SCRATCH
 ROUNDS="${1:-2}"; REPS="${2:-2}"; LENS="${3:-256,512,1024}"
-DEC="${DECODE_ART:-$WS/xdna-engine/artifacts/qwen3-0.6b/decode}"
-PRE="${PREFILL_ART:-/mnt/data/xdna/scratch/prefill/full_l28_m256_s2048}"
-OUT="${TIME_OUT:-/mnt/data/xdna/scratch/prefill/timing}"
+DEC="${DECODE_ART:-$REPO/artifacts/qwen3-0.6b/decode}"
+PRE="${PREFILL_ART:-$XDNA_SCRATCH/prefill/full_l28_m256_s2048}"
+OUT="${TIME_OUT:-$XDNA_SCRATCH/prefill/timing}"
 # Ask cargo where it puts binaries: rust/.cargo/config.toml redirects target-dir off /home, and a
 # stale rust/target/ directory survives there, so a hardcoded path finds a directory and no binary.
 TGT="$(cd "$REPO/rust" && cargo metadata --format-version 1 --no-deps 2>/dev/null \

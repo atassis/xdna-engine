@@ -19,14 +19,13 @@
 # Needs .venv-export (torch + transformers), deliberately not .venv-iron. ~2 min at 2000 tokens.
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WS="$(cd "$REPO/.." && pwd)"
+. "$REPO/scripts/lib/data_root.sh"   # -> QLAB_WORK
 PLAN="${1:?usage: gate_precision.sh <plan> [TOKENS] [MAX_PPL_PCT]}"
 TOKENS="${2:-2000}"
 MAXPCT="${3:-1.0}"
 VENV="${VENV_EXPORT:-$REPO/.venv-export}"
-[ -x "$VENV/bin/python" ] || VENV="$WS/xdna-engine/.venv-export"
 [ -x "$VENV/bin/python" ] || { echo "ERROR: no export venv (torch+transformers) at $VENV"; exit 1; }
-QLAB="${QLAB_WORK:-/mnt/data/xdna/qlab}"
+QLAB="$QLAB_WORK"
 CORPUS="${PRECISION_GATE_CORPUS:-$QLAB/corpora/natural-prose.txt}"
 [ -r "$CORPUS" ] || { echo "ERROR: no corpus at $CORPUS (hostlab/make_corpora.py builds them)"; exit 1; }
 OUT="${PRECISION_GATE_OUT:-$QLAB/runs/precision-gate.json}"

@@ -11,21 +11,17 @@
 # meta.json.
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WS="$(cd "$REPO/.." && pwd)"
+. "$REPO/scripts/lib/data_root.sh"   # -> XDNA_SCRATCH
 LAYERS="${1:-1}"; BATCH="${2:-256}"; SEQ="${3:-2048}"
-OUT="${4:-/mnt/data/xdna/scratch/prefill/full_l${LAYERS}_m${BATCH}_s${SEQ}}"
+OUT="${4:-$XDNA_SCRATCH/prefill/full_l${LAYERS}_m${BATCH}_s${SEQ}}"
 OUT="$(realpath -m "$OUT")"
 CAUSAL="${CAUSAL:-rows}"
 SPEC="${SPEC:-qwen3-0.6b}"   # override for a non-qwen3 spec (e.g. gemma4-12b)
 VENV_IRON="${VENV_IRON:-$REPO/.venv-iron}"
-[ -x "$VENV_IRON/bin/python" ] || VENV_IRON="$WS/xdna-engine/.venv-iron"
 . "$REPO/scripts/amd_paths.sh"
 IRON="${IRON:-$IRON_DIR}"
-# $REPO/artifacts/<spec>, not "$WS/artifacts-<spec>" -- the latter has a hyphen where a path
-# separator belongs and is anchored at the workspace; it resolves to a directory that has
-# never existed, so the build died on a missing weight rather than on a clear message.
 WEIGHTS="${WEIGHTS:-$REPO/artifacts/qwen3-0.6b/weights}"
-DECODE_META="${DECODE_META:-$WS/xdna-engine/artifacts/qwen3-0.6b/decode/meta.json}"
+DECODE_META="${DECODE_META:-$REPO/artifacts/qwen3-0.6b/decode/meta.json}"
 
 [ -x "$VENV_IRON/bin/python" ] || { echo "ERROR: no iron venv at $VENV_IRON"; exit 1; }
 iron_require_pin || exit 1
@@ -86,7 +82,7 @@ QUANT_ARGS=()
 
 # Build artifacts go to NVMe, never the tmpfs scratchpad. Per-arm work dir, because IRON keys
 # cached operator artifacts by NAME and a shared dir lets one arm link another's binaries.
-WORK="${KEEP_WORK:-/mnt/data/xdna/scratch/prefill/build_full_l${LAYERS}_m${BATCH}_s${SEQ}_${CAUSAL}}"
+WORK="${KEEP_WORK:-$XDNA_SCRATCH/prefill/build_full_l${LAYERS}_m${BATCH}_s${SEQ}_${CAUSAL}}"
 mkdir -p "$WORK" "$OUT"
 cd "$WORK"
 exec "$VENV_IRON/bin/python" "$REPO/designs/decode_fused/gen_llm_prefill.py" \
