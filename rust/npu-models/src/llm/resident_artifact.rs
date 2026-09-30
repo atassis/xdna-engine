@@ -503,9 +503,9 @@ mod tests {
     /// keeps it elsewhere; the repo's own convention for a device-box fixture is a defaulted,
     /// overridable path (`detokenize.rs::qwen3_tokenizer_path`).
     fn store_dir() -> PathBuf {
-        let dir = std::env::var("RESIDENT_STORE_DIR")
-            .unwrap_or_else(|_| "/mnt/data/xdna/artifacts/gemma4-12b/store".to_string());
-        PathBuf::from(dir)
+        std::env::var("RESIDENT_STORE_DIR").map(PathBuf::from).unwrap_or_else(|_| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/artifacts/gemma4-12b/store")
+        })
     }
 
     #[test]

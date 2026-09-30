@@ -14,10 +14,17 @@ use std::path::{Path, PathBuf};
 
 const GATE: f64 = 1e-4;
 
-fn checkpoint_dir() -> PathBuf { PathBuf::from("/mnt/data/xdna/artifacts/gemma4-12b-qat/checkpoint") }
-fn oracle_dir() -> PathBuf { PathBuf::from("/mnt/data/xdna/artifacts/gemma4-12b-qat/resize_oracle") }
+// XDNA_ARTIFACTS overrides; default is this checkout's own <repo>/data/artifacts (see
+// scripts/lib/data_root.sh). On a device box with weights elsewhere, export XDNA_ARTIFACTS.
+fn artifacts_dir() -> PathBuf {
+    std::env::var("XDNA_ARTIFACTS").map(PathBuf::from).unwrap_or_else(|_| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/artifacts")
+    })
+}
+fn checkpoint_dir() -> PathBuf { artifacts_dir().join("gemma4-12b-qat/checkpoint") }
+fn oracle_dir() -> PathBuf { artifacts_dir().join("gemma4-12b-qat/resize_oracle") }
 fn upscale_oracle_dir() -> PathBuf {
-    PathBuf::from("/mnt/data/xdna/artifacts/gemma4-12b-qat/resize_oracle_upscale")
+    artifacts_dir().join("gemma4-12b-qat/resize_oracle_upscale")
 }
 
 fn skip_if_missing(p: &Path) -> bool {
@@ -121,7 +128,7 @@ fn audio_forward_end_to_end_against_oracle() {
     if skip_if_missing(&aud_path) { return; }
 
     let towers = Gemma4Towers::load(&checkpoint_dir()).unwrap();
-    let wav = std::fs::read("/mnt/data/xdna/artifacts/wer_clips_large/en_044.wav").unwrap();
+    let wav = std::fs::read(artifacts_dir().join("wer_clips_large/en_044.wav")).unwrap();
     let rows = towers.audio_forward(&wav).unwrap();
 
     let oracle = load_npy_f32(&aud_path);

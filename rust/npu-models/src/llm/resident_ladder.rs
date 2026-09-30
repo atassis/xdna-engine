@@ -1047,8 +1047,9 @@ mod tests {
             eprintln!("SKIP: set NPU_LLM_DEVICE_GATE=1 to run (opens the NPU device -- wrap with npu_lock.sh queue --)");
             return;
         }
-        let dir = std::env::var("NPU_RESIDENT_DIR")
-            .unwrap_or_else(|_| "/mnt/data/xdna/artifacts/gemma4-12b/resident_rf48C_p7148a7".to_string());
+        let dir = std::env::var("NPU_RESIDENT_DIR").unwrap_or_else(|_| {
+            format!("{}/../../data/artifacts/gemma4-12b/resident_rf48C_p7148a7", env!("CARGO_MANIFEST_DIR"))
+        });
         let dev = Rc::new(Device::open(0).expect("open the NPU"));
         let mut f = LadderResidentForward::open(&dev, Path::new(&dir)).expect("open the resident forward");
         let ids = |seed: u32, n: usize| (0..n as u32).map(|i| 1000 + (i * 7919 + seed * 104729) % 200_000).collect::<Vec<u32>>();
@@ -1087,8 +1088,9 @@ mod tests {
             eprintln!("SKIP: set NPU_LLM_DEVICE_GATE=1 NPU_RESIDENT_BENCH=1 (opens the NPU device)");
             return;
         }
-        let dir = std::env::var("NPU_RESIDENT_DIR")
-            .unwrap_or_else(|_| "/mnt/data/xdna/artifacts/gemma4-12b/resident_rf48C_p7148a7".to_string());
+        let dir = std::env::var("NPU_RESIDENT_DIR").unwrap_or_else(|_| {
+            format!("{}/../../data/artifacts/gemma4-12b/resident_rf48C_p7148a7", env!("CARGO_MANIFEST_DIR"))
+        });
         let lens: Vec<usize> = std::env::var("NPU_RESIDENT_BENCH_P").unwrap_or_else(|_| "4096".into())
             .split(',').map(|v| v.parse().unwrap()).collect();
         let dev = Rc::new(Device::open(0).expect("open the NPU"));

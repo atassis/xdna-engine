@@ -22,11 +22,11 @@
 //!
 //! Run only through `npu_lock.sh`, with the service stopped for the window (see the task). Every
 //! path below is read from the environment: this example ships no machine-specific default for
-//! anything outside `/mnt/data` (the repo's existing convention for a device-box scratch path, e.g.
-//! `detokenize.rs::qwen3_tokenizer_path`) or anything that would name a sibling private repo.
+//! anything outside this checkout's own <repo>/data (see scripts/lib/data_root.sh) or anything
+//! that would name a sibling private repo.
 //! Required: `RF_BRIDGE_PY` (the bridge script), `RF_BRIDGE_PYTHON` (its interpreter, one with
 //! pyxrt+numpy), `RF_BRIDGE_PYTHONPATH` (that interpreter's PYTHONPATH for the IRON checkout the
-//! bridge imports from). Optional: `RF_BUILD_DIR` (default `/mnt/data/xdna/scratch/rf/build/rls1`).
+//! bridge imports from). Optional: `RF_BUILD_DIR` (default: <repo>/data/scratch/rf/build/rls1).
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -39,7 +39,9 @@ use npu_xrt::{unpack_bf16_to_f32, Bo, Device, ElfResident, FLAG_HOST_ONLY};
 use serde_json::{json, Value};
 
 fn build_dir() -> String {
-    std::env::var("RF_BUILD_DIR").unwrap_or_else(|_| "/mnt/data/xdna/scratch/rf/build/rls1".to_string())
+    std::env::var("RF_BUILD_DIR").unwrap_or_else(|_| {
+        format!("{}/../../data/scratch/rf/build/rls1", env!("CARGO_MANIFEST_DIR"))
+    })
 }
 
 fn env_required(name: &str) -> String {

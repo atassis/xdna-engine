@@ -262,9 +262,9 @@ mod tests {
 
     fn qwen3_tokenizer_path() -> PathBuf {
         let dir = std::env::var("QWEN3_TOKENIZER_DIR").unwrap_or_else(|_| {
-            "/mnt/data/cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/\
-             c1899de289a04d12100db370d81485cdf75e47ca"
-                .to_string()
+            let hf_home = std::env::var("HF_HOME")
+                .unwrap_or_else(|_| format!("{}/.cache/huggingface", std::env::var("HOME").unwrap_or_default()));
+            format!("{hf_home}/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca")
         });
         PathBuf::from(dir).join("tokenizer.json")
     }
