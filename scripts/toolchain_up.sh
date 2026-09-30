@@ -76,11 +76,10 @@ _link_vendored_tools() {
 # Refresh the include/ symlinks aie.iron + the kernel headers resolve against. Run on BOTH the cold
 # build and the warm early-return so a plain re-run against any instance is self-healing (the warm
 # path does not rebuild, so these would otherwise never be recreated if removed).
-# NOTE the aie_api source: the WHEEL, not `mlir-aie/third_party/aie_api` which toolchain.lock pins.
-# The two are structurally decoupled -- bumping MLIR_AIE_FORK_COMMIT moves the pinned headers and
-# leaves this symlink untouched -- so the headers kernels compile against are not the ones the lock
-# describes. Repointing it is a measured behaviour change, not a cleanup; scripts/check_aie_api_pin.sh
-# ratchets the current state so a bump cannot move it silently.
+# aie_api comes from the instance's own source tree, i.e. the submodule MLIR_AIE_FORK_COMMIT pins.
+# The wheel's copy (2025) sends aie2p load_unaligned_v down the aie2 path, 256-bit loads with a 32 B
+# shift, and returns wrong lanes on device; the pinned tree has the aie2p 512-bit path.
+# scripts/check_aie_api_pin.sh ratchets this link.
 # These point SHARED state (the instance is keyed by the lock, not by the caller) at a path, so the
 # path must outlive any one caller. $REPO is whatever tree toolchain_up.sh was run from, and a linked
 # worktree is ephemeral: running this from one repointed the instance at it, and DELETING that
@@ -96,7 +95,7 @@ _shared_link_root() {
 }
 _link_include_dirs() {
   local root; root="$(_shared_link_root)"
-  ln -sfn "$root/.venv-iron/lib/python3.14/site-packages/mlir_aie/include/aie_api" "$INST/build/include/aie_api"
+  ln -sfn "$INST/src/third_party/aie_api/include/aie_api" "$INST/build/include/aie_api"
   ln -sfn "$root/mlir-aie/aie_kernels" "$INST/build/include/aie_kernels"   # aie.iron _default_source_path resolves kernel .cc here (aie2p/mm.cc etc.)
   # A dangling shared symlink is worse than a missing one: it fails deep inside Peano naming a header,
   # not the wiring. Say it here, where the cause is still visible.

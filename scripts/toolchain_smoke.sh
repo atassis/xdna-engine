@@ -85,11 +85,21 @@ fi
   || { echo "SMOKE FAIL: Peano archiver check failed -- run scripts/install_peano_local.sh --check"; exit 1; }
 
 # 5) the aie_api headers the kernels just compiled against are the ones the last gate signed off on.
-#    They are NOT the pinned ones -- the instance symlinks the wheel copy while toolchain.lock pins
-#    the submodule -- and this does not assert otherwise. It ratchets: a pin bump that moves the
-#    headers under the kernels, or a repoint of the symlink, fails HERE rather than being found later
-#    by grepping whichever copy came to hand. See scripts/check_aie_api_pin.sh.
+#    A pin bump that moves them, or a repoint of the symlink, fails HERE. See check_aie_api_pin.sh.
 "$REPO/scripts/check_aie_api_pin.sh" >/dev/null \
   || { echo "SMOKE FAIL: aie_api header state drifted -- run scripts/check_aie_api_pin.sh"; exit 1; }
+
+# 6) aie2p load_unaligned_v takes the 512-bit path. The aie2 path (256-bit vldb wl/wh, 32 B shift)
+#    returns wrong lanes on aie2p hardware; the wheel's aie_api emits it.
+ULD="$(mktemp -d)"
+printf '%s\n' '#include <aie_api/aie.hpp>' \
+  'void p(float *o, const float *i) { aie::store_v(o, aie::load_unaligned_v<32>(i, 1)); }' > "$ULD/p.cc"
+"$PEANO_INSTALL_DIR/bin/clang++" -I"$INST/build/include" --system-header-prefix=aie_api/ -std=c++20 -O2 \
+  -D__AIE_API_AIE_ADF_HPP__ --target=aie2p-none-unknown-elf -w -c "$ULD/p.cc" -o "$ULD/p.o" \
+  || { echo "SMOKE FAIL: load_unaligned_v probe did not compile"; exit 1; }
+if "$PEANO_INSTALL_DIR/bin/llvm-objdump" -d "$ULD/p.o" | grep -qE 'vldb[[:space:]]+w[lh]'; then
+  echo "SMOKE FAIL: aie2p load_unaligned_v lowers to 256-bit loads -- aie_api is not the pinned tree"; exit 1
+fi
+rm -rf "$ULD"
 
 echo "SMOKE PASS (CPU): logical_tile=$logical -> $placed_how, xclbin built, llvm-ar OK, aie_api pin OK"

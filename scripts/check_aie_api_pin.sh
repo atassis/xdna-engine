@@ -1,15 +1,9 @@
 #!/usr/bin/env bash
 # Are the aie_api headers kernels COMPILE against the ones toolchain.lock PINS?
 #
-# They are not, and that is the point of this check. `toolchain_up.sh:_link_include_dirs` symlinks
-# `$INST/build/include/aie_api` at the mlir_aie WHEEL (`setup_kernel_env.sh` hardcodes its version),
-# while `toolchain.lock` pins `mlir-aie/third_party/aie_api` through MLIR_AIE_FORK_COMMIT. Those two
-# are structurally decoupled: bumping the fork commit moves the pinned headers and leaves the linked
-# ones exactly where they were, with no error and a green lock.
-#
-# So this does NOT assert the two are equal -- repointing the symlink is a measured behaviour change,
-# not a cleanup, and belongs to whoever is willing to re-gate the kernels behind it. It RATCHETS:
-# the divergence is recorded in a baseline and any CHANGE to it fails, whichever direction it moves.
+# They should be: toolchain_up.sh links `$INST/build/include/aie_api` at the instance's own pinned
+# tree. It RATCHETS rather than asserting equality:
+# the state is recorded in a baseline and any CHANGE to it fails, whichever direction it moves.
 # A pin bump that shifts the headers under the kernels then announces itself here instead of being
 # discovered later by grepping a stale copy and drawing a conclusion about the wrong tree.
 #
@@ -54,6 +48,30 @@ disk_sha="$(_short "$(git -C "$REPO/mlir-aie/third_party/aie_api" rev-parse --ve
 linked_h="$(_tree_hash "$linked")"; _require_present "$linked_h" "instance aie_api" "$linked"
 pinned_h="$(_tree_hash "$pinned")"; _require_present "$pinned_h" "pinned aie_api" "$pinned"
 now="linked=$linked_h pinned=$pinned_h lock_sha=$lock_sha disk_sha=$disk_sha"
+
+# Direct proof the compiler resolved OUR tree, not just a tree-hash comparison to a baseline it could
+# ratchet forward on a bad bump. __XDNA_AIE_API_FORK__ is a sentinel only atassis/aie_api defines
+# (proposed as commit 1d91fa0 on its local/pin-sentinel-20260930 branch, not yet in this pin or
+# pushed) -- upstream Xilinx/aie_api and the vendored mlir_aie wheel copy never define it. Once a
+# pin carries it this block should be made fatal; until then it is informational, since MLIR_AIE_FORK_COMMIT
+# 8e3958b596a's third_party/aie_api (1db7142) predates the sentinel commit.
+_probe_sentinel() {
+  local peano="$REPO/.venv-iron/lib/python3.14/site-packages/llvm-aie/bin/clang++"
+  [ -x "$peano" ] || { echo "[aie_api_pin] sentinel probe skipped: no Peano clang++ at $peano"; return 0; }
+  local tu; tu="$(mktemp -d)/p.cc"
+  printf '%s\n' '#include <aie_api/aie.hpp>' \
+    '#ifdef __XDNA_AIE_API_FORK__' 'static_assert(true, "fork sentinel present");' '#else' \
+    '#error "no __XDNA_AIE_API_FORK__ -- aie_api did not resolve the fork pin"' '#endif' > "$tu"
+  if "$peano" -I"$linked" --system-header-prefix=aie_api/ -std=c++20 -D__AIE_API_AIE_ADF_HPP__ \
+       --target=aie2p-none-unknown-elf -w -fsyntax-only "$tu" 2>/dev/null; then
+    echo "[aie_api_pin] sentinel probe: __XDNA_AIE_API_FORK__ present at $linked"
+  else
+    echo "[aie_api_pin] sentinel probe: __XDNA_AIE_API_FORK__ NOT in the current pin (expected until" \
+         "the fork commit above is picked up) -- tree-hash ratchet below is the live gate"
+  fi
+  rm -rf "$(dirname "$tu")"
+}
+_probe_sentinel
 
 if [ "${1:-}" = "--write-baseline" ]; then
   printf '%s\n' "$now" > "$BASELINE"
