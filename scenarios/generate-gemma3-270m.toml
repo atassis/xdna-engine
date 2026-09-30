@@ -25,6 +25,46 @@ name = "gemma3-270m"
 #   as a RELATIVE 3rd arg to build_llm_decode.sh silently miscompiles the artifact into a phantom
 #   nested dir under the shared $WORK cache (the script cd's into $WORK before invoking the
 #   generator, so a relative --out resolves against the wrong cwd) -- always pass an ABSOLUTE OUT.
+# PREPARED 2026-10-01, NOT INSTALLED (feat/gemma3-270m-qat-int4): weights from
+#   google/gemma-3-270m-it-qat-q4_0-unquantized instead of unsloth/gemma-3-270m-it, mlp/attn_o/head
+#   packed int4 g32 full_range (q/k/v, norms stay bf16):
+#     weights  scripts/dump_llm_weights.py --spec gemma3-270m --checkpoint-dir <qat snapshot> \
+#                --out artifacts/gemma3-270m/weights_qat_int4g32 --quant int4 --quant-group 32 \
+#                --quant-full-range --quant-leaves gate_proj,up_proj,down_proj,o_proj,embed_tokens
+#     decode   WEIGHTS=artifacts/gemma3-270m/weights_qat_int4g32 \
+#                scripts/build_llm_decode.sh gemma3-270m "" artifacts/gemma3-270m/decode_qat_int4_p8e3958
+#   858M dump (vs 1.7G bf16), 504M decode dir (vs 512M).
+#
+#   GRID CHECK: unlike gemma4-12b's QAT checkpoint, this one is NOT pre-snapped to the Q4_0 grid --
+#   a 32-element block has 31-32 distinct float values, and our full_range/clip_search int4 g32
+#   quantizer disagrees with the literal ggml Q4_0 formula on the same weights by 9-13% rel-L2 (4
+#   sampled tensors). Genuinely QAT-tuned (5.2% rel-L2 vs the bf16 unsloth weights), just not
+#   grid-exact -- quantized here as an ordinary fine-tuned checkpoint, not as a grid round-trip.
+#
+#   GENERATOR FIX (this branch): gen_llm_decode.py's packed-dump precision adoption forced
+#   PRECISION_PLAN["qkv"] to the packed mlp/attn_o format whenever ANY site was packed, even with
+#   no q/k/v tensor in the dump's `packed` list -- silently live-quantizing q/k/v at
+#   scale_kind="none" for weights nobody asked to pack. Fixed to gate each site on whether it has a
+#   tensor in PACKED (sequence_name's "qkv..." fragment gone after the fix).
+#
+#   GATES (device, IRON=iron-curate-wt @f8d7903): in-format oracle
+#   tests/refs/gemma3-270m/qat_int4g32_oracle.json (int4 g32 full_range quantize/dequantize of the
+#   QAT checkpoint via llm_hf_bf16_ref.py --quant-from) -- 8/8 PARITY PASS, twice, byte-identical
+#   token ids both times (verify_llm_decode.py refuses a bf16-oracle gate against a quantized build
+#   outright: "exact token parity across two weight formats is not a defect test"). Determinism:
+#   [193, 107, 77801, 1600, 107, 236769, 237386, 236768] both runs. Cross-format vs
+#   tests/refs/gemma3-270m/qat_bf16_oracle.json (QAT checkpoint at bf16): oracle [9079, 236761, 107,
+#   818, 5279, 529, 7001, 563] vs device int4 [9079, 236761, 108, 2859, 564, 1006, 528, 9079] -- 2/8
+#   exact, diverges at a knife-edge step-2 margin (0.125/0.75) then free-running compounds; not a
+#   defect (isolated by the in-format gate), expected at this size/format. Sanity text, 2 prompts:
+#   fluent both ("The ocean is a vast and mysterious body of water."; arithmetic wrong on "2+2?").
+#
+#   SPEED (M=1, n=20 reps, ALTERNATED old/new/new/old, Power Mode Turbo): old median 50.57/50.66 ms,
+#   new median 50.38/50.20 ms, p10/p90 bands overlap across all 4 runs -- FLAT, no measurable
+#   change. Expected: every fused arm is OFF for this spec's shape (unfused per-op GEMVs either
+#   way), so the weight format isn't the dominant cost here.
+#
+#   NOT DONE: install.sh, served-default flip, merge. Rollback: decode_p8e3958 + weights below.
 [artifacts]
 decode = "artifacts/gemma3-270m/decode_p8e3958"
 weights = "artifacts/gemma3-270m/weights"
