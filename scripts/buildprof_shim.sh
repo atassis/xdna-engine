@@ -13,8 +13,10 @@ mkdir -p "$dir"
 log="$dir/aiecc-$(date +%s%N)-$$.log"
 { printf 'argv: %s\n' "$*"; printf 'cwd: %s\n' "$PWD"; } > "$log"
 start=$(date +%s%N)
+extra=()
+[ "${BUILDPROF_TRACE:-0}" = 1 ] && extra=(--profile-trace="$log.trace.json")
 # aiecc buffers its own stderr until exit, so this doesn't interleave with the profile capture.
-"$real" "$@" --profile --no-progress 2> "$log.err"
+"$real" "$@" --profile --no-progress "${extra[@]}" 2> "$log.err"
 rc=$?
 cat "$log.err" >&2
 cat "$log.err" >> "$log"
