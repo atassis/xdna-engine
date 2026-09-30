@@ -13,6 +13,8 @@ FAKE = """#!/usr/bin/env bash
 printf 'ELF-%s' "$1" > full.elf
 [ "${NONDET:-0}" = 1 ] && head -c 16 /dev/urandom >> full.elf
 printf 'x' > aie.xclbin
+mkdir -p sim/reports; printf 'r' > "sim/reports/graph report.xpe"
+[ "${NONDET_SUB:-0}" = 1 ] && head -c 16 /dev/urandom >> "sim/reports/graph report.xpe"
 exit 0
 """
 
@@ -52,3 +54,9 @@ def test_requires_explicit_peano(tmp_path):
     r = subprocess.run([str(CHECK), str(src), str(tmp_path / "o"), "--"], env=e,
                        capture_output=True, text=True)
     assert r.returncode == 2 and "PEANO_INSTALL_DIR" in r.stderr
+
+
+def test_nondeterminism_in_a_subdirectory_fails(tmp_path):
+    r = _run(tmp_path, NONDET_SUB="1")
+    assert r.returncode == 1
+    assert "DIFF sim/reports/graph report.xpe" in r.stdout
