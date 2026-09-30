@@ -62,6 +62,25 @@ pub trait DecodeStep {
         Ok(CacheState::Retained)
     }
 
+    /// How much of a `reused`-token ledger prefix the cache can still be resumed from. A linear
+    /// cache keeps every position it wrote, so the default keeps all of it; a ring overwrites the
+    /// slots of old positions, and a backend with one answers `reused` or 0.
+    fn resume_limit(&self, reused: usize) -> usize {
+        reused
+    }
+
+    /// Whether this backend's batched prefill has been device-gated resuming mid-sequence. False
+    /// leaves the batched path on `NPU_LLM_REUSE_KV_BATCHED` (see [`reuse_on_batched_prefill`]).
+    fn batched_resume_gated(&self) -> bool {
+        false
+    }
+
+    /// The position granule a batched prefill may resume on. The default is the batch itself:
+    /// blocked KV is contiguous only inside one (see [`batched_resume_point`]).
+    fn prefill_resume_granule(&self) -> Option<usize> {
+        self.prefill_batch()
+    }
+
     /// Whether this backend carries state that absorbs every token and has no position to mask
     /// (Gated DeltaNet's `S` and conv window). Only such a backend can share a primed prefix
     /// between decide questions by snapshot; a positional KV cache shares through the ledger.
@@ -245,6 +264,18 @@ fn reuse_on_batched_prefill() -> bool {
 /// How many leading ids two sequences share.
 fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
+/// [`common_prefix_len`], ended at the first position whose media row differs between the two.
+fn common_prefix_len_with_media(
+    a: &[u32], a_media: &std::collections::HashMap<usize, u64>,
+    b: &[u32], b_media: &std::collections::HashMap<usize, u64>,
+) -> usize {
+    let n = common_prefix_len(a, b);
+    a_media.keys().chain(b_media.keys()).copied()
+        .filter(|&p| p < n && a_media.get(&p) != b_media.get(&p))
+        .min()
+        .unwrap_or(n)
 }
 
 /// Where a decide request's questions can share one primed prefix: their common token prefix,
@@ -525,6 +556,9 @@ pub struct LlmGenerator<D: DecodeStep> {
     /// state -- fluently, with no warning, and no happy-path test would see it. Every path that
     /// writes KV must update it or clear it. There is no third option.
     resident: Vec<u32>,
+    /// [`MediaEmbeds::fingerprints`](crate::llm::multimodal::MediaEmbeds::fingerprints) of the
+    /// media rows among `resident`'s positions. Empty when every resident position is text.
+    resident_media: std::collections::HashMap<usize, u64>,
     /// `[multimodal].tower_checkpoint` from the scenario, resolved to an absolute directory. `None`
     /// means this model declares no towers -- a request carrying media is a 400
     /// ([`Self::media_for`]), never a silent drop.
@@ -551,7 +585,7 @@ struct MediaForResult {
 impl<D: DecodeStep> LlmGenerator<D> {
     pub fn new(cfg: ModelConfig, decode: D) -> Self {
         LlmGenerator {
-            cfg, decode, scenario_defaults: Default::default(), resident: Vec::new(),
+            cfg, decode, scenario_defaults: Default::default(), resident: Vec::new(), resident_media: Default::default(),
             tower_checkpoint: None, towers: std::cell::RefCell::new(None), nli_head: None,
         }
     }
@@ -711,14 +745,17 @@ impl<D: DecodeStep> LlmGenerator<D> {
         }
         if self.decode.reset()? == CacheState::Cleared {
             self.resident.clear();
+            self.resident_media.clear();
         }
         let batchable = ids.len() - 1;
-        let reused = common_prefix_len(&self.resident, ids).min(batchable);
-        let batched_from = match reuse_on_batched_prefill() {
-            true => batched_resume_point(reused, self.decode.prefill_batch()),
+        let reused = self.decode.resume_limit(
+            common_prefix_len_with_media(&self.resident, &self.resident_media, ids, &Default::default()).min(batchable));
+        let batched_from = match reuse_on_batched_prefill() || self.decode.batched_resume_gated() {
+            true => batched_resume_point(reused, self.decode.prefill_resume_granule()),
             false => 0,
         };
         self.resident.clear();
+        self.resident_media.clear();
         let mut primed = reused;
         let mut reused_from = reused;
         let mut batched = 0;
@@ -743,6 +780,7 @@ impl<D: DecodeStep> LlmGenerator<D> {
     /// fresh path batched the whole prompt, and a stepwise suffix would be a different datapath.
     fn prime_suffix(&mut self, ids: &[u32], b: usize) -> Result<Primed, EngineError> {
         self.resident.clear();
+        self.resident_media.clear();
         let batchable = ids.len() - 1;
         let primed = match batchable > b {
             true => self.decode.prefill(&ids[..batchable], b)?.max(b),
@@ -773,6 +811,7 @@ impl<D: DecodeStep> LlmGenerator<D> {
         let t = Instant::now();
         self.decode.reset()?;
         self.resident.clear();
+        self.resident_media.clear();
         if self.decode.prefill(&ids[0][..b], 0)? < b {
             return Ok(None);
         }
@@ -981,6 +1020,7 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
         // the ledger: describing a zeroed cache is the same defect as describing a stale one.
         if self.decode.reset()? == CacheState::Cleared {
             self.resident.clear();
+            self.resident_media.clear();
         }
         let mut prefill_us = t0.elapsed().as_micros() as u64;
         let t_tokenize = Instant::now();
@@ -1011,6 +1051,7 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
         } else {
             crate::llm::multimodal::scatter_media_rows(&prompt_ids, &media.attachments, media.d_model)?
         };
+        let media_fps = media_embeds.fingerprints();
         self.decode.set_media(media_embeds);
         let prompt_tokens = prompt_ids.len() as u32;
         // The KV window is a HARD bound, and crossing it is silent rather than loud: `pos` becomes
@@ -1093,7 +1134,8 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
         // How much of this prompt the cache already holds. Clamped to `batchable` because only
         // `step` returns logits and the first `sample()` reads them: an identical repeat must still
         // run its last position, or there is nothing to sample from.
-        let reused = common_prefix_len(&self.resident, &prompt_ids).min(batchable);
+        let reused = self.decode.resume_limit(
+            common_prefix_len_with_media(&self.resident, &self.resident_media, &prompt_ids, &media_fps).min(batchable));
         // The BATCHED path can only resume on a batch boundary -- it writes `batch` consecutive
         // positions from one `kv_off`, and blocked KV is contiguous only inside a block, so a
         // chunk starting mid-block would straddle one. `prime()` refuses a misaligned resume; this
@@ -1102,8 +1144,8 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
         //
         // The per-token path has no such constraint: `step` writes one position at its own
         // `kv_off`, so it resumes at `reused` exactly.
-        let batched_from = match reuse_on_batched_prefill() {
-            true => batched_resume_point(reused, self.decode.prefill_batch()),
+        let batched_from = match reuse_on_batched_prefill() || self.decode.batched_resume_gated() {
+            true => batched_resume_point(reused, self.decode.prefill_resume_granule()),
             // Off: the batched path re-primes from zero exactly as it did before the ledger, so
             // main's behaviour on that path is byte-identical to today's.
             false => 0,
@@ -1113,6 +1155,7 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
         // number of positions written, and a ledger that survives that is the silent-wrong-answer
         // path this field's doc warns about.
         self.resident.clear();
+        self.resident_media.clear();
         let mut primed = reused;
         // `prefill_batch()` is the CAPABILITY probe -- `Some` means a batched prefill artifact is
         // loaded. Its `M` no longer gates the decision: `prime()` pads a partial chunk itself, and
@@ -1373,10 +1416,11 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
         // OVERSTATES the cache is the silent-wrong-answer path this field's doc warns about: the
         // next request would reuse positions that hold nothing. Dropping it costs one re-prime.
         match prefill_stopped {
-            true => self.resident.clear(),
+            true => { self.resident.clear(); self.resident_media.clear(); }
             false => {
                 self.resident = history;
                 self.resident.truncate(pos);
+                self.resident_media = media_fps;
             }
         }
         let provenance = ArmProvenance { n_past: Some(pos as u32), ..self.decode.provenance() };
@@ -2543,6 +2587,38 @@ mod ledger_tests {
         steps.borrow_mut().clear();
         gen.generate_to_string(&Prompt::Raw(words(40)), &p).unwrap();
         assert_eq!(steps.borrow()[0], 0, "reused a prefix from a cache the backend had zeroed");
+    }
+
+    /// Every image's placeholders share one token id, so two different images of one size give
+    /// identical ids; only the row fingerprint tells their KV apart.
+    #[test]
+    fn a_different_image_behind_identical_placeholder_ids_ends_the_shared_prefix() {
+        use std::collections::HashMap;
+        let ids = [1u32, 2, 9, 9, 9, 3, 4];
+        let a: HashMap<usize, u64> = [(2, 10), (3, 11), (4, 12)].into();
+        let same = a.clone();
+        let b: HashMap<usize, u64> = [(2, 10), (3, 99), (4, 12)].into();
+        assert_eq!(common_prefix_len_with_media(&ids, &a, &ids, &same), 7);
+        assert_eq!(common_prefix_len_with_media(&ids, &a, &ids, &b), 3);
+        assert_eq!(common_prefix_len_with_media(&ids, &a, &ids, &HashMap::new()), 2);
+        assert_eq!(common_prefix_len_with_media(&ids[..2], &a, &ids, &b), 2);
+    }
+
+    /// A ring backend that can no longer resume the shared prefix must get a full re-prime.
+    #[test]
+    fn a_backend_resume_limit_below_the_ledger_forces_a_full_prime() {
+        struct Ring(Recording);
+        impl DecodeStep for Ring {
+            fn step(&mut self, t: u32, p: usize) -> Result<Vec<f32>, EngineError> { self.0.step(t, p) }
+            fn resume_limit(&self, _reused: usize) -> usize { 0 }
+        }
+        let (inner, _primes, steps) = gen_with(false);
+        let mut gen = LlmGenerator::new(build_cfg(None), Ring(inner.decode));
+        let p = params();
+        gen.generate_to_string(&Prompt::Raw(words(20)), &p).unwrap();
+        steps.borrow_mut().clear();
+        gen.generate_to_string(&Prompt::Raw(words(40)), &p).unwrap();
+        assert_eq!(steps.borrow()[0], 0, "resumed a prefix the backend said its ring no longer holds");
     }
 
     /// The tool loop is the case this exists for: every round-trip re-sends the whole conversation

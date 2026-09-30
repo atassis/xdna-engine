@@ -138,8 +138,24 @@ pub struct MediaAttachment {
 pub struct MediaEmbeds(HashMap<usize, Vec<u8>>);
 
 impl MediaEmbeds {
+    /// A hash of each substituted row, by prompt position: what the prefix ledger compares, since
+    /// every image's placeholders share one token id.
+    pub fn fingerprints(&self) -> HashMap<usize, u64> {
+        use std::hash::{Hash, Hasher};
+        self.0.iter().map(|(&pos, row)| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            row.hash(&mut h);
+            (pos, h.finish())
+        }).collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// The bf16 row substituted at `pos`, if any.
+    pub fn row(&self, pos: usize) -> Option<&[u8]> {
+        self.0.get(&pos).map(Vec::as_slice)
     }
 }
 
