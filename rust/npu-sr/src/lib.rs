@@ -133,6 +133,7 @@ impl SrEngine {
 
     /// Change the frame shape (any supported scale and size) and sharpness of a
     /// [`SrEngine::load_scaled`] engine without reloading the design.
+    #[cfg_attr(not(npu_sr_fsr1), allow(unused_variables))]
     pub fn configure(&mut self, in_w: usize, in_h: usize, out_w: usize, out_h: usize, sharpness: f64)
         -> Result<(), SrError> {
         match self {
@@ -282,6 +283,7 @@ impl SrEngine {
     }
 
     /// Zero-copy dispatch over dma-buf fds; see [`fsr1_frame::Fsr1FrameEngine::process_dmabuf`].
+    #[cfg_attr(not(npu_sr_fsr1), allow(unused_variables))]
     pub fn process_dmabuf(&mut self, in_fd: std::os::raw::c_int, out_fd: std::os::raw::c_int)
         -> Result<(), SrError> {
         match self {
