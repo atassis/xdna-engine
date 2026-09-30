@@ -1,4 +1,4 @@
-//! Check `declared_kernels.json` (the repo-root, checked-in list of kernels the engine needs)
+//! Check `config/declared_kernels.json` (the checked-in list of kernels the engine needs)
 //! against what actually exists under a kernels root -- an install's published `kernels/`
 //! directory, or a dev checkout's `kernels/` if it has one.
 //!
@@ -14,7 +14,7 @@
 //!
 //!   cargo run -p npu-asr --bin verify_declared_kernels -- [<repo-root>] [<kernels-root>]
 //!
-//! repo-root defaults to the current directory (where declared_kernels.json is read from).
+//! repo-root defaults to the current directory (its `config/declared_kernels.json` is read).
 //! kernels-root defaults to <repo-root>/kernels (PUBLISHED_KERNELS_DIR) -- pass the install's
 //! kernels directory explicitly to check a deployed set instead of a dev checkout.
 //!

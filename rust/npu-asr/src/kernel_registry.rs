@@ -630,14 +630,14 @@ pub struct DeclaredFamily {
 /// declared family maps 1:1 onto `resolve_kernel_dir`'s `kernels/<family>` destination.
 pub type DeclaredKernelSet = BTreeMap<String, DeclaredFamily>;
 
-/// The checked-in declaration file, at the repo root -- NOT `MANIFEST_FILE`, and not inside any
+/// The checked-in declaration file, at `repo_root/config` -- NOT `MANIFEST_FILE`, and not inside any
 /// kernel build/publish directory. Those are per-directory and generated; this is repo-wide and
 /// hand-maintained. Two different files because they answer two different questions, not two
 /// formats racing to answer the same one.
 pub const DECLARED_KERNELS_FILE: &str = "declared_kernels.json";
 
 pub fn declared_kernels_path(repo_root: &Path) -> PathBuf {
-    repo_root.join(DECLARED_KERNELS_FILE)
+    repo_root.join("config").join(DECLARED_KERNELS_FILE)
 }
 
 pub fn load_declared_kernel_set(repo_root: &Path) -> std::io::Result<DeclaredKernelSet> {
