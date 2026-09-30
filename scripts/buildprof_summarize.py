@@ -40,13 +40,17 @@ def parse_profile(text):
             continue
         if not inside:
             continue
+        # The total row has an empty dRSS column (3 tokens: ms, peak, "total"), so ROW --
+        # which requires 4 -- never matches it; detect it by its last token instead, before
+        # trying ROW, or the sentinel is never cleared and a later digit-led line is misread
+        # as still being inside the block.
+        if line.split()[-1:] == ["total"]:
+            inside = False
+            continue
         m = ROW.match(line)
         if not m:
             continue
         ms, _drss, peak, edge = m.groups()
-        if edge.strip() == "total":
-            inside = False
-            continue
         rows.append((edge.strip(), int(ms), float(peak) if peak != "-" else 0.0))
     return rows
 

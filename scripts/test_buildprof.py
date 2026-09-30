@@ -113,6 +113,20 @@ def test_stage_of_classifies_edges():
     assert s("something_new") == "other"
 
 
+def test_parse_profile_stops_at_total_row():
+    # The real `total` row has an empty dRSS column (3 tokens), so ROW never matches it; a
+    # digit-led line after it must not be swept in as if it were still inside the block.
+    text = (
+        "aiecc: profile (per-edge time and resident memory):\n"
+        "        ms    dRSS MiB    peak MiB  edge\n"
+        "       120        10.0       110.0  placed.mlir\n"
+        "     12160                   900.0  total\n"
+        "        5         1.0         2.0  not_a_profile_row.mlir\n"
+    )
+    rows = _summ().parse_profile(text)
+    assert rows == [("placed.mlir", 120, 110.0)]
+
+
 def test_parse_profile_rows(tmp_path):
     _run(tmp_path, ["aie.mlir"])
     log = next((tmp_path / "logs").glob("aiecc-*.log"))
