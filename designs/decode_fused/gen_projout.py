@@ -32,6 +32,7 @@ import ml_dtypes
 import newstack_compat  # noqa: F401 — MUST precede iron imports (new-mlir-aie port shim)
 from iron.common import AIEContext
 from elf_dispatch_compat import OperatorSequence, load_elf
+from elf_zst import write_elf
 from iron.operators.gemv.op import GEMV
 
 BF16 = ml_dtypes.bfloat16
@@ -105,7 +106,7 @@ def main():
     x0[D] = 1.0
     wb("x", bf16(x0))
 
-    open(os.path.join(a.out, "projout.elf"), "wb").write(elf)
+    elf_prov = write_elf(os.path.join(a.out, "projout.elf"), elf)
     meta = {
         "elf": "projout.elf", "kernel_name": "main:sequence",
         "input_size": int(in_sz), "output_size": int(out_sz), "scratch_size": int(scr),
@@ -114,6 +115,7 @@ def main():
         "vocab": VOCAB, "vocab_pad": VOCAB_PAD, "D": D, "k_aug": K_AUG, "vs": VS,
         "argmax": bool(a.argmax), "cols": COLS,
     }
+    meta.update(elf_prov)
     json.dump(meta, open(os.path.join(a.out, "meta.json"), "w"), indent=2)
     print(f"wrote proj_out GEMV ELF ({len(elf)}B, scratch {scr/1e6:.1f}MB, weight {mat_pad.nbytes//2/1e6:.0f}MB bf16) to {a.out}")
 

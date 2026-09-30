@@ -28,6 +28,7 @@ import torch
 import newstack_compat  # noqa: F401
 from iron.common import AIEContext
 from elf_dispatch_compat import OperatorSequence, load_elf
+from elf_zst import write_elf
 from iron.operators.gemm.op import GEMM
 from iron.operators.gemv.op import GEMV
 from iron.operators.layer_norm.op import LayerNorm
@@ -329,7 +330,7 @@ def main():
     if eng:
         for nm, arr in weights_to_write.items():
             wb(nm, arr)
-        open(os.path.join(a.out, "decode_b.elf"), "wb").write(elf)
+        elf_prov = write_elf(os.path.join(a.out, "decode_b.elf"), elf)
         meta = {
             "elf": "decode_b.elf", "kernel_name": "main:sequence",
             "input_size": int(in_sz), "output_size": int(out_sz), "scratch_size": int(scr),
@@ -341,6 +342,7 @@ def main():
         }
         if not sp:
             del meta["scratchpad"]
+        meta.update(elf_prov)
         json.dump(meta, open(os.path.join(a.out, "meta.json"), "w"), indent=2)
         print(f"\nwrote {NL}-layer batched decode ELF [engine-only] ({len(elf)}B, scratch {scr/1e6:.1f}MB) B={B} to {a.out}")
         return
@@ -384,7 +386,7 @@ def main():
     wb("x", X.reshape(-1)); wb(out_name, outX.reshape(-1))
     for nm, arr in weights_to_write.items():
         wb(nm, arr)
-    open(os.path.join(a.out, "decode_b.elf"), "wb").write(elf)
+    elf_prov = write_elf(os.path.join(a.out, "decode_b.elf"), elf)
 
     meta = {
         "elf": "decode_b.elf", "kernel_name": "main:sequence",
@@ -396,6 +398,7 @@ def main():
     if sp:
         meta["scratchpad"] = {"params": scratchpad_params, "kv_param": "kv_off", "mask_param": "sm_mask",
                               "head_dim": HD, "num_preceding": P}
+    meta.update(elf_prov)
     json.dump(meta, open(os.path.join(a.out, "meta.json"), "w"), indent=2)
     print(f"\nwrote {NL}-layer batched decode ELF ({len(elf)}B, scratch {scr/1e6:.1f}MB) B={B} to {a.out}")
 

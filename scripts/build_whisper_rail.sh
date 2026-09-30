@@ -17,4 +17,5 @@ if [ ! -f "$WEIGHTS/model.decoder.embed_positions.weight.npy" ]; then
 fi
 WEIGHTS="$WEIGHTS" GEN_EXTRA="--max-seq ${MAX_SEQ:-512}" \
     bash "$REPO/scripts/build_llm_decode.sh" "$SPEC" "" "$OUT"
-sha256sum "$OUT/decode.elf"
+"$PY" -c 'import json,sys; m=json.load(open(sys.argv[1])); print(m["sha256"], sys.argv[2])' \
+    "$OUT/meta.json" "$OUT/decode.elf"

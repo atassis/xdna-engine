@@ -1812,8 +1812,8 @@ impl LlmArtifact {
 }
 
 /// Read a control-code ELF, transparently decompressing `<path>.zst` when `path` itself is
-/// absent. Both forms may exist (the build keeps the plain `.elf` unless `ELF_ZST_ONLY=1`); the
-/// plain file wins so a partial/corrupt `.zst` never shadows a good `.elf`.
+/// absent. Builds write `.zst` only; a plain `path` present anyway (a stale build, a hand-copied
+/// artifact) wins so a partial/corrupt `.zst` never shadows it.
 pub fn read_elf_bytes(path: &Path) -> Result<Vec<u8>, EngineError> {
     if path.is_file() {
         return fs::read(path).map_err(|e| EngineError::Load(format!("read {}: {e}", path.display())));
@@ -3359,8 +3359,8 @@ mod tests {
         assert_eq!(read_elf_bytes(&elf).unwrap(), b"not really an ELF, just content");
     }
 
-    /// `<name>.elf.zst` alone (no `<name>.elf`, `ELF_ZST_ONLY=1` shape) must decompress to
-    /// byte-identical content, and the sha256 over those bytes -- what `artifact_hash` hashes --
+    /// `<name>.elf.zst` alone (no `<name>.elf`, the shape every build now produces) must decompress
+    /// to byte-identical content, and the sha256 over those bytes -- what `artifact_hash` hashes --
     /// must match the sha256 of the original uncompressed bytes.
     #[test]
     fn read_elf_bytes_decompresses_zst_only_byte_identical() {

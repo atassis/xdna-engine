@@ -7,8 +7,8 @@
 # IRON defaults to amd_paths.sh's IRON_DIR and is gated on the API SURFACE below, never on a
 # branch name -- the same idiom build_llm_decode.sh uses. Override with IRON=<dir>.
 #
-# Also writes prefill.elf.zst (zstd -3 --long=27, elf_zst.py) and records both sha256s in
-# meta.json. ELF_ZST_ONLY=1 drops the plain prefill.elf after compressing.
+# Writes prefill.elf.zst only (zstd -3 --long=27, elf_zst.py) and records both sha256s in
+# meta.json.
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WS="$(cd "$REPO/.." && pwd)"

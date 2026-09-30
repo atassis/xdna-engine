@@ -64,5 +64,5 @@ WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT   # amd/IRON writes build/ inter
 mkdir -p "$OUT"
 echo "[build] gen_decode --layers $LAYERS -> $OUT (work=$WORK) ${GEN_EXTRA:+extra: $GEN_EXTRA}"
 ( cd "$WORK" && "$VENV_IRON/bin/python" "$GEN" --weights "$WEIGHTS" --layers "$LAYERS" --out "$OUT" ${GEN_EXTRA:-} )
-echo "[build] done. decode.elf=$(du -h "$OUT/decode.elf" | cut -f1); params:"
+echo "[build] done. decode.elf.zst=$(du -h "$OUT/decode.elf.zst" | cut -f1); params:"
 cat "$OUT/params.txt"

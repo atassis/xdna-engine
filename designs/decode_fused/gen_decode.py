@@ -24,6 +24,7 @@ import newstack_compat  # noqa: F401 — MUST precede iron imports (new-mlir-aie
 from iron.common import AIEContext
 from buffer_blob import write_blob
 from elf_dispatch_compat import OperatorSequence, load_elf
+from elf_zst import write_elf
 from iron.operators.gemv.op import GEMV
 from iron.operators.layer_norm.op import LayerNorm
 from iron.operators.elementwise_add.op import ElementwiseAdd
@@ -593,7 +594,7 @@ def main():
     wb("x", x); wb(out_name, x_out)
     for nm, arr in weights_to_write.items():
         wb(nm, arr)
-    open(os.path.join(a.out, "decode.elf"), "wb").write(elf)
+    elf_prov = write_elf(os.path.join(a.out, "decode.elf"), elf)
 
     meta = {
         "elf": "decode.elf", "kernel_name": "main:sequence",
@@ -640,6 +641,7 @@ def main():
         "fuse_bias_aug": ({**({"xn_f": D, "h": FF} if fuse_ffn else {}),
                            **({"xn_s": D, "cts": D, "xn_c": D, "ctc": D} if fuse_attn else {})}), "fuse_bias_vs": VS,
     }
+    meta.update(elf_prov)
     json.dump(meta, open(os.path.join(a.out, "meta.json"), "w"), indent=2)
     print(f"\nwrote {NL}-layer decode ELF ({len(elf)}B, scratch {scr/1e6:.1f}MB) to {a.out}")
 

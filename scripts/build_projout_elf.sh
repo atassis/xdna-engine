@@ -24,4 +24,4 @@ mkdir -p "$OUT"
 ARGMAX_FLAG="--argmax"; [ -n "${PROJOUT_NO_ARGMAX:-}" ] && ARGMAX_FLAG=""
 echo "[build] gen_projout ${ARGMAX_FLAG} -> $OUT (work=$WORK)"
 ( cd "$WORK" && "$VENV_IRON/bin/python" "$GEN" --weights "$WEIGHTS" --out "$OUT" ${ARGMAX_FLAG} )
-echo "[build] done. projout.elf=$(du -h "$OUT/projout.elf" | cut -f1)"
+echo "[build] done. projout.elf.zst=$(du -h "$OUT/projout.elf.zst" | cut -f1)"

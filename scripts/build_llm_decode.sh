@@ -6,8 +6,8 @@
 #     spec    qwen3-0.6b | gemma3-270m
 #     LAYERS  default: the spec's full depth
 #
-# Also writes decode.elf.zst (zstd -3 --long=27, elf_zst.py) and records both sha256s in
-# meta.json. ELF_ZST_ONLY=1 drops the plain decode.elf after compressing.
+# Writes decode.elf.zst only (zstd -3 --long=27, elf_zst.py) and records both sha256s in
+# meta.json.
 #
 # Env overrides: VENV_IRON, IRON (an IRON checkout carrying iron/common/fusion.py), WEIGHTS.
 # NOTE the shared workspace IRON checkout is NOT usable by default: its local integration-stack has
