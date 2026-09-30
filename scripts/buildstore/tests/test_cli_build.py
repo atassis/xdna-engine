@@ -40,3 +40,16 @@ def test_iron_pin_verified_is_a_key_input(tmp_path):
     b = cli(tmp_path, "build", "fake", "--recipes", str(tsv), "--out-root", str(tmp_path / "o"))
     assert b.startswith("BUILT fake ") and b.split()[2] != a.split()[2]
     assert (tmp_path / "o" / "fake" / "o").read_text().strip() == "b" * 40
+
+def test_xdna_cache_resolved_and_baked_in(tmp_path):
+    """cache_env.sh's own default resolves XDNA_CACHE via the worktree's .git, which a replay
+    sandbox never has (same class as the IRON pin). build() must resolve it once, outside any
+    sandbox, and put a CONCRETE path in the manifest env."""
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "cache_env.sh").write_text(
+        'export XDNA_CACHE="${XDNA_CACHE:-/resolved/by/cache_env}"\n')
+    tsv = tmp_path / "r.tsv"
+    tsv.write_text('fake\t. "$REPO/scripts/cache_env.sh" && echo "$XDNA_CACHE" > "$OUT/o"\n')
+    a = cli(tmp_path, "build", "fake", "--recipes", str(tsv), "--out-root", str(tmp_path / "o"))
+    assert a.startswith("BUILT fake ")
+    assert (tmp_path / "o" / "fake" / "o").read_text().strip() == "/resolved/by/cache_env"

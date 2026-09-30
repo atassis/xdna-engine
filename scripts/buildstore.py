@@ -33,6 +33,22 @@ def _elapsed_seconds(s):
     return h * 3600 + m * 60 + sec
 
 
+def resolve_xdna_cache(repo, env):
+    """XDNA_CACHE, when not already in the hermetic env: cache_env.sh's own default resolves it
+    via a worktree's .git (git-common-dir, to inherit the main checkout's cache), which a replay
+    sandbox never has. Resolve it here, once, outside any sandbox, and bake it into env -- same
+    reasoning as iron_pin_verified."""
+    if "XDNA_CACHE" in env:
+        return
+    cache_env = pathlib.Path(repo) / "scripts" / "cache_env.sh"
+    if not cache_env.is_file():
+        return
+    r = subprocess.run(["bash", "-c", f'. "{cache_env}"; echo "$XDNA_CACHE"'],
+                       cwd=repo, env=env, capture_output=True, text=True)
+    if r.returncode == 0 and r.stdout.strip():
+        env["XDNA_CACHE"] = r.stdout.strip()
+
+
 def iron_pin_verified(repo, env):
     """Run amd_paths.sh's iron_require_pin ONCE, outside any replay sandbox (which never has
     .git -- see the function's own comment), and return the sha it verified. None for a repo
@@ -81,6 +97,7 @@ def cmd_build(args):
             argv = ["bash", "-c", f"cd {repo} && {cmd}"]
             env = record.hermetic_env(os.environ, record.allowlist())
             env["REPO"] = str(repo)
+            resolve_xdna_cache(repo, env)
             want = iron_pin_verified(repo, env)
             if want:
                 env["IRON_PIN_VERIFIED"] = want
