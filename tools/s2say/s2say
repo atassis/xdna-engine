@@ -7,7 +7,7 @@
 #   s2say --out-dir ~/clips "text"
 #   s2say --where                    show which binary, model and config are in use
 #
-# Installed by cli/install.sh. Paths resolve env -> ~/.config/s2say/config -> repo-relative, so an
+# Installed by tools/s2say/install.sh. Paths resolve env -> ~/.config/s2say/config -> repo-relative, so an
 # installed copy does not depend on the checkout staying where it was when it was installed.
 #
 # WHICH HARDWARE THIS USES, stated plainly because it is the whole question right now:
@@ -70,7 +70,7 @@ fi
 for f in "$S2" "$MODEL" "$TOKENIZER"; do
   [[ -e "$f" ]] || {
     echo "missing: $f" >&2
-    echo "run 's2say --where' to see resolved paths, or re-run cli/install.sh" >&2
+    echo "run 's2say --where' to see resolved paths, or re-run tools/s2say/install.sh" >&2
     exit 1
   }
 done

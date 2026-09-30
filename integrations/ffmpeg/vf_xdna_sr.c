@@ -6,7 +6,7 @@
  * the enlarged frame. Decode/encode stay ffmpeg's job; this filter only upscales.
  *
  * Written against FFmpeg 8.0 (FFFilter API). Delivered as an out-of-tree patch (ffmpeg has no stable
- * filter-plugin ABI) -- see ffmpeg/apply.sh. Upstreaming is a separate, owner-gated act.
+ * filter-plugin ABI) -- see integrations/ffmpeg/apply.sh. Upstreaming is a separate, owner-gated act.
  *
  * This file is part of the xdna-engine project. AGPL-3.0 (matches the engine); when contributed to
  * FFmpeg it would carry FFmpeg's LGPL header instead.

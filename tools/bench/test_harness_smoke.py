@@ -1,6 +1,6 @@
 """CPU-only rot guard for the benchmark harnesses. No NPU, no models, no network, no build.
 
-`bench/compare.py` -- the harness that produced a shipped head-to-head result -- silently stopped
+`tools/bench/compare.py` -- the harness that produced a shipped head-to-head result -- silently stopped
 running for weeks and was only caught by accident, because nothing exercises these modules except a
 human doing a comparison. Four independent rots had accumulated: it spawned a binary deleted in the CLI
 migration, started a version-incompatible service, constructed an energy meter that threw before taking
@@ -28,10 +28,10 @@ from pathlib import Path
 import pytest
 import requests
 
-ROOT = Path(__file__).resolve().parent.parent
-BENCH = ROOT / "bench"
+ROOT = Path(__file__).resolve().parent.parent.parent
+BENCH = ROOT / "tools" / "bench"
 
-# Every non-test module in bench/, discovered rather than listed: a NEW harness module is covered the
+# Every non-test module in tools/bench/, discovered rather than listed: a NEW harness module is covered the
 # moment it lands, which is the failure mode being guarded (nobody remembers to add it here).
 BENCH_MODULES = sorted(
     p.stem for p in BENCH.glob("*.py")
@@ -48,18 +48,18 @@ def test_bench_modules_were_discovered():
 def _is_first_party(module_name):
     """Is a failed import OUR code moving, or a third-party package simply not installed?
 
-    The distinction is the whole point of this guard. `bench/bench.py` needs `onnx_asr`, an optional
+    The distinction is the whole point of this guard. `tools/bench/bench.py` needs `onnx_asr`, an optional
     pypi dep -- absent on a fresh clone and absent in CI, and its absence says nothing about rot. But
     if `bench.backends` stops resolving, that IS rot and must fail loudly. So: a module is first-party
     when its top-level name corresponds to a file or package inside the repo.
     """
     top = module_name.split(".")[0]
-    return (ROOT / f"{top}.py").exists() or (ROOT / top).is_dir()
+    return (ROOT / f"{top}.py").exists() or (ROOT / top).is_dir() or (BENCH.parent / top).is_dir()
 
 
 @pytest.mark.parametrize("mod", BENCH_MODULES)
 def test_module_imports(mod):
-    """Import-time rot: a moved first-party dependency or a syntax error anywhere in bench/.
+    """Import-time rot: a moved first-party dependency or a syntax error anywhere in tools/bench/.
 
     Deliberately does NOT fail on a missing optional third-party package -- a guard that goes red for
     an unrelated reason gets ignored, and an ignored guard is how the original rot survived for weeks.

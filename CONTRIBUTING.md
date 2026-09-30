@@ -63,7 +63,7 @@ context at a time in practice, see `README.md`), so stop any other service holdi
 Once, after cloning, run `git config core.hooksPath hooks` -- it activates a pre-push
 guard (`hooks/pre-push`) that blocks pushes carrying certain leaked material into this
 public tree. It won't fire on ordinary contributions; it exists for my own workflow
-across a private companion project.
+across a private companion project. See `hooks/README.md` for what it covers.
 
 ## Code style
 

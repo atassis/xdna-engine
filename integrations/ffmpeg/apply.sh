@@ -5,7 +5,7 @@
 # Assumes the checkout already exists at target/ffmpeg-xdna (n8.0) and libxdna_sr.so is built
 # (cargo build -p npu-sr-capi). Idempotent: re-running re-copies + rebuilds.
 set -euo pipefail
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"        # xdna-engine repo root
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"     # xdna-engine repo root
 FFDIR="$ROOT/target/ffmpeg-xdna"
 LIBDIR="$ROOT/rust/target/debug"                # where libxdna_sr.so lives
 HDR="$ROOT/rust/npu-sr-capi/include"
@@ -13,7 +13,7 @@ HDR="$ROOT/rust/npu-sr-capi/include"
 [ -d "$FFDIR" ] || { echo "clone first: git clone --depth 1 -b n8.0 https://git.ffmpeg.org/ffmpeg.git $FFDIR"; exit 1; }
 [ -f "$LIBDIR/libxdna_sr.so" ] || { echo "build the lib first: (cd $ROOT/rust && cargo build -p npu-sr-capi)"; exit 1; }
 
-cp "$ROOT/ffmpeg/vf_xdna_sr.c" "$FFDIR/libavfilter/"
+cp "$ROOT/integrations/ffmpeg/vf_xdna_sr.c" "$FFDIR/libavfilter/"
 cp "$HDR/xdna_sr.h" "$FFDIR/libavfilter/"
 
 # Register the filter: extern decl in allfilters.c + the Makefile object (gated by CONFIG_XDNA_SR_FILTER).

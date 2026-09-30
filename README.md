@@ -91,9 +91,9 @@ does not need it.
   MHA, conv, LayerNorm, ...), each with its numpy golden where one exists ([index](aie_kernels/INDEX.md))
 - `designs/` - the IRON multi-core dataflow graphs the engine actually dispatches, built from
   those kernels ([layout + build model per design](designs/README.md))
-- `experiments/` - one-off studies and A/B probes, not dispatched by the engine
+- `tools/experiments/` - one-off studies and A/B probes, not dispatched by the engine
 - `scripts/` - model export/convert, kernel builds, device probes, eval ([index](scripts/README.md))
-- `bench/` - latency/energy benchmark harness
+- `tools/bench/` - latency/energy benchmark harness
 - `docs/` - engineering deep-dives (data-movement thesis, AIE2P architecture/roofline, benchmark methodology, ...)
 - `mlir-aie/` - pinned submodule (the open AIE toolchain)
 

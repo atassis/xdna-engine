@@ -241,7 +241,9 @@ fn exec_with_xrt_ini(root: &Path) {
         return;
     }
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let found = [Some(root.join("xrt.ini")), home.map(|h| h.join(".config/xrt/xrt.ini"))]
+    // root.join("xrt.ini") is the INSTALLED layout (install.sh stages it there); a source
+    // checkout keeps its copy at config/xrt.ini, checked second so an install always wins.
+    let found = [Some(root.join("xrt.ini")), Some(root.join("config/xrt.ini")), home.map(|h| h.join(".config/xrt/xrt.ini"))]
         .into_iter().flatten().find(|p| p.is_file());
     let Some(ini) = found else {
         eprintln!("[npu-serve] WARNING: no xrt.ini found; ELFs over 64 MiB will fail to load");

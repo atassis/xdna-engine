@@ -27,7 +27,7 @@ STACK ?=
 
 # Extra clang flags, appended verbatim. Exists for the aie2p subregister-liveness
 # wrong-code defect that silently drops the second aie::tanh's result -- see
-# experiments/probes/tanh_subreg_clobber.ll. Either of these makes it correct:
+# tools/experiments/probes/tanh_subreg_clobber.ll. Either of these makes it correct:
 #   EXTRA_CFLAGS="-mllvm -enable-subreg-liveness=false"
 #   EXTRA_CFLAGS="-mllvm -join-liveintervals=false"
 EXTRA_CFLAGS ?=

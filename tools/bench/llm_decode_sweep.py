@@ -19,8 +19,8 @@ warm, measure, stop. Pin --pmode (default `performance`); leaving it unset lets 
 governor move under the sweep and the fit degrades to noise.
 
 Usage:
-    bench/llm_decode_sweep.py --models qwen3:0.6b,qwen3:1.7b,qwen3:4b,qwen3:8b \
-        --out bench/results/flm-decode-sweep.json
+    tools/bench/llm_decode_sweep.py --models qwen3:0.6b,qwen3:1.7b,qwen3:4b,qwen3:8b \
+        --out tools/bench/results/flm-decode-sweep.json
 """
 import argparse
 import json

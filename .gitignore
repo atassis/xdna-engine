@@ -1,8 +1,11 @@
 # python
 .venv/
 .venv-iron/
+.venv-export/
 __pycache__/
 *.pyc
+.pytest_cache/
+.ruff_cache/
 
 # local wheelhouse for the un-fetchable mlir_aie toolchain wheel (~290MB); repacked from the
 # uv archive cache by scripts/build_wheelhouse.sh, never committed.
@@ -57,9 +60,12 @@ aie_kernels/_test/gen/
 /target/
 
 # whole_array probe build output (per-pin dirs are disposable, like probes/build)
-experiments/probes/build*/
+tools/experiments/probes/build*/
 
 # per-worktree cargo target-dir, written by scripts/setup_worktree.sh
 /.cargo/
 
 scratch/
+
+# regenerated per pytest run
+tests_latest.csv

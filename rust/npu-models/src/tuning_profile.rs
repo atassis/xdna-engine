@@ -5,7 +5,7 @@ use npu_asr::ctx2::Precision;
 use npu_asr::tuning::TuningConfig;
 use serde::Deserialize;
 
-/// Returns the hardware-class id used to pick `profiles/<class>.toml`. Single supported class today;
+/// Returns the hardware-class id used to pick `config/profiles/<class>.toml`. Single supported class today;
 /// TODO: derive from xrt-smi / device id when a second class is targeted.
 pub fn detect_hw_class() -> String {
     "xdna2".to_string()
@@ -43,10 +43,10 @@ impl TuningProfile {
     }
 }
 
-/// Load `profiles/<detect()>.toml` under `root`; if absent, baked default (+ env). Never fails hard
-/// on a missing profile (baked default is a valid resolution).
+/// Load `config/profiles/<detect()>.toml` under `root`; if absent, baked default (+ env). Never
+/// fails hard on a missing profile (baked default is a valid resolution).
 pub fn resolve(root: &std::path::Path, precision: Precision) -> TuningConfig {
-    let path = root.join("profiles").join(format!("{}.toml", detect_hw_class()));
+    let path = root.join("config").join("profiles").join(format!("{}.toml", detect_hw_class()));
     match std::fs::read_to_string(&path) {
         Ok(s) => TuningProfile::from_toml_str(&s)
             .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))

@@ -73,9 +73,9 @@ EDSR has no shipped scenario yet, so it is reachable only through the FFmpeg fil
 (point `schedule=` at `artifacts/edsr/edsr.json`), or by adding your own `image-sr` scenario +
 `[[model]]` entry for it.
 
-FFmpeg filter (compiles the filter into a local FFmpeg build; see `ffmpeg/README-xdna-sr-filter.md`):
+FFmpeg filter (compiles the filter into a local FFmpeg build; see `integrations/ffmpeg/README-xdna-sr-filter.md`):
 
-    bash ffmpeg/apply.sh
+    bash integrations/ffmpeg/apply.sh
     LD_LIBRARY_PATH=rust/target/release target/ffmpeg-xdna/ffmpeg \
       -i input.mp4 -vf "xdna_sr=schedule=artifacts/edsr/edsr.json:npu=1" output.mp4
 

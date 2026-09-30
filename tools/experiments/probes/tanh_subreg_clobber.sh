@@ -2,7 +2,7 @@
 # Score tanh_subreg_clobber.ll against every Peano build we have, plus the two flags
 # that make it correct. Device-free: this is a codegen defect, so compiling is enough.
 #
-#   experiments/probes/tanh_subreg_clobber.sh [extra llc flags...]
+#   tools/experiments/probes/tanh_subreg_clobber.sh [extra llc flags...]
 set -uo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 ll="$here/tanh_subreg_clobber.ll"

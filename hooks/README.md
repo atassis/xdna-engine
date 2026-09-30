@@ -20,3 +20,7 @@ Verify it is on -- an uninstalled hook is indistinguishable from a passing one:
 
 Checking `.git/hooks/` instead is the trap: with `core.hooksPath` set, git does not
 look there, so an empty `.git/hooks/` says nothing about whether the guards are live.
+
+`pre-push-fork` is a separate hook for the pinned upstream forks (mlir-aie, llvm-aie,
+IRON, ...), installed per fork into that checkout's own `.git/hooks/pre-push` -- see
+its header for why it cannot reuse `pre-push`.

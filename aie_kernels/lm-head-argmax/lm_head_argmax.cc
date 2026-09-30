@@ -34,7 +34,7 @@
 //
 // The API pattern (aie::mmul<M,K,N,TA,TB,accauto> -> load_v -> acc.mac ->
 // acc.to_vector<Out>()) is copied verbatim from
-// experiments/ffn_bfp16/repro_847_mmul888_bfp16.cc. The co-produced
+// tools/experiments/ffn_bfp16/repro_847_mmul888_bfp16.cc. The co-produced
 // (value, mask) argmax primitive is aie::max_cmp, whose mask semantics
 // (m[i]==0 -> keep v1[i], m[i]==1 -> take v2[i]) are documented in
 // aie_api/include/aie_api/aie.hpp and mirrored exactly by aie::select, so a
