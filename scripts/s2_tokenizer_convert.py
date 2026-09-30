@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import re
 import unicodedata
 from pathlib import Path
@@ -33,9 +34,10 @@ from typing import Optional
 
 import regex
 
-DEFAULT_MODEL_DIR = Path(
-    "/mnt/data/cache/huggingface/hub/models--fishaudio--openaudio-s1-mini/snapshots/"
-    "f4b445029346701e082b60bb63fcc2d1bb17a0e2"
+_HF_HOME = Path(os.environ.get("HF_HOME", str(Path.home() / ".cache" / "huggingface")))
+DEFAULT_MODEL_DIR = (
+    _HF_HOME / "hub" / "models--fishaudio--openaudio-s1-mini" / "snapshots"
+    / "f4b445029346701e082b60bb63fcc2d1bb17a0e2"
 )
 DEFAULT_OUT = Path("artifacts/openaudio-s1-mini/tokenizer/tokenizer.json")
 
