@@ -44,13 +44,17 @@ def _bind_file(root, p):
     _mount(p, tgt, None, MS_BIND | MS_REMOUNT | MS_RDONLY)
 
 
-def _bind_whole(root, p):
-    """Bind a whole real path (furniture only -- not a recorded build input)."""
+def _bind_whole(root, p, writable=False):
+    """Bind a whole real path (furniture only -- not a recorded build input). `writable` is for
+    a real path the recorded run itself mutates in place (toolchain_up.sh's idempotent backfill
+    symlinks into the shared instance) -- read-only would make replay diverge from what the
+    real run actually did."""
     tgt = root / p.lstrip("/")
     (tgt.mkdir(parents=True, exist_ok=True) if os.path.isdir(p)
      else (tgt.parent.mkdir(parents=True, exist_ok=True), tgt.touch()))
     _mount(p, tgt, None, MS_BIND)
-    _mount(p, tgt, None, MS_BIND | MS_REMOUNT | MS_RDONLY)
+    if not writable:
+        _mount(p, tgt, None, MS_BIND | MS_REMOUNT | MS_RDONLY)
 
 
 def build_plan(manifest_path, scratch):
@@ -63,7 +67,7 @@ def build_plan(manifest_path, scratch):
     base -= files | dirs
     files = sorted((p for p in files if os.path.exists(p)), key=len)
     dirs = sorted((p for p in dirs if os.path.exists(p)), key=len)
-    furniture = [p for p in sorted(base, key=len) if os.path.exists(p)]
+    furniture = [[p, False] for p in sorted(base, key=len) if os.path.exists(p)]
     # build_llm_decode.sh/build_prefill.sh/gate_llm.sh etc probe `[ -x "$VENV_IRON/bin/python" ]`
     # (VENV_IRON defaults to "$REPO/.venv-iron") before running anything -- a stat(2)/access(2)
     # check rec_preload.c's open-based hooks never see, so no manifest records it either way.
@@ -75,22 +79,24 @@ def build_plan(manifest_path, scratch):
                             os.path.join(os.path.dirname(repo), "xdna-engine", ".venv-iron",
                                         "bin", "python")):
             if os.path.exists(venv_python):
-                furniture.append(venv_python)
+                furniture.append([venv_python, False])
     # toolchain_up.sh's `[ -e "$MLIR_DISTRO_ABS/bin/mlir-tblgen" ]` is the same unhooked-probe
     # class: on the cached-instance fast path the file is never opened, only stat-tested, so no
     # manifest records it either. Bind whichever mlir-distro trees are actually provisioned.
     xdna_cache = m["env"].get("XDNA_CACHE")
     if xdna_cache:
-        furniture += glob.glob(os.path.join(xdna_cache, "mlir-distro", "*", "mlir", "bin",
-                                            "mlir-tblgen"))
+        furniture += [[p, False] for p in glob.glob(os.path.join(
+            xdna_cache, "mlir-distro", "*", "mlir", "bin", "mlir-tblgen"))]
     # The whole built toolchain instance: content-addressed by toolchain.lock's LOCKHASH
     # (buildstore.py's resolve_mlir_aie_instance), so its tree is furniture, not per-file
     # inputs -- its every internal existence probe is otherwise the same unhooked-probe class
     # as mlir-tblgen above, and there are too many of them (aie-translate, vendored symlinks,
-    # backfill markers) to track one by one.
+    # backfill markers) to track one by one. WRITABLE: the real run itself backfills idempotent
+    # symlinks into this shared instance in place (toolchain_up.sh's _link_vendored_tools);
+    # read-only would make replay diverge from what the real run actually did.
     instance = m["env"].get("MLIR_AIE_INSTANCE")
     if instance and os.path.isdir(instance):
-        furniture.append(instance)
+        furniture.append([instance, True])
     symlinks = {"/lib64": "usr/lib", "/lib": "usr/lib", "/bin": "usr/bin", "/sbin": "usr/bin"}
     symlinks.update(m["links"])
     # ld.so resolves a DT_NEEDED soname through ld.so.cache to a *symlink* path (e.g.
@@ -157,8 +163,8 @@ def apply_and_exec(plan):
             continue
         os.symlink(target, link)
 
-    for p in plan["furniture"]:
-        _bind_whole(root, p)
+    for p, writable in plan["furniture"]:
+        _bind_whole(root, p, writable=writable)
     for p in plan["rw"]:
         real = scratch / "rw" / p.lstrip("/")
         _mount(real, root / p.lstrip("/"), None, MS_BIND)

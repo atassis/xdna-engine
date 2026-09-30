@@ -67,7 +67,11 @@ def test_replay_furnishes_whole_mlir_aie_instance(tmp_path):
     inst = tmp_path / "instance" / "build" / "bin"; inst.mkdir(parents=True)
     (inst / "aie-translate").write_text("bin")
     out = tmp_path / "out"; out.mkdir()
-    script = f'[ -e "$MLIR_AIE_INSTANCE/build/bin/aie-translate" ] && echo ok > {out}/o'
+    # toolchain_up.sh's _link_vendored_tools backfills a missing symlink into the shared
+    # instance in place, even on the cached path -- the instance must be WRITABLE, not RO.
+    script = (f'[ -e "$MLIR_AIE_INSTANCE/build/bin/aie-translate" ] && '
+              f'ln -sfn /nonexistent "$MLIR_AIE_INSTANCE/build/bin/backfilled" && '
+              f'echo ok > {out}/o')
     cmd = ["bash", "-c", script]
     m = record.run(cmd, cwd=tmp_path, env={"PATH": "/usr/bin:/bin",
                                           "MLIR_AIE_INSTANCE": str(tmp_path / "instance")},
