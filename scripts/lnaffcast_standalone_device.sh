@@ -40,6 +40,7 @@
 # alike, and `npu-asr` was renamed to `xdna-engine`, so the old name returns a false all-clear.
 set -u
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$WT"
+. "$WT/scripts/lib/data_root.sh"   # -> XDNA_ARTIFACTS
 LOG="$WT/artifacts/lnaffcast_standalone.log"
 mkdir -p "$WT/artifacts"; : > "$LOG"
 log(){ echo -e "$*" | tee -a "$LOG"; }
@@ -56,7 +57,7 @@ BASE="${BASE:-512x1024x1024_32x32x128_8c_modalidbf16outkrtpkrllnaff1024}"
 X1=${BASE}scat21x
 REPS="${REPS:-5}"
 ROWS="${ROWS:-512}"
-LN_DIR="${LN_DIR:-/mnt/data/xdna/artifacts/parakeet/ln}"
+LN_DIR="${LN_DIR:-$XDNA_ARTIFACTS/parakeet/ln}"
 
 log "===== lnaffcast: mode vs the SHIPPED standalone op at ${ROWS} rows  $(date -Is) ====="
 log "[svc] stopping xdna-engine + npu-vox"

@@ -45,6 +45,8 @@ from ml_dtypes import bfloat16
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gemm_command_accounting import insts_bin
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
+from data_root import XDNA_ARTIFACTS  # noqa: E402
 
 import pyxrt
 from aie.utils.npukernel import NPUKernel
@@ -164,7 +166,7 @@ def main(o):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--ln-dir", default="/mnt/data/xdna/artifacts/parakeet/ln",
+    p.add_argument("--ln-dir", default=str(XDNA_ARTIFACTS / "parakeet" / "ln"),
                    help="the SHIPPED artifact dir -- price what the encoder loads, not a rebuild")
     p.add_argument("--stem", default=f"lnaffcast_{ROWS}x{COLS}")
     p.add_argument("--artifacts", default="artifacts")

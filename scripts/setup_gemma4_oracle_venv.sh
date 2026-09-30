@@ -11,7 +11,8 @@
 #   bash scripts/setup_gemma4_oracle_venv.sh
 #   $GEMMA4_ORACLE_VENV/bin/python scripts/llm_hf_bf16_ref.py --model <checkpoint> --layers 6 ...
 set -euo pipefail
-VENV="${GEMMA4_ORACLE_VENV:-/mnt/data/xdna/venvs/gemma4-oracle}"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VENV="${GEMMA4_ORACLE_VENV:-$REPO/.venv-gemma4-oracle}"
 [ -d "$VENV" ] || uv venv --python 3.12 "$VENV"
 # torch CPU-only by the same policy as the export venv; the +cpu wheel needs the PyTorch index.
 uv pip install --python "$VENV" \
