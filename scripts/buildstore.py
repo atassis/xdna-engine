@@ -18,9 +18,11 @@ import argparse, datetime, glob, hashlib, json, os, pathlib, shutil, subprocess,
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "buildstore"))
+sys.path.insert(0, str(HERE / "lib"))
 import identity, record, store  # noqa: E402
+from data_root import XDNA_CAS  # noqa: E402
 
-WS = HERE.parent.parent
+REPO = HERE.parent
 
 
 def parse_recipes(path):
@@ -197,8 +199,8 @@ def _build_one(name, cmd, repo, s, out_root, no_hit, verify):
 
 
 def cmd_build(args):
-    cas = pathlib.Path(os.environ.get("BUILDSTORE_CAS", "/mnt/data/xdna/cas"))
-    repo = pathlib.Path(os.environ.get("BUILDSTORE_REPO", str(WS / "xdna-engine")))
+    cas = pathlib.Path(os.environ.get("BUILDSTORE_CAS", str(XDNA_CAS)))
+    repo = pathlib.Path(os.environ.get("BUILDSTORE_REPO", str(REPO)))
     recipes_path = args.recipes or (HERE / "s0_recipes.tsv")
     recipes = parse_recipes(recipes_path)
     s = store.Store(cas)
@@ -247,7 +249,7 @@ def cmd_repin_report(args):
     information, never a gate."""
     a = json.loads(pathlib.Path(args.report_a).read_text())
     b = json.loads(pathlib.Path(args.report_b).read_text())
-    cas = pathlib.Path(os.environ.get("BUILDSTORE_CAS", "/mnt/data/xdna/cas"))
+    cas = pathlib.Path(os.environ.get("BUILDSTORE_CAS", str(XDNA_CAS)))
     s = store.Store(cas)
     device_work = []
     for name in sorted(set(a) | set(b)):
@@ -289,7 +291,7 @@ def cmd_gate_record(args):
     """Record a device gate result keyed by artifact IDENTITY, not path or pin -- never fails
     a gate: a broken artifact dir or an unreadable driver/fw file is a WARNING, not an error."""
     try:
-        cas = pathlib.Path(os.environ.get("BUILDSTORE_CAS", "/mnt/data/xdna/cas"))
+        cas = pathlib.Path(os.environ.get("BUILDSTORE_CAS", str(XDNA_CAS)))
         ident = identity.of(args.artifact_dir)
         rec = {
             "result": "pass" if int(args.rc) == 0 else "fail",
@@ -311,7 +313,7 @@ def cmd_gate_record(args):
 def cmd_gate_status(args):
     """VALID when identity + driver + firmware all match the current system, STALE <what
     moved> otherwise, NONE when this identity has no recorded gate at all."""
-    cas = pathlib.Path(os.environ.get("BUILDSTORE_CAS", "/mnt/data/xdna/cas"))
+    cas = pathlib.Path(os.environ.get("BUILDSTORE_CAS", str(XDNA_CAS)))
     ident = identity.of(args.artifact_dir)
     gdir = cas / "gates" / ident
     files = sorted(gdir.glob("*.json")) if gdir.is_dir() else []
