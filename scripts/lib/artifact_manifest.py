@@ -87,7 +87,11 @@ def identity_of(target: Path) -> dict:
 def build(engine_root: Path, artifacts_root: Path, rels: list[str]) -> dict:
     out = []
     for rel in rels:
-        target = (artifacts_root / rel).resolve()
+        # `rel` is "artifacts/<sub>" (as scenario fields spell it); `artifacts_root` is
+        # $ENGINE_ARTIFACTS, which already IS that "artifacts" directory -- strip the prefix
+        # the same way install.sh's staging loop does, or every path doubles it.
+        sub = rel[len("artifacts/"):] if rel.startswith("artifacts/") else rel
+        target = (artifacts_root / sub).resolve()
         if not target.exists():
             print(f"# WARN: not staged (missing under artifacts root): {rel}", file=sys.stderr)
             continue
@@ -99,7 +103,7 @@ def verify(engine_root: Path, manifest_path: Path) -> int:
     manifest = json.loads(manifest_path.read_text())
     mismatches = 0
     for entry in manifest["artifacts"]:
-        link = engine_root / "artifacts" / entry["path"]
+        link = engine_root / entry["path"]  # entry["path"] already starts with "artifacts/"
         target = Path(entry["target"])
         if not target.exists():
             print(f"MISMATCH {entry['path']}: source gone ({target})")
