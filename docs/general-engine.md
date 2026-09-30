@@ -145,9 +145,8 @@ remains a separate integration that talks to `npu-sr` directly, not through `npu
 Gemma 4-12B are all served through the same `npu_engine::llm` path (`NpuDecodeStep` driving a
 fused-decode ELF, wired into the registry's `Generate` arm) -- none of them owns a model-specific
 crate. A model is an `LlmSpec` entry in `designs/decode_fused/llm_decode_spec.py`
-(`GEMMA3_270M`, `GEMMA4_12B` alongside Qwen3's own entry) plus a scenario TOML
-(`scenarios/generate-gemma3-270m.toml`, `scenarios/generate-gemma4-12b.toml`), the same shape
-Qwen3 uses. This is the "models are data over reusable op-types" rail: adding a model means
+(`GEMMA3_270M` alongside Qwen3's own entry) plus a scenario TOML
+(`scenarios/generate-gemma3-270m.toml`), the same shape Qwen3 uses. This is the "models are data over reusable op-types" rail: adding a model means
 writing its spec and authoring only the op-types not already in the vocabulary, not a new crate.
 
 **Kernel-binary selection is a per-model hardcoded path, not a lookup.** A model crate names
