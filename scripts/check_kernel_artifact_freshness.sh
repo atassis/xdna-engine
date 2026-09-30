@@ -134,8 +134,8 @@ check_elf_one() {
     echo "[check_kernel_artifact_freshness] UNSTAMPED $rel meta.json names no elf -- rebuild with $regen" >&2
     fail=1; return
   fi
-  if [ ! -s "$dir/$elf" ]; then
-    echo "[check_kernel_artifact_freshness] EMPTY     $rel is stamped current ($current) but holds no $elf; rebuild with $regen" >&2
+  if [ ! -s "$dir/$elf" ] && [ ! -s "$dir/$elf.zst" ]; then
+    echo "[check_kernel_artifact_freshness] EMPTY     $rel is stamped current ($current) but holds no $elf(.zst); rebuild with $regen" >&2
     fail=1; return
   fi
   echo "[check_kernel_artifact_freshness] OK        $rel (toolchain.lock=$current)"
