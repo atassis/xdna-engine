@@ -403,7 +403,7 @@ def test_int8_kc_recompute_from_kc_matches_bf16_within_bounds_over_free_running_
     # k_norm.weight (seed 42) avoided that regime by luck, not by a general property of the math.
     # What actually makes this safe: Gemma-4-12B's REAL k_norm weights are UNIFORM per layer, not
     # per-channel-varying -- checked all 48 layers' real checkpoint tensors
-    # (/mnt/data/xdna/artifacts/gemma4-12b/weights_int4g32qat_hf/*.self_attn.k_norm.weight.npy):
+    # ($XDNA_ARTIFACTS/gemma4-12b/weights_int4g32qat_hf/*.self_attn.k_norm.weight.npy):
     # every layer's min/max/mean |w| agree to within ~1e-4 (global-layer min|w|=0.0605, layer 17,
     # uniform across all 512 channels). A UNIFORM gain is an overall rescale, which RoPE-inversion
     # and RMSNorm's scale-invariance genuinely do absorb -- confirmed by re-running this same

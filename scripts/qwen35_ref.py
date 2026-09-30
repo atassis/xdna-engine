@@ -8,7 +8,7 @@ compares the two at truncated depth: agreement there is the evidence this file i
 paraphrase of it. Streaming exists because the bf16 checkpoint is ~9 GB and this box has ~5 GB free
 with the NPU service resident.
 
-  python scripts/qwen35_ref.py --ckpt /mnt/data/xdna/artifacts/qwen3.5-4b/hf --check-hf 4
+  python scripts/qwen35_ref.py --ckpt $XDNA_ARTIFACTS/qwen3.5-4b/hf --check-hf 4
   python scripts/qwen35_ref.py --ckpt ... --prompt "The capital of France is" --out golden.npz
 """
 import argparse
@@ -20,6 +20,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from safetensors import safe_open
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
+from data_root import XDNA_ARTIFACTS  # noqa: E402
 
 PFX = "model.language_model."
 
@@ -289,7 +292,7 @@ def check_incremental(ck, ids, n):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default="/mnt/data/xdna/artifacts/qwen3.5-4b/hf")
+    ap.add_argument("--ckpt", default=str(XDNA_ARTIFACTS / "qwen3.5-4b" / "hf"))
     ap.add_argument("--prompt", default="The capital of France is")
     ap.add_argument("--layers", type=int, default=None)
     ap.add_argument("--check-hf", type=int, default=0, metavar="N")

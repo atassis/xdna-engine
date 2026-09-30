@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The fixed NLI gate set: the first 500 MNLI validation_mismatched and 500 ANLI test_r3 pairs.
 
-  python scripts/nli_eval_set.py --out /mnt/data/xdna/scratch/openjev/nli_1000.jsonl
+  python scripts/nli_eval_set.py --out $XDNA_SCRATCH/openjev/nli_1000.jsonl
 """
 import argparse
 import json

@@ -20,6 +20,8 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from qwen35_ref import Ckpt, Model  # noqa: E402
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
+from data_root import XDNA_ARTIFACTS  # noqa: E402
 
 LETTERS = "ABCDEFGHIJKLMNOP"
 SYSTEM = ("Apply the supplied criterion to the supplied evidence. Choose exactly one listed option. "
@@ -63,7 +65,7 @@ def answer_label(qtype, keys, probs):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default="/mnt/data/xdna/artifacts/qwen3.5-4b/hf")
+    ap.add_argument("--ckpt", default=str(XDNA_ARTIFACTS / "qwen3.5-4b" / "hf"))
     ap.add_argument("--tasks", required=True, help="JevBench jsonl (datasets/public/original.jsonl)")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--out", default=None)
