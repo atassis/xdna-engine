@@ -6,10 +6,13 @@ build <recipe>...|--all [--recipes TSV] [--out-root DIR] [--no-hit] [--report FI
 recipe's lock, check stored actions newest-first for a hit, else run it under the recorder and
 store the result. TSV format matches run_s0.sh: tab-separated, `#` comments, NORECIPE skipped.
 --report writes {recipe: {identity, tree, status, seconds, peak_rss_kb}}; with --report, one
-recipe's failure is a FAILED line, not an abort (only --all uses this in practice).
+recipe's failure is a FAILED line, not an abort (only --all uses this in practice). --verify is
+the sufficiency gate: on a HIT, cold-rebuild into scratch, outside the store, and require the
+same identity.of() (owner 2026-09-30; supersedes the plan's bwrap/unshare replay as the gate).
 
 gate-record/gate-status: device gate results keyed by artifact identity + driver + firmware.
 repin-report A.json B.json: compare two `build --report` outputs by identity.
+replay MANIFEST REF_OUT SCRATCH: DIAGNOSTIC only, not a gate -- see cmd_replay.
 """
 import argparse, datetime, glob, hashlib, json, os, pathlib, shutil, subprocess, sys, time
 
@@ -102,39 +105,72 @@ def parse_time_v(path):
     return wall, peak
 
 
-def _build_one(name, cmd, repo, s, out_root, no_hit):
+def _recipe_env(repo, s, cache_key):
+    """Hermetic env + its cache roots for one recipe run. `cache_key` names the caches dir --
+    a real build and its --verify cold rebuild use different keys so verify never reads a
+    cache the real build warmed."""
+    env = record.hermetic_env(os.environ, record.allowlist())
+    env["REPO"] = str(repo)
+    resolve_xdna_cache(repo, env)
+    resolve_mlir_aie_instance(repo, env)
+    want = iron_pin_verified(repo, env)
+    if want:
+        env["IRON_PIN_VERIFIED"] = want
+    npu_cache = pathlib.Path(s.root) / "caches" / cache_key / "npu_cache"
+    ccache_dir = pathlib.Path(s.root) / "caches" / cache_key / "ccache"
+    env["XDNA_BLOB_POOL"] = "0"
+    env["NPU_CACHE_HOME"] = str(npu_cache)
+    env["CCACHE_DIR"] = str(ccache_dir)
+    cache_roots = [npu_cache, ccache_dir]
+    if env.get("XDNA_CACHE"):
+        cache_roots.append(pathlib.Path(env["XDNA_CACHE"]) / "kobj")
+    return env, cache_roots
+
+
+def _verify_one(name, cmd, repo, s, expect_identity):
+    """The P1 sufficiency gate (owner 2026-09-30): cold-rebuild `cmd` into a fresh scratch dir,
+    outside the store, and compare its identity to a HIT's. This replaces the plan's original
+    bwrap/unshare replay as the GATE -- that mechanism (`replay` subcommand) stays a diagnostic;
+    it currently stops at CPython venv bootstrap (sysconfig installed_base)."""
+    scratch = pathlib.Path(s.root) / "verify" / name
+    shutil.rmtree(scratch, ignore_errors=True)
+    out, work = scratch / "out", scratch / "work"
+    out.mkdir(parents=True)
+    work.mkdir(parents=True)
+    env, cache_roots = _recipe_env(repo, s, f"{name}-verify")
+    env["OUT"] = str(out)
+    env["KEEP_WORK"] = str(work)
+    for root in cache_roots[:2]:
+        pathlib.Path(root).mkdir(parents=True, exist_ok=True)
+    argv = ["bash", "-c", f"cd {repo} && {cmd}"]
+    record.run(argv, cwd=repo, env=env, out_roots=[out], work_roots=[work], cache_roots=cache_roots)
+    got = identity.of(out)
+    shutil.rmtree(scratch, ignore_errors=True)
+    if got != expect_identity:
+        raise RuntimeError(f"verify: {name} cold identity {got} != {expect_identity}")
+
+
+def _build_one(name, cmd, repo, s, out_root, no_hit, verify):
     """Build (or hit) one recipe. Returns {status: HIT|BUILT, identity, tree, seconds,
     peak_rss_kb}. Raises on failure -- the caller (cmd_build) decides whether that aborts the
     whole run (explicit recipe list) or is recorded as one FAILED line (--all --report)."""
     t0 = time.time()
     with s.lock(name):
         argv = ["bash", "-c", f"cd {repo} && {cmd}"]
-        env = record.hermetic_env(os.environ, record.allowlist())
-        env["REPO"] = str(repo)
-        resolve_xdna_cache(repo, env)
-        resolve_mlir_aie_instance(repo, env)
-        want = iron_pin_verified(repo, env)
-        if want:
-            env["IRON_PIN_VERIFIED"] = want
+        env, cache_roots = _recipe_env(repo, s, name)
 
         staging = pathlib.Path(s.root) / "staging" / name
         out = staging / "out"
         work = staging / "work"
-        npu_cache = pathlib.Path(s.root) / "caches" / name / "npu_cache"
-        ccache_dir = pathlib.Path(s.root) / "caches" / name / "ccache"
         env["OUT"] = str(out)
         env["KEEP_WORK"] = str(work)
-        env["XDNA_BLOB_POOL"] = "0"
-        env["NPU_CACHE_HOME"] = str(npu_cache)
-        env["CCACHE_DIR"] = str(ccache_dir)
-        cache_roots = [npu_cache, ccache_dir]
-        if env.get("XDNA_CACHE"):
-            cache_roots.append(pathlib.Path(env["XDNA_CACHE"]) / "kobj")
 
         if not no_hit:
             hit = next((a for a in s.actions(name)
                        if record.check(a["manifest"], env=env, argv=argv) == []), None)
             if hit is not None:
+                if verify:
+                    _verify_one(name, cmd, repo, s, hit["identity"])
                 s.materialize(hit["tree"], out_root / name)
                 return {"status": "HIT", "identity": hit["identity"], "tree": hit["tree"],
                         "seconds": time.time() - t0, "peak_rss_kb": None}
@@ -142,8 +178,8 @@ def _build_one(name, cmd, repo, s, out_root, no_hit):
         shutil.rmtree(staging, ignore_errors=True)
         out.mkdir(parents=True)
         work.mkdir(parents=True)
-        npu_cache.mkdir(parents=True, exist_ok=True)
-        ccache_dir.mkdir(parents=True, exist_ok=True)
+        for root in cache_roots[:2]:  # npu_cache, ccache_dir; XDNA_CACHE/kobj is real, not ours to create
+            pathlib.Path(root).mkdir(parents=True, exist_ok=True)
         time_file = staging / "time.txt"
         manifest = record.run(argv, cwd=repo, env=env, out_roots=[out], work_roots=[work],
                               cache_roots=cache_roots, time_file=time_file)
@@ -178,7 +214,7 @@ def cmd_build(args):
             print(f"SKIP {name} NORECIPE")
             continue
         try:
-            r = _build_one(name, cmd, repo, s, out_root, args.no_hit)
+            r = _build_one(name, cmd, repo, s, out_root, args.no_hit, args.verify)
         except Exception as e:  # noqa: BLE001 -- --all must not abort on one recipe's failure
             if not args.report:
                 raise
@@ -193,6 +229,15 @@ def cmd_build(args):
     record.save_statcache(str(statcache))
     if args.report:
         pathlib.Path(args.report).write_text(json.dumps(report, sort_keys=True, indent=2))
+
+
+def cmd_replay(args):
+    """DIAGNOSTIC, not a gate (owner 2026-09-30): the unshare/mount manifest replay of Task 3,
+    exposed here for convenience. `build --verify`'s cold-rebuild identity match is the actual
+    sufficiency gate. Replay currently stops at CPython venv bootstrap (sysconfig
+    installed_base) -- a failing exit here is a known gap, not a build regression."""
+    return subprocess.run([sys.executable, str(HERE / "buildstore" / "replay.py"),
+                           args.manifest, args.ref_out, args.scratch]).returncode
 
 
 def cmd_repin_report(args):
@@ -291,6 +336,13 @@ def main(argv=None):
     b.add_argument("--no-hit", action="store_true")
     b.add_argument("--all", action="store_true")
     b.add_argument("--report", type=pathlib.Path, default=None)
+    b.add_argument("--verify", action="store_true",
+                   help="on a HIT, cold-rebuild into scratch and compare identity (the P1 "
+                        "sufficiency gate; see _verify_one)")
+    rl = sub.add_parser("replay", help="diagnostic only, not a gate -- see replay.py")
+    rl.add_argument("manifest")
+    rl.add_argument("ref_out")
+    rl.add_argument("scratch")
     gr = sub.add_parser("gate-record")
     gr.add_argument("artifact_dir")
     gr.add_argument("gate")
@@ -312,6 +364,8 @@ def main(argv=None):
         cmd_gate_status(args)
     elif args.cmd == "repin-report":
         cmd_repin_report(args)
+    elif args.cmd == "replay":
+        sys.exit(cmd_replay(args))
 
 
 if __name__ == "__main__":

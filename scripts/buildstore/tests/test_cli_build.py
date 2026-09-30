@@ -18,6 +18,40 @@ def test_second_run_hits_and_input_change_misses(tmp_path):
     assert c.startswith("BUILT fake ") and c.split()[2] != a.split()[2]
     assert (tmp_path / "o" / "fake" / "o").read_text() == "2"
 
+def test_verify_passes_on_a_deterministic_hit_and_catches_a_nondeterministic_one(tmp_path):
+    """--verify is the P1 sufficiency gate: cold-rebuild a HIT into scratch and require the
+    same identity.of(). A deterministic recipe passes; one whose output varies per run (what
+    the stored manifest can't see) must fail the gate, not silently HIT."""
+    tsv = tmp_path / "r.tsv"
+    tsv.write_text("fake\techo fixed > \"$OUT/o\"\n"
+                   "flaky\techo \"$RANDOM\" > \"$OUT/o\"\n")
+    out = tmp_path / "o"
+    cli(tmp_path, "build", "fake", "flaky", "--recipes", str(tsv), "--out-root", str(out))
+    cli(tmp_path, "build", "fake", "--recipes", str(tsv), "--out-root", str(out), "--verify")
+    r = subprocess.run([sys.executable, str(CLI), "build", "flaky", "--recipes", str(tsv),
+                       "--out-root", str(out), "--verify"],
+                       env=dict(os.environ, BUILDSTORE_CAS=str(tmp_path / "cas"),
+                               BUILDSTORE_REPO=str(tmp_path)),
+                       capture_output=True, text=True)
+    assert r.returncode != 0 and "cold identity" in r.stderr
+
+
+def test_replay_subcommand_dispatches_to_replay_py(tmp_path):
+    """`buildstore.py replay` is the diagnostic surface for Task 3's mechanism, not a gate --
+    just check it dispatches and reports success on a trivial manifest."""
+    import json
+    HERE = pathlib.Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(HERE)); import record  # noqa: E402
+    (tmp_path / "a.h").write_text("1"); out = tmp_path / "out"; out.mkdir()
+    cmd = ["bash", "-c", f"cat {tmp_path}/a.h > {out}/o"]
+    m = record.run(cmd, cwd=tmp_path, env={"PATH": "/usr/bin:/bin"}, out_roots=[out],
+                   work_roots=[], cache_roots=[])
+    mf = tmp_path / "m.json"; mf.write_text(json.dumps(m))
+    r = subprocess.run([sys.executable, str(CLI), "replay", str(mf), str(out),
+                       str(tmp_path / "r")])
+    assert r.returncode == 0
+
+
 def test_iron_pin_verified_is_a_key_input(tmp_path):
     """A repo whose scripts/amd_paths.sh gates on IRON_PIN_VERIFIED: build injects the verified
     sha, so a stale pin (lock changed under it) is a cache MISS, not a silent stale hit."""
