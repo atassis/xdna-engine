@@ -4,7 +4,7 @@
 A batched-prefill ELF built with `--decode-meta` carries no weight blobs of its own
 (`meta.json`'s `weights_from` names the decode build's `buffers/` dir instead) and shares one
 `FusedArena` with decode at runtime -- so every weight/cache buffer must sit at the identical
-scratch offset in both. `rust/npu-engine/src/llm/artifact.rs`'s `check_shared_layout_agrees`
+scratch offset in both. `rust/npu-models/src/llm/artifact.rs`'s `check_shared_layout_agrees`
 enforces this AT LOAD, refusing to bind the pair; this script mirrors that same comparison
 (shared buffer name + either side typed `scratch` -> offsets must match) so a mismatched pair
 never reaches the load path. `weights_from` is exactly what `arena_shared` gates on

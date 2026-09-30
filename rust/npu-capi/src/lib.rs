@@ -1,4 +1,4 @@
-//! C ABI over npu-engine. Handle-based, return-code errors + thread-local last-error. Every entry
+//! C ABI over npu-models. Handle-based, return-code errors + thread-local last-error. Every entry
 //! point catches unwinds (no panic may cross the FFI boundary).
 
 use std::cell::RefCell;
@@ -6,7 +6,7 @@ use std::ffi::{c_char, c_int, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 
-use npu_engine::{Engine, Model, ModelKind};
+use npu_models::{Engine, Model, ModelKind};
 
 thread_local! { static LAST_ERROR: RefCell<CString> = RefCell::new(CString::new("").unwrap()); }
 
@@ -151,11 +151,11 @@ pub extern "C" fn npu_last_error() -> *const c_char {
     LAST_ERROR.with(|e| e.borrow().as_ptr())
 }
 
-// --- Runtime control plane (multi-model, config-driven) over npu-runtime ---
+// --- Runtime control plane (multi-model, config-driven) over npu-service ---
 
-use npu_runtime::actor::Handle as RtHandle;
-use npu_runtime::config::Config;
-use npu_runtime::loader::EngineLoader;
+use npu_service::actor::Handle as RtHandle;
+use npu_service::config::Config;
+use npu_service::loader::EngineLoader;
 
 /// Opaque control-plane handle: a running device actor + its config path.
 pub struct NpuRuntime { handle: RtHandle, join: Option<std::thread::JoinHandle<()>>, cfg_path: std::path::PathBuf }
@@ -171,7 +171,7 @@ pub unsafe extern "C" fn npu_runtime_start(config_path: *const c_char) -> *mut N
         };
         let cfg = match Config::load(&p) { Ok(c) => c, Err(e) => { set_error(e); return ptr::null_mut(); } };
         let root = std::env::current_dir().unwrap_or_else(|_| ".".into());
-        let (handle, join) = match npu_runtime::start(cfg, Box::new(EngineLoader { root })) {
+        let (handle, join) = match npu_service::start(cfg, Box::new(EngineLoader { root })) {
             Ok(hj) => hj,
             Err(e) => { set_error(e.to_string()); return ptr::null_mut(); }
         };
@@ -237,7 +237,7 @@ pub unsafe extern "C" fn npu_runtime_reload(rt: *mut NpuRuntime) -> c_int {
 pub unsafe extern "C" fn npu_runtime_models_json(rt: *mut NpuRuntime) -> *mut c_char {
     let r = catch_unwind(AssertUnwindSafe(|| {
         let Some(rt) = (unsafe { rt.as_ref() }) else { set_error("runtime is null"); return ptr::null_mut(); };
-        let json = npu_runtime::http::models_json(&rt.handle.status());
+        let json = npu_service::http::models_json(&rt.handle.status());
         CString::new(json).map(|c| c.into_raw()).unwrap_or(ptr::null_mut())
     }));
     r.unwrap_or_else(|_| { set_error("panic in npu_runtime_models_json"); ptr::null_mut() })

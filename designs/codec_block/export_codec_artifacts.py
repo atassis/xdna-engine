@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Export every design the S2 decoder chain builds as a `final.xclbin` + `insts.bin` artifact pair
 the Rust engine can load -- the bridge from the Python bring-up scaffold (`iron.jit`, in-process)
-to the pre-built-artifact model `npu-engine` already uses for every other kernel.
+to the pre-built-artifact model `npu-models` already uses for every other kernel.
 
 HOW THE DESIGN SET IS ENUMERATED, and why not hardcoded. `decoder_chain.run_head/run_stage/
 run_tail` are the real forward pass (head -> stage1..4 -> tail); each op call bottoms out in

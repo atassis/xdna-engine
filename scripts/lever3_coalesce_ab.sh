@@ -101,7 +101,7 @@ fi
 
 # ---- rust binaries (MUST rebuild — whisper.rs adds NPU_DECODE_FUSED_DIR override) ----
 log "\n[build] building release binaries in this worktree (first build can take several minutes) ..."
-if ( cd "$WT/rust" && cargo build -p npu-dev --release && cargo build -p npu-engine --release --bin engine_serve ) >>"$LOG" 2>&1; then
+if ( cd "$WT/rust" && cargo build -p npu-dev --release && cargo build -p npu-models --release --bin engine_serve ) >>"$LOG" 2>&1; then
   log "[build] binaries OK"
 else
   log "[ERR] cargo build FAILED — see log above. Aborting."; exit 1

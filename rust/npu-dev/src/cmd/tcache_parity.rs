@@ -20,8 +20,8 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use ndarray::Array2;
-use npu_engine::asr::whisper_decoder::{FusedDecoder, WhisperDecoderWeights};
-use npu_engine::config::ScenarioConfig;
+use npu_models::asr::whisper_decoder::{FusedDecoder, WhisperDecoderWeights};
+use npu_models::config::ScenarioConfig;
 use npu_xrt::Device;
 
 const D: usize = 768;

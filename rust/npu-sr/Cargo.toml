@@ -9,7 +9,7 @@ name = "npu_sr"
 path = "src/lib.rs"
 
 [dependencies]
-npu-engine = { path = "../npu-engine" }
+npu-models = { path = "../npu-models" }
 npu-xrt = { path = "../npu-xrt" }
 npu-weights = { path = "../npu-weights" }
 ndarray = "0.16"

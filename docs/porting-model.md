@@ -13,9 +13,9 @@ the previous.
 Two different things count as "a new model" here, and they cost differently:
 
 - **A new encoder** that fits the shared `Frontend / Encoder / Head` pipeline
-  (`rust/npu-engine/src/pipeline.rs`) -- another embedding model, another ASR encoder,
+  (`rust/npu-models/src/pipeline.rs`) -- another embedding model, another ASR encoder,
   a vision backbone. This is the cheap path: BERT-family embeddings live entirely as
-  three small files inside `npu-engine` (`rust/npu-engine/src/bert/`).
+  three small files inside `npu-models` (`rust/npu-models/src/bert/`).
 - **A new architecture family** -- an autoregressive decoder, or anything whose control
   flow doesn't fit `Encoder::forward_last`'s single forward pass. An encoder-decoder gets
   its own crate (`npu-whisper`, `npu-parakeet`), reusing the fused-decode / KV-cache
@@ -26,7 +26,7 @@ Two different things count as "a new model" here, and they cost differently:
 
 `ARCHITECTURE.md`'s "Known seams" section is honest about the cost of the second path:
 model placement has no single rule (GigaAM is `npu-asr`, Parakeet is `npu-parakeet`, BERT
-and ESM are modules inside `npu-engine`), and the capability set (`ModelKind`/`Scenario`)
+and ESM are modules inside `npu-models`), and the capability set (`ModelKind`/`Scenario`)
 is closed, so a genuinely new modality means editing `registry.rs`'s dispatch, not just
 adding a file. Read that section before choosing where a new model lives.
 
@@ -70,16 +70,16 @@ source = "hf:org/repo"      # or "path:/abs/dir"
 arch = "your_arch_name"
 ```
 
-(`rust/npu-engine/src/config.rs`'s `Artifacts::model_spec()`). This is additive -- a
+(`rust/npu-models/src/config.rs`'s `Artifacts::model_spec()`). This is additive -- a
 scenario that instead sets the legacy `weights = "artifacts/..."` npy directory keeps
 working unchanged; every shipped scenario in `scenarios/` still uses that path except
-where a declarative one has been proven (`rust/npu-engine/tests/declarative_weights.rs`
+where a declarative one has been proven (`rust/npu-models/tests/declarative_weights.rs`
 is the host-only, no-NPU proof that a synthetic source checkpoint round-trips through
 `transform` -> bake -> load).
 
 Your weight-store type then needs a `load_checkpoint()` reading
 `npu_weights::checkpoint::load(path, arch)` the way `BertWeights::load_checkpoint()`
-does (`rust/npu-engine/src/bert/weights.rs`) -- same tensor-name scheme your `transform`
+does (`rust/npu-models/src/bert/weights.rs`) -- same tensor-name scheme your `transform`
 wrote (`emb/<k>` and `L{i}/<k>` for BERT).
 
 If you need a host-side reference to check the on-NPU path against during bring-up,
@@ -102,7 +102,7 @@ pub trait Encoder {
 `x` is `[M, D_in]` (bf16-valued f32), `valid_len` the non-padded row count, return is
 `[M, D]`. `Frontend` (raw input -> `(Array2<f32>, valid_len)`) and `Head`
 (encoded -> `Self::Output`) are per-domain host glue with an associated type, not shared
-across models -- look at `rust/npu-engine/src/bert/frontend.rs` (WordPiece tokenize ->
+across models -- look at `rust/npu-models/src/bert/frontend.rs` (WordPiece tokenize ->
 summed word/position/type embeddings -> LayerNorm) and `bert/head.rs` (mean/CLS pooling +
 optional L2-normalize) for what "small" actually means: 62 and 67 lines.
 
@@ -122,7 +122,7 @@ same file:
   (see the trait's own doc comment on why the other three models launder that mutability
   through `RefCell` instead of declaring it).
 
-Finally wire the build path into `registry::try_build()` (`rust/npu-engine/src/registry.rs`).
+Finally wire the build path into `registry::try_build()` (`rust/npu-models/src/registry.rs`).
 Today's dispatch is `ModelKind::from_scenario_kind(&cfg.scenario.kind)` and then, for ASR
 and Embed, a `cfg.scenario.name.to_lowercase().contains("parakeet"/"whisper"/"esm")`
 match with a generic fallback. This is the seam `ARCHITECTURE.md` calls out ("the

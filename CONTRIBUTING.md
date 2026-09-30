@@ -69,7 +69,7 @@ across a private companion project.
 
 - Match the style of the file you're editing over an abstract rule. There's no
   `rustfmt.toml`/`clippy.toml` beyond `cargo`'s defaults, and comment density varies
-  deliberately by directory (compare `aie_kernels/*/*.cc` to `rust/npu-engine/src/*.rs`)
+  deliberately by directory (compare `aie_kernels/*/*.cc` to `rust/npu-models/src/*.rs`)
   -- look at neighboring files before adding new ones, not a fixed word count.
 - Prefer a doc comment that states a real constraint, a real shape contract, or the
   reason a non-obvious choice was made over one that restates what the code already

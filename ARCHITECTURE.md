@@ -9,9 +9,9 @@ transformer or conv model plugs into, rather than a per-model stack.
 ```
    models (ASR / embeddings / LLM / vision)     npu-sr (video super-resolution)
         |  Frontend / Encoder / Head traits          |  frame in / frame out
-   npu-engine ......... general multi-model pipeline |
+   npu-models ......... general multi-model pipeline |
         |                                            |
-   npu-runtime ........ control plane: desired-state config, reconcile, one device actor
+   npu-service ........ control plane: desired-state config, reconcile, one device actor
    npu-weights ........ bake HF safetensors/ONNX -> mmap bf16 weight checkpoint
         |                                            |
    npu-xrt ............ safe Rust bindings over a C++ XRT shim -> the NPU
@@ -21,9 +21,9 @@ transformer or conv model plugs into, rather than a per-model stack.
    mlir-aie (submodule) the open AIE toolchain (kernel build + place-tiles)
 ```
 
-`npu-sr` sits BESIDE `npu-engine`, not under it: it drives `npu-xrt` directly and has its own
-frame-in/frame-out ABI, not `npu-engine`'s `Model`/`Scenario` types. `npu-runtime` constructs
-an `SrEngine` directly (scenario kind `image-sr`) rather than through `npu-engine`, so the two
+`npu-sr` sits BESIDE `npu-models`, not under it: it drives `npu-xrt` directly and has its own
+frame-in/frame-out ABI, not `npu-models`'s `Model`/`Scenario` types. `npu-service` constructs
+an `SrEngine` directly (scenario kind `image-sr`) rather than through `npu-models`, so the two
 stacks share the device, the weight loader AND, since `/v1/images/upscale`, the request path
 (HTTP server, control socket, device actor) -- just not the model-pipeline abstraction.
 Unifying that last part is open work, not a shipped property; see "Known seams" below.
@@ -38,15 +38,15 @@ including `npu-dev` which contains device tests and debug tools.
 | `npu-asr` | GigaAM-v3 Conformer encoder on the NPU: matmul-heavy ops as whole-array dispatches with reused buffers, depthwise-conv on device, host glue via `npu-asr-host`. |
 | `npu-asr-host` | Pure host-side tensor math for that encoder, no NPU dependency: LayerNorm, RoPE, attention, GLU, and the im2col subsampling front-end. |
 | `npu-xrt` | Safe Rust bindings to drive the XDNA2 NPU via a thin C++ XRT shim. |
-| `npu-engine` | General multi-model engine over the kernel kit: a `Frontend / Encoder / Head` pipeline serving ASR and embeddings. |
-| `npu-runtime` | Control plane over `npu-engine`: desired-state config, reconcile, and a single device actor that serializes NPU work. |
+| `npu-models` | General multi-model engine over the kernel kit: a `Frontend / Encoder / Head` pipeline serving ASR and embeddings. |
+| `npu-service` | Control plane over `npu-models`: desired-state config, reconcile, and a single device actor that serializes NPU work. |
 | `npu-weights` | Rust-native weight loader: bakes HF safetensors / ONNX into an mmap-able bf16 checkpoint with a content fingerprint and parity gate. |
 | `npu-onnx` | Runs ONNX graphs from Rust via a thin C shim over the system onnxruntime (oracles + fallback). |
 | `npu-parakeet` | Parakeet-TDT FastConformer encoder (rel-pos attention, depthwise conv1d k=9, /8 conv2D subsample). |
 | `npu-whisper` | Whisper-small encoder + decoder reference and the on-NPU decode path. |
-| `npu-sr` | Super-resolution engine: frame in / frame out video upscaling (ESPCN, EDSR). Own schedule JSON, own `SrEngine` ABI, drives `npu-xrt` directly; constructed by `npu-runtime` for `POST /v1/images/upscale`. |
+| `npu-sr` | Super-resolution engine: frame in / frame out video upscaling (ESPCN, EDSR). Own schedule JSON, own `SrEngine` ABI, drives `npu-xrt` directly; constructed by `npu-service` for `POST /v1/images/upscale`. |
 | `npu-sr-capi` | C ABI over `npu-sr` (`libxdna_sr.so`) for the ffmpeg `vf_xdna_sr` filter and other embedders. |
-| `npu-capi` | C ABI over `npu-engine` (cdylib + staticlib, cbindgen header) for in-process embedding from any language. |
+| `npu-capi` | C ABI over `npu-models` (cdylib + staticlib, cbindgen header) for in-process embedding from any language. |
 | `npu-cli` | `npu` multitool: serve, transcribe, embed, generate, chat, diarize, models, config, reload, bake, doctor, `top`, and the measurement readers `stats` / `replay`. |
 | `npu-dev` | Device tests, parity checks, and debug tools. Subcommands: kernels-build/manifest/verify, s2-chain/design, verify-parakeet/whisper/whisper-decode, parakeet-encode, whisper-e2e, fused-elf, prefill-token-gate/time/golden, mha-decode, conveyor-parity, tcache-parity. Run with no arguments to list all. `cargo build --release -p npu-dev`. |
 | `npu-dispatch` | Byte-marshaling helpers and dispatch profiling with zero model-specific semantics; the one definition of `PAD_M`/`WA_SUBDIR`/`u16_bytes` that `npu-asr`, `npu-parakeet` and `npu-whisper` each used to copy. |
@@ -56,7 +56,7 @@ including `npu-dev` which contains device tests and debug tools.
 
 A request enters through a `Frontend` (tokenize / feature-extract), runs the model's
 `Encoder` (and, for autoregressive models, a decode loop) on the NPU, and finishes in a
-`Head` (pooling, projection, argmax). The device actor in `npu-runtime` serializes all NPU
+`Head` (pooling, projection, argmax). The device actor in `npu-service` serializes all NPU
 dispatches, since the NPU is single-tenant.
 
 ## Model residency
@@ -73,7 +73,7 @@ model's `state` and `idle_s`.
 
 `max_resident` counts SLOTS, not resources. Co-residency actually costs two independent budgets:
 pinned XRT buffer-object bytes (what fits resident) and array time (who runs). The accountant's
-`bo_bytes()` currently reports a fixed `0` (`npu-runtime/src/loader.rs`), so the first is untracked;
+`bo_bytes()` currently reports a fixed `0` (`npu-service/src/loader.rs`), so the first is untracked;
 the second is not a per-model budget at all, because the kernels here claim the whole array and
 contexts therefore time-slice it rather than running side by side. Making the byte budget real is
 open work.
@@ -84,16 +84,16 @@ Where the tree does not yet match the story above. Named here so a reader is not
 
 - **Model placement has no single rule.** GigaAM lives in `npu-asr` (a model-specific crate
   under a generic name), Parakeet in `npu-parakeet`, but BERT and ESM live as modules INSIDE
-  `npu-engine`, and Whisper is split across both `npu-whisper` and `npu-engine/src/asr/`.
-- **`npu-engine` is mostly not the engine.** Its generic core (`api`, `config`, `lib`,
+  `npu-models`, and Whisper is split across both `npu-whisper` and `npu-models/src/asr/`.
+- **`npu-models` is mostly not the engine.** Its generic core (`api`, `config`, `lib`,
   `pipeline`, `registry`, `tuning_profile`) is ~460 lines; the other ~4200 are the ASR, BERT
   and ESM model implementations that happen to share its manifest.
 - **The capability set is closed.** `ModelKind { Asr, Embed, Diarize, Generate, Tts }` is
   threaded through `api.rs`, `pipeline.rs`, `loader.rs`, `actor.rs` and `select.rs`, so a sixth
   modality means editing all five. `image-sr` avoids that cost by not being a `ModelKind`
-  variant at all -- `npu-runtime` constructs `npu_sr::SrEngine` (which implements the open
+  variant at all -- `npu-service` constructs `npu_sr::SrEngine` (which implements the open
   `Servable` trait) directly for that scenario kind, which is why it reaches the request path
-  without `npu-engine`'s closed enum ever naming it.
+  without `npu-models`'s closed enum ever naming it.
 - **Kernel binaries are selected by hardcoded path.** Model crates name xclbins as string
   literals with shape, tile, column count and variant encoded in the filename (for example
   `final_512x1024x4096_64x32x128_8c_modalsilu.xclbin`). There is no machine-readable

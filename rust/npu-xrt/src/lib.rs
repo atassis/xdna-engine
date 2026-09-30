@@ -831,7 +831,7 @@ impl Device {
 
     /// Live total of pinned BO bytes this device has allocated and not yet freed. Excludes
     /// [`Bo::sub`] views (they alias, not allocate). The residency accountant's real number --
-    /// see `npu_engine::Model::bo_bytes` and `npu_runtime::loader::EngineModel::footprint`.
+    /// see `npu_models::Model::bo_bytes` and `npu_service::loader::EngineModel::footprint`.
     pub fn resident_bo_bytes(&self) -> u64 {
         self.bo_bytes.get()
     }

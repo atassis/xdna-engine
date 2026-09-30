@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use serde_json::Value;
 
-use npu_runtime::config::{Config, ModelCfg};
+use npu_service::config::{Config, ModelCfg};
 
 /// How long a single `xrt-smi` invocation gets before doctor gives up on it. Generous for a
 /// read-only report (`examine` is near-instant when the device answers at all), tight enough that
@@ -207,11 +207,11 @@ pub struct ModelArtifactCheck {
 /// through `WhisperAsr::build` (the only consumer of `[decode] backend` today) -- gated the same way
 /// `registry::try_build` dispatches, on the scenario NAME, not `kind` (parakeet is `kind = "asr"` too
 /// and does not read this field).
-fn whisper_decode_backend_detail(sc: &npu_engine::config::ScenarioConfig) -> Option<String> {
+fn whisper_decode_backend_detail(sc: &npu_models::config::ScenarioConfig) -> Option<String> {
     if !sc.scenario.name.to_lowercase().contains("whisper") {
         return None;
     }
-    let (tier, source) = npu_engine::config::resolve_decode_backend(sc);
+    let (tier, source) = npu_models::config::resolve_decode_backend(sc);
     Some(format!("{tier} ({source})"))
 }
 
@@ -224,7 +224,7 @@ fn scenario_artifact_check(m: &ModelCfg, root: &Path) -> ModelArtifactCheck {
     let p = Path::new(&m.scenario);
     let scenario_path = if p.is_absolute() { p.to_path_buf() } else { root.join(p) };
     let display = scenario_path.display().to_string();
-    match npu_engine::config::ScenarioConfig::load(&scenario_path) {
+    match npu_models::config::ScenarioConfig::load(&scenario_path) {
         Err(e) => ModelArtifactCheck {
             name: m.name.clone(), scenario_path: display, ok: false,
             detail: format!("scenario error: {e}"), decode_backend: None,
@@ -284,7 +284,7 @@ impl DoctorReport {
         let platform = xrt_smi_json(Some("platform"), "platform").map(|v| parse_platform(&v));
         let hw_contexts = xrt_smi_json(Some("aie-partitions"), "aie-partitions")
             .map(|v| parse_hw_contexts(&v));
-        let device_node_present = npu_engine::Engine::available();
+        let device_node_present = npu_models::Engine::available();
 
         let model_checks: Vec<ModelArtifactCheck> = match &engine_root {
             Some(r) => cfg.models.iter().map(|m| scenario_artifact_check(m, r)).collect(),

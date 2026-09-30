@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 """Token-level parity gate for the multimodal prompt JOIN (image/audio/video placeholder scatter
-into the text embedding sequence) -- the mechanism `rust/npu-engine/src/llm/multimodal.rs`
+into the text embedding sequence) -- the mechanism `rust/npu-models/src/llm/multimodal.rs`
 implements at the engine layer (`scatter_media_rows` + the `embed_row` hook both
 `NpuDecodeStep::step` and `NpuPrefill::prime` call). This script is the HOST-ONLY, no-device
 numeric check that the JOIN CONTRACT is right; the Rust side is unit-tested against the same
@@ -74,7 +74,7 @@ def build_ours(input_ids, image_rows, audio_rows, video_rows, embed_table, d_mod
     OVERRIDDEN by `scatter_media_rows`'s per-position media rows (unscaled) at placeholder
     positions -- `embed_row`'s "media override, else text gather" order, run over a whole sequence
     instead of per-token. Video is scattered the same way as image/audio: `scatter_media_rows`
-    treats VIDEO_TOKEN_ID identically (see rust/npu-engine/src/llm/multimodal.rs)."""
+    treats VIDEO_TOKEN_ID identically (see rust/npu-models/src/llm/multimodal.rs)."""
     scale = np.sqrt(d_model).astype(np.float32)
     out = np.stack([embed_table[t] for t in input_ids]).astype(np.float32) * scale
     iters = {token_ids["image_token_id"]: iter(image_rows),

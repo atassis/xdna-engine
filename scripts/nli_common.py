@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """openjev's NLI prompt, decision hypotheses and long-premise windowing, defined once.
 
-`rust/npu-engine/src/nli.rs` mirrors this file; `--golden` writes the cases its tests read, so a
+`rust/npu-models/src/nli.rs` mirrors this file; `--golden` writes the cases its tests read, so a
 drift between the two is a test failure rather than a quiet accuracy loss.
 
   python scripts/nli_common.py --golden tests/refs/nli/common_golden.json

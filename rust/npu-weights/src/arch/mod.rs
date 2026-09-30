@@ -67,7 +67,7 @@ const ARCH_NAMES_ARR: [&str; REGISTRY.len()] = {
 };
 
 /// Every `--arch` value `get` accepts, derived from [`REGISTRY`] at compile time -- same shape as
-/// `npu_runtime::config_doc::SERVER_KEYS`, a `pub const` slice single-sourced with the code that
+/// `npu_service::config_doc::SERVER_KEYS`, a `pub const` slice single-sourced with the code that
 /// consumes the names.
 pub const ARCH_NAMES: &[&str] = &ARCH_NAMES_ARR;
 

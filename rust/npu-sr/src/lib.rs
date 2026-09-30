@@ -8,9 +8,9 @@ pub mod pipeline;
 
 use std::path::Path;
 
-use npu_engine::EngineError;
+use npu_models::EngineError;
 
-/// Engine error surface (mirrors `npu_engine::api::EngineError` style).
+/// Engine error surface (mirrors `npu_models::api::EngineError` style).
 #[derive(thiserror::Error, Debug)]
 pub enum SrError {
     #[error("no XDNA2 NPU device available")]
@@ -148,21 +148,21 @@ impl SrEngine {
     }
 }
 
-/// True if an XDNA2 NPU device node is present (cheap file check; mirrors `npu_engine::Engine::available`).
+/// True if an XDNA2 NPU device node is present (cheap file check; mirrors `npu_models::Engine::available`).
 pub fn npu_available() -> bool {
     std::path::Path::new("/dev/accel/accel0").exists()
 }
 
-// image in, image out, genuinely &mut self. Routed through npu-runtime's `EngineLoader` for
-// scenario kind `image-sr`, not npu_engine's own `ModelKind`/`Scenario` (npu_engine cannot depend
-// on npu_sr). `npu_sr` already depends on `npu_engine` (for `esm::native`'s conv-as-GEMM rail,
+// image in, image out, genuinely &mut self. Routed through npu-service's `EngineLoader` for
+// scenario kind `image-sr`, not npu_models's own `ModelKind`/`Scenario` (npu_models cannot depend
+// on npu_sr). `npu_sr` already depends on `npu_models` (for `esm::native`'s conv-as-GEMM rail,
 // `frontier.rs`), so this adapter costs no new Cargo dependency.
-impl npu_engine::capability::Servable for SrEngine {
-    fn capabilities(&self) -> npu_engine::capability::Capability {
-        npu_engine::capability::Capability::IMAGE_SR
+impl npu_models::capability::Servable for SrEngine {
+    fn capabilities(&self) -> npu_models::capability::Capability {
+        npu_models::capability::Capability::IMAGE_SR
     }
-    fn run(&mut self, req: npu_engine::capability::Request) -> Result<npu_engine::capability::Response, EngineError> {
-        use npu_engine::capability::{Request, Response};
+    fn run(&mut self, req: npu_models::capability::Request) -> Result<npu_models::capability::Response, EngineError> {
+        use npu_models::capability::{Request, Response};
         match req {
             Request::Image { rgb, w, h } => {
                 // SrError -> EngineError: no `From` impl (orphan rule -- neither type is local to

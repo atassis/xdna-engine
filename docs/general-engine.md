@@ -17,7 +17,7 @@ make the next model's estimate wrong.
 
 ## The shared contract: `Frontend` / `Encoder` / `Head`
 
-`rust/npu-engine/src/pipeline.rs` defines the traits every model sits behind:
+`rust/npu-models/src/pipeline.rs` defines the traits every model sits behind:
 
 ```rust
 pub trait Encoder {
@@ -31,10 +31,10 @@ in, `[M, D]` out. It says nothing about attention type, position encoding, layer
 kernel precision -- a Conformer block, a Transformer-XL block, and a BERT block all satisfy it.
 Five concrete encoders implement it today:
 
-- `ConformerEncoder` (GigaAM-v3), `rust/npu-engine/src/asr/mod.rs`
-- `FastConformerEncoder` (Parakeet), `rust/npu-engine/src/asr/parakeet.rs`
-- `BertEncoder`, `rust/npu-engine/src/bert/encoder.rs`
-- `EsmEncoder` and `EsmEncoderNative`, `rust/npu-engine/src/esm/encoder.rs`
+- `ConformerEncoder` (GigaAM-v3), `rust/npu-models/src/asr/mod.rs`
+- `FastConformerEncoder` (Parakeet), `rust/npu-models/src/asr/parakeet.rs`
+- `BertEncoder`, `rust/npu-models/src/bert/encoder.rs`
+- `EsmEncoder` and `EsmEncoderNative`, `rust/npu-models/src/esm/encoder.rs`
 
 Everything upstream and downstream of that one call is per-domain:
 
@@ -61,7 +61,7 @@ this trait and the rest of the pipeline (residency handling, HTTP routing, confi
 CLI) does not change. This is what let BERT, ESM-2, GigaAM, and Parakeet ship as the same kind
 of thing to the registry despite four different attention/position schemes.
 
-**The scenario config format.** `rust/npu-engine/src/config.rs`'s `ScenarioConfig` is one TOML
+**The scenario config format.** `rust/npu-models/src/config.rs`'s `ScenarioConfig` is one TOML
 shape -- `[scenario]` (kind, name), an optional `[model]` block (hidden/ff/heads/layers/
 precision/kernel -- optional because non-transformer models like the diarization PyanNet/
 ResNet34 graphs have none of these fields), `[artifacts]`, and a per-kind block
@@ -81,11 +81,11 @@ profiling with zero model-specific semantics" -- its own doc comment. It used to
 byte-identical copies inside `npu-asr`, `npu-parakeet`, and `npu-whisper`; it is now the one
 definition every encoder crate depends on for padding constants and NPU-time profiling.
 
-**The serving substrate.** `npu-runtime`'s device actor (`rust/npu-runtime/src/actor.rs`) is a
+**The serving substrate.** `npu-service`'s device actor (`rust/npu-service/src/actor.rs`) is a
 single thread owning one `Registry` of loaded models, reachable through a cloneable `Handle`.
 It knows nothing about ASR, embeddings, or LLMs -- it knows `Scenario` variants, capability
 routing, residency (`max_resident`, LRU eviction, idle-unload, idle-release), and reconciling a
-`Config` against what is currently loaded. The HTTP server (`rust/npu-runtime/src/http.rs`) and
+`Config` against what is currently loaded. The HTTP server (`rust/npu-service/src/http.rs`) and
 the `npu` CLI are both thin clients of this one `Handle`; adding a model that reuses an
 existing `Encoder`/`Frontend`/`Head` set costs zero new lines in either. The NPU is
 single-tenant, so this actor is also the thing that keeps every model's device access
@@ -108,14 +108,14 @@ transformer decoder fused into a single resident ELF dispatch (`asr/whisper.rs`,
 
 **Whisper's encoder does not go through the shared trait.** `WhisperAsr` holds a
 `npu_whisper::encoder::WhisperEncoder` and calls its inherent `forward_last` method directly
-(`asr/whisper.rs`); that type does not implement `npu_engine::pipeline::Encoder`. It has the
+(`asr/whisper.rs`); that type does not implement `npu_models::pipeline::Encoder`. It has the
 same shape by convention, not by the compiler enforcing it -- Whisper's model code is also
-split across two crates (`npu-whisper` for the reference/decoder, `npu-engine::asr` for the
+split across two crates (`npu-whisper` for the reference/decoder, `npu-models::asr` for the
 NPU wiring), where GigaAM and Parakeet each keep their non-generic parts in one dedicated
 crate (`npu-asr`, `npu-parakeet`). `ARCHITECTURE.md`'s "Known seams" section names this same
 inconsistency from the crate-layout side.
 
-**Diarization is host-only today.** `rust/npu-engine/src/diarize/mod.rs`'s own doc comment:
+**Diarization is host-only today.** `rust/npu-models/src/diarize/mod.rs`'s own doc comment:
 "Host-only in v1; the NPU embedder swaps in behind `SpeakerEmbedder` without touching this
 file." The `Diarizer` trait and the `DiarizePipeline` shape (segmenter -> embedder -> clusterer,
 each swappable) generalize across the two shipped manifests (pyannote 3.1 and
@@ -126,23 +126,23 @@ context away from a co-resident ASR model.
 **The capability set is closed, not open.** `ModelKind { Asr, Embed, Diarize, Generate, Tts }`
 (`api.rs`) is threaded through five places (`api`, `pipeline`, `loader`, `actor`, `select`);
 adding a sixth capability means editing all five -- which is exactly why `image-sr` is not a
-`ModelKind` variant. `rust/npu-engine/src/capability.rs`'s `Capability`/`Servable`/`Request`/
+`ModelKind` variant. `rust/npu-models/src/capability.rs`'s `Capability`/`Servable`/`Request`/
 `Response` types are the open replacement: `npu_sr::SrEngine` implements `Servable` directly
-and `npu-runtime`'s `EngineLoader` constructs one for scenario kind `image-sr`
+and `npu-service`'s `EngineLoader` constructs one for scenario kind `image-sr`
 (`/v1/images/upscale`), bypassing `ModelKind`/`registry::try_build` entirely rather than
 adding a sixth arm to them.
 
 **Video super-resolution is still a second, separate pipeline for everything but routing.**
 `npu-sr` does not implement `Encoder`/`Frontend`/`Head`, has its own frame-in/frame-out ABI and
-error type, and drives `npu-xrt` directly rather than going through `npu-engine`'s own
-`Model`/`Scenario` types -- `npu-runtime` constructs an `SrEngine` beside `npu_engine::Model`,
+error type, and drives `npu-xrt` directly rather than going through `npu-models`'s own
+`Model`/`Scenario` types -- `npu-service` constructs an `SrEngine` beside `npu_models::Model`,
 not through it. It IS now reachable through the HTTP server and the control socket
 (`/v1/images/upscale`, `npu upscale`; see [api.md](api.md)), the same device actor and
 single-flight serialization every other capability gets; the ffmpeg filter (`vf_xdna_sr`)
 remains a separate integration that talks to `npu-sr` directly, not through `npu serve`.
 
 **Small-LLM decode reuses primitives, not code-per-model, across models.** Qwen3, Gemma 3 and
-Gemma 4-12B are all served through the same `npu_engine::llm` path (`NpuDecodeStep` driving a
+Gemma 4-12B are all served through the same `npu_models::llm` path (`NpuDecodeStep` driving a
 fused-decode ELF, wired into the registry's `Generate` arm) -- none of them owns a model-specific
 crate. A model is an `LlmSpec` entry in `designs/decode_fused/llm_decode_spec.py`
 (`GEMMA3_270M` alongside Qwen3's own entry) plus a scenario TOML

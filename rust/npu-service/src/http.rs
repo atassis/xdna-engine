@@ -1,0 +1,4074 @@
+//! Thin blocking HTTP surface over the device `Handle`. The NPU is single-tenant, so this is a
+//! single-flight server (one request at a time). OpenAI-shaped inference routes + control/admin
+//! routes. The request->response decision is the pure `route()` fn (host-testable with a mock
+//! Handle); `serve()` is only the socket plumbing.
+use std::io::{BufRead, BufReader, Write};
+use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+
+use crate::actor::Handle;
+use crate::config::Config;
+use crate::config_doc::ConfigDoc;
+use crate::registry::{LoadState, ModelStatus};
+use crate::stream::StreamItem;
+use npu_models::telemetry::wire;
+use npu_models::capability::{Capability, Request as EngineReq, Response as EngineResp};
+use npu_models::FinishReason;
+
+const MAX_BODY: usize = 16 * 1024 * 1024;
+const SOCKET_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Connections served at once. A ceiling, not a tuning knob: past it the honest answer is 503
+/// rather than an unbounded thread pile, and the device behind them is single-tenant anyway.
+const MAX_CONNECTIONS: usize = 64;
+
+/// A parsed request, enough for routing.
+pub struct Request {
+    pub method: String,
+    pub path: String,
+    pub boundary: String,
+    pub body: Vec<u8>,
+}
+
+/// A response body. Not always JSON: `/v1/audio/speech` returns audio bytes, the same way OpenAI's
+/// does, so the body cannot be a `String`.
+pub enum Body {
+    Json(String),
+    Wav(Vec<u8>),
+    /// Headerless little-endian i16 mono PCM: OpenAI's `response_format: "pcm"`. No sample rate
+    /// travels with it -- that is the format's own limitation, not something lost here -- so a
+    /// caller that asks for it is presumed to already know the model's rate out of band.
+    Pcm(Vec<u8>),
+    /// Server-Sent Events. The generator runs on the actor thread; this is the receiving end of the
+    /// channel it feeds, plus what the socket loop needs to render each item into a `data:` frame.
+    /// No `Debug`/`PartialEq`: a `Receiver` has neither, and nothing needs to compare a stream body.
+    Stream(SseStream),
+    /// `/v1/images/upscale`'s success body: 4 bytes LE width, 4 bytes LE height, then raw RGB8
+    /// pixels (`docs/api.md` documents the layout). A header-before-pixels encoding rather than a
+    /// response header, since `Response` here is `(status, Body)` with no header map -- the same
+    /// reason `Wav`/`Pcm` are pre-rendered byte blobs rather than a body plus side-channel metadata.
+    Image(Vec<u8>),
+}
+
+impl Body {
+    /// The body as text -- the JSON for a JSON body, empty otherwise. For tests and logging.
+    pub fn text(&self) -> &str {
+        match self { Body::Json(s) => s, Body::Wav(_) | Body::Pcm(_) | Body::Stream(_) | Body::Image(_) => "" }
+    }
+    pub fn content_type(&self) -> &'static str {
+        match self {
+            Body::Json(_) => "application/json",
+            Body::Wav(_) => "audio/wav",
+            Body::Pcm(_) => "audio/pcm",
+            Body::Image(_) => "application/octet-stream",
+            // Ollama's stream is newline-delimited JSON, not SSE -- a client that got
+            // `text/event-stream` here would look for `data:` prefixes that are not coming.
+            Body::Stream(st) => match st.kind {
+                SseKind::OllamaChat => "application/x-ndjson",
+                _ => "text/event-stream",
+            },
+        }
+    }
+    pub fn bytes(&self) -> &[u8] {
+        match self {
+            Body::Json(s) => s.as_bytes(),
+            Body::Wav(v) | Body::Pcm(v) | Body::Image(v) => v,
+            Body::Stream(_) => &[],
+        }
+    }
+    /// Encode `/v1/images/upscale`'s success body: 4 bytes LE width, 4 bytes LE height, then `rgb`.
+    pub fn image(w: usize, h: usize, rgb: &[u8]) -> Body {
+        let mut v = Vec::with_capacity(8 + rgb.len());
+        v.extend_from_slice(&(w as u32).to_le_bytes());
+        v.extend_from_slice(&(h as u32).to_le_bytes());
+        v.extend_from_slice(rgb);
+        Body::Image(v)
+    }
+}
+impl std::fmt::Display for Body {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Body::Json(s) => f.write_str(s),
+            Body::Wav(v) => write!(f, "<{} bytes of audio/wav>", v.len()),
+            Body::Pcm(v) => write!(f, "<{} bytes of audio/pcm>", v.len()),
+            Body::Image(v) => write!(f, "<{} bytes of image>", v.len()),
+            Body::Stream(_) => f.write_str("<event-stream>"),
+        }
+    }
+}
+impl From<String> for Body { fn from(s: String) -> Body { Body::Json(s) } }
+impl From<&str> for Body { fn from(s: &str) -> Body { Body::Json(s.to_string()) } }
+
+/// Which OpenAI route an `SseStream` is rendering for -- the two shapes differ (`delta` vs `text`,
+/// and chat alone has a role-announcement chunk).
+pub enum SseKind { Chat, Completion, OllamaChat }
+
+/// A streaming generation in progress, plus what `respond()` needs to render OpenAI-shaped frames
+/// from it without knowing anything about JSON itself living on the actor side.
+pub struct SseStream {
+    rx: std::sync::mpsc::Receiver<StreamItem>,
+    id: String,
+    created: i64,
+    model: String,
+    kind: SseKind,
+    /// Set when this response's client goes away. The generator polls it at every dispatch
+    /// boundary, which is what lets a prefill -- emitting nothing for minutes -- still be stopped.
+    cancel: npu_models::Cancel,
+    /// Render frames from the per-token records instead of the plain text items, and close with a
+    /// summary frame. Off, the stream is byte-for-byte what it was before telemetry existed.
+    stats: bool,
+}
+
+impl SseStream {
+    fn new(
+        rx: std::sync::mpsc::Receiver<StreamItem>,
+        model: String,
+        kind: SseKind,
+        stats: bool,
+        cancel: npu_models::Cancel,
+    ) -> SseStream {
+        let prefix = match kind {
+            SseKind::Chat => "chatcmpl",
+            SseKind::Completion => "cmpl",
+            SseKind::OllamaChat => "ollama",
+        };
+        SseStream { rx, id: gen_id(prefix), created: unix_now(), model, kind, stats, cancel }
+    }
+
+    /// The identity every rendered line shares, so the SSE frames and the run log cannot disagree
+    /// about which run they describe.
+    fn meta(&self) -> wire::RunMeta {
+        wire::RunMeta {
+            id: self.id.clone(),
+            created: self.created,
+            model: self.model.clone(),
+            chat: matches!(self.kind, SseKind::Chat),
+        }
+    }
+    /// The chat-only preamble: OpenAI announces the role before any content, in its own chunk.
+    fn render_role(&self) -> String {
+        format!(
+            "{{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\
+             \"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\"}},\"finish_reason\":null}}]}}",
+            self.id, self.created, parse::json_escape(&self.model))
+    }
+    fn render_text(&self, text: &str) -> String {
+        match self.kind {
+            SseKind::Chat => format!(
+                "{{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\
+                 \"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{}\"}},\"finish_reason\":null}}]}}",
+                self.id, self.created, parse::json_escape(&self.model), parse::json_escape(text)),
+            SseKind::Completion => format!(
+                "{{\"id\":\"{}\",\"object\":\"text_completion\",\"created\":{},\"model\":\"{}\",\
+                 \"choices\":[{{\"index\":0,\"text\":\"{}\",\"finish_reason\":null}}]}}",
+                self.id, self.created, parse::json_escape(&self.model), parse::json_escape(text)),
+            SseKind::OllamaChat => crate::ollama::chat_chunk(&self.model, &self.created_at(), text),
+        }
+    }
+    fn render_done(&self, reason: FinishReason) -> String {
+        // OpenAI's `finish_reason` cannot say "stopped early" -- its vocabulary has no such value --
+        // so a cancelled generation reports `stop` there and carries the truth beside it. Without
+        // this a client whose run an operator killed sees a completion that merely looks short.
+        let cut = match reason {
+            FinishReason::Aborted => ",\"x_npu_finish\":\"aborted\"",
+            _ => "",
+        };
+        match self.kind {
+            SseKind::Chat => format!(
+                "{{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\
+                 \"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"{}\"}}]{cut}}}",
+                self.id, self.created, parse::json_escape(&self.model), reason.as_str()),
+            SseKind::Completion => format!(
+                "{{\"id\":\"{}\",\"object\":\"text_completion\",\"created\":{},\"model\":\"{}\",\
+                 \"choices\":[{{\"index\":0,\"text\":\"\",\"finish_reason\":\"{}\"}}]}}",
+                self.id, self.created, parse::json_escape(&self.model), reason.as_str()),
+            // Unused: the Ollama stream's terminal frame carries the report, so `respond_stream`
+            // builds it from `StreamItem::Done` directly rather than through this.
+            SseKind::OllamaChat => String::new(),
+        }
+    }
+
+    /// RFC3339 for the Ollama surface, which stamps `created_at` as a string where OpenAI stamps
+    /// `created` as a unix integer.
+    fn created_at(&self) -> String {
+        rfc3339(self.created)
+    }
+    /// One tool call as a single streaming delta.
+    ///
+    /// OpenAI's wire format is a fragment concatenation -- `function.arguments` arrives in pieces
+    /// that the client joins by `index` -- so ONE fragment carrying the whole call is valid and
+    /// every client handles it. Streaming the arguments token by token is a later refinement with
+    /// no format change; it would not make anything parse that does not parse now.
+    fn render_tool_call(&self, c: &npu_models::ToolCall, index: usize) -> String {
+        let call = serde_json::json!({
+            "index": index,
+            "id": c.id,
+            "type": "function",
+            "function": { "name": c.name, "arguments": c.arguments.to_string() },
+        });
+        format!(
+            "{{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\
+             \"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{call}]}},\"finish_reason\":null}}]}}",
+            self.id, self.created, parse::json_escape(&self.model))
+    }
+    fn render_error(&self, msg: &str) -> String {
+        format!("{{\"error\":{{\"message\":\"{}\"}}}}", parse::json_escape(msg))
+    }
+}
+
+/// A process-unique id for a completion object (`chatcmpl-...` / `cmpl-...`). Not cryptographic,
+/// just distinct: a nanosecond timestamp plus a monotonic counter, so two completions started in
+/// the same nanosecond (the actor is single-flight, but the counter costs nothing) still differ.
+fn gen_id(prefix: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos()).unwrap_or(0);
+    format!("{prefix}-{nanos:x}{n:x}")
+}
+fn unix_now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// (status code, body).
+pub type Response = (u16, Body);
+
+/// Pure routing decision. Mutating admin routes load/edit/save the config at `cfg_path` then ask the
+/// actor to reconcile. No socket here -> unit-testable with a mock-backed Handle.
+pub fn route(req: &Request, handle: &Handle, cfg_path: &Path) -> Response {
+    match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/health") => (200, "{\"status\":\"ok\"}".into()),
+        // `ok` is COMPUTED, not asserted. It used to be the literal `true`, so a service whose model
+        // had failed to load reported healthy to systemd while answering every request with an error
+        // -- the shape that hid a 5-day outage. A Failed model makes this 503; `Unloaded` never does,
+        // because that is deliberate (deferred over the byte budget, or swept for being idle).
+        ("GET", "/healthz") => {
+            let npu = npu_models::Engine::available();
+            // Same rule as `/v1/models`: a health check that can hang is not a health check.
+            let st = handle.snapshot().models;
+            let n = st.iter().filter(|s| s.state == LoadState::Loaded).count();
+            let failed: Vec<&ModelStatus> = st.iter().filter(|s| s.state == LoadState::Failed).collect();
+            let names = failed.iter()
+                .map(|s| format!("\"{}\"", parse::json_escape(&s.name))).collect::<Vec<_>>().join(",");
+            let ok = failed.is_empty();
+            (if ok { 200 } else { 503 },
+             format!("{{\"ok\":{ok},\"npu\":{npu},\"loaded\":{n},\"failed\":[{names}]}}").into())
+        }
+        // From the actor's last PUBLICATION, never by asking it. A status read that queues behind
+        // the command it exists to explain is the failure this replaced: while one generation ran,
+        // this route timed out for an hour and there was no way to see why.
+        ("GET", "/v1/models") => {
+            let snap = handle.snapshot();
+            (200, models_json_aged(&snap.models, snap.at.elapsed().as_secs(), snap.doing.as_deref()).into())
+        }
+        ("POST", "/v1/chat/completions") => chat_completions(req, handle),
+        ("POST", "/v1/completions") => completions(req, handle),
+        ("POST", "/v1/embeddings") => embeddings(req, handle),
+        ("POST", "/v1/systemone") => systemone(req, handle),
+        ("POST", "/predict") => predict(req, handle),
+        ("POST", "/rerank") => rerank(req, handle),
+        // The Ollama surface. Same models, same engine -- a second wire, because OpenAI's has no
+        // field for a capability or a context length and every client therefore asks the user.
+        ("GET", "/api/version") => (200, crate::ollama::version_json().into()),
+        ("GET", "/api/tags") | ("GET", "/api/ps") => ollama_tags(handle, cfg_path),
+        ("POST", "/api/show") => ollama_show(req, handle, cfg_path),
+        ("POST", "/api/chat") => ollama_chat(req, handle),
+        ("POST", "/v1/audio/speech") => audio_speech(req, handle),
+        ("POST", "/v1/audio/transcriptions") => transcriptions(req, handle),
+        ("POST", "/v1/audio/diarizations") => diarizations(req, handle),
+        ("POST", "/v1/images/upscale") => images_upscale(req, handle),
+        // Deliberately BEFORE the reload/model routes and deliberately not going through the
+        // actor: this is the one command whose whole purpose is to be answerable while the actor
+        // is busy.
+        ("POST", "/admin/cancel") => admin_cancel(handle),
+        ("POST", "/admin/reload") => admin_reload(handle, cfg_path),
+        ("POST", "/admin/models") => admin_add_model(req, handle, cfg_path),
+        ("POST", "/admin/defaults") => admin_set_default(req, handle, cfg_path),
+        ("POST", "/admin/server") => admin_set_server(req, handle, cfg_path),
+        // Before the generic model routes: these are sub-resources, and a prefix match on
+        // `/admin/models/` would otherwise swallow them.
+        ("POST", p) if p.starts_with("/admin/models/") && p.ends_with("/resident") =>
+            admin_set_resident(&p["/admin/models/".len()..p.len() - "/resident".len()],
+                               req, handle, cfg_path),
+        ("POST", p) if p.starts_with("/admin/models/") && p.ends_with("/cancel") =>
+            admin_cancel_model(&p["/admin/models/".len()..p.len() - "/cancel".len()], handle),
+        ("POST", p) if p.starts_with("/admin/models/") && p.ends_with("/load") =>
+            admin_load(&p["/admin/models/".len()..p.len() - "/load".len()], handle),
+        ("POST", p) if p.starts_with("/admin/models/") && p.ends_with("/unload") =>
+            admin_unload(&p["/admin/models/".len()..p.len() - "/unload".len()], req, handle),
+        ("POST", p) if p.starts_with("/admin/models/") && p.ends_with("/bake") =>
+            admin_bake(&p["/admin/models/".len()..p.len() - "/bake".len()], req, handle),
+        ("DELETE", p) if p.starts_with("/admin/models/") =>
+            admin_remove_model(&p["/admin/models/".len()..].to_string(), handle, cfg_path),
+        ("GET", _) => (404, "{\"error\":\"not found\"}".into()),
+        _ => (404, "{\"error\":\"not found\"}".into()),
+    }
+}
+
+/// Render model statuses as the `/v1/models` JSON list (reused by the C ABI control surface).
+///
+/// `state` + `idle_s` are what make a hot swap observable from outside: `idle_s` counts seconds since
+/// the model last served a request and is `null` while it is not resident. `pinned` is the config's
+/// `resident = true`, reported because otherwise the only way to check whether a pin had reached the
+/// running service was to read the file and assume. `pin_honored` is a SEPARATE fact from `pinned`:
+/// `pinned && !pin_honored` means the invariant currently refuses to protect this pin (over
+/// `memory_ceiling_mb`) -- a state `npu reload` cannot fix by re-asserting the same config, unlike
+/// ordinary pin/unpin drift, so a reader needs both bits to tell the two apart.
+pub fn models_json(status: &[ModelStatus]) -> String {
+    models_doc(status, None, None)
+}
+
+/// The same list, plus how old the snapshot behind it is.
+///
+/// The HTTP surface answers from the actor's last publication rather than by asking the actor, so a
+/// reader is entitled to know whether that publication is a second old or twenty minutes -- which
+/// is the difference between "idle" and "something has held the device since before you looked".
+pub fn models_json_aged(status: &[ModelStatus], age_s: u64, doing: Option<&str>) -> String {
+    models_doc(status, Some(age_s), doing)
+}
+
+fn models_doc(status: &[ModelStatus], age_s: Option<u64>, doing: Option<&str>) -> String {
+    let mut data = String::new();
+    for (i, s) in status.iter().enumerate() {
+        if i > 0 { data.push(','); }
+        let kind = s.capability.map(|c| c.0).unwrap_or("unknown");
+        let state = match s.state { LoadState::Loaded => "loaded", LoadState::Failed => "failed", LoadState::Unloaded => "unloaded" };
+        let idle = match s.idle_s { Some(n) => n.to_string(), None => "null".to_string() };
+        data.push_str(&format!(
+            "{{\"id\":\"{}\",\"object\":\"model\",\"kind\":\"{kind}\",\"state\":\"{state}\",\"detail\":\"{}\",\"bo_bytes\":{},\"idle_s\":{idle},\"pinned\":{},\"pin_honored\":{},\"busy\":{},\"served\":{},\"busy_us\":{}}}",
+            s.name, parse::json_escape(&s.detail), s.bo_bytes, s.pinned, s.pin_honored, s.busy, s.served, s.busy_us));
+    }
+    let Some(age) = age_s else {
+        return format!("{{\"object\":\"list\",\"data\":[{data}]}}");
+    };
+    // `doing` names a phase `data` cannot show -- a model being LOADED is not yet anything to mark
+    // busy, and that is the longest wait the actor has.
+    let doing = match doing {
+        Some(d) => format!(",\"doing\":\"{}\"", parse::json_escape(d)),
+        None => String::new(),
+    };
+    format!("{{\"object\":\"list\",\"data\":[{data}],\"age_s\":{age}{doing}}}")
+}
+
+/// Map an engine error onto a status code. `NoModel` is 503, not 400: nothing is wrong with the
+/// request -- the server has no model for that capability, and a client cannot fix it by retrying
+/// differently. This is what `/v1/chat/completions` and `/v1/audio/speech` answer today, since no
+/// generate or tts model is configured yet; both routes are otherwise complete.
+fn engine_err(e: &npu_models::EngineError) -> Response {
+    let code = match e {
+        // Busy is a 503 with a reason, not a hang and not a 500: nothing is wrong with the request
+        // and retrying it later is exactly the right thing to do.
+        npu_models::EngineError::NoModel(_)
+        | npu_models::EngineError::NotAvailable
+        | npu_models::EngineError::Busy(_) => 503,
+        npu_models::EngineError::WrongKind { .. } | npu_models::EngineError::Unsupported(_) => 400,
+        npu_models::EngineError::Load(_) | npu_models::EngineError::Device(_) => 500,
+    };
+    (code, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e.to_string())).into())
+}
+
+/// OpenAI chat completions. Serves `Capability::GENERATE` with the FULL message array (system
+/// prompt + history, not just the last turn) and the full sampling surface -- see `parse::
+/// parse_chat_request`. Streams via SSE when the body asks for it, buffers otherwise.
+fn chat_completions(req: &Request, handle: &Handle) -> Response {
+    let body = String::from_utf8_lossy(&req.body).to_string();
+    let parsed = match parse::parse_chat_request(&body) {
+        Ok(p) => p,
+        Err(e) => return (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e)).into()),
+    };
+    // Cloned BEFORE the params move into the actor: this is the handle the READER uses to stop the
+    // WRITER once the client goes away, and it is the only path that works while prefill is
+    // producing nothing.
+    let cancel = parsed.params.cancel.clone();
+    let served = match handle.generate(parsed.model.as_deref(), parsed.prompt, parsed.params) {
+        Ok(s) => s,
+        Err(e) => return engine_err(&e),
+    };
+    if parsed.stream {
+        (200, Body::Stream(SseStream::new(served.value, served.model, SseKind::Chat, parsed.stats, cancel)))
+    } else {
+        render_buffered(served.model, served.value, SseKind::Chat)
+    }
+}
+
+/// The install root scenarios resolve against -- the same resolution `npu-cli` does, and the same
+/// one `EngineLoader` was handed. Derived from the config's own location when the variable is
+/// unset, because `engine.toml` lives at the root by construction.
+fn engine_root(cfg_path: &Path) -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("XDNA_ENGINE_ROOT") {
+        return std::path::PathBuf::from(p);
+    }
+    cfg_path.parent().map(Path::to_path_buf).unwrap_or_default()
+}
+
+/// Capabilities for one model, by name, resolved from the config's scenario without loading it.
+fn caps_for(cfg_path: &Path, name: &str) -> Option<crate::ollama::GenerateCapabilities> {
+    let cfg = Config::load(cfg_path).ok()?;
+    let m = cfg.models.iter().find(|m| m.name == name)?;
+    crate::ollama::capabilities(&engine_root(cfg_path), &m.scenario, name)
+}
+
+/// `GET /api/tags`. Generate models only: Ollama has no vocabulary for an ASR or embedding model,
+/// and listing one would drop it into a client's chat picker where every request 400s.
+fn ollama_tags(handle: &Handle, cfg_path: &Path) -> Response {
+    let st: Vec<ModelStatus> =
+        handle.status().into_iter().filter(crate::ollama::is_chat_model).collect();
+    (200, crate::ollama::tags_json(&st, &|n| caps_for(cfg_path, n)).into())
+}
+
+/// `POST /api/show`. The endpoint a client reads `capabilities` and `<arch>.context_length` from.
+fn ollama_show(req: &Request, handle: &Handle, cfg_path: &Path) -> Response {
+    let body = String::from_utf8_lossy(&req.body).to_string();
+    let name = match extract_str_field(&body, "model").or_else(|| extract_str_field(&body, "name")) {
+        Some(n) => n,
+        None => return (400, "{\"error\":\"missing \\\"model\\\"\"}".into()),
+    };
+    let st = handle.status();
+    match crate::ollama::show_json(&name, &st, caps_for(cfg_path, &name).as_ref()) {
+        Some(j) => (200, j.into()),
+        None => (404, format!("{{\"error\":\"model {} not found\"}}", parse::json_escape(&name)).into()),
+    }
+}
+
+/// `POST /api/chat`. The same generation path as `/v1/chat/completions` over Ollama's shapes --
+/// `options` instead of top-level sampling fields, NDJSON instead of SSE, and `stream` defaulting
+/// to TRUE rather than false, which is the one default that differs and the one a client notices.
+fn ollama_chat(req: &Request, handle: &Handle) -> Response {
+    let body = String::from_utf8_lossy(&req.body).to_string();
+    let parsed = match parse::parse_ollama_chat_request(&body) {
+        Ok(p) => p,
+        Err(e) => return (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e)).into()),
+    };
+    // Cloned BEFORE the params move into the actor: this is the handle the READER uses to stop the
+    // WRITER once the client goes away, and it is the only path that works while prefill is
+    // producing nothing.
+    let cancel = parsed.params.cancel.clone();
+    let served = match handle.generate(parsed.model.as_deref(), parsed.prompt, parsed.params) {
+        Ok(s) => s,
+        Err(e) => return engine_err(&e),
+    };
+    if parsed.stream {
+        (200, Body::Stream(SseStream::new(served.value, served.model, SseKind::OllamaChat, false, cancel)))
+    } else {
+        render_ollama_buffered(served.model, served.value)
+    }
+}
+
+/// Drain a generation and render Ollama's single-object body.
+fn render_ollama_buffered(model: String, rx: std::sync::mpsc::Receiver<StreamItem>) -> Response {
+    let created = unix_now();
+    let mut text = String::new();
+    let mut calls: Vec<npu_models::ToolCall> = Vec::new();
+    let (reason, report) = loop {
+        match rx.recv() {
+            Ok(StreamItem::Text(t)) => text.push_str(&t),
+            Ok(StreamItem::ToolCall(c)) => calls.push(c),
+            // A buffered caller sees nothing until the end; progress has no one to reassure.
+            Ok(StreamItem::Step(_)) | Ok(StreamItem::Progress { .. }) => {}
+            Ok(StreamItem::Done { reason, report, .. }) => break (reason, report),
+            Ok(StreamItem::Error(e)) => return engine_err(&e),
+            Err(_) => return (500, "{\"error\":\"generation ended without a result\"}".into()),
+        }
+    };
+    (200, crate::ollama::chat_buffered(&model, &rfc3339(created), &text, &calls, reason, &report).into())
+}
+
+/// OpenAI text completions: same generation path as chat, over a raw (non-templated) prompt string.
+fn completions(req: &Request, handle: &Handle) -> Response {
+    let body = String::from_utf8_lossy(&req.body).to_string();
+    let parsed = match parse::parse_completion_request(&body) {
+        Ok(p) => p,
+        Err(e) => return (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e)).into()),
+    };
+    // Cloned BEFORE the params move into the actor: this is the handle the READER uses to stop the
+    // WRITER once the client goes away, and it is the only path that works while prefill is
+    // producing nothing.
+    let cancel = parsed.params.cancel.clone();
+    let served = match handle.generate(parsed.model.as_deref(), parsed.prompt, parsed.params) {
+        Ok(s) => s,
+        Err(e) => return engine_err(&e),
+    };
+    if parsed.stream {
+        (200, Body::Stream(SseStream::new(served.value, served.model, SseKind::Completion, parsed.stats, cancel)))
+    } else {
+        render_buffered(served.model, served.value, SseKind::Completion)
+    }
+}
+
+/// Drain a generation to completion and render the OpenAI non-streaming shape. Draining fully
+/// (rather than stopping at the first error) is deliberate: the actor side always sends exactly one
+/// terminal item (`Done` or `Error`), so this loop always terminates.
+///
+/// The measurement objects are UNCONDITIONAL here, the way llama-server's `timings` is. There is no
+/// bandwidth argument against them on a buffered response -- they are a few hundred bytes once --
+/// and a client that did not ask for them ignores two unknown keys. The streaming path is where the
+/// opt-in lives, because there the cost is per token.
+fn render_buffered(model: String, rx: std::sync::mpsc::Receiver<StreamItem>, kind: SseKind) -> Response {
+    let chat = matches!(kind, SseKind::Chat);
+    let id = gen_id(if chat { "chatcmpl" } else { "cmpl" });
+    let created = unix_now();
+    let meta = wire::RunMeta { id: id.clone(), created, model: model.clone(), chat };
+    let mut log = crate::run_log::RunLog::open(&id);
+    if let Some(l) = log.as_mut() { l.header(&meta); }
+    let mut text = String::new();
+    let mut calls: Vec<npu_models::ToolCall> = Vec::new();
+    let (reason, report) = loop {
+        match rx.recv() {
+            Ok(StreamItem::Text(t)) => text.push_str(&t),
+            Ok(StreamItem::ToolCall(c)) => calls.push(c),
+            Ok(StreamItem::Step(r)) => {
+                if let Some(l) = log.as_mut() { l.line(&wire::chunk_line(&r, &meta)); }
+            }
+            Ok(StreamItem::Progress { .. }) => {}
+            Ok(StreamItem::Done { reason, report, .. }) => break (reason, report),
+            // Classified, not blanket-500: a prompt that does not fit the context window is the
+            // caller's to fix, and `engine_err` already knows that `Unsupported` is a 400.
+            Ok(StreamItem::Error(e)) => return engine_err(&e),
+            Err(_) =>
+                return (500, "{\"error\":\"generation ended without a result\"}".into()),
+        }
+    };
+    if let Some(l) = log.as_mut() {
+        // Prefill lands after the token lines because its record only reaches this layer with the
+        // terminal item. The reader dispatches on `object` and does not care about line order.
+        l.line(&wire::prefill_line(&report.prefill, &meta));
+        l.line(&wire::summary_line(&report, &meta, reason));
+    }
+    let mut obj = wire::completion_object_with_calls(&text, &calls, reason, &report, &meta);
+    // The full report, not just `timings`/`x_npu` (which are `Summary`, missing e.g. `prefill`):
+    // this is what lets a CLI-over-socket client render the exact same stats table/footer the
+    // in-process path does, from the identical `GenerationReport` -- an OpenAI-shaped client reads
+    // only the fields above and ignores this one.
+    if let Some(m) = obj.as_object_mut() {
+        m.insert("x_npu_report".to_string(), serde_json::to_value(&*report).unwrap_or(serde_json::Value::Null));
+    }
+    (200, obj.to_string().into())
+}
+
+/// OpenAI speech synthesis. Serves `Capability::TTS` and returns audio bytes, not JSON.
+///
+/// `voice`, `speed` and `stream_format` are rejected by name when a caller actually asks for one
+/// (S6: a field that changes the response cannot be a silent no-op -- see
+/// `parse::reject_unsupported_speech_fields`). `response_format` is the same rule but with two
+/// real answers: `"wav"` (the default) and `"pcm"`, the only two shapes this server can produce.
+fn audio_speech(req: &Request, handle: &Handle) -> Response {
+    let body = String::from_utf8_lossy(&req.body).to_string();
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+    let format = match parse::reject_unsupported_speech_fields(&v) {
+        Ok(f) => f,
+        Err(e) => return (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e)).into()),
+    };
+    let model = extract_str_field(&body, "model");
+    let input = match parse::parse_inputs(&body) {
+        Ok(v) => match v.into_iter().next() {
+            Some(t) => t,
+            None => return (400, "{\"error\":\"input is empty\"}".into()),
+        },
+        Err(e) => return (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e)).into()),
+    };
+    let served = match handle.serve(Capability::TTS, model.as_deref(), EngineReq::Text(input)) {
+        Ok(s) => s,
+        Err(e) => return engine_err(&e),
+    };
+    match served.value {
+        EngineResp::Audio { pcm, sample_rate } => match format {
+            SpeechFormat::Wav => (200, Body::Wav(parse::wav_from_i16(&pcm, sample_rate))),
+            SpeechFormat::Pcm => (200, Body::Pcm(parse::pcm_bytes(&pcm))),
+        },
+        other => (500, format!("{{\"error\":\"{} returned a {} response\"}}",
+            parse::json_escape(&served.model), other.shape()).into()),
+    }
+}
+
+/// The two audio shapes this server can actually produce -- the only two values
+/// `reject_unsupported_speech_fields` lets `response_format` resolve to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeechFormat { Wav, Pcm }
+
+/// TypeSafe's `/v1/systemone`: typed questions over one `state`, answered off a generate model's
+/// next-token logits (npu_models::decide). Questions keep their request order, which is why the
+/// body is parsed with serde_json's preserve_order rather than the field extractors above. The
+/// response always carries `x_npu`, the way a non-streaming chat completion does (docs/measurement.md).
+fn systemone(req: &Request, handle: &Handle) -> Response {
+    let bad = |m: String| -> Response { (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&m)).into()) };
+    let body: serde_json::Value = match serde_json::from_slice(&req.body) {
+        Ok(v) => v,
+        Err(e) => return bad(format!("body is not JSON: {e}")),
+    };
+    let decide = match parse_systemone(&body) {
+        Ok(d) => d,
+        Err(m) => return bad(m),
+    };
+    let model = body.get("model").and_then(|v| v.as_str());
+    let t0 = std::time::Instant::now();
+    let served = match handle.serve(Capability::GENERATE, model, EngineReq::Decide(decide)) {
+        Ok(s) => s,
+        Err(e) => return engine_err(&e),
+    };
+    let total_us = t0.elapsed().as_micros() as u64;
+    let d = match served.value {
+        EngineResp::Decisions(d) => d,
+        other => return engine_err(&npu_models::EngineError::Device(format!(
+            "decide returned a {} response", other.shape()))),
+    };
+    let ms = |us: u64| us as f64 / 1e3;
+    let stats = &d.stats;
+    let questions: serde_json::Map<String, serde_json::Value> = stats.questions.iter().map(|q| (q.id.clone(), serde_json::json!({
+        "prompt_tokens": q.prompt_tokens, "reused_tokens": q.reused_tokens,
+        "batched_tokens": q.batched_tokens, "stepwise_tokens": q.stepwise_tokens,
+        "restore_ms": ms(q.restore_us), "prefill_ms": ms(q.prefill_us), "readout_ms": ms(q.readout_us),
+    }))).collect();
+    let x_npu = serde_json::json!({
+        "queue_ms": ms(served.queue_us), "load_ms": ms(served.load_us), "total_ms": ms(total_us),
+        "shared_prefix_tokens": stats.shared_prefix_tokens,
+        "prefix_ms": ms(stats.prefix_us), "snapshot_ms": ms(stats.snapshot_us),
+        "questions": questions,
+    });
+    let out: serde_json::Map<String, serde_json::Value> = d.answers.into_iter().map(answer_json).collect();
+    (200, serde_json::json!({"model": served.model, "answers": out, "x_npu": x_npu}).to_string().into())
+}
+
+/// One answer in Jev's shape: `type` names the question kind; score probabilities are keyed by level.
+fn answer_json(a: npu_models::DecideAnswer) -> (String, serde_json::Value) {
+    match a {
+        npu_models::DecideAnswer::Noul { id, p_true } =>
+            (id, serde_json::json!({"type": "noul", "noul": p_true})),
+        npu_models::DecideAnswer::Choice { id, choice, probabilities, confidence } => {
+            let p: serde_json::Map<String, serde_json::Value> =
+                probabilities.into_iter().map(|(k, p)| (k, p.into())).collect();
+            (id, serde_json::json!({"type": "choice", "choice": choice, "probabilities": p, "confidence": confidence}))
+        }
+        npu_models::DecideAnswer::Score { id, score, probabilities, confidence } => {
+            let p: serde_json::Map<String, serde_json::Value> =
+                probabilities.into_iter().enumerate().map(|(i, p)| (i.to_string(), p.into())).collect();
+            (id, serde_json::json!({"type": "score", "score": score, "probabilities": p, "confidence": confidence}))
+        }
+    }
+}
+
+fn serve_nli(body: &serde_json::Value, handle: &Handle, pairs: Vec<(String, String)>)
+    -> Result<npu_models::NliScores, Response> {
+    let model = body.get("model").and_then(|v| v.as_str());
+    let served = handle.serve(Capability::GENERATE, model, EngineReq::Nli(npu_models::NliRequest { pairs }))
+        .map_err(|e| engine_err(&e))?;
+    match served.value {
+        EngineResp::NliScores(s) => Ok(s),
+        other => Err(engine_err(&npu_models::EngineError::Device(format!("nli returned a {} response", other.shape())))),
+    }
+}
+
+/// TEI's `/predict` for a pair classifier: `{"inputs": [a, b]}` or `{"inputs": [[a, b], ...]}`,
+/// each answered with every label's probability, highest first.
+fn predict(req: &Request, handle: &Handle) -> Response {
+    let bad = |m: &str| -> Response { (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(m)).into()) };
+    let body: serde_json::Value = match serde_json::from_slice(&req.body) { Ok(v) => v, Err(_) => return bad("body is not JSON") };
+    let pair = |v: &serde_json::Value| -> Option<(String, String)> {
+        let a = v.as_array().filter(|a| a.len() == 2)?;
+        Some((a[0].as_str()?.to_string(), a[1].as_str()?.to_string()))
+    };
+    let inputs = body.get("inputs");
+    let (single, pairs) = match inputs.and_then(pair) {
+        Some(p) => (true, vec![p]),
+        None => match inputs.and_then(|v| v.as_array()).map(|a| a.iter().map(pair).collect::<Option<Vec<_>>>()) {
+            Some(Some(ps)) if !ps.is_empty() => (false, ps),
+            _ => return bad("`inputs` must be a [premise, hypothesis] pair or a non-empty array of them"),
+        },
+    };
+    let s = match serve_nli(&body, handle, pairs) { Ok(s) => s, Err(r) => return r };
+    let one = |p: &Vec<f64>| {
+        let mut v: Vec<(&String, f64)> = s.labels.iter().zip(p.iter().copied()).collect();
+        v.sort_by(|a, b| b.1.total_cmp(&a.1));
+        serde_json::Value::Array(v.into_iter().map(|(l, x)| serde_json::json!({"label": l, "score": x})).collect())
+    };
+    let out = match single {
+        true => one(&s.probs[0]),
+        false => serde_json::Value::Array(s.probs.iter().map(one).collect()),
+    };
+    (200, out.to_string().into())
+}
+
+/// TEI's `/rerank`: each text scored by P(entailment) of openjev's answer hypothesis over the query.
+fn rerank(req: &Request, handle: &Handle) -> Response {
+    let bad = |m: &str| -> Response { (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(m)).into()) };
+    let body: serde_json::Value = match serde_json::from_slice(&req.body) { Ok(v) => v, Err(_) => return bad("body is not JSON") };
+    let Some(query) = body.get("query").and_then(|v| v.as_str()) else { return bad("missing `query`") };
+    let texts: Vec<String> = match body.get("texts").and_then(|v| v.as_array())
+        .map(|a| a.iter().map(|t| t.as_str().map(str::to_string)).collect::<Option<Vec<_>>>()) {
+        Some(Some(t)) if !t.is_empty() => t,
+        _ => return bad("`texts` must be a non-empty array of strings"),
+    };
+    let pairs = texts.iter().map(|t| (query.to_string(), npu_models::nli::RERANK_HYPOTHESIS.replacen("{text}", t, 1))).collect();
+    let s = match serve_nli(&body, handle, pairs) { Ok(s) => s, Err(r) => return r };
+    let e = s.labels.iter().position(|l| l == "entailment").unwrap_or(1);
+    let mut ranked: Vec<(usize, f64)> = s.probs.iter().map(|p| p[e]).enumerate().collect();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let out: Vec<serde_json::Value> = ranked.into_iter().map(|(i, x)| serde_json::json!({"index": i, "score": x})).collect();
+    (200, serde_json::Value::Array(out).to_string().into())
+}
+
+fn parse_systemone(body: &serde_json::Value) -> Result<npu_models::DecideRequest, String> {
+    use npu_models::DecideQuestion;
+    let evidence = body.get("state").cloned().ok_or("missing `state`")?;
+    let qs = body.get("questions").and_then(|v| v.as_object()).ok_or("`questions` must be an object")?;
+    if qs.is_empty() {
+        return Err("`questions` is empty".into());
+    }
+    let text = |v: &serde_json::Value| v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string());
+    let mut questions = Vec::with_capacity(qs.len());
+    for (id, q) in qs {
+        let kind = q.get("type").and_then(|v| v.as_str()).ok_or(format!("question `{id}` has no `type`"))?;
+        let instr = q.get("instructions").map(text).ok_or(format!("question `{id}` has no `instructions`"))?;
+        let crit = q.get("criteria");
+        let question = match kind {
+            "noul" | "boolean" => {
+                let side = |k: &str| crit.and_then(|c| c.get(k)).map(text);
+                DecideQuestion::noul(id, &instr, side("true").as_deref(), side("false").as_deref())
+            }
+            "choice" => {
+                let c = crit.and_then(|c| c.as_object()).ok_or(format!("choice `{id}` needs a criteria object"))?;
+                DecideQuestion::choice(id, &instr, c.iter().map(|(k, v)| (k.clone(), text(v))).collect())
+            }
+            "score" => {
+                let c = crit.and_then(|c| c.as_array()).ok_or(format!("score `{id}` needs a criteria array"))?;
+                DecideQuestion::score(id, &instr, c.iter().map(text).collect())
+            }
+            other => return Err(format!("question `{id}` has unknown type `{other}`")),
+        };
+        question.validate()?;
+        questions.push(question);
+    }
+    Ok(npu_models::DecideRequest { evidence, questions })
+}
+
+fn embeddings(req: &Request, handle: &Handle) -> Response {
+    let body = String::from_utf8_lossy(&req.body).to_string();
+    let model = extract_str_field(&body, "model");
+    let inputs = match parse::parse_inputs(&body) {
+        Ok(v) if v.is_empty() => return (400, "{\"error\":\"input is empty\"}".into()),
+        Ok(v) => v,
+        Err(e) => return (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e)).into()),
+    };
+    let mut data = String::new();
+    let mut served = String::new();
+    for (i, text) in inputs.iter().enumerate() {
+        match handle.embed(model.as_deref(), text) {
+            Ok(s) => {
+                served = s.model;
+                let arr = s.value.iter().map(|x| format!("{x}")).collect::<Vec<_>>().join(",");
+                if i > 0 { data.push(','); }
+                data.push_str(&format!("{{\"object\":\"embedding\",\"index\":{i},\"embedding\":[{arr}]}}"));
+            }
+            Err(e) => return (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e.to_string())).into()),
+        }
+    }
+    (200, format!("{{\"object\":\"list\",\"data\":[{data}],\"model\":\"{}\"}}", parse::json_escape(&served)).into())
+}
+
+fn transcriptions(req: &Request, handle: &Handle) -> Response {
+    let file = match parse::extract_file_part(&req.body, &req.boundary) {
+        Some(w) => w, None => return (400, "{\"error\":\"no file part\"}".into()),
+    };
+    // Any container ffmpeg can read, not only an exact 16 kHz mono WAV. OpenAI-shaped clients upload
+    // mp3/m4a/webm and video, and the strict parser answered every one of them with the same 400.
+    let samples = match crate::media::decode_bytes(file) {
+        Ok(s) if !s.is_empty() => s,
+        Ok(_) => return (400, "{\"error\":\"file decoded to no audio\"}".into()),
+        Err(e) => return (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e)).into()),
+    };
+    // OpenAI's transcription request carries `model` as a form field. This route used to drop it and
+    // always serve the default, which left ASR -- the capability this engine actually ships -- with
+    // no way to pick a model per request even though the actor has always taken one.
+    let model = parse::extract_form_field(&req.body, &req.boundary, "model");
+    match handle.transcribe(model.as_deref(), samples, 16_000) {
+        Ok(s) => (200, format!("{{\"text\":\"{}\",\"model\":\"{}\"}}",
+            parse::json_escape(&s.value), parse::json_escape(&s.model)).into()),
+        Err(e) => engine_err(&e),
+    }
+}
+
+/// Speaker diarization. OpenAI has no diarization endpoint, so this mirrors the shape of our own
+/// `/v1/audio/transcriptions`: multipart `file` part + a `model` form field.
+fn diarizations(req: &Request, handle: &Handle) -> Response {
+    let file = match parse::extract_file_part(&req.body, &req.boundary) {
+        Some(w) => w, None => return (400, "{\"error\":\"no file part\"}".into()),
+    };
+    // Any container ffmpeg can read, not only an exact 16 kHz mono WAV. OpenAI-shaped clients upload
+    // mp3/m4a/webm and video, and the strict parser answered every one of them with the same 400.
+    let samples = match crate::media::decode_bytes(file) {
+        Ok(s) if !s.is_empty() => s,
+        Ok(_) => return (400, "{\"error\":\"file decoded to no audio\"}".into()),
+        Err(e) => return (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e)).into()),
+    };
+    let model = parse::extract_form_field(&req.body, &req.boundary, "model");
+    match handle.diarize(model.as_deref(), samples, 16_000) {
+        Ok(s) => (200, segments_json(&s.model, &s.value).into()),
+        Err(e) => engine_err(&e),
+    }
+}
+
+/// One video frame, one request (`npu upscale` calls this once per frame -- see `docs/api.md`):
+/// multipart `w`/`h` fields + an `image` part of exactly `w*h*3` raw RGB8 bytes. Response is
+/// `Body::image` (dims header + upscaled RGB8), never JSON, so the wire cost stays one copy of the
+/// pixels each way.
+fn images_upscale(req: &Request, handle: &Handle) -> Response {
+    let bad = |m: String| -> Response { (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&m)).into()) };
+    let dim = |field: &str| -> Result<usize, Response> {
+        parse::extract_form_field(&req.body, &req.boundary, field)
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .ok_or_else(|| bad(format!("missing or invalid {field}")))
+    };
+    let w = match dim("w") { Ok(w) => w, Err(r) => return r };
+    let h = match dim("h") { Ok(h) => h, Err(r) => return r };
+    let image = match parse::extract_named_file_part(&req.body, &req.boundary, "image") {
+        Some(b) => b, None => return bad("no image part".into()),
+    };
+    let want = match w.checked_mul(h).and_then(|n| n.checked_mul(3)) {
+        Some(n) => n, None => return bad(format!("w={w} h={h} overflows")),
+    };
+    if image.len() != want {
+        return bad(format!("image is {} bytes, want w*h*3={want}", image.len()));
+    }
+    let model = parse::extract_form_field(&req.body, &req.boundary, "model");
+    let served = match handle.serve(Capability::IMAGE_SR, model.as_deref(),
+        EngineReq::Image { rgb: image.to_vec(), w, h }) {
+        Ok(s) => s,
+        Err(e) => return engine_err(&e),
+    };
+    match served.value {
+        EngineResp::Image { rgb, w, h } => (200, Body::image(w, h, &rgb)),
+        other => (500, format!("{{\"error\":\"{} returned a {} response\"}}",
+            parse::json_escape(&served.model), other.shape()).into()),
+    }
+}
+
+/// Render segments. `speaker` is a cluster INDEX internally; the `SPEAKER_NN` label is produced
+/// here, at the edge, so nothing downstream has to parse a string back into a number.
+fn segments_json(model: &str, segs: &[npu_models::capability::Segment]) -> String {
+    let items: Vec<String> = segs.iter().map(|s| format!(
+        "{{\"start\":{:.3},\"end\":{:.3},\"speaker\":\"SPEAKER_{:02}\"}}",
+        s.start_s, s.end_s, s.speaker)).collect();
+    format!("{{\"model\":\"{}\",\"segments\":[{}]}}", parse::json_escape(model), items.join(","))
+}
+
+fn admin_reload(handle: &Handle, cfg_path: &Path) -> Response {
+    match Config::load(cfg_path) {
+        Ok(cfg) => match handle.reconcile(cfg) {
+            Ok(rep) => (200, format!(
+                "{{\"loaded\":{},\"unloaded\":{},\"failed\":{},\"deferred\":{},\"pinned_deferred\":{},\
+                 \"evicted\":{},\"pinned_over_cap\":{}}}",
+                rep.loaded.len(), rep.unloaded.len(), rep.failed.len(), rep.deferred.len(),
+                rep.pinned_deferred.len(), rep.evicted.len(), rep.pinned_over_cap.len()).into()),
+            Err(e) => engine_err(&e),
+        },
+        Err(e) => (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e)).into()),
+    }
+}
+
+fn admin_add_model(req: &Request, handle: &Handle, cfg_path: &Path) -> Response {
+    let body = String::from_utf8_lossy(&req.body).to_string();
+    let (name, scenario) = match (extract_str_field(&body, "name"), extract_str_field(&body, "scenario")) {
+        (Some(n), Some(s)) => (n, s),
+        _ => return (400, "{\"error\":\"need name + scenario\"}".into()),
+    };
+    // In place, so re-pointing a model's scenario keeps every other key the operator set on it. The
+    // remove-then-push this replaces wrote `resident: false` back every time, silently unpinning a
+    // model whose scenario path was being corrected.
+    mutate_and_reconcile(handle, cfg_path, |doc| doc.add_model(&name, &scenario))
+}
+
+fn admin_remove_model(name: &str, handle: &Handle, cfg_path: &Path) -> Response {
+    let name = name.to_string();
+    mutate_and_reconcile(handle, cfg_path, |doc| doc.remove_model(&name).map(|_| ()))
+}
+
+/// Pin or unpin a model: `{"resident": true}`.
+///
+/// The live half of `npu model enable`. It takes effect without a restart because reconcile now
+/// adopts a changed `ModelCfg` for an already-loaded model instead of only noticing a scenario
+/// change -- see `Registry::update_cfg`.
+fn admin_set_resident(name: &str, req: &Request, handle: &Handle, cfg_path: &Path) -> Response {
+    let name = name.to_string();
+    let on = match serde_json::from_slice::<serde_json::Value>(&req.body)
+        .ok().as_ref().and_then(|v| v.get("resident")).and_then(|v| v.as_bool()) {
+        Some(b) => b,
+        None => return (400, "{\"error\":\"need a boolean `resident` field\"}".into()),
+    };
+    // A pin on a model that is not configured is a typo, not an instruction. Writing it would leave
+    // a `resident` key on nothing, which the config cannot even represent.
+    mutate_and_reconcile(handle, cfg_path, move |doc| match doc.set_resident(&name, on)? {
+        true => Ok(()),
+        false => Err(format!("unknown model {name:?} (not in the config)")),
+    })
+}
+
+/// Set one `[server]` key. The last config mutation the CLI still performed itself, which meant
+/// two processes wrote `engine.toml`: the service through every other `/admin` route, and the CLI
+/// through this one. One file, one writer -- and the writer is whoever owns the reconcile.
+fn admin_set_server(req: &Request, handle: &Handle, cfg_path: &Path) -> Response {
+    let body = String::from_utf8_lossy(&req.body).to_string();
+    let (key, value) = match (extract_str_field(&body, "key"), extract_str_field(&body, "value")) {
+        (Some(k), Some(v)) => (k, v),
+        _ => return (400, "{\"error\":\"need key + value\"}".into()),
+    };
+    // `set_server` validates the key and the value's shape, so an unknown key is a 400 with the
+    // reason rather than a silently ignored write.
+    mutate_and_reconcile(handle, cfg_path, |doc| doc.set_server(&key, &value))
+}
+
+fn admin_set_default(req: &Request, handle: &Handle, cfg_path: &Path) -> Response {
+    let body = String::from_utf8_lossy(&req.body).to_string();
+    let (cap, model) = match (extract_str_field(&body, "capability"), extract_str_field(&body, "model")) {
+        (Some(c), Some(m)) => (c, m),
+        _ => return (400, "{\"error\":\"need capability + model\"}".into()),
+    };
+    // A capability nothing implements is rejected rather than written: the old match silently
+    // dropped anything that was not asr/embed, so `/admin/defaults` reported 200 and changed nothing.
+    let cap = match Capability::from_name(&cap) {
+        Some(c) => c,
+        None => return (400, format!("{{\"error\":\"unknown capability {}\"}}", parse::json_escape(&cap)).into()),
+    };
+    mutate_and_reconcile(handle, cfg_path, |doc| { doc.set_default(cap, &model); Ok(()) })
+}
+
+/// Edit the config FILE, then reconcile the running registry against it.
+///
+/// Through `ConfigDoc`, not `Config`: writing back a deserialized struct rebuilt the file from the
+/// struct's fields and destroyed everything else it carried -- every comment, including the ones
+/// the engine's own generated config ships with.
+/// Make a model resident now. Touches the DEVICE, not the config -- residency is runtime state, and
+/// an operator warming a model for the next hour is not editing what the service serves at boot.
+/// Use `/admin/models/<name>/resident` for the persistent form.
+///
+/// 409 rather than 400 at capacity: the request is well-formed and the server understood it, the
+/// state just conflicts. A client can act on that (unload something, raise the cap) where a 400
+/// would tell it to fix its request.
+/// Stop the running generation. 200 either way -- "there was nothing to cancel" is an answer, not
+/// a failure, and a caller racing the end of a generation must not see an error for winning.
+fn admin_cancel(handle: &Handle) -> Response {
+    match handle.cancel_current() {
+        Some(model) => (200, format!(
+            "{{\"cancelled\":true,\"model\":\"{}\"}}", parse::json_escape(&model)).into()),
+        None => (200, "{\"cancelled\":false}".into()),
+    }
+}
+
+/// Stop the generation belonging to ONE model. 200 whether or not it was that model's turn: "it was
+/// not generating" is an answer, and the reply names what was actually stopped so a caller who
+/// picked the wrong model can tell that from nothing running at all.
+fn admin_cancel_model(name: &str, handle: &Handle) -> Response {
+    match handle.cancel_model(name) {
+        true => (200, format!(
+            "{{\"cancelled\":true,\"model\":\"{}\"}}", parse::json_escape(name)).into()),
+        false => (200, "{\"cancelled\":false}".into()),
+    }
+}
+
+fn admin_load(name: &str, handle: &Handle) -> Response {
+    match handle.load(name) {
+        Ok(r) => (200, format!(
+            "{{\"loaded\":{},\"resident_mb\":{},\"ceiling_mb\":{},\"unweighed\":[{}]}}",
+            r.loaded, r.resident_mb, r.ceiling_mb,
+            r.unweighed.iter().map(|n| format!("\"{}\"", parse::json_escape(n)))
+                .collect::<Vec<_>>().join(",")).into()),
+        Err(e @ npu_models::EngineError::Unsupported(_)) =>
+            (409, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e.to_string())).into()),
+        Err(e) => engine_err(&e),
+    }
+}
+
+/// Release a model's device memory, keeping its config entry. `released: false` means it was not
+/// resident -- not an error: the caller asked for a state and that state already holds.
+/// Release a model's device memory. HARD by default: a generation running on that model is
+/// cancelled first.
+///
+/// "Stop" is an instruction, not a request, and an operator who types it has a reason -- so the
+/// default is that it works. Refusing while the model is busy left the only way out as waiting the
+/// generation out, which for a long prompt is an hour. `{"soft": true}` is the opt-out: it leaves a
+/// running generation alone and queues for the device the ordinary way, which may answer 503 busy.
+///
+/// Only THIS model's generation is cancelled -- see `InFlight::cancel_if`.
+fn admin_unload(name: &str, req: &Request, handle: &Handle) -> Response {
+    let soft = String::from_utf8_lossy(&req.body).contains("\"soft\":true")
+        || String::from_utf8_lossy(&req.body).contains("\"soft\": true");
+    let cancelled = !soft && handle.cancel_model(name);
+    match handle.unload(name) {
+        Ok(released) => (200,
+            format!("{{\"released\":{released},\"cancelled\":{cancelled}}}").into()),
+        Err(e) => engine_err(&e),
+    }
+}
+
+/// Host-only, no device: bake a model's declarative weight spec into a checkpoint. `force`
+/// defaults to false on a missing/malformed body -- unlike `resident`, this overrides an
+/// already-idempotent operation (`ensure_checkpoint` skips a fresh checkpoint on its own) rather
+/// than instructing a state, so there is nothing to reject a bad body for.
+fn admin_bake(name: &str, req: &Request, handle: &Handle) -> Response {
+    let force = serde_json::from_slice::<serde_json::Value>(&req.body)
+        .ok().as_ref().and_then(|v| v.get("force")).and_then(|v| v.as_bool()).unwrap_or(false);
+    match handle.bake(name, force) {
+        Ok(p) => (200, format!("{{\"checkpoint\":{}}}",
+            p.map(|p| format!("\"{}\"", parse::json_escape(&p.display().to_string())))
+             .unwrap_or_else(|| "null".into())).into()),
+        Err(e) => engine_err(&e),
+    }
+}
+
+fn mutate_and_reconcile(handle: &Handle, cfg_path: &Path,
+                        f: impl FnOnce(&mut ConfigDoc) -> Result<(), String>) -> Response {
+    let bad = |code: u16, e: String| -> Response {
+        (code, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e)).into())
+    };
+    let mut doc = match ConfigDoc::load(cfg_path) { Ok(d) => d, Err(e) => return bad(400, e) };
+    if let Err(e) = f(&mut doc) { return bad(400, e) }
+    let cfg = match doc.save(cfg_path) { Ok(c) => c, Err(e) => return bad(500, e) };
+    match handle.reconcile(cfg) {
+        Ok(rep) => (200, format!(
+            "{{\"loaded\":{},\"unloaded\":{},\"failed\":{},\"deferred\":{},\"pinned_deferred\":{},\
+             \"evicted\":{},\"pinned_over_cap\":{}}}",
+            rep.loaded.len(), rep.unloaded.len(), rep.failed.len(), rep.deferred.len(),
+            rep.pinned_deferred.len(), rep.evicted.len(), rep.pinned_over_cap.len()).into()),
+        Err(e) => engine_err(&e),
+    }
+}
+
+/// Minimal extraction of a JSON string field `"<key>":"<value>"`.
+fn extract_str_field(body: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let idx = body.find(&needle)?;
+    let rest = &body[idx + needle.len()..];
+    let q1 = rest.find('"')?;
+    let s = &rest[q1 + 1..];
+    let q2 = s.find('"')?;
+    Some(s[..q2].to_string())
+}
+
+/// Blocking single-flight server. Reads each request, routes it, writes the response.
+///
+/// `$NPU_HTTP_ENDPOINT` (`host:port`), if set, overrides `port` entirely -- an explicit bind
+/// address for a container or a test, the same override tier `control_socket::socket_path` gives
+/// the control socket. Unset, this binds `127.0.0.1:<port>` exactly as before that variable existed.
+pub fn serve(handle: Handle, cfg_path: PathBuf, port: u16) -> std::io::Result<()> {
+    let addr = std::env::var("NPU_HTTP_ENDPOINT").unwrap_or_else(|_| format!("127.0.0.1:{port}"));
+    let listener = TcpListener::bind(addr)?;
+    serve_on(listener, handle, cfg_path)
+}
+
+/// Like `serve`, but on an already-bound listener. Lets a caller (a test, chiefly) claim an
+/// OS-assigned ephemeral port via `TcpListener::bind("127.0.0.1:0")` and read it back with
+/// `local_addr()` before handing the listener over here -- no bind-then-guess race.
+pub fn serve_on(listener: TcpListener, handle: Handle, cfg_path: PathBuf) -> std::io::Result<()> {
+    eprintln!("[npu-serve] ready on http://{}", listener.local_addr()?);
+    let live = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    for stream in listener.incoming() {
+        let s = match stream {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[npu-serve] accept: {e}");
+                continue;
+            }
+        };
+        // A connection per thread. The DEVICE stays serialized -- the actor is still its only owner
+        // -- but the socket must not be: handling connections in the accept loop made one slow
+        // request a total outage, and `/health` (a constant, touching no state) could not answer
+        // while a generation ran because the loop never came back to accept it.
+        if live.fetch_add(1, Ordering::Relaxed) >= MAX_CONNECTIONS {
+            live.fetch_sub(1, Ordering::Relaxed);
+            let mut s = s;
+            let _ = respond(&mut s, 503, &"{\"error\":\"too many connections\"}".into());
+            continue;
+        }
+        let (handle, cfg_path, live) = (handle.clone(), cfg_path.clone(), live.clone());
+        // Detached: nothing joins these, and a panicking connection must not take the listener with
+        // it. `handle_conn` already converts its own errors into responses.
+        let _ = std::thread::Builder::new().name("npu-http".into()).spawn(move || {
+            if let Err(e) = handle_conn(s, &handle, &cfg_path) {
+                eprintln!("[npu-serve] {e}");
+            }
+            live.fetch_sub(1, Ordering::Relaxed);
+        });
+    }
+    Ok(())
+}
+
+/// Parse one HTTP-shaped request off `reader`. Shared by every transport (this module's own
+/// `handle_conn` for TCP, `control_socket`'s Unix front end) so a request looks identical no matter
+/// which socket carried it -- the two used to parse independently, which is how the Unix side went
+/// three-plus months without noticing it never read `boundary` at all.
+///
+/// `Err` of kind `InvalidData` means the declared body is over `MAX_BODY`; every other `Err` is IO.
+pub(crate) fn parse_request(reader: &mut impl BufRead) -> std::io::Result<Request> {
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let mut parts = line.split_whitespace();
+    let method = parts.next().unwrap_or("").to_string();
+    let path = parts.next().unwrap_or("").to_string();
+    let mut content_len = 0usize;
+    let mut boundary = String::new();
+    loop {
+        let mut h = String::new();
+        if reader.read_line(&mut h)? == 0 { break; }
+        let h = h.trim_end();
+        if h.is_empty() { break; }
+        let l = h.to_ascii_lowercase();
+        if let Some(v) = l.strip_prefix("content-length:") { content_len = v.trim().parse().unwrap_or(0); }
+        else if l.starts_with("content-type:") {
+            if let Some(idx) = l.find("boundary=") { boundary = h[idx + "boundary=".len()..].trim().trim_matches('"').to_string(); }
+        }
+    }
+    if content_len > MAX_BODY {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "body too large"));
+    }
+    let mut body = vec![0u8; content_len];
+    reader.read_exact(&mut body)?;
+    Ok(Request { method, path, boundary, body })
+}
+
+#[cfg(test)]
+mod parse_request_tests {
+    use super::*;
+
+    /// The Unix front end used to parse the request line and headers itself, and its own copy never
+    /// read `Content-Type`/`boundary` at all -- silent over stub tests, live only once a multipart
+    /// upload (transcribe/diarize) actually hit it. Sharing `parse_request` closes the class rather
+    /// than the instance; this pins the field it dropped.
+    #[test]
+    fn a_multipart_content_type_yields_its_boundary() {
+        let raw = "POST /v1/audio/transcriptions HTTP/1.1\r\n\
+                   Content-Type: multipart/form-data; boundary=XYZ\r\n\
+                   Content-Length: 3\r\n\r\nabc";
+        let mut r = std::io::BufReader::new(raw.as_bytes());
+        let req = parse_request(&mut r).unwrap();
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.path, "/v1/audio/transcriptions");
+        assert_eq!(req.boundary, "XYZ");
+        assert_eq!(req.body, b"abc");
+    }
+
+    #[test]
+    fn a_body_over_the_limit_is_reported_before_reading_it() {
+        let raw = format!("POST /x HTTP/1.1\r\nContent-Length: {}\r\n\r\n", MAX_BODY + 1);
+        let mut r = std::io::BufReader::new(raw.as_bytes());
+        let e = match parse_request(&mut r) { Err(e) => e, Ok(_) => panic!("expected an error") };
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+    }
+}
+
+fn handle_conn(mut stream: TcpStream, handle: &Handle, cfg_path: &Path) -> std::io::Result<()> {
+    let _ = stream.set_read_timeout(Some(SOCKET_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(SOCKET_TIMEOUT));
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let req = match parse_request(&mut reader) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData =>
+            return respond(&mut stream, 413, &"{\"error\":\"too large\"}".into()),
+        Err(e) => return Err(e),
+    };
+    let (code, body) = route(&req, handle, cfg_path);
+    respond(&mut stream, code, &body)
+}
+
+/// Write one response, over any stream that can be written to -- TCP (this module's own callers) or
+/// the control socket (`control_socket.rs`), so a streamed generation renders byte-identically
+/// regardless of transport.
+/// How often a streaming response asks whether its client is still there.
+///
+/// Needed because "did a write fail" is not an answer during prefill: nothing is being written.
+/// Bounds detection to this plus one dispatch.
+const PEER_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Whether the client is still connected, WITHOUT consuming anything it sent.
+///
+/// The default is "alive". A transport that cannot answer cheaply must never guess `false`: a
+/// wrong "gone" kills a live generation, which is strictly worse than noticing a dead one late.
+pub(crate) trait PeerAlive {
+    fn peer_alive(&self) -> bool {
+        true
+    }
+}
+
+impl PeerAlive for TcpStream {
+    /// `peek` is `recv(MSG_PEEK)`: it looks without consuming, so a pipelined request still arrives
+    /// intact. `Ok(0)` is the orderly close we are hunting; `WouldBlock` is a healthy connection
+    /// with nothing to say, which is the common case and must not read as gone.
+    fn peer_alive(&self) -> bool {
+        if self.set_nonblocking(true).is_err() {
+            return true;
+        }
+        let alive = match self.peek(&mut [0u8; 1]) {
+            Ok(0) => false,
+            Ok(_) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => true,
+            Err(_) => false,
+        };
+        let _ = self.set_nonblocking(false);
+        alive
+    }
+}
+
+/// The control socket is the CLI, which does not abandon a request mid-flight the way a browser
+/// does. Left on the default rather than given a second implementation nothing exercises.
+impl PeerAlive for std::os::unix::net::UnixStream {}
+
+pub(crate) fn respond<W: Write + PeerAlive>(stream: &mut W, code: u16, body: &Body) -> std::io::Result<()> {
+    if let Body::Stream(s) = body {
+        return respond_stream(stream, code, s);
+    }
+    let data = body.bytes();
+    // Header and body are written separately because the body is not always UTF-8 (audio/wav).
+    let head = format!(
+        "HTTP/1.1 {code} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        reason_phrase(code), body.content_type(), data.len());
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(data)?;
+    stream.flush()
+}
+
+pub(crate) fn reason_phrase(code: u16) -> &'static str {
+    match code {
+        200 => "OK", 400 => "Bad Request", 404 => "Not Found", 413 => "Payload Too Large",
+        500 => "Internal Server Error", 501 => "Not Implemented", 503 => "Service Unavailable",
+        _ => "Error",
+    }
+}
+
+/// The next item, or `None` once the generation is over.
+///
+/// This is where a streaming response learns its client left. Waiting on the channel alone cannot
+/// tell: during prefill the generator produces nothing for minutes, so there is no write to fail
+/// and no item to arrive. Polling the socket on the timeout is the only signal that does not
+/// require traffic -- and setting `cancel` is what reaches the generator, which is otherwise
+/// several dispatches deep in the driver.
+///
+/// `Err` is returned only for a write failure by the caller; a vanished peer is a clean end.
+fn next_item<W: Write + PeerAlive>(
+    stream: &mut W,
+    s: &SseStream,
+) -> std::io::Result<Option<StreamItem>> {
+    loop {
+        match s.rx.recv_timeout(PEER_POLL_INTERVAL) {
+            Ok(item) => return Ok(Some(item)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(None),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if !stream.peer_alive() {
+                    s.cancel.cancel(npu_models::CancelReason::PeerGone);
+                    return Ok(None);
+                }
+            }
+        }
+    }
+}
+
+/// Stream Server-Sent Events as the actor produces them: one `data:` frame per item, `[DONE]`
+/// terminates. No `Content-Length` -- the length is not known up front, which is the whole point.
+///
+/// A failed write (the client hung up) returns `Err` immediately instead of trying the rest of the
+/// stream, which drops `s.rx` on the way out. The actor's next `tx.send` then fails and the
+/// generator's sink returns `false` -- this is the entire disconnect-abort mechanism; nothing here
+/// signals the actor directly.
+fn respond_stream<W: Write + PeerAlive>(stream: &mut W, code: u16, s: &SseStream) -> std::io::Result<()> {
+    if matches!(s.kind, SseKind::OllamaChat) {
+        return respond_ndjson(stream, code, s);
+    }
+    let head = format!(
+        "HTTP/1.1 {code} {}\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\
+         Connection: close\r\n\r\n", reason_phrase(code));
+    stream.write_all(head.as_bytes())?;
+    if matches!(s.kind, SseKind::Chat) {
+        stream.write_all(format!("data: {}\n\n", s.render_role()).as_bytes())?;
+    }
+    let meta = s.meta();
+    let mut log = crate::run_log::RunLog::open(&s.id);
+    if let Some(l) = log.as_mut() { l.header(&meta); }
+    // OpenAI indexes tool calls within the choice, and a client concatenates argument fragments by
+    // that index. We emit each call whole, so every index appears exactly once.
+    let mut tool_calls_seen = 0usize;
+    while let Some(item) = next_item(stream, s)? {
+        // Exactly one of `Text` and `Step` drives the frames, never both: a record's `emit` is the
+        // same bytes the text item carries, so the stream reads identically either way. With stats
+        // off this is byte-for-byte the stream that existed before telemetry.
+        let frame = match item {
+            StreamItem::Text(t) => {
+                if s.stats { continue }
+                s.render_text(&t)
+            }
+            // An SSE COMMENT, not a data frame: spec-legal, ignored by every client, and it is what
+            // stops a proxy timing out a prefill that produces nothing for minutes. A `data:` frame
+            // would reach a strict client as an unknown object in the middle of a completion.
+            StreamItem::Progress { prefilled, total } => {
+                stream.write_all(format!(": prefill {prefilled}/{total}\n\n").as_bytes())?;
+                continue;
+            }
+            StreamItem::Step(r) => {
+                if log.is_none() && !s.stats { continue }
+                // Rendered once and used for both destinations: the log and the wire must carry
+                // the same bytes, and rendering twice is how they stop doing that.
+                let line = wire::chunk_line(&r, &meta);
+                if let Some(l) = log.as_mut() { l.line(&line); }
+                if !s.stats { continue }
+                line.to_string()
+            }
+            StreamItem::Done { reason, report, .. } => {
+                if let Some(l) = log.as_mut() {
+                    l.line(&wire::prefill_line(&report.prefill, &meta));
+                    l.line(&wire::summary_line(&report, &meta, reason));
+                }
+                // The finish frame first, so a client that stops at `finish_reason` still sees the
+                // stream end where it always did; the summary is an extra frame after it, and only
+                // for a caller that asked -- OpenAI gates its own trailing usage chunk the same way,
+                // because a strict client is entitled to be surprised by an unknown `object`.
+                stream.write_all(format!("data: {}\n\n", s.render_done(reason)).as_bytes())?;
+                if !s.stats { continue }
+                // A CLI-over-socket client always requests `stats` (see `npu-cli`'s socket client)
+                // regardless of its OWN `--stats` display flag, precisely to get this: the full
+                // report is what lets it render either the one-line or the full table locally, from
+                // the identical `GenerationReport` the in-process path used. Gated the same as
+                // `summary_line` below -- `stats: false` keeps this stream byte-for-byte what it was
+                // before telemetry existed, which `a_stream_without_the_opt_in_is_unchanged` pins.
+                let report_frame = serde_json::json!({"x_npu_report": &*report}).to_string();
+                stream.write_all(format!("data: {report_frame}\n\n").as_bytes())?;
+                wire::summary_line(&report, &meta, reason).to_string()
+            }
+            // Tool-call frames are never suppressed by `stats`. `Text` can be, because the same
+            // bytes come back on the `Step` line; a call has no other carrier, and dropping one
+            // would leave the client with a `tool_calls` finish reason and nothing to execute.
+            StreamItem::ToolCall(c) => {
+                let i = tool_calls_seen;
+                tool_calls_seen += 1;
+                s.render_tool_call(&c, i)
+            }
+            StreamItem::Error(e) => s.render_error(&e.to_string()),
+        };
+        stream.write_all(format!("data: {frame}\n\n").as_bytes())?;
+    }
+    // A client that left gets no terminator -- there is nobody to read it -- but the LOG still owes
+    // an ending, or this run is a header and nothing else.
+    if let Some(r) = s.cancel.reason() {
+        if let Some(l) = log.as_mut() {
+            l.line(&wire::aborted_line(&meta, r.as_str()));
+        }
+        return Ok(());
+    }
+    stream.write_all(b"data: [DONE]\n\n")?;
+    stream.flush()
+}
+
+
+/// Ollama's stream: one bare JSON object per line. No `data:` prefix, no blank-line separator, no
+/// `[DONE]` sentinel -- the last object carries `done: true` and IS the terminator.
+///
+/// The disconnect-abort mechanism is the SSE path's, unchanged: a failed write drops `s.rx`, the
+/// actor's next send fails, and the generator's sink returns false.
+fn respond_ndjson<W: Write + PeerAlive>(stream: &mut W, code: u16, s: &SseStream) -> std::io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 {code} {}\r\nContent-Type: application/x-ndjson\r\nCache-Control: no-cache\r\n\
+         Connection: close\r\n\r\n", reason_phrase(code));
+    stream.write_all(head.as_bytes())?;
+    let stamp = s.created_at();
+    while let Some(item) = next_item(stream, s)? {
+        let line = match item {
+            StreamItem::Text(t) => crate::ollama::chat_chunk(&s.model, &stamp, &t),
+            // A tool call has no other carrier on this wire, so it is never suppressed.
+            StreamItem::ToolCall(c) => crate::ollama::chat_tool_call_chunk(&s.model, &stamp, &c),
+            // Ollama's wire is NDJSON; it has no comment syntax to carry a heartbeat in.
+            StreamItem::Step(_) | StreamItem::Progress { .. } => continue,
+            StreamItem::Done { reason, report, .. } =>
+                crate::ollama::chat_done(&s.model, &stamp, reason, &report),
+            // Ollama has no error frame in-stream; a client reads the field and stops.
+            StreamItem::Error(e) =>
+                serde_json::json!({ "error": e.to_string() }).to_string(),
+        };
+        stream.write_all(line.as_bytes())?;
+        stream.write_all(b"\n")?;
+        stream.flush()?;
+    }
+    stream.flush()
+}
+
+/// HTTP/JSON/WAV parsing helpers (ported from the C3 npu-serve), pure + unit-tested.
+pub mod parse {
+    /// The `input` of an embeddings request: one string, or an array of them.
+    ///
+    /// A real scan over JSON string literals, not a search for `[` and `]`. The previous version
+    /// looked for those characters anywhere in the body, so a `[` inside a string value started an
+    /// "array", a `]` inside one ended it, and splitting on unescaped `"` cut an input in half at
+    /// every `\"`. All three returned a wrong answer under HTTP 200; prose with links, quotes or
+    /// brackets is the common case, not the corner case.
+    ///
+    /// `Err` rather than a best guess: the old fallback treated an unparseable body as the text to
+    /// embed, which turned a client bug into a plausible-looking vector.
+    pub fn parse_inputs(body: &str) -> Result<Vec<String>, String> {
+        let b = body.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] != b'"' { i += 1; continue; }
+            let (key, after) = scan_json_string(body, i)?;
+            // A string is a KEY only if a colon follows it; otherwise it is a value, and scanning
+            // past it as a unit is exactly what stops `"input"` inside a value from matching.
+            let mut j = after;
+            while j < b.len() && b[j].is_ascii_whitespace() { j += 1; }
+            if j < b.len() && b[j] == b':' {
+                if key == "input" { return scan_input_value(body, j + 1); }
+                i = j + 1;
+            } else {
+                i = after;
+            }
+        }
+        Err("missing \"input\" field".into())
+    }
+
+    /// The value after `"input":` -- a string, or an array of strings.
+    fn scan_input_value(s: &str, mut i: usize) -> Result<Vec<String>, String> {
+        let b = s.as_bytes();
+        while i < b.len() && b[i].is_ascii_whitespace() { i += 1; }
+        match b.get(i) {
+            Some(b'"') => Ok(vec![scan_json_string(s, i)?.0]),
+            Some(b'[') => {
+                let mut out = Vec::new();
+                i += 1;
+                loop {
+                    while i < b.len() && b[i].is_ascii_whitespace() { i += 1; }
+                    match b.get(i) {
+                        Some(b']') => return Ok(out),
+                        Some(b',') => i += 1,
+                        Some(b'"') => { let (v, n) = scan_json_string(s, i)?; out.push(v); i = n; }
+                        Some(c) => return Err(format!("input array: expected a string, got {:?}", *c as char)),
+                        None => return Err("unterminated input array".into()),
+                    }
+                }
+            }
+            Some(c) => Err(format!("input must be a string or an array of strings, got {:?}", *c as char)),
+            None => Err("input has no value".into()),
+        }
+    }
+
+    /// Decode the JSON string literal starting at `start` (which must be its opening quote).
+    /// Returns the decoded text and the index just past the closing quote.
+    fn scan_json_string(s: &str, start: usize) -> Result<(String, usize), String> {
+        let b = s.as_bytes();
+        if b.get(start) != Some(&b'"') { return Err("expected a string".into()); }
+        let mut out = String::new();
+        let mut i = start + 1;
+        while i < b.len() {
+            match b[i] {
+                b'"' => return Ok((out, i + 1)),
+                b'\\' => {
+                    i += 1;
+                    match *b.get(i).ok_or("string ends inside an escape")? {
+                        b'"' => out.push('"'),
+                        b'\\' => out.push('\\'),
+                        b'/' => out.push('/'),
+                        b'b' => out.push('\u{8}'),
+                        b'f' => out.push('\u{c}'),
+                        b'n' => out.push('\n'),
+                        b'r' => out.push('\r'),
+                        b't' => out.push('\t'),
+                        b'u' => { let (c, n) = scan_unicode_escape(b, i + 1)?; out.push(c); i = n - 1; }
+                        c => return Err(format!("bad escape \\{:?}", c as char)),
+                    }
+                    i += 1;
+                }
+                // Not ASCII-indexable: step by whole chars so multi-byte UTF-8 is copied intact.
+                // Slicing `s` is O(1), so this stays linear over the body.
+                _ => {
+                    let c = s[i..].chars().next().ok_or("invalid UTF-8 in string")?;
+                    out.push(c);
+                    i += c.len_utf8();
+                }
+            }
+        }
+        Err("unterminated string".into())
+    }
+
+    /// A `\uXXXX` escape, including the surrogate PAIR a non-BMP character needs. Returns the
+    /// character and the index just past the escape. A lone surrogate is an error, not a
+    /// replacement char: it means the client sent something it could not have meant.
+    fn scan_unicode_escape(b: &[u8], i: usize) -> Result<(char, usize), String> {
+        let hi = hex4(b, i)?;
+        if !(0xD800..0xDC00).contains(&hi) {
+            let c = char::from_u32(hi as u32).ok_or("invalid \\u escape")?;
+            return Ok((c, i + 4));
+        }
+        if b.get(i + 4) != Some(&b'\\') || b.get(i + 5) != Some(&b'u') {
+            return Err("high surrogate without a following \\u escape".into());
+        }
+        let lo = hex4(b, i + 6)?;
+        if !(0xDC00..0xE000).contains(&lo) { return Err("high surrogate not followed by a low one".into()); }
+        let cp = 0x10000 + (((hi - 0xD800) as u32) << 10) + (lo - 0xDC00) as u32;
+        Ok((char::from_u32(cp).ok_or("invalid surrogate pair")?, i + 10))
+    }
+
+    /// The generation request extracted from a chat/completions body: routing (`model`), the prompt,
+    /// the full sampling surface, and whether to stream.
+    pub struct ParsedGenerate {
+        pub model: Option<String>,
+        pub prompt: npu_models::Prompt,
+        pub params: npu_models::GenerateParams,
+        pub stream: bool,
+        /// Per-token measurement in the stream. Opt-in, not because measuring is expensive -- the
+        /// records exist either way -- but because it is 173 bytes per token on the wire (measured
+        /// 2026-09-09 over a 64-token qwen3-0.6b completion: 354 B/token with it, 182 without), and a
+        /// client that did not ask for them should not pay to carry them.
+        pub stats: bool,
+    }
+
+    /// `stream_options: {"include_stats": true}`, spelled after OpenAI's own `include_usage` so it
+    /// sits where a caller already looks, with a top-level `x_npu_stats` as the curl-friendly
+    /// shorthand.
+    pub fn wants_stats(v: &serde_json::Value) -> bool {
+        v.get("stream_options").and_then(|o| o.get("include_stats")).and_then(|b| b.as_bool())
+            .or_else(|| v.get("x_npu_stats").and_then(|b| b.as_bool()))
+            .unwrap_or(false)
+    }
+
+    /// `/v1/chat/completions`: the full `messages` array (system prompt + history, not just the last
+    /// turn -- that was the bug) plus the sampling surface. `serde_json`, not the hand-rolled scanner
+    /// above: `messages` is genuinely nested (array of objects, content sometimes itself an array),
+    /// and that shape is exactly where a hand-rolled parser accumulates bugs.
+    pub fn parse_chat_request(body: &str) -> Result<ParsedGenerate, String> {
+        let v: serde_json::Value = serde_json::from_str(body).map_err(|e| format!("invalid JSON: {e}"))?;
+        let model = v.get("model").and_then(|m| m.as_str()).map(str::to_string);
+        let messages = v.get("messages").and_then(|m| m.as_array())
+            .ok_or_else(|| "missing \"messages\" array".to_string())?;
+        if messages.is_empty() { return Err("\"messages\" must not be empty".into()); }
+        let mut chat = Vec::with_capacity(messages.len());
+        for (i, m) in messages.iter().enumerate() {
+            let role = m.get("role").and_then(|r| r.as_str())
+                .ok_or_else(|| format!("messages[{i}]: missing \"role\""))?.to_string();
+            // An assistant turn that called a tool carries the call in `tool_calls`, not in
+            // `content`, and OpenAI sends `content: null` for it. That is not missing content.
+            let calls = match m.get("tool_calls").and_then(|c| c.as_array()) {
+                Some(c) if !c.is_empty() => parse_tool_calls(c).map_err(|e| format!("messages[{i}]: {e}"))?,
+                _ => Vec::new(),
+            };
+            let (content, media) = parse_content(m.get("content"), !calls.is_empty())
+                .map_err(|e| format!("messages[{i}]: {e}"))?;
+            let mut msg = npu_models::ChatMessage::new(role, content);
+            if !calls.is_empty() {
+                msg = msg.with_tool_calls(calls);
+            }
+            if let Some(id) = m.get("tool_call_id").and_then(|c| c.as_str()) {
+                msg = msg.with_tool_call_id(id);
+            }
+            if !media.is_empty() {
+                msg = msg.with_media(media);
+            }
+            chat.push(msg);
+        }
+        let mut params = parse_generate_params(&v)?;
+        params.tools = parse_tools(&v)?;
+        let stream = v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
+        reject_unsupported(&v, false)?;
+        Ok(ParsedGenerate { model, prompt: npu_models::Prompt::Chat(chat), params, stream,
+                            stats: wants_stats(&v) })
+    }
+
+    /// The declared `tools`, after `tool_choice` has had its say.
+    ///
+    /// `tool_choice: "none"` returns an EMPTY list rather than being recorded as a flag: "the model
+    /// will not call a tool" is exactly what an unrendered tools block means, so there is nothing
+    /// further downstream to know about. `"required"` and a named function are rejected in
+    /// `reject_unsupported` -- we cannot GUARANTEE either without constrained decoding, and
+    /// accepting them and hoping is the silent substitution this surface exists to refuse.
+    fn parse_tools(v: &serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+        if v.get("tool_choice").and_then(|c| c.as_str()) == Some("none") {
+            return Ok(Vec::new());
+        }
+        let Some(tools) = v.get("tools").filter(|t| !t.is_null()) else { return Ok(Vec::new()) };
+        let tools = tools.as_array().ok_or_else(|| "\"tools\" must be an array".to_string())?;
+        for (i, t) in tools.iter().enumerate() {
+            if t.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()).is_none() {
+                return Err(format!("tools[{i}]: missing \"function.name\""));
+            }
+        }
+        Ok(tools.clone())
+    }
+
+    /// The `tool_calls` on an assistant turn we are being sent BACK, so the model can see what it
+    /// called. `arguments` is a JSON string on the wire; a template renders it as an object, so it
+    /// is decoded here rather than left for the template to fail on.
+    fn parse_tool_calls(calls: &[serde_json::Value]) -> Result<Vec<npu_models::ToolCall>, String> {
+        calls
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let f = c.get("function")
+                    .ok_or_else(|| format!("tool_calls[{i}]: missing \"function\""))?;
+                let name = f.get("name").and_then(|n| n.as_str())
+                    .ok_or_else(|| format!("tool_calls[{i}]: missing \"function.name\""))?;
+                let arguments = match f.get("arguments") {
+                    Some(serde_json::Value::String(s)) if s.trim().is_empty() => serde_json::json!({}),
+                    Some(serde_json::Value::String(s)) => serde_json::from_str(s)
+                        .map_err(|e| format!("tool_calls[{i}]: \"arguments\" is not JSON: {e}"))?,
+                    Some(other) => other.clone(),
+                    None => serde_json::json!({}),
+                };
+                Ok(npu_models::ToolCall {
+                    id: c.get("id").and_then(|x| x.as_str()).unwrap_or("call_0").to_string(),
+                    name: name.to_string(),
+                    arguments,
+                })
+            })
+            .collect()
+    }
+
+    /// `POST /api/chat`. Ollama's request shape over the same `ParsedGenerate` the OpenAI routes
+    /// produce, so exactly one generation path exists downstream.
+    ///
+    /// Three real differences from `parse_chat_request`, each a bug if assumed away:
+    ///   * sampling lives under `options`, not at the top level;
+    ///   * `stream` defaults to TRUE (OpenAI's defaults to false);
+    ///   * `num_predict: -1` means "no limit", which is the ABSENCE of a request value here rather
+    ///     than a number, so the model's own budget still applies.
+    pub fn parse_ollama_chat_request(body: &str) -> Result<ParsedGenerate, String> {
+        let v: serde_json::Value = serde_json::from_str(body).map_err(|e| format!("invalid JSON: {e}"))?;
+        let model = v.get("model").and_then(|m| m.as_str()).map(str::to_string);
+        let messages = v.get("messages").and_then(|m| m.as_array())
+            .ok_or_else(|| "missing \"messages\" array".to_string())?;
+        if messages.is_empty() { return Err("\"messages\" must not be empty".into()); }
+        let mut chat = Vec::with_capacity(messages.len());
+        for (i, m) in messages.iter().enumerate() {
+            let role = m.get("role").and_then(|r| r.as_str())
+                .ok_or_else(|| format!("messages[{i}]: missing \"role\""))?.to_string();
+            let calls = match m.get("tool_calls").and_then(|c| c.as_array()) {
+                Some(c) if !c.is_empty() => parse_tool_calls(c).map_err(|e| format!("messages[{i}]: {e}"))?,
+                _ => Vec::new(),
+            };
+            let (content, media) = parse_content(m.get("content"), !calls.is_empty())
+                .map_err(|e| format!("messages[{i}]: {e}"))?;
+            let mut msg = npu_models::ChatMessage::new(role, content);
+            if !calls.is_empty() { msg = msg.with_tool_calls(calls); }
+            if let Some(id) = m.get("tool_call_id").and_then(|c| c.as_str()) {
+                msg = msg.with_tool_call_id(id);
+            }
+            if !media.is_empty() { msg = msg.with_media(media); }
+            chat.push(msg);
+        }
+
+        let mut params = npu_models::GenerateParams::default();
+        let opts = v.get("options").and_then(|o| o.as_object());
+        let opt = |k: &str| opts.and_then(|o| o.get(k));
+        params.temperature = opt("temperature").and_then(|x| x.as_f64()).map(|f| f as f32);
+        params.top_p = opt("top_p").and_then(|x| x.as_f64()).map(|f| f as f32);
+        params.top_k = opt("top_k").and_then(|x| x.as_u64()).map(|n| n as u32);
+        params.seed = opt("seed").and_then(|x| x.as_u64());
+        params.repetition_penalty = opt("repeat_penalty").and_then(|x| x.as_f64()).map(|f| f as f32);
+        params.max_tokens = match opt("num_predict").and_then(|x| x.as_i64()) {
+            Some(n) if n >= 0 => Some(n as u32),
+            _ => None,
+        };
+        params.stop = match opt("stop") {
+            Some(serde_json::Value::String(s)) => vec![s.clone()],
+            Some(serde_json::Value::Array(a)) =>
+                a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect(),
+            _ => Vec::new(),
+        };
+        params.tools = parse_tools(&v)?;
+        // `think` is Ollama's spelling of the kwarg our template calls `enable_thinking`. Absent
+        // leaves it UNSET, which is not the same as true -- see `ChatTemplate::render_with`.
+        params.enable_thinking = v.get("think").and_then(|x| x.as_bool());
+        params.validate()?;
+
+        let stream = v.get("stream").and_then(|s| s.as_bool()).unwrap_or(true);
+        Ok(ParsedGenerate { model, prompt: npu_models::Prompt::Chat(chat), params, stream, stats: false })
+    }
+
+    /// A message's `content`: a plain string, or OpenAI's multi-part array form. `text` parts
+    /// flatten in place; `image_url`/`input_audio` parts decode to raw bytes (returned separately,
+    /// in appearance order) and leave a `<|image|>`/`<|audio|>` marker in the text -- the SAME
+    /// literal string the model's own chat template emits for a media item
+    /// (`gemma4_media.rs`/`multimodal.rs`'s `expand_media_placeholders` expands it downstream once
+    /// the actual soft-token count is known). Any other part type is REJECTED rather than silently
+    /// dropped -- dropping content changes the prompt's meaning with no trace, spec S6.
+    fn parse_content(v: Option<&serde_json::Value>, has_tool_calls: bool)
+        -> Result<(String, Vec<npu_models::ChatMedia>), String> {
+        match v {
+            // OpenAI sends `content: null` on an assistant turn whose payload is `tool_calls`, and
+            // omits it entirely on some clients. That is not missing content -- the turn's content
+            // IS the call. Only a turn with no call either way is still an error.
+            Some(serde_json::Value::Null) | None if has_tool_calls => Ok((String::new(), Vec::new())),
+            Some(serde_json::Value::String(s)) => Ok((s.clone(), Vec::new())),
+            Some(serde_json::Value::Array(parts)) => {
+                let mut out = String::new();
+                let mut media = Vec::new();
+                for p in parts {
+                    match p.get("type").and_then(|t| t.as_str()) {
+                        Some("text") => out.push_str(p.get("text").and_then(|t| t.as_str()).unwrap_or("")),
+                        Some("image_url") => {
+                            let url = p.get("image_url").and_then(|i| i.get("url")).and_then(|u| u.as_str())
+                                .ok_or("\"image_url\" part missing \"image_url.url\"")?;
+                            media.push(npu_models::ChatMedia::Image(decode_data_url(url, "image")?));
+                            out.push_str("<|image|>");
+                        }
+                        Some("input_audio") => {
+                            let ia = p.get("input_audio")
+                                .ok_or("\"input_audio\" part missing \"input_audio\"")?;
+                            let format = ia.get("format").and_then(|f| f.as_str()).unwrap_or("");
+                            if format != "wav" {
+                                return Err(format!(
+                                    "\"input_audio.format\" {format:?} is not supported (supported: \"wav\")"));
+                            }
+                            let b64 = ia.get("data").and_then(|d| d.as_str())
+                                .ok_or("\"input_audio\" part missing \"input_audio.data\"")?;
+                            let bytes = base64::Engine::decode(
+                                &base64::engine::general_purpose::STANDARD, b64)
+                                .map_err(|e| format!("\"input_audio.data\" is not valid base64: {e}"))?;
+                            media.push(npu_models::ChatMedia::Audio(bytes));
+                            out.push_str("<|audio|>");
+                        }
+                        Some(other) => return Err(format!("unsupported content part type {other:?}")),
+                        None => return Err("content part missing \"type\"".into()),
+                    }
+                }
+                Ok((out, media))
+            }
+            Some(_) => Err("\"content\" must be a string or an array of parts".into()),
+            None => Err("missing \"content\"".into()),
+        }
+    }
+
+    /// `image_url.url`'s ONLY supported form is a `data:` URL -- `data:<mime>;base64,<payload>`.
+    /// A remote `http(s)://` URL is a clear 400, never a silent fetch: this server does no network
+    /// I/O to serve a generation, and fetching one would be a very different trust/latency surface
+    /// than "decode the bytes you sent me".
+    fn decode_data_url(url: &str, what: &str) -> Result<Vec<u8>, String> {
+        let payload = url.strip_prefix("data:")
+            .and_then(|rest| rest.split_once(",").map(|(_, b64)| b64))
+            .ok_or_else(|| format!(
+                "\"{what}_url.url\" must be a data: URL (data:<mime>;base64,<payload>); \
+                 remote http(s) URLs are not fetched by this server"))?;
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, payload)
+            .map_err(|e| format!("\"{what}_url.url\" payload is not valid base64: {e}"))
+    }
+
+    /// `/v1/completions`. The array form of `prompt` (OpenAI allows batching several prompts in one
+    /// request) is rejected with a clear 400 -- this surface serves one completion per request, and
+    /// silently taking just the first would answer a different request than the one sent.
+    pub fn parse_completion_request(body: &str) -> Result<ParsedGenerate, String> {
+        let v: serde_json::Value = serde_json::from_str(body).map_err(|e| format!("invalid JSON: {e}"))?;
+        let model = v.get("model").and_then(|m| m.as_str()).map(str::to_string);
+        let prompt = match v.get("prompt") {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(serde_json::Value::Array(_)) =>
+                return Err("array \"prompt\" (batched prompts) is not supported; send one string".into()),
+            Some(_) => return Err("\"prompt\" must be a string".into()),
+            None => return Err("missing \"prompt\"".into()),
+        };
+        let params = parse_generate_params(&v)?;
+        let stream = v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
+        reject_unsupported(&v, true)?;
+        Ok(ParsedGenerate { model, prompt: npu_models::Prompt::Raw(prompt), params, stream,
+                            stats: wants_stats(&v) })
+    }
+
+    /// The shared sampling surface: OpenAI's fields plus `top_k`/`repetition_penalty`, neither in
+    /// OpenAI's schema but both universal among local servers (`GenerateParams`'s own doc comment).
+    /// A field absent from the body keeps `GenerateParams::default()` -- OpenAI's defaults (e.g.
+    /// `temperature: 1.0`), never a silent substitution of greedy.
+    fn parse_generate_params(v: &serde_json::Value) -> Result<npu_models::GenerateParams, String> {
+        let mut p = npu_models::GenerateParams::default();
+        if let Some(x) = v.get("temperature") { p.temperature = Some(as_f32(x, "temperature")?); }
+        if let Some(x) = v.get("top_p") { p.top_p = Some(as_f32(x, "top_p")?); }
+        if let Some(x) = v.get("top_k") { p.top_k = Some(as_u32(x, "top_k")?); }
+        // `max_completion_tokens` is OpenAI's current spelling; `max_tokens` is the deprecated one
+        // every existing client still sends. Accept both, reject a body that sets them to different
+        // values rather than silently picking a winner.
+        let max_tokens = match (v.get("max_tokens"), v.get("max_completion_tokens")) {
+            (Some(a), Some(b)) => {
+                let (a, b) = (as_u32(a, "max_tokens")?, as_u32(b, "max_completion_tokens")?);
+                if a != b {
+                    return Err(format!(
+                        "\"max_tokens\" ({a}) and \"max_completion_tokens\" ({b}) disagree; send one"));
+                }
+                Some(a)
+            }
+            (Some(a), None) => Some(as_u32(a, "max_tokens")?),
+            (None, Some(b)) => Some(as_u32(b, "max_completion_tokens")?),
+            (None, None) => None,
+        };
+        p.max_tokens = max_tokens;
+        if let Some(x) = v.get("seed") { p.seed = Some(as_u64(x, "seed")?); }
+        if let Some(x) = v.get("presence_penalty") { p.presence_penalty = Some(as_f32(x, "presence_penalty")?); }
+        if let Some(x) = v.get("frequency_penalty") { p.frequency_penalty = Some(as_f32(x, "frequency_penalty")?); }
+        if let Some(x) = v.get("repetition_penalty") { p.repetition_penalty = Some(as_f32(x, "repetition_penalty")?); }
+        // `chat_template_kwargs` is the spelling vLLM and SGLang use, and the one reasoning models
+        // are driven by in practice. Honour `enable_thinking`; 400 on any other key rather than
+        // accept it silently -- an ignored template kwarg changes the PROMPT, which is the "answer
+        // a request other than the one that was sent" case `reject_unsupported` exists for.
+        if let Some(k) = v.get("chat_template_kwargs") {
+            let obj = k.as_object().ok_or("\"chat_template_kwargs\" must be an object")?;
+            for (key, val) in obj {
+                match key.as_str() {
+                    "enable_thinking" => p.enable_thinking = Some(val.as_bool()
+                        .ok_or("\"chat_template_kwargs.enable_thinking\" must be a boolean")?),
+                    other => return Err(format!(
+                        "\"chat_template_kwargs.{other}\" is not supported")),
+                }
+            }
+        }
+        p.stop = match v.get("stop") {
+            None | Some(serde_json::Value::Null) => Vec::new(),
+            Some(serde_json::Value::String(s)) => vec![s.clone()],
+            Some(serde_json::Value::Array(items)) => items.iter()
+                .map(|i| i.as_str().map(str::to_string)
+                    .ok_or_else(|| "\"stop\" array must contain only strings".to_string()))
+                .collect::<Result<Vec<_>, _>>()?,
+            Some(_) => return Err("\"stop\" must be a string or an array of strings".into()),
+        };
+        // `x_npu_` like `x_npu_stats`: not an OpenAI field, so it needs the same escape hatch.
+        // Until now only reachable in-process (`npu generate --dispatch-log`, which built a
+        // `GenerateParams` directly); the CLI becoming a socket client needs a wire carrier or the
+        // flag silently stops doing anything the moment `generate`/`chat` stop calling the engine
+        // in-process.
+        if let Some(x) = v.get("x_npu_dispatch_log") {
+            p.dispatch_log = Some(x.as_bool().ok_or("\"x_npu_dispatch_log\" must be a boolean")?);
+        }
+        // Shared with the CLI so the two surfaces cannot drift on what they accept.
+        p.validate()?;
+        Ok(p)
+    }
+    fn as_f32(v: &serde_json::Value, field: &str) -> Result<f32, String> {
+        v.as_f64().map(|f| f as f32).ok_or_else(|| format!("\"{field}\" must be a number"))
+    }
+    fn as_u32(v: &serde_json::Value, field: &str) -> Result<u32, String> {
+        v.as_u64().and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| format!("\"{field}\" must be a non-negative integer"))
+    }
+    fn as_u64(v: &serde_json::Value, field: &str) -> Result<u64, String> {
+        v.as_u64().ok_or_else(|| format!("\"{field}\" must be a non-negative integer"))
+    }
+
+    /// Spec S6 ("branch freely on *how*, never silently on *what*"): a client-visible parameter this
+    /// surface cannot honour must be a 400, not a quiet no-op. `n != 1`, `logprobs`, `logit_bias`,
+    /// `tools` and friends all change what the RESPONSE IS; accepting them and ignoring their effect
+    /// would answer a request other than the one that was sent, with no trace of the substitution.
+    /// `null`, `[]` or `{}` -- the three ways a client says "nothing here". A field with one of
+    /// these asks for no behaviour, so it can be accepted whatever the field means.
+    fn is_empty_collection(v: &serde_json::Value) -> bool {
+        match v {
+            serde_json::Value::Null => true,
+            serde_json::Value::Array(a) => a.is_empty(),
+            serde_json::Value::Object(o) => o.is_empty(),
+            _ => false,
+        }
+    }
+
+    fn reject_unsupported(v: &serde_json::Value, completions: bool) -> Result<(), String> {
+        if let Some(n) = v.get("n").and_then(|x| x.as_u64()) {
+            if n != 1 { return Err("\"n\" != 1 is not supported".into()); }
+        }
+        let logprobs_wanted = if completions {
+            v.get("logprobs").map(|x| !x.is_null()).unwrap_or(false)
+        } else {
+            v.get("logprobs").and_then(|x| x.as_bool()).unwrap_or(false)
+        };
+        if logprobs_wanted { return Err("\"logprobs\" is not supported".into()); }
+        // NOT `!is_null()`: an EMPTY collection requests nothing, so honouring it and ignoring it
+        // are the SAME response and S6 does not apply. `tools: []` is what a client sends on a
+        // plain chat with tool support switched on, and rejecting it was a hard 400 on every
+        // message. `logit_bias: {}` is the same shape.
+        for field in ["logit_bias", "response_format"] {
+            if v.get(field).is_some_and(|x| !is_empty_collection(x)) {
+                return Err(format!("\"{field}\" is not supported"));
+            }
+        }
+        // `auto` and `none` are both honoured -- `none` by not rendering the tools block, which is
+        // exactly what it means. `required` and a named function are not: without constrained
+        // decoding we cannot make the model call anything, and answering as if we had is the silent
+        // substitution this function exists to prevent.
+        match v.get("tool_choice") {
+            None => {}
+            Some(x) if is_empty_collection(x) => {}
+            Some(serde_json::Value::String(s)) if s == "auto" || s == "none" => {}
+            Some(_) => {
+                return Err("\"tool_choice\" other than \"auto\" or \"none\" is not supported \
+                            (this server does not constrain decoding, so it cannot guarantee a call)"
+                    .into())
+            }
+        }
+        // `stream_options` used to be rejected whole. It carries `include_stats` now, so the
+        // rejection narrows to the keys inside it rather than disappearing: `include_usage` is a
+        // real OpenAI feature this server does not emit, and quietly accepting it would be exactly
+        // the silent no-op this function exists to prevent.
+        if let Some(o) = v.get("stream_options").filter(|x| !x.is_null()) {
+            let Some(o) = o.as_object() else { return Err("\"stream_options\" must be an object".into()) };
+            for k in o.keys() {
+                if k != "include_stats" {
+                    return Err(format!("\"stream_options.{k}\" is not supported \
+                                        (this server honours \"include_stats\")"));
+                }
+            }
+        }
+        if completions {
+            if v.get("echo").and_then(|x| x.as_bool()).unwrap_or(false) {
+                return Err("\"echo\" is not supported".into());
+            }
+            if let Some(b) = v.get("best_of").and_then(|x| x.as_u64()) {
+                if b != 1 { return Err("\"best_of\" != 1 is not supported".into()); }
+            }
+            if v.get("suffix").map(|x| !x.is_null()).unwrap_or(false) {
+                return Err("\"suffix\" is not supported".into());
+            }
+        }
+        Ok(())
+    }
+
+    /// `/v1/audio/speech`'s request-shape check, the audio sibling of `reject_unsupported`: a
+    /// field this surface cannot honour must be a 400 naming it, never a silent no-op -- answering
+    /// `response_format: "mp3"` with a 200 and a WAV body would be a 200 that lied. Returns the
+    /// resolved `SpeechFormat` (`Wav` when the field is absent, since that is the one shape every
+    /// existing caller of this route already gets).
+    pub fn reject_unsupported_speech_fields(v: &serde_json::Value) -> Result<super::SpeechFormat, String> {
+        // No supported value exists yet (no model resolves a voice), so ANY explicit choice is a
+        // request this server cannot honour -- unlike `response_format`/`speed`, there is no
+        // default value that would make the field a no-op.
+        if let Some(voice) = v.get("voice").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) {
+            return Err(format!(
+                "\"voice\" {voice:?} is not supported (this server does not offer voice selection)"));
+        }
+        let format = match v.get("response_format").and_then(|x| x.as_str()) {
+            None | Some("wav") => super::SpeechFormat::Wav,
+            Some("pcm") => super::SpeechFormat::Pcm,
+            Some(other) => return Err(format!(
+                "\"response_format\" {other:?} is not supported (supported: [\"wav\", \"pcm\"])")),
+        };
+        if let Some(speed) = v.get("speed").and_then(|x| x.as_f64()) {
+            if speed != 1.0 {
+                return Err(format!(
+                    "\"speed\" {speed} is not supported (no resampling implemented; only 1.0)"));
+            }
+        }
+        if v.get("stream_format").is_some_and(|x| !x.is_null()) {
+            return Err("\"stream_format\" is not supported (this server does not stream audio)".into());
+        }
+        Ok(format)
+    }
+
+    /// Headerless little-endian i16 mono PCM -- `response_format: "pcm"`'s wire shape.
+    pub fn pcm_bytes(pcm: &[i16]) -> Vec<u8> {
+        let mut w = Vec::with_capacity(pcm.len() * 2);
+        for s in pcm { w.extend_from_slice(&s.to_le_bytes()); }
+        w
+    }
+
+    /// Wrap mono i16 PCM in a 44-byte canonical WAV header. The rate comes from the model, not a
+    /// constant: TTS does not output at the 16 kHz the ASR side works in.
+    pub fn wav_from_i16(pcm: &[i16], sample_rate: u32) -> Vec<u8> {
+        let data_len = (pcm.len() * 2) as u32;
+        let mut w = Vec::with_capacity(44 + data_len as usize);
+        w.extend_from_slice(b"RIFF");
+        w.extend_from_slice(&(36 + data_len).to_le_bytes());
+        w.extend_from_slice(b"WAVEfmt ");
+        w.extend_from_slice(&16u32.to_le_bytes());            // PCM fmt chunk size
+        w.extend_from_slice(&1u16.to_le_bytes());             // format = PCM
+        w.extend_from_slice(&1u16.to_le_bytes());             // channels = mono
+        w.extend_from_slice(&sample_rate.to_le_bytes());
+        w.extend_from_slice(&(sample_rate * 2).to_le_bytes()); // byte rate = rate * blockalign
+        w.extend_from_slice(&2u16.to_le_bytes());             // block align = channels * 2
+        w.extend_from_slice(&16u16.to_le_bytes());            // bits per sample
+        w.extend_from_slice(b"data");
+        w.extend_from_slice(&data_len.to_le_bytes());
+        for s in pcm { w.extend_from_slice(&s.to_le_bytes()); }
+        w
+    }
+
+    fn hex4(b: &[u8], i: usize) -> Result<u16, String> {
+        let s = b.get(i..i + 4).ok_or("truncated \\u escape")?;
+        let s = std::str::from_utf8(s).map_err(|_| "bad \\u escape".to_string())?;
+        u16::from_str_radix(s, 16).map_err(|_| format!("bad \\u escape {s:?}"))
+    }
+    pub fn json_escape(s: &str) -> String {
+        let mut o = String::with_capacity(s.len());
+        for ch in s.chars() {
+            match ch {
+                '"' => o.push_str("\\\""), '\\' => o.push_str("\\\\"),
+                '\n' => o.push_str("\\n"), '\r' => o.push_str("\\r"), '\t' => o.push_str("\\t"),
+                c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+                c => o.push(c),
+            }
+        }
+        o
+    }
+    pub fn extract_file_part<'a>(body: &'a [u8], boundary: &str) -> Option<&'a [u8]> {
+        extract_named_file_part(body, boundary, "file")
+    }
+    /// Like `extract_file_part`, for an upload part under a field name other than `file` (e.g.
+    /// `/v1/images/upscale`'s `image` part).
+    pub fn extract_named_file_part<'a>(body: &'a [u8], boundary: &str, field: &str) -> Option<&'a [u8]> {
+        if boundary.is_empty() { return None; }
+        let delim = format!("--{boundary}");
+        let want = format!("name=\"{}\"", field.to_ascii_lowercase());
+        for part in split_on(body, delim.as_bytes()) {
+            let hdr_end = match find(part, b"\r\n\r\n") { Some(h) => h, None => continue };
+            let headers = String::from_utf8_lossy(&part[..hdr_end]).to_ascii_lowercase();
+            if headers.contains(&want) {
+                let mut data = &part[hdr_end + 4..];
+                if data.ends_with(b"\r\n") { data = &data[..data.len() - 2]; }
+                return Some(data);
+            }
+        }
+        None
+    }
+    /// Value of a plain (non-file) multipart form field, e.g. `model` on a transcription request.
+    /// Parts carrying a `filename=` are skipped: those are uploads, handled by `extract_file_part`.
+    pub fn extract_form_field(body: &[u8], boundary: &str, field: &str) -> Option<String> {
+        if boundary.is_empty() { return None; }
+        let delim = format!("--{boundary}");
+        let want = format!("name=\"{}\"", field.to_ascii_lowercase());
+        for part in split_on(body, delim.as_bytes()) {
+            let hdr_end = match find(part, b"\r\n\r\n") { Some(h) => h, None => continue };
+            let headers = String::from_utf8_lossy(&part[..hdr_end]).to_ascii_lowercase();
+            if !headers.contains(&want) || headers.contains("filename=") { continue; }
+            let mut data = &part[hdr_end + 4..];
+            if data.ends_with(b"\r\n") { data = &data[..data.len() - 2]; }
+            let v = String::from_utf8_lossy(data).trim().to_string();
+            return if v.is_empty() { None } else { Some(v) };
+        }
+        None
+    }
+    pub fn split_on<'a>(hay: &'a [u8], sep: &[u8]) -> Vec<&'a [u8]> {
+        let mut out = Vec::new();
+        let (mut start, mut i) = (0usize, 0usize);
+        while i + sep.len() <= hay.len() {
+            if &hay[i..i + sep.len()] == sep { out.push(&hay[start..i]); i += sep.len(); start = i; }
+            else { i += 1; }
+        }
+        out.push(&hay[start..]);
+        out
+    }
+    pub fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+        if needle.is_empty() || hay.len() < needle.len() { return None; }
+        (0..=hay.len() - needle.len()).find(|&i| &hay[i..i + needle.len()] == needle)
+    }
+    pub fn parse_wav_i16(wav: &[u8]) -> Option<Vec<i16>> {
+        if wav.len() < 12 || &wav[0..4] != b"RIFF" || &wav[8..12] != b"WAVE" { return None; }
+        let mut off = 12usize;
+        let mut fmt_ok = false;
+        let mut data: Option<&[u8]> = None;
+        while off + 8 <= wav.len() {
+            let id = &wav[off..off + 4];
+            let sz = u32::from_le_bytes([wav[off + 4], wav[off + 5], wav[off + 6], wav[off + 7]]) as usize;
+            let body_start = off + 8;
+            let body_end = body_start.saturating_add(sz).min(wav.len());
+            match id {
+                b"fmt " if body_end - body_start >= 16 => {
+                    let b = &wav[body_start..body_end];
+                    let audio_fmt = u16::from_le_bytes([b[0], b[1]]);
+                    let channels = u16::from_le_bytes([b[2], b[3]]);
+                    let rate = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+                    let bits = u16::from_le_bytes([b[14], b[15]]);
+                    fmt_ok = (audio_fmt == 1 || audio_fmt == 0xFFFE) && bits == 16 && channels == 1 && rate == 16_000;
+                }
+                b"data" => data = Some(&wav[body_start..body_end]),
+                _ => {}
+            }
+            off = body_start.saturating_add(sz).saturating_add(sz & 1);
+        }
+        if !fmt_ok { return None; }
+        let data = data?;
+        let n = data.len() / 2;
+        Some((0..n).map(|i| i16::from_le_bytes([data[i * 2], data[i * 2 + 1]])).collect())
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        fn ok(body: &str) -> Vec<String> { parse_inputs(body).expect("should parse") }
+
+        #[test]
+        fn parse_inputs_single_and_array() {
+            assert_eq!(ok(r#"{"input":"hello"}"#), vec!["hello".to_string()]);
+            assert_eq!(ok(r#"{"input":["a","b"]}"#), vec!["a".to_string(), "b".to_string()]);
+        }
+
+        /// The three defects found by indexing the KB through the engine (2026-07-27). Each returned
+        /// a WRONG answer with HTTP 200, which is worse than an error: `rest.find('[')` treated a
+        /// bracket inside a string value as the start of an array, `arr.find(']')` ended the array at
+        /// the first bracket inside a string, and `split('"')` on odd indices was escape-unaware.
+        #[test]
+        fn parse_inputs_survives_the_three_measured_defects() {
+            // 1. a bracket in a single input parsed as an array of nothing -> 0 embeddings, HTTP 200.
+            // `rest.find('[')` fired on the FIRST bracket wherever it sat, so one is enough to
+            // reproduce; the case that found this in the wild carried a doubled-bracket link.
+            assert_eq!(ok(r#"{"input":"see [a link] here"}"#),
+                vec!["see [a link] here".to_string()]);
+            // 2. a `]` inside one element truncated the batch
+            let many: Vec<String> = (0..64)
+                .map(|i| if i == 7 { "a ] bracket".to_string() } else { format!("t{i}") }).collect();
+            let body = format!("{{\"input\":[{}]}}",
+                many.iter().map(|t| format!("\"{}\"", t)).collect::<Vec<_>>().join(","));
+            assert_eq!(ok(&body), many);
+            // 3. an escaped quote split one input into two
+            assert_eq!(ok(r#"{"input":["a","he said \"hi\"","c"]}"#),
+                vec!["a".to_string(), "he said \"hi\"".to_string(), "c".to_string()]);
+        }
+
+        /// Gate 1's corpus. Every case asserts a specific value -- "did not crash" is not a pass,
+        /// because the defining bug returned 200 with an empty body.
+        #[test]
+        fn parse_inputs_adversarial_corpus() {
+            // brackets, braces, backslashes, leading dashes
+            assert_eq!(ok(r#"{"input":"- a bullet"}"#), vec!["- a bullet".to_string()]);
+            assert_eq!(ok(r#"{"input":"-- a flag"}"#), vec!["-- a flag".to_string()]);
+            assert_eq!(ok(r#"{"input":"a lone { brace"}"#), vec!["a lone { brace".to_string()]);
+            assert_eq!(ok(r#"{"input":"back\\slash"}"#), vec!["back\\slash".to_string()]);
+            // whitespace escapes survive as characters, not as literals
+            assert_eq!(ok(r#"{"input":"line\nnext\ttab"}"#), vec!["line\nnext\ttab".to_string()]);
+            // empty and whitespace-only are inputs, not absences
+            assert_eq!(ok(r#"{"input":""}"#), vec![String::new()]);
+            assert_eq!(ok(r#"{"input":"   "}"#), vec!["   ".to_string()]);
+            // non-ASCII and emoji, literal and \u-escaped, including a surrogate pair
+            assert_eq!(ok(r#"{"input":"привет 🌍"}"#), vec!["привет 🌍".to_string()]);
+            assert_eq!(ok(r#"{"input":"при"}"#), vec!["при".to_string()]);
+            assert_eq!(ok(r#"{"input":"🌍"}"#), vec!["🌍".to_string()]);
+            // field order must not matter, and `model` must never be mistaken for the input
+            assert_eq!(ok(r#"{"model":"bge","input":"x"}"#), vec!["x".to_string()]);
+            assert_eq!(ok(r#"{"input":"x","model":"bge"}"#), vec!["x".to_string()]);
+            // a value that merely CONTAINS the key name is not the key
+            assert_eq!(ok(r#"{"model":"has \"input\": inside","input":"real"}"#),
+                vec!["real".to_string()]);
+            // longer than any model window: length is the caller's problem, not the parser's
+            let long = "x".repeat(100_000);
+            assert_eq!(ok(&format!("{{\"input\":\"{long}\"}}")), vec![long]);
+            // a batch mixing all of the above
+            assert_eq!(ok(r#"{"input":["[l]","he \"said\"","- b","🌍",""]}"#),
+                vec!["[l]".to_string(), "he \"said\"".to_string(), "- b".to_string(),
+                     "🌍".to_string(), String::new()]);
+            assert_eq!(ok(r#"{"input":[]}"#), Vec::<String>::new());
+        }
+
+        /// Malformed input must be an error the route can turn into a 400 -- never a silent empty
+        /// `data` list, and never the old "treat the whole body as the text" fallback.
+        #[test]
+        fn parse_inputs_rejects_malformed_instead_of_guessing() {
+            for bad in [
+                "",                              // no body at all
+                "not json",
+                r#"{"model":"bge"}"#,            // no input field
+                r#"{"input":}"#,                 // no value
+                r#"{"input":"unterminated"#,     // unterminated string
+                r#"{"input":["a","b""#,          // unterminated array
+                r#"{"input":123}"#,              // wrong type
+                r#"{"input":[1,2]}"#,            // wrong element type
+                r#"{"input":"bad \q escape"}"#,
+                r#"{"input":"\ud83c only a high surrogate"}"#,
+            ] {
+                assert!(parse_inputs(bad).is_err(), "must reject {bad:?}");
+            }
+        }
+        #[test]
+        fn json_escape_quotes_and_newlines() { assert_eq!(json_escape("a\"b\nc"), "a\\\"b\\nc"); }
+        #[test]
+        fn parse_wav_rejects_non_riff() { assert!(parse_wav_i16(b"not a wav").is_none()); }
+
+        #[test]
+        fn pcm_bytes_is_headerless_little_endian_i16() {
+            assert_eq!(pcm_bytes(&[1, -1, 256]), vec![1, 0, 255, 255, 0, 1]);
+            assert_eq!(pcm_bytes(&[]), Vec::<u8>::new());
+        }
+
+        #[test]
+        fn speech_fields_default_to_wav_when_nothing_is_asked_for() {
+            assert_eq!(reject_unsupported_speech_fields(&serde_json::json!({})), Ok(super::super::SpeechFormat::Wav));
+            assert_eq!(reject_unsupported_speech_fields(&serde_json::json!({"response_format":"wav"})),
+                Ok(super::super::SpeechFormat::Wav));
+        }
+
+        #[test]
+        fn speech_fields_accept_pcm() {
+            assert_eq!(reject_unsupported_speech_fields(&serde_json::json!({"response_format":"pcm"})),
+                Ok(super::super::SpeechFormat::Pcm));
+        }
+
+        #[test]
+        fn speech_fields_reject_each_unsupported_field_by_name() {
+            assert!(reject_unsupported_speech_fields(&serde_json::json!({"response_format":"mp3"}))
+                .unwrap_err().contains("response_format"));
+            assert!(reject_unsupported_speech_fields(&serde_json::json!({"voice":"alloy"}))
+                .unwrap_err().contains("voice"));
+            assert!(reject_unsupported_speech_fields(&serde_json::json!({"speed":0.5}))
+                .unwrap_err().contains("speed"));
+            assert!(reject_unsupported_speech_fields(&serde_json::json!({"stream_format":"audio"}))
+                .unwrap_err().contains("stream_format"));
+            // An explicit 1.0 is the implicit default, not a request for something unimplemented.
+            assert!(reject_unsupported_speech_fields(&serde_json::json!({"speed":1.0})).is_ok());
+        }
+        #[test]
+        fn form_field_reads_model_and_ignores_the_upload() {
+            let b = "X";
+            let body = concat!(
+                "--X\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngigaam\r\n",
+                "--X\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n\r\nRIFF\r\n",
+                "--X--\r\n").as_bytes();
+            assert_eq!(extract_form_field(body, b, "model").as_deref(), Some("gigaam"));
+            assert_eq!(extract_form_field(body, b, "language"), None);
+            // The file part must not be mistaken for a text field even when asked for by name.
+            assert_eq!(extract_form_field(body, b, "file"), None);
+            assert_eq!(extract_file_part(body, b), Some(&b"RIFF"[..]));
+        }
+
+        #[test]
+        fn parse_chat_request_rejects_malformed_bodies() {
+            for bad in [
+                "not json",
+                "{}",                                        // no messages
+                r#"{"messages":[]}"#,                         // empty
+                r#"{"messages":[{"content":"hi"}]}"#,         // no role
+                r#"{"messages":[{"role":"user"}]}"#,          // no content
+                r#"{"messages":[{"role":"user","content":123}]}"#, // wrong content type
+                r#"{"messages":[{"role":"user","content":"hi"}],"stop":5}"#,
+                r#"{"messages":[{"role":"user","content":"hi"}],"temperature":"hot"}"#,
+            ] {
+                assert!(parse_chat_request(bad).is_err(), "must reject {bad:?}");
+            }
+        }
+
+        #[test]
+        fn parse_completion_request_rejects_malformed_bodies() {
+            for bad in ["not json", "{}", r#"{"prompt":123}"#, r#"{"prompt":["a","b"]}"#] {
+                assert!(parse_completion_request(bad).is_err(), "must reject {bad:?}");
+            }
+        }
+
+        #[test]
+        fn parse_completion_request_accepts_a_bare_string_prompt() {
+            let p = parse_completion_request(r#"{"prompt":"hello"}"#).unwrap();
+            assert!(matches!(p.prompt, npu_models::Prompt::Raw(s) if s == "hello"));
+            assert!(!p.stream);
+        }
+    }
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+    use crate::actor::start;
+    use crate::config::{Config, ModelCfg, ServerCfg};
+    use crate::loader::mock::MockLoader;
+    use std::collections::BTreeMap;
+
+    fn get(path: &str) -> Request { Request { method: "GET".into(), path: path.into(), boundary: String::new(), body: vec![] } }
+    fn post(path: &str, body: &str) -> Request { Request { method: "POST".into(), path: path.into(), boundary: String::new(), body: body.as_bytes().to_vec() } }
+
+    fn mock_handle() -> (Handle, std::thread::JoinHandle<()>, tempfile::TempDir, PathBuf) {
+        let mut t = BTreeMap::new();
+        t.insert("bge".to_string(), Ok((Capability::EMBED, 1)));
+        t.insert("c".to_string(), Ok((Capability::EMBED, 1)));
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("engine.toml");
+        let cfg = Config {
+            server: ServerCfg::default(),
+            models: vec![ModelCfg { name: "bge".into(), scenario: "x".into(), resident: false }],
+            ..Default::default()
+        };
+        cfg.save(&cfg_path).unwrap();
+        let (h, j) = start(cfg, Box::new(MockLoader { table: t })).unwrap();
+        (h, j, dir, cfg_path)
+    }
+
+    #[test]
+    fn healthz_models_chat_and_unknown() {
+        let (h, j, _d, p) = mock_handle();
+        // Not pinned, so not resident yet -- this test is about the reported shape of a loaded
+        // model, so make it one explicitly.
+        route(&post("/admin/models/bge/load", ""), &h, &p);
+        assert_eq!(route(&get("/healthz"), &h, &p).0, 200);
+        let (code, body) = route(&get("/v1/models"), &h, &p);
+        assert_eq!(code, 200);
+        assert!(body.text().contains("\"id\":\"bge\"") && body.text().contains("\"state\":\"loaded\""));
+        // A resident model reports how long it has been idle, so a swap is observable from outside.
+        assert!(body.text().contains("\"idle_s\":0"), "{body}");
+        assert_eq!(route(&get("/nope"), &h, &p).0, 404);
+        assert_eq!(route(&get("/health"), &h, &p).1.text(), "{\"status\":\"ok\"}");
+        h.shutdown(); j.join().unwrap();
+    }
+    /// Both new routes resolve a capability through the rail. With no generate or tts model
+    /// configured they answer 503 (a server-configuration fact) rather than the old hardcoded 501,
+    /// and rather than 400, which would blame the client for the server having no model.
+    #[test]
+    fn chat_and_speech_report_no_model_as_503() {
+        let (h, j, _d, p) = mock_handle();
+        let (code, body) = route(&post("/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"hi"}]}"#), &h, &p);
+        assert_eq!(code, 503, "{body}");
+        assert!(body.text().contains("no generate model configured"), "{body}");
+        let (code, body) = route(&post("/v1/audio/speech", r#"{"input":"hi"}"#), &h, &p);
+        assert_eq!(code, 503, "{body}");
+        assert!(body.text().contains("no tts model configured"), "{body}");
+        // A malformed body is still the client's fault, and is distinguished from the above.
+        assert_eq!(route(&post("/v1/chat/completions", "{}"), &h, &p).0, 400);
+        assert_eq!(route(&post("/v1/audio/speech", "{}"), &h, &p).0, 400);
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// `/v1/audio/speech` against a model that DOES declare the capability: the rail carries it end
+    /// to end, and speech comes back as audio bytes rather than JSON. (The equivalent for
+    /// `/v1/chat/completions` needs a `TextGenerator`, which `MockModel` does not implement -- see
+    /// `mod generate_tests` below.)
+    #[test]
+    fn speech_serves_when_a_model_declares_the_capability() {
+        let mut t = BTreeMap::new();
+        t.insert("tts".to_string(), Ok((Capability::TTS, 1)));
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("engine.toml");
+        let cfg = Config {
+            server: ServerCfg { idle_unload_s: 0, ..Default::default() },
+            models: vec![ModelCfg { name: "tts".into(), scenario: "y".into(), resident: false }],
+            ..Default::default()
+        };
+        cfg.save(&p).unwrap();
+        let (h, j) = start(cfg, Box::new(MockLoader { table: t })).unwrap();
+
+        let (code, body) = route(&post("/v1/audio/speech", r#"{"input":"hello"}"#), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(body.content_type(), "audio/wav");
+        let wav = body.bytes();
+        assert_eq!(&wav[..4], b"RIFF");
+        // The mock speaks at 24 kHz; the header must carry the model's rate, not a 16 kHz constant.
+        assert_eq!(u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]), 24_000);
+        assert_eq!(parse::parse_wav_i16(wav).map(|v| v.len()), None,
+            "parse_wav_i16 only accepts the 16 kHz ASR shape, so it must reject 24 kHz speech");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// Shared setup for the request-shape tests below: one mock model declaring `Capability::TTS`.
+    fn tts_handle() -> (Handle, std::thread::JoinHandle<()>, tempfile::TempDir, PathBuf) {
+        let mut t = BTreeMap::new();
+        t.insert("tts".to_string(), Ok((Capability::TTS, 1)));
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("engine.toml");
+        let cfg = Config {
+            server: ServerCfg { idle_unload_s: 0, ..Default::default() },
+            models: vec![ModelCfg { name: "tts".into(), scenario: "y".into(), resident: false }],
+            ..Default::default()
+        };
+        cfg.save(&p).unwrap();
+        let (h, j) = start(cfg, Box::new(MockLoader { table: t })).unwrap();
+        (h, j, dir, p)
+    }
+
+    /// `response_format: "pcm"` is the second real shape this server can produce: headerless
+    /// little-endian PCM, not a WAV with its header stripped by the client.
+    #[test]
+    fn speech_response_format_pcm_answers_headerless_pcm() {
+        let (h, j, _d, p) = tts_handle();
+        let (code, body) = route(&post("/v1/audio/speech",
+            r#"{"input":"hello","response_format":"pcm"}"#), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(body.content_type(), "audio/pcm");
+        // The mock speaks 8 samples (16 bytes); a WAV response would carry a 44-byte header first.
+        assert_eq!(body.bytes().len(), 16, "{:?}", body.bytes());
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// A `response_format` this server cannot produce (real OpenAI values it does not implement)
+    /// is a 400 naming the field and the two it DOES support -- not a 200 lying about the bytes.
+    #[test]
+    fn speech_rejects_an_unsupported_response_format_by_name() {
+        let (h, j, _d, p) = tts_handle();
+        let (code, body) = route(&post("/v1/audio/speech",
+            r#"{"input":"hello","response_format":"mp3"}"#), &h, &p);
+        assert_eq!(code, 400, "{body}");
+        assert!(body.text().contains("response_format") && body.text().contains("mp3"), "{body}");
+        assert!(body.text().contains("wav") && body.text().contains("pcm"), "{body}");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// `speed` has no implementation (no resampling in the AR loop) -- a request for anything but
+    /// the implicit 1.0 must be a 400, never a silently-ignored field.
+    #[test]
+    fn speech_rejects_a_speed_other_than_1() {
+        let (h, j, _d, p) = tts_handle();
+        let (code, body) = route(&post("/v1/audio/speech",
+            r#"{"input":"hello","speed":1.5}"#), &h, &p);
+        assert_eq!(code, 400, "{body}");
+        assert!(body.text().contains("speed"), "{body}");
+        // 1.0 is a request for the implicit default, so it must still serve.
+        let (code, _) = route(&post("/v1/audio/speech", r#"{"input":"hello","speed":1.0}"#), &h, &p);
+        assert_eq!(code, 200);
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// `voice` has no selectable value at all yet, so any name given must be refused -- omitting
+    /// the field entirely is the only way to get a 200, and that must still work.
+    #[test]
+    fn speech_rejects_any_named_voice() {
+        let (h, j, _d, p) = tts_handle();
+        let (code, body) = route(&post("/v1/audio/speech",
+            r#"{"input":"hello","voice":"nova"}"#), &h, &p);
+        assert_eq!(code, 400, "{body}");
+        assert!(body.text().contains("voice") && body.text().contains("nova"), "{body}");
+        let (code, _) = route(&post("/v1/audio/speech", r#"{"input":"hello"}"#), &h, &p);
+        assert_eq!(code, 200);
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// `stream_format` asks for a streamed body; this route never streams audio.
+    #[test]
+    fn speech_rejects_stream_format() {
+        let (h, j, _d, p) = tts_handle();
+        let (code, body) = route(&post("/v1/audio/speech",
+            r#"{"input":"hello","stream_format":"sse"}"#), &h, &p);
+        assert_eq!(code, 400, "{body}");
+        assert!(body.text().contains("stream_format"), "{body}");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// `/healthz` must go 503 once a model has failed, and must NOT be tripped by a model that is
+    /// merely unloaded -- deferral and idle-sweep are deliberate, and a health check that cries wolf
+    /// on them gets ignored.
+    /// Build a server from (name, load-result) pairs, so a test can put a model in a chosen state.
+    /// Every model costs one MB, so `ceiling_mb` admits exactly that many.
+    fn health_setup(models: &[(&str, bool)], ceiling_mb: u64)
+        -> (Handle, std::thread::JoinHandle<()>, tempfile::TempDir, PathBuf) {
+        let mut t = BTreeMap::new();
+        for (n, ok) in models {
+            t.insert((*n).to_string(),
+                if *ok { Ok((Capability::EMBED, 1024 * 1024)) } else { Err("no such xclbin".to_string()) });
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("engine.toml");
+        let cfg = Config {
+            server: ServerCfg { memory_ceiling_mb: ceiling_mb, idle_unload_s: 0, ..Default::default() },
+            models: models.iter()
+                .map(|(n, _)| ModelCfg { name: (*n).into(), scenario: "x".into(), resident: false }).collect(),
+            ..Default::default()
+        };
+        cfg.save(&p).unwrap();
+        let (h, j) = start(cfg, Box::new(MockLoader { table: t })).unwrap();
+        (h, j, dir, p)
+    }
+
+    /// A model left unloaded over the byte budget is deliberate. A health check that cries wolf on
+    /// it gets ignored, which would defeat the point of the one below.
+    #[test]
+    fn healthz_is_ok_when_a_model_is_merely_deferred() {
+        let (h, j, _d, p) = health_setup(&[("bge", true), ("e5", true)], 1);
+        let (code, body) = route(&get("/healthz"), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        assert!(body.text().contains("\"ok\":true") && body.text().contains("\"failed\":[]"), "{body}");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// ...but a model that FAILED to load makes the service unhealthy and names itself. `ok` used to
+    /// be the literal `true`, which is how a 5-day outage looked healthy to systemd.
+    #[test]
+    fn healthz_is_503_and_names_the_model_that_failed() {
+        // Neither is pinned, so reconcile only declares them now -- explicitly load both, the same
+        // way a real `npu model start` (or a request) would, to actually attempt `broken` and let it fail.
+        let (h, j, _d, p) = health_setup(&[("bge", true), ("broken", false)], 2);
+        route(&post("/admin/models/bge/load", ""), &h, &p);
+        route(&post("/admin/models/broken/load", ""), &h, &p);
+        let (code, body) = route(&get("/healthz"), &h, &p);
+        assert_eq!(code, 503, "a failed model must make the service unhealthy: {body}");
+        assert!(body.text().contains("\"ok\":false"), "{body}");
+        assert!(body.text().contains("\"broken\""), "the failing model is named: {body}");
+        assert!(body.text().contains("\"loaded\":1"), "the healthy one is still counted: {body}");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// The live half of `npu model enable`: the file is edited and the running registry adopts it,
+    /// with no unload and no restart.
+    #[test]
+    fn admin_resident_pins_a_loaded_model_in_place() {
+        let (h, j, _d, p) = mock_handle();
+        assert!(route(&get("/v1/models"), &h, &p).1.text().contains("\"pinned\":false"));
+
+        let (code, body) = route(&post("/admin/models/bge/resident", r#"{"resident":true}"#), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        assert!(route(&get("/v1/models"), &h, &p).1.text().contains("\"pinned\":true"),
+            "the pin has to reach the running registry, not just the file");
+        assert!(std::fs::read_to_string(&p).unwrap().contains("resident = true"),
+            "and it has to survive a restart, i.e. be in the file");
+
+        let (code, _) = route(&post("/admin/models/bge/resident", r#"{"resident":false}"#), &h, &p);
+        assert_eq!(code, 200);
+        assert!(route(&get("/v1/models"), &h, &p).1.text().contains("\"pinned\":false"));
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// The behaviour asked for: an explicit load REFUSES at capacity rather than evicting, and the
+    /// refusal is a 409 naming what holds the slots.
+    #[test]
+    fn admin_load_refuses_at_capacity_with_409_and_never_evicts() {
+        let (h, j, _d, p) = health_setup(&[("bge", true), ("e5", true)], 1);
+        // Neither is pinned, so nothing is resident yet -- take the only MB explicitly, the way a
+        // real `npu model start` would, instead of relying on boot to have done it.
+        route(&post("/admin/models/bge/load", ""), &h, &p);
+        let (code, body) = route(&post("/admin/models/e5/load", ""), &h, &p);
+        assert_eq!(code, 409, "at capacity is a state conflict, not a bad request: {body}");
+        assert!(body.text().contains("1 MB of 1 MB in use"), "{body}");
+        assert!(body.text().contains("bge"), "the refusal names what is in the way: {body}");
+        let models = route(&get("/v1/models"), &h, &p).1;
+        assert!(models.text().contains("\"id\":\"bge\",\"object\":\"model\",\"kind\":\"embed\",\"state\":\"loaded\""),
+            "a refusal must not have evicted the incumbent: {models}");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn admin_load_then_unload_round_trips_and_frees_the_slot() {
+        let (h, j, _d, p) = health_setup(&[("bge", true), ("e5", true)], 1);
+        // Neither is pinned; load `bge` explicitly so there is a slot to free below.
+        route(&post("/admin/models/bge/load", ""), &h, &p);
+
+        let (code, body) = route(&post("/admin/models/bge/unload", ""), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        assert!(body.text().contains("\"released\":true"), "{body}");
+
+        // ...which is what makes room for the load that was refused a moment ago.
+        let (code, body) = route(&post("/admin/models/e5/load", ""), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        assert!(body.text().contains("\"loaded\":true") && body.text().contains("\"resident_mb\":1"), "{body}");
+
+        // Idempotent in both directions: asking for a state that already holds is not an error.
+        assert!(route(&post("/admin/models/e5/load", ""), &h, &p).1.text().contains("\"loaded\":false"));
+        assert!(route(&post("/admin/models/bge/unload", ""), &h, &p).1.text().contains("\"released\":false"));
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// Residency is runtime state. `npu model start` must not quietly rewrite what the box serves at boot.
+    #[test]
+    fn admin_load_and_unload_leave_the_config_file_untouched() {
+        let (h, j, _d, p) = mock_handle();
+        let before = std::fs::read_to_string(&p).unwrap();
+        route(&post("/admin/models/bge/unload", ""), &h, &p);
+        route(&post("/admin/models/bge/load", ""), &h, &p);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), before,
+            "load/unload are device operations, not config edits");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn admin_load_and_unload_reject_a_model_that_is_not_configured() {
+        let (h, j, _d, p) = mock_handle();
+        assert_ne!(route(&post("/admin/models/nope/load", ""), &h, &p).0, 200);
+        assert_ne!(route(&post("/admin/models/nope/unload", ""), &h, &p).0, 200);
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// A mock model has no declarative spec (`ModelLoader::bake`'s default), the same "legacy npy
+    /// weights" case the CLI's own `npu bake` reports -- so the route must answer 200 with a null
+    /// checkpoint, not treat "nothing to do" as a failure.
+    #[test]
+    fn admin_bake_reports_nothing_to_bake_for_a_legacy_weights_model() {
+        let (h, j, _d, p) = mock_handle();
+        let (code, body) = route(&post("/admin/models/bge/bake", ""), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        assert!(body.text().contains("\"checkpoint\":null"), "{body}");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn admin_bake_rejects_a_model_that_is_not_configured() {
+        let (h, j, _d, p) = mock_handle();
+        assert_ne!(route(&post("/admin/models/nope/bake", ""), &h, &p).0, 200);
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn admin_resident_rejects_an_unknown_model_and_a_missing_field() {
+        let (h, j, _d, p) = mock_handle();
+        let before = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(route(&post("/admin/models/nope/resident", r#"{"resident":true}"#), &h, &p).0, 400,
+            "a pin on a model the config does not have is a typo, not an instruction");
+        assert_eq!(route(&post("/admin/models/bge/resident", "{}"), &h, &p).0, 400);
+        assert_eq!(route(&post("/admin/models/bge/resident", r#"{"resident":"yes"}"#), &h, &p).0, 400);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), before, "a rejected edit writes nothing");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// The admin surface writes the same file a human reads. It used to round-trip it through the
+    /// serializer, which deleted every comment in it.
+    #[test]
+    fn admin_edits_preserve_the_files_comments() {
+        let (h, j, _d, p) = mock_handle();
+        let commented = format!("# hand-written note\n{}", std::fs::read_to_string(&p).unwrap());
+        std::fs::write(&p, &commented).unwrap();
+
+        route(&post("/admin/models/bge/resident", r#"{"resident":true}"#), &h, &p);
+        route(&post("/admin/models", r#"{"name":"c","scenario":"y"}"#), &h, &p);
+        route(&post("/admin/defaults", r#"{"capability":"embed","model":"bge"}"#), &h, &p);
+
+        let after = std::fs::read_to_string(&p).unwrap();
+        assert!(after.contains("# hand-written note"), "comments destroyed:\n{after}");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// Re-pointing a model's scenario must not silently drop the pin the operator set on it.
+    #[test]
+    fn admin_add_model_on_an_existing_name_keeps_its_pin() {
+        let (h, j, _d, p) = mock_handle();
+        route(&post("/admin/models/bge/resident", r#"{"resident":true}"#), &h, &p);
+        route(&post("/admin/models", r#"{"name":"bge","scenario":"y"}"#), &h, &p);
+        let cfg = Config::load(&p).unwrap();
+        assert_eq!(cfg.find("bge").unwrap().scenario, "y");
+        assert!(cfg.find("bge").unwrap().resident, "add-model must not unpin what it is re-pointing");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn embeddings_echoes_model() {
+        let (h, j, _d, p) = mock_handle();
+        let (code, body) = route(&post("/v1/embeddings", r#"{"input":"hi"}"#), &h, &p);
+        assert_eq!(code, 200);
+        assert!(body.text().contains("\"model\":\"bge\""), "{body}");
+        h.shutdown(); j.join().unwrap();
+    }
+    #[test]
+    fn admin_add_then_models_reflects_it() {
+        let (h, j, _d, p) = mock_handle();
+        let (code, _) = route(&post("/admin/models", r#"{"name":"c","scenario":"z.toml"}"#), &h, &p);
+        assert_eq!(code, 200);
+        let (_, body) = route(&get("/v1/models"), &h, &p);
+        assert!(body.text().contains("\"id\":\"c\""), "added model missing: {body}");
+        // and it persisted to the config file
+        let cfg = Config::load(&p).unwrap();
+        assert!(cfg.find("c").is_some());
+        h.shutdown(); j.join().unwrap();
+    }
+    #[test]
+    fn models_shows_a_swap_at_one_slot() {
+        // One slot, two configured models: /v1/models is where an operator sees which one holds the
+        // device right now, and what happened to the other.
+        let mut t = BTreeMap::new();
+        t.insert("bge".to_string(), Ok((Capability::EMBED, 1024 * 1024)));
+        t.insert("e5".to_string(), Ok((Capability::EMBED, 1024 * 1024)));
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("engine.toml");
+        let cfg = Config {
+            server: ServerCfg { memory_ceiling_mb: 1, idle_unload_s: 0, ..Default::default() },
+            models: vec![
+                ModelCfg { name: "bge".into(), scenario: "x".into(), resident: false },
+                ModelCfg { name: "e5".into(), scenario: "y".into(), resident: false },
+            ],
+            ..Default::default()
+        };
+        cfg.save(&p).unwrap();
+        let (h, j) = start(cfg, Box::new(MockLoader { table: t })).unwrap();
+        let (code, body) = route(&post("/v1/embeddings", r#"{"model":"e5","input":"hi"}"#), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        assert!(body.text().contains("\"model\":\"e5\""), "{body}");
+        let (_, models) = route(&get("/v1/models"), &h, &p);
+        assert!(models.text().contains("\"id\":\"e5\",\"object\":\"model\",\"kind\":\"embed\",\"state\":\"loaded\""), "{models}");
+        assert!(models.text().contains("\"idle_s\":null"), "the evicted model reports no idle time: {models}");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn diarizations_renders_segments_as_labelled_spans() {
+        let segs = vec![
+            npu_models::capability::Segment { start_s: 0.5, end_s: 3.25, speaker: 0 },
+            npu_models::capability::Segment { start_s: 3.0, end_s: 4.0, speaker: 11 },
+        ];
+        let body = segments_json("pyannote-3.1", &segs);
+        assert!(body.contains("\"model\":\"pyannote-3.1\""), "{body}");
+        assert!(body.contains("\"start\":0.500"), "{body}");
+        assert!(body.contains("\"end\":3.250"), "{body}");
+        assert!(body.contains("\"speaker\":\"SPEAKER_00\""), "index 0 renders zero-padded: {body}");
+        assert!(body.contains("\"speaker\":\"SPEAKER_11\""), "{body}");
+        // Overlapping spans are legal and must both survive.
+        assert_eq!(body.matches("\"start\"").count(), 2, "{body}");
+    }
+
+    #[test]
+    fn an_empty_diarization_is_a_valid_empty_list_not_an_error() {
+        assert_eq!(segments_json("m", &[]), "{\"model\":\"m\",\"segments\":[]}");
+    }
+
+    /// Builds the exact multipart body `npu-cli`'s `call_multipart_bytes` sends: optional `model`,
+    /// then `w`/`h` fields, then the `image` part.
+    fn upscale_multipart(w: usize, ht: usize, model: Option<&str>, image: &[u8]) -> Request {
+        const B: &str = "X";
+        let mut body = Vec::new();
+        if let Some(m) = model {
+            body.extend_from_slice(
+                format!("--{B}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{m}\r\n").as_bytes());
+        }
+        for (k, v) in [("w", w), ("h", ht)] {
+            body.extend_from_slice(
+                format!("--{B}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n").as_bytes());
+        }
+        body.extend_from_slice(
+            format!("--{B}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"f.rgb\"\r\n\r\n").as_bytes());
+        body.extend_from_slice(image);
+        body.extend_from_slice(format!("\r\n--{B}--\r\n").as_bytes());
+        Request { method: "POST".into(), path: "/v1/images/upscale".into(), boundary: B.into(), body }
+    }
+
+    #[test]
+    fn images_upscale_round_trips_through_the_mock_servable() {
+        let mut t = BTreeMap::new();
+        t.insert("espcn".to_string(), Ok((Capability::IMAGE_SR, 1)));
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("engine.toml");
+        let cfg = Config {
+            server: ServerCfg::default(),
+            models: vec![ModelCfg { name: "espcn".into(), scenario: "x".into(), resident: false }],
+            ..Default::default()
+        };
+        cfg.save(&p).unwrap();
+        let (h, j) = start(cfg, Box::new(MockLoader { table: t })).unwrap();
+        let (w, ht) = (2usize, 2usize);
+        let image: Vec<u8> = (0..w * ht * 3).map(|i| i as u8).collect();
+        let (code, body) = route(&upscale_multipart(w, ht, Some("espcn"), &image), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(body.content_type(), "application/octet-stream");
+        let bytes = body.bytes();
+        assert_eq!(&bytes[0..4], &(w as u32).to_le_bytes(), "width header");
+        assert_eq!(&bytes[4..8], &(ht as u32).to_le_bytes(), "height header");
+        assert_eq!(&bytes[8..], &image[..], "mock echoes the image unchanged");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn images_upscale_rejects_an_image_whose_length_disagrees_with_w_times_h_times_3() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("engine.toml");
+        let cfg = Config::default();
+        cfg.save(&p).unwrap();
+        let (h, j) = start(cfg, Box::new(MockLoader { table: BTreeMap::new() })).unwrap();
+        let (code, body) = route(&upscale_multipart(2, 2, None, &[0u8; 5]), &h, &p);
+        assert_eq!(code, 400, "{body}");
+        assert!(body.text().contains("want w*h*3"), "{body}");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn images_upscale_rejects_a_missing_dimension_field() {
+        const B: &str = "X";
+        let body = format!(
+            "--{B}\r\nContent-Disposition: form-data; name=\"h\"\r\n\r\n2\r\n\
+             --{B}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"f.rgb\"\r\n\r\n\
+             \r\n--{B}--\r\n"
+        ).into_bytes();
+        let req = Request { method: "POST".into(), path: "/v1/images/upscale".into(), boundary: B.into(), body };
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("engine.toml");
+        let cfg = Config::default();
+        cfg.save(&p).unwrap();
+        let (h, j) = start(cfg, Box::new(MockLoader { table: BTreeMap::new() })).unwrap();
+        let (code, body) = route(&req, &h, &p);
+        assert_eq!(code, 400, "{body}");
+        assert!(body.text().contains("missing or invalid w"), "{body}");
+        h.shutdown(); j.join().unwrap();
+    }
+}
+
+/// Generation-surface tests: `/v1/chat/completions` and `/v1/completions`, buffered and streaming.
+/// `MockModel` (used everywhere else in this file) has no `TextGenerator`, so this module builds its
+/// own fixture -- a scripted generator that emits a fixed token list with a settable per-token delay,
+/// per the task's own prescription for testing this surface without a real decoder.
+#[cfg(test)]
+pub(crate) mod generate_tests {
+    use super::*;
+    use crate::actor::start;
+    use crate::config::{Config, ModelCfg, ServerCfg};
+    use crate::loader::{ModelLoader, Servable, StreamServable};
+    use npu_models::capability::{Capability, Request as EngineReq, Response as EngineResp};
+
+    /// A choice's criteria are ORDERED -- their order assigns the answer letters -- so parsing must
+    /// keep the request's order, not sort it; and a request with no `state` is a 400, not a guess.
+    /// JevBench's `typesafe` adapter rejects an answer without `type`, and a score whose
+    /// probabilities are not an object keyed by level (its djev fixture is Jev's shape).
+    #[test]
+    fn systemone_answers_carry_their_type_and_key_scores_by_level() {
+        let (_, n) = answer_json(npu_models::DecideAnswer::Noul { id: "n".into(), p_true: 0.8 });
+        assert_eq!(n, serde_json::json!({"type": "noul", "noul": 0.8}));
+        let (_, c) = answer_json(npu_models::DecideAnswer::Choice { id: "c".into(), choice: "b".into(),
+            probabilities: vec![("a".into(), 0.25), ("b".into(), 0.75)], confidence: 0.5 });
+        assert_eq!(c, serde_json::json!({"type": "choice", "choice": "b",
+            "probabilities": {"a": 0.25, "b": 0.75}, "confidence": 0.5}));
+        let (id, s) = answer_json(npu_models::DecideAnswer::Score { id: "s".into(), score: 0.75,
+            probabilities: vec![0.25, 0.75], confidence: 0.5 });
+        assert_eq!(id, "s");
+        assert_eq!(s, serde_json::json!({"type": "score", "score": 0.75,
+            "probabilities": {"0": 0.25, "1": 0.75}, "confidence": 0.5}));
+    }
+
+    #[test]
+    fn systemone_keeps_choice_order_and_refuses_a_missing_state() {
+        let body = serde_json::json!({"state": "s", "questions": {
+            "q1": {"type": "choice", "instructions": "i", "criteria": {"zeta": "z", "alpha": "a", "mid": "m"}},
+            "q0": {"type": "noul", "instructions": "i"},
+            "q2": {"type": "score", "instructions": "i", "criteria": ["lo", "hi"]}}});
+        let r = parse_systemone(&body).expect("parses");
+        let keys: Vec<&str> = r.questions[0].options.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["zeta", "alpha", "mid"]);
+        assert_eq!(r.questions.iter().map(|q| q.id.as_str()).collect::<Vec<_>>(), ["q1", "q0", "q2"]);
+        assert_eq!(r.questions[1].options[0].1, "The proposition is true.");
+        assert!(parse_systemone(&serde_json::json!({"questions": {"q": {"type": "noul", "instructions": "i"}}})).is_err());
+        assert!(parse_systemone(&serde_json::json!({"state": "s", "questions": {"q": {"type": "choice",
+            "instructions": "i", "criteria": {"only": "one"}}}})).is_err(), "one option is not a choice");
+    }
+
+    /// The route always answers `x_npu`, keyed by question id in request order -- `queue`/`load`
+    /// from the actor's own `Served`, the rest from `Decisions.stats` (`decide_handle`, below).
+    #[test]
+    fn systemone_reports_where_the_time_went() {
+        let (h, j, _d, p) = decide_handle();
+        let body = serde_json::json!({"state": "s", "questions": {
+            "first": {"type": "noul", "instructions": "i"},
+            "second": {"type": "noul", "instructions": "i"},
+        }});
+        let (code, resp) = route(&post("/v1/systemone", &body.to_string()), &h, &p);
+        assert_eq!(code, 200, "{resp}");
+        let v: serde_json::Value = serde_json::from_str(resp.text()).unwrap();
+        let x = &v["x_npu"];
+        for k in ["queue_ms", "load_ms", "total_ms", "prefix_ms", "snapshot_ms"] {
+            assert!(x[k].is_number(), "{k} missing: {x}");
+        }
+        assert!(x["shared_prefix_tokens"].is_u64());
+        let q = x["questions"].as_object().unwrap();
+        assert_eq!(q.keys().collect::<Vec<_>>(), ["first", "second"], "request order, keyed by id");
+        assert!(q["first"]["prefill_ms"].as_f64().unwrap() > 0.0);
+        assert!(x["total_ms"].as_f64().unwrap() >= x["load_ms"].as_f64().unwrap());
+        h.shutdown(); let _ = j.join();
+    }
+
+    use npu_models::{Chunk, FinishReason, GenerateParams, GenerateUsage, GenerationReport, Prompt,
+                     StepRecord, TextGenerator};
+    use npu_models::EngineError;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    pub(crate) fn post(path: &str, body: &str) -> Request {
+        Request { method: "POST".into(), path: path.into(), boundary: String::new(), body: body.as_bytes().to_vec() }
+    }
+    pub(crate) fn ss(v: &[&str]) -> Vec<String> { v.iter().map(|s| s.to_string()).collect() }
+    fn close(a: f32, b: f32) -> bool { (a - b).abs() < 1e-6 }
+
+    type Seen = Arc<Mutex<Option<(Prompt, GenerateParams)>>>;
+
+    /// Emits `tokens` in order, one `Chunk::Text` per call to `sink` (with `delay` between them),
+    /// then `Chunk::Done`. Records every `(prompt, params)` it was invoked with, and how many tokens
+    /// it managed to SEND before the sink said stop -- what the disconnect test observes.
+    struct ScriptedGenerator { tokens: Vec<String>, delay: Duration, sent: Arc<AtomicUsize>, seen: Seen }
+    impl TextGenerator for ScriptedGenerator {
+        fn generate(&mut self, prompt: &Prompt, params: &GenerateParams,
+            sink: &mut dyn FnMut(Chunk<'_>) -> bool) -> Result<(), EngineError> {
+            *self.seen.lock().unwrap() = Some((prompt.clone(), params.clone()));
+            let mut usage = GenerateUsage::default();
+            let mut report = GenerationReport::default();
+            let t0 = std::time::Instant::now();
+            let cap = (params.max_tokens.unwrap_or(npu_models::DEFAULT_MAX_TOKENS) as usize).min(self.tokens.len());
+            for (i, tok) in self.tokens.iter().take(cap).enumerate() {
+                if !self.delay.is_zero() { std::thread::sleep(self.delay); }
+                self.sent.fetch_add(1, Ordering::SeqCst);
+                usage.completion_tokens += 1;
+                let t_us = t0.elapsed().as_micros() as u64;
+                let rec = StepRecord {
+                    seq: i as u32,
+                    token: Some(1000 + i as u32),
+                    text: tok.clone(),
+                    emit: tok.clone(),
+                    t_us,
+                    dt_us: t_us.saturating_sub(report.steps.last().map(|s| s.t_us).unwrap_or(0)),
+                    ..StepRecord::default()
+                };
+                let live = sink(Chunk::Text(&rec.emit)) && sink(Chunk::Step(&rec));
+                report.steps.push(rec);
+                if !live {
+                    report.usage = usage;
+                    let _ = sink(Chunk::Done { reason: FinishReason::Aborted, usage, report: &report });
+                    return Ok(());
+                }
+            }
+            // Declaring tools makes the scripted model call one. That is the whole contract this
+            // layer has to carry: the generator decides, the wire renders.
+            let mut reason = if cap < self.tokens.len() { FinishReason::Length } else { FinishReason::Stop };
+            if !params.tools.is_empty() {
+                let call = npu_models::ToolCall {
+                    id: "call_0".into(),
+                    name: "get_weather".into(),
+                    arguments: serde_json::json!({ "city": "Paris" }),
+                };
+                sink(Chunk::ToolCall(&call));
+                if reason == FinishReason::Stop {
+                    reason = FinishReason::ToolCalls;
+                }
+            }
+            report.usage = usage;
+            report.generate_us = t0.elapsed().as_micros() as u64;
+            sink(Chunk::Done { reason, usage, report: &report });
+            Ok(())
+        }
+    }
+
+    struct GenModel { gen: ScriptedGenerator }
+    impl Servable for GenModel {
+        fn capabilities(&self) -> Capability { Capability::GENERATE }
+        fn run(&mut self, _req: EngineReq) -> Result<EngineResp, EngineError> {
+            Err(EngineError::Unsupported("use generate_stream".into()))
+        }
+    }
+    impl StreamServable for GenModel {
+        fn generate_stream(&mut self, prompt: &Prompt, params: &GenerateParams,
+            sink: &mut dyn FnMut(Chunk<'_>) -> bool) -> Result<(), EngineError> {
+            self.gen.generate(prompt, params, sink)
+        }
+    }
+
+    struct GenLoader { tokens: Vec<String>, delay: Duration, sent: Arc<AtomicUsize>, seen: Seen }
+    impl ModelLoader for GenLoader {
+        fn load(&self, _cfg: &ModelCfg) -> Result<Box<dyn StreamServable>, EngineError> {
+            Ok(Box::new(GenModel { gen: ScriptedGenerator {
+                tokens: self.tokens.clone(), delay: self.delay, sent: self.sent.clone(), seen: self.seen.clone(),
+            }}))
+        }
+        fn declared_capability(&self, _cfg: &ModelCfg) -> Option<Capability> { Some(Capability::GENERATE) }
+    }
+
+    pub(crate) fn gen_handle(tokens: Vec<String>, delay: Duration)
+        -> (Handle, std::thread::JoinHandle<()>, tempfile::TempDir, PathBuf, Arc<AtomicUsize>, Seen) {
+        let sent = Arc::new(AtomicUsize::new(0));
+        let seen: Seen = Arc::new(Mutex::new(None));
+        let loader = GenLoader { tokens, delay, sent: sent.clone(), seen: seen.clone() };
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("engine.toml");
+        let cfg = Config {
+            server: ServerCfg { idle_unload_s: 0, ..Default::default() },
+            models: vec![ModelCfg { name: "llm".into(), scenario: "x".into(), resident: false }],
+            ..Default::default()
+        };
+        cfg.save(&p).unwrap();
+        let (h, j) = start(cfg, Box::new(loader)).unwrap();
+        (h, j, dir, p, sent, seen)
+    }
+
+    /// Answers each question with a fixed `Noul`, and stats scaled by the question's position so a
+    /// caller can tell them apart -- non-zero throughout, since a zeroed mock proves nothing about
+    /// `x_npu`'s wiring.
+    struct DecideModel;
+    impl Servable for DecideModel {
+        fn capabilities(&self) -> Capability { Capability::GENERATE }
+        fn run(&mut self, req: EngineReq) -> Result<EngineResp, EngineError> {
+            let d = match req {
+                EngineReq::Decide(d) => d,
+                other => return Err(EngineError::Unsupported(format!("DecideModel cannot serve {}", other.shape()))),
+            };
+            let answers = d.questions.iter().map(|q| npu_models::DecideAnswer::Noul { id: q.id.clone(), p_true: 0.6 }).collect();
+            let questions = d.questions.iter().enumerate().map(|(i, q)| npu_models::QuestionStats {
+                id: q.id.clone(), prompt_tokens: 20, reused_tokens: 5 * i, batched_tokens: 3, stepwise_tokens: 2,
+                restore_us: 100, prefill_us: 1_500 + 100 * i as u64, readout_us: 50,
+            }).collect();
+            Ok(EngineResp::Decisions(npu_models::Decisions {
+                answers,
+                stats: npu_models::DecideStats { shared_prefix_tokens: 7, prefix_us: 200, snapshot_us: 80, questions },
+            }))
+        }
+    }
+    impl StreamServable for DecideModel {}
+
+    struct DecideLoader;
+    impl ModelLoader for DecideLoader {
+        fn load(&self, _cfg: &ModelCfg) -> Result<Box<dyn StreamServable>, EngineError> { Ok(Box::new(DecideModel)) }
+        fn declared_capability(&self, _cfg: &ModelCfg) -> Option<Capability> { Some(Capability::GENERATE) }
+    }
+
+    pub(crate) fn decide_handle() -> (Handle, std::thread::JoinHandle<()>, tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("engine.toml");
+        let cfg = Config {
+            server: ServerCfg { idle_unload_s: 0, ..Default::default() },
+            models: vec![ModelCfg { name: "llm".into(), scenario: "x".into(), resident: false }],
+            ..Default::default()
+        };
+        cfg.save(&p).unwrap();
+        let (h, j) = start(cfg, Box::new(DecideLoader)).unwrap();
+        (h, j, dir, p)
+    }
+
+    /// Entailment grows with the hypothesis length, so a caller can see ordering and batching.
+    struct NliModel;
+    impl Servable for NliModel {
+        fn capabilities(&self) -> Capability { Capability::GENERATE }
+        fn run(&mut self, req: EngineReq) -> Result<EngineResp, EngineError> {
+            let r = match req {
+                EngineReq::Nli(r) => r,
+                other => return Err(EngineError::Unsupported(format!("NliModel cannot serve {}", other.shape()))),
+            };
+            let probs = r.pairs.iter().map(|(_, h)| {
+                let e = (h.len() as f64 / 100.0).min(0.9);
+                vec![(1.0 - e) / 2.0, e, (1.0 - e) / 2.0]
+            }).collect();
+            Ok(EngineResp::NliScores(npu_models::NliScores {
+                labels: vec!["contradiction".into(), "entailment".into(), "neutral".into()],
+                windows: vec![1; r.pairs.len()], probs, stats: Default::default() }))
+        }
+    }
+    impl StreamServable for NliModel {}
+    struct NliLoader;
+    impl ModelLoader for NliLoader {
+        fn load(&self, _cfg: &ModelCfg) -> Result<Box<dyn StreamServable>, EngineError> { Ok(Box::new(NliModel)) }
+        fn declared_capability(&self, _cfg: &ModelCfg) -> Option<Capability> { Some(Capability::GENERATE) }
+    }
+    fn nli_handle() -> (Handle, std::thread::JoinHandle<()>, tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("engine.toml");
+        let cfg = Config {
+            server: ServerCfg { idle_unload_s: 0, ..Default::default() },
+            models: vec![ModelCfg { name: "jev".into(), scenario: "x".into(), resident: false }],
+            ..Default::default()
+        };
+        cfg.save(&p).unwrap();
+        let (h, j) = start(cfg, Box::new(NliLoader)).unwrap();
+        (h, j, dir, p)
+    }
+
+    #[test]
+    fn predict_takes_one_pair_or_a_batch_in_teis_shape() {
+        let (h, j, _d, p) = nli_handle();
+        // NliModel's e = (hyp.len()/100).min(0.9); entailment beats contradiction/neutral's tied
+        // (1-e)/2 only once e > 1/3, i.e. a hypothesis over ~34 chars -- the plan's own 10-char
+        // "bbbbbbbbbb" scores e=0.1 and contradiction/neutral would win the sort instead.
+        let (code, body) = route(&post("/predict",
+            r#"{"inputs":["a","bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]}"#), &h, &p);
+        assert_eq!(code, 200, "{}", body.text());
+        let v: serde_json::Value = serde_json::from_str(body.text()).unwrap();
+        assert_eq!(v[0]["label"], "entailment", "sorted by score, highest first");
+        let (code, body) = route(&post("/predict", r#"{"inputs":[["a","b"],["c","dd"]]}"#), &h, &p);
+        assert_eq!(code, 200);
+        let v: serde_json::Value = serde_json::from_str(body.text()).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 2);
+        assert_eq!(v[1].as_array().unwrap().len(), 3);
+        assert_eq!(route(&post("/predict", r#"{"inputs":[]}"#), &h, &p).0, 400);
+        h.shutdown(); let _ = j.join();
+    }
+
+    #[test]
+    fn rerank_returns_indices_by_entailment() {
+        let (h, j, _d, p) = nli_handle();
+        let (code, body) = route(&post("/rerank", r#"{"query":"q","texts":["x","xxxxxxxxxxxxxxxxxxxx","xxx"]}"#), &h, &p);
+        assert_eq!(code, 200, "{}", body.text());
+        let v: serde_json::Value = serde_json::from_str(body.text()).unwrap();
+        let order: Vec<u64> = v.as_array().unwrap().iter().map(|r| r["index"].as_u64().unwrap()).collect();
+        assert_eq!(order, vec![1, 2, 0]);
+        assert_eq!(route(&post("/rerank", r#"{"query":"q","texts":[]}"#), &h, &p).0, 400);
+        h.shutdown(); let _ = j.join();
+    }
+
+    /// A buffered response carries its own measurements, always. This is the surface a human hits
+    /// with curl and the one Open WebUI reads; making it opt-in would mean the default answer to
+    /// "how fast was that" is silence.
+    #[test]
+    fn a_buffered_response_always_carries_its_measurements() {
+        let (h, j, _d, p, _sent, _seen) = gen_handle(ss(&["Hello", ", ", "world"]), Duration::from_millis(5));
+        let (code, body) = route(&post("/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"hi"}]}"#), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(body.text()).unwrap();
+        // usage is untouched: the OpenAI contract does not move because we added to it.
+        assert_eq!(v["usage"]["completion_tokens"], 3);
+        assert_eq!(v["timings"]["predicted_n"], 3, "llama.cpp-shaped, for the tools that read it");
+        assert!(v["timings"]["predicted_per_second"].as_f64().unwrap() > 0.0);
+        let x = &v["x_npu"];
+        assert!(x["tok_per_s"].as_f64().unwrap() > 0.0);
+        assert!(x["itl_ms"]["p99"].as_f64().is_some());
+        assert!(x["spans_ms"]["total"].as_f64().unwrap() >= x["spans_ms"]["decode"].as_f64().unwrap());
+        assert!(x["bound"].as_str().is_some(), "a verdict, not just numbers");
+        assert!(x["lever"].as_str().is_some(), "and what to do about it");
+        h.shutdown(); let _ = j.join();
+    }
+
+    /// `x_npu_report` is the full `GenerationReport`, not the `Summary` `timings`/`x_npu` render --
+    /// this is what lets a CLI-over-socket client build the exact same stats table the in-process
+    /// path does, by deserializing the identical struct rather than reconstructing it from a
+    /// human-oriented rendering.
+    #[test]
+    fn the_buffered_response_carries_the_full_report_for_a_socket_client_to_deserialize() {
+        let (h, j, _d, p, _sent, _seen) = gen_handle(ss(&["a", "b", "c"]), Duration::from_millis(1));
+        let (code, body) = route(&post("/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"hi"}]}"#), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(body.text()).unwrap();
+        let report: npu_models::GenerationReport =
+            serde_json::from_value(v["x_npu_report"].clone()).expect("must deserialize");
+        assert_eq!(report.summarize().completion_tokens, 3);
+        h.shutdown(); let _ = j.join();
+    }
+
+    /// The route that closes the two-writer gap: `[server]` keys were the last mutation the CLI
+    /// made to `engine.toml` itself while the service rewrote the same file for everything else.
+    #[test]
+    fn admin_server_edits_the_file_and_rejects_a_key_it_does_not_know() {
+        let (h, j, dir, p, _s, _seen) = gen_handle(ss(&["x"]), Duration::ZERO);
+        let _ = dir;
+        let (code, body) = route(&post("/admin/server", r#"{"key":"memory_ceiling_mb","value":"3"}"#), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        assert!(body.text().contains("\"loaded\""), "answers with a reconcile report: {body}");
+        assert!(std::fs::read_to_string(&p).unwrap().contains("memory_ceiling_mb = 3"),
+            "the SERVICE wrote the file");
+
+        // A key nothing reads is a 400 with the reason, not a silently ignored write. `max_resident`
+        // is the meaningful instance of this, not a made-up one: retired, and must fail the same way
+        // a typo would, not parse and silently do nothing.
+        let (code, body) = route(&post("/admin/server", r#"{"key":"max_resident","value":"1"}"#), &h, &p);
+        assert_eq!(code, 400, "{body}");
+        let (code, _) = route(&post("/admin/server", r#"{"key":"memory_ceiling_mb"}"#), &h, &p);
+        assert_eq!(code, 400, "a request missing `value` is refused");
+        h.shutdown(); let _ = j.join();
+    }
+
+    #[test]
+    fn stats_are_requested_by_either_spelling_and_off_by_default() {
+        use parse::wants_stats;
+        let v = |b: &str| serde_json::from_str::<serde_json::Value>(b).unwrap();
+        assert!(!wants_stats(&v(r#"{"messages":[]}"#)));
+        assert!(wants_stats(&v(r#"{"stream_options":{"include_stats":true}}"#)));
+        assert!(wants_stats(&v(r#"{"x_npu_stats":true}"#)));
+        assert!(!wants_stats(&v(r#"{"x_npu_stats":false}"#)));
+        // Not a false cognate: OpenAI's own include_usage means something else and must not turn
+        // per-token telemetry on by itself.
+        assert!(!wants_stats(&v(r#"{"stream_options":{"include_usage":true}}"#)));
+    }
+
+    /// The run log has to be readable by the thing that reads run logs. Writing a format nothing
+    /// parses is the classic way an instrument becomes decoration.
+    #[test]
+    fn a_written_run_log_parses_back_into_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = wire::RunMeta { id: "chatcmpl-x".into(), created: 1, model: "m".into(), chat: true };
+        let mut log = crate::run_log::RunLog::open_in(dir.path(), &meta.id).unwrap();
+        log.header(&meta);
+        let mut report = GenerationReport { usage: GenerateUsage { prompt_tokens: 2, completion_tokens: 2 },
+                                            generate_us: 40_000, ..Default::default() };
+        for i in 0..2u32 {
+            let rec = StepRecord { seq: i, token: Some(7 + i), text: format!("t{i}"), emit: format!("t{i}"),
+                                   t_us: 20_000 * (i as u64 + 1), dt_us: 20_000, ..Default::default() };
+            log.line(&wire::chunk_line(&rec, &meta));
+            report.steps.push(rec);
+        }
+        log.line(&wire::prefill_line(&report.prefill, &meta));
+        log.line(&wire::summary_line(&report, &meta, FinishReason::Stop));
+        drop(log);
+
+        let text = std::fs::read_to_string(dir.path().join("chatcmpl-x.jsonl")).unwrap();
+        let run = wire::parse_run(&text).unwrap();
+        assert_eq!(run.id, "chatcmpl-x");
+        assert_eq!(run.steps, report.steps);
+        assert_eq!(run.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(run.summary.unwrap().completion_tokens, 2);
+    }
+
+    #[test]
+    fn non_streaming_chat_completion_returns_full_text_and_the_whole_message_array() {
+        let (h, j, _d, p, _sent, seen) = gen_handle(ss(&["Hello", ", ", "world"]), Duration::ZERO);
+        let (code, body) = route(&post("/v1/chat/completions",
+            r#"{"messages":[{"role":"system","content":"be terse"},{"role":"user","content":"hi"}]}"#), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(body.text()).unwrap();
+        assert_eq!(v["object"], "chat.completion");
+        assert_eq!(v["choices"][0]["message"]["role"], "assistant");
+        assert_eq!(v["choices"][0]["message"]["content"], "Hello, world");
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+        assert_eq!(v["usage"]["completion_tokens"], 3);
+        assert!(v["id"].is_string() && v["created"].is_number());
+        // THE bug: the full array (system + user), not just the last turn, must reach the generator.
+        let (prompt, _) = seen.lock().unwrap().clone().unwrap();
+        match prompt {
+            Prompt::Chat(msgs) => {
+                assert_eq!(msgs.len(), 2, "{msgs:?}");
+                assert_eq!((msgs[0].role.as_str(), msgs[0].content.as_str()), ("system", "be terse"));
+                assert_eq!((msgs[1].role.as_str(), msgs[1].content.as_str()), ("user", "hi"));
+            }
+            Prompt::Raw(_) => panic!("chat completions must produce Prompt::Chat"),
+        }
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn every_sampling_param_round_trips() {
+        let (h, j, _d, p, _sent, seen) = gen_handle(ss(&["ok"]), Duration::ZERO);
+        let body = r#"{"messages":[{"role":"user","content":"hi"}],
+            "temperature":0.3,"top_p":0.5,"top_k":40,"max_tokens":7,
+            "seed":42,"presence_penalty":0.1,"frequency_penalty":0.2,"repetition_penalty":1.3,
+            "stop":"STOP"}"#;
+        let (code, resp) = route(&post("/v1/chat/completions", body), &h, &p);
+        assert_eq!(code, 200, "{resp}");
+        let (_, params) = seen.lock().unwrap().clone().unwrap();
+        assert!(close(params.temperature.unwrap(), 0.3), "{:?}", params.temperature);
+        assert!(close(params.top_p.unwrap(), 0.5), "{:?}", params.top_p);
+        assert_eq!(params.top_k, Some(40));
+        assert_eq!(params.max_tokens, Some(7));
+        assert_eq!(params.seed, Some(42));
+        assert!(close(params.presence_penalty.unwrap(), 0.1), "{:?}", params.presence_penalty);
+        assert!(close(params.frequency_penalty.unwrap(), 0.2), "{:?}", params.frequency_penalty);
+        assert!(close(params.repetition_penalty.unwrap(), 1.3), "{:?}", params.repetition_penalty);
+        assert_eq!(params.stop, vec!["STOP".to_string()]);
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// `chat_template_kwargs.enable_thinking` is the spelling vLLM and SGLang accept, and the one
+    /// thing standing between a Qwen3 chat request and an answer: unset, the model reasons, and at
+    /// the 256-token default it never leaves `<think>`. Absent leaves `None` -- the template's own
+    /// default -- rather than a substituted `true`, which for Qwen3 is the same prompt but would
+    /// hide the distinction from anything reading these params.
+    #[test]
+    fn chat_template_kwargs_enable_thinking_round_trips_and_defaults_to_unset() {
+        for (body, want) in [
+            (r#"{"messages":[{"role":"user","content":"hi"}],"chat_template_kwargs":{"enable_thinking":false}}"#, Some(false)),
+            (r#"{"messages":[{"role":"user","content":"hi"}],"chat_template_kwargs":{"enable_thinking":true}}"#, Some(true)),
+            (r#"{"messages":[{"role":"user","content":"hi"}]}"#, None),
+        ] {
+            let (h, j, _d, p, _sent, seen) = gen_handle(ss(&["ok"]), Duration::ZERO);
+            let (code, resp) = route(&post("/v1/chat/completions", body), &h, &p);
+            assert_eq!(code, 200, "{resp}");
+            let (_, params) = seen.lock().unwrap().clone().unwrap();
+            assert_eq!(params.enable_thinking, want, "body: {body}");
+            h.shutdown(); j.join().unwrap();
+        }
+    }
+
+    /// `--dispatch-log` was in-process-only until the CLI became a socket client: this is the wire
+    /// carrier it needs, or the flag silently stops doing anything.
+    #[test]
+    fn x_npu_dispatch_log_round_trips_and_defaults_to_unset() {
+        for (body, want) in [
+            (r#"{"messages":[{"role":"user","content":"hi"}],"x_npu_dispatch_log":true}"#, Some(true)),
+            (r#"{"messages":[{"role":"user","content":"hi"}],"x_npu_dispatch_log":false}"#, Some(false)),
+            (r#"{"messages":[{"role":"user","content":"hi"}]}"#, None),
+        ] {
+            let (h, j, _d, p, _sent, seen) = gen_handle(ss(&["ok"]), Duration::ZERO);
+            let (code, resp) = route(&post("/v1/chat/completions", body), &h, &p);
+            assert_eq!(code, 200, "{resp}");
+            let (_, params) = seen.lock().unwrap().clone().unwrap();
+            assert_eq!(params.dispatch_log, want, "body: {body}");
+            h.shutdown(); j.join().unwrap();
+        }
+    }
+
+    /// An unhonoured template kwarg changes the PROMPT, so it must 400 rather than be dropped --
+    /// the same rule `reject_unsupported` enforces for `n`/`logprobs`/`tools`. Before this, the
+    /// whole `chat_template_kwargs` object was silently ignored, so a client asking for
+    /// thinking-off got thinking-on and a 200.
+    #[test]
+    fn an_unknown_or_ill_typed_template_kwarg_is_a_400_not_a_silent_drop() {
+        for body in [
+            r#"{"messages":[{"role":"user","content":"hi"}],"chat_template_kwargs":{"nonesuch":1}}"#,
+            r#"{"messages":[{"role":"user","content":"hi"}],"chat_template_kwargs":{"enable_thinking":"no"}}"#,
+            r#"{"messages":[{"role":"user","content":"hi"}],"chat_template_kwargs":7}"#,
+        ] {
+            let (h, j, _d, p, _sent, _seen) = gen_handle(ss(&["ok"]), Duration::ZERO);
+            let (code, resp) = route(&post("/v1/chat/completions", body), &h, &p);
+            assert_eq!(code, 400, "body {body} should be rejected, got {resp}");
+            h.shutdown(); j.join().unwrap();
+        }
+    }
+
+    /// Absent fields must arrive UNSET, not pre-filled with the engine's numbers. Parsing is not
+    /// where defaults are chosen any more: the scenario's `[generation]` block and then the
+    /// checkpoint's `generation_config.json` sit below the request, and a parser that substituted
+    /// 1.0 here would silently outrank both.
+    #[test]
+    fn absent_fields_stay_unset_so_the_lower_tiers_can_apply() {
+        let (h, j, _d, p, _sent, seen) = gen_handle(ss(&["ok"]), Duration::ZERO);
+        let (code, resp) = route(&post("/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"hi"}]}"#), &h, &p);
+        assert_eq!(code, 200, "{resp}");
+        let (_, params) = seen.lock().unwrap().clone().unwrap();
+        assert_eq!(params.temperature, None, "parsing must not choose a temperature");
+        assert_eq!(params.top_p, None);
+        assert_eq!(params.top_k, None);
+        assert_eq!(params.presence_penalty, None);
+        assert_eq!(params.frequency_penalty, None);
+        assert_eq!(params.repetition_penalty, None);
+        assert_eq!(params.max_tokens, None, "an absent max_tokens must stay unset, so the model default can apply");
+        assert!(params.stop.is_empty());
+        assert_eq!(params.seed, None);
+        assert_eq!(params.enable_thinking, None, "absent kwarg must not become a substituted true");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn stop_accepts_a_string_or_an_array() {
+        let (h, j, _d, p, _sent, seen) = gen_handle(ss(&["ok"]), Duration::ZERO);
+        route(&post("/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"hi"}],"stop":"END"}"#), &h, &p);
+        assert_eq!(seen.lock().unwrap().clone().unwrap().1.stop, vec!["END".to_string()]);
+        route(&post("/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"hi"}],"stop":["A","B"]}"#), &h, &p);
+        assert_eq!(seen.lock().unwrap().clone().unwrap().1.stop, vec!["A".to_string(), "B".to_string()]);
+        let (code, body) = route(&post("/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"hi"}],"stop":5}"#), &h, &p);
+        assert_eq!(code, 400, "{body}");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// Fails immediately with a chosen `EngineError`, so the status classification of an error
+    /// raised INSIDE generation (after the response has been promised) is testable.
+    struct FailingModel(Option<EngineError>);
+    impl Servable for FailingModel {
+        fn capabilities(&self) -> Capability { Capability::GENERATE }
+        fn run(&mut self, _req: EngineReq) -> Result<EngineResp, EngineError> {
+            Err(EngineError::Unsupported("use generate_stream".into()))
+        }
+    }
+    impl StreamServable for FailingModel {
+        fn generate_stream(&mut self, _prompt: &Prompt, _params: &GenerateParams,
+            _sink: &mut dyn FnMut(Chunk<'_>) -> bool) -> Result<(), EngineError> {
+            Err(self.0.take().expect("FailingModel used twice"))
+        }
+    }
+
+    fn failing_handle(err: EngineError)
+        -> (Handle, std::thread::JoinHandle<()>, tempfile::TempDir, PathBuf) {
+        struct L(Mutex<Option<EngineError>>);
+        impl ModelLoader for L {
+            fn load(&self, _cfg: &ModelCfg) -> Result<Box<dyn StreamServable>, EngineError> {
+                Ok(Box::new(FailingModel(self.0.lock().unwrap().take())))
+            }
+            fn declared_capability(&self, _cfg: &ModelCfg) -> Option<Capability> {
+                Some(Capability::GENERATE)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("engine.toml");
+        let cfg = Config {
+            server: ServerCfg { idle_unload_s: 0, ..Default::default() },
+            models: vec![ModelCfg { name: "llm".into(), scenario: "x".into(), resident: false }],
+            ..Default::default()
+        };
+        cfg.save(&p).unwrap();
+        let (h, j) = start(cfg, Box::new(L(Mutex::new(Some(err))))).unwrap();
+        (h, j, dir, p)
+    }
+
+    /// A prompt that does not fit the model's context window is the CALLER's mistake, and it is
+    /// raised inside `generate` -- past the point where the route has already returned Ok. Before
+    /// `StreamItem::Error` carried the `EngineError`, every such failure rendered as a blanket 500.
+    #[test]
+    fn a_client_fault_raised_inside_generation_is_a_400_not_a_500() {
+        let (h, j, _d, p) = failing_handle(EngineError::Unsupported(
+            "prompt is 2601 tokens but this model's context window is 2048".into()));
+        let (code, body) = route(&post("/v1/completions", r#"{"prompt":"hi"}"#), &h, &p);
+        assert_eq!(code, 400, "{body}");
+        assert!(body.text().contains("context window"), "{}", body.text());
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// The other half: an engine fault raised in the same place must still be a 500, so the
+    /// classification is doing work rather than blanket-downgrading everything to 400.
+    #[test]
+    fn an_engine_fault_raised_inside_generation_is_still_a_500() {
+        let (h, j, _d, p) = failing_handle(EngineError::Device("dispatch timed out".into()));
+        let (code, body) = route(&post("/v1/completions", r#"{"prompt":"hi"}"#), &h, &p);
+        assert_eq!(code, 500, "{body}");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn max_tokens_truncates_and_reports_length() {
+        let (h, j, _d, p, _sent, _seen) = gen_handle(ss(&["a", "b", "c", "d", "e"]), Duration::ZERO);
+        let (code, body) = route(&post("/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":2}"#), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(body.text()).unwrap();
+        assert_eq!(v["choices"][0]["finish_reason"], "length");
+        assert_eq!(v["choices"][0]["message"]["content"], "ab");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// A multi-byte codepoint split across tokens produces an empty `Chunk::Text` until it completes
+    /// -- that must be forwarded, not filtered, and must not corrupt the reassembled text.
+    #[test]
+    fn an_empty_text_chunk_is_forwarded_without_corrupting_the_result() {
+        let (h, j, _d, p, _sent, _seen) = gen_handle(ss(&["", "hi", ""]), Duration::ZERO);
+        let (code, body) = route(&post("/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"x"}]}"#), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(body.text()).unwrap();
+        assert_eq!(v["choices"][0]["message"]["content"], "hi");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn unsupported_sampling_params_are_rejected_not_silently_dropped() {
+        let (h, j, _d, p, _sent, _seen) = gen_handle(ss(&["x"]), Duration::ZERO);
+        for body in [
+            r#"{"messages":[{"role":"user","content":"hi"}],"n":2}"#,
+            r#"{"messages":[{"role":"user","content":"hi"}],"logprobs":true}"#,
+            r#"{"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function"}]}"#,
+            r#"{"messages":[{"role":"user","content":"hi"}],"logit_bias":{"123":10}}"#,
+        ] {
+            let (code, resp) = route(&post("/v1/chat/completions", body), &h, &p);
+            assert_eq!(code, 400, "{body}: got {resp}");
+        }
+        // ...but explicit no-op values (OpenAI clients send these routinely) must still pass.
+        let (code, resp) = route(&post("/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"hi"}],"n":1,"logprobs":false}"#), &h, &p);
+        assert_eq!(code, 200, "{resp}");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn a_multipart_content_array_of_text_parts_is_flattened_and_unknown_types_are_rejected() {
+        let (h, j, _d, p, _sent, seen) = gen_handle(ss(&["ok"]), Duration::ZERO);
+        let (code, resp) = route(&post("/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}]}"#),
+            &h, &p);
+        assert_eq!(code, 200, "{resp}");
+        match seen.lock().unwrap().clone().unwrap().0 {
+            Prompt::Chat(msgs) => assert_eq!(msgs[0].content, "ab"),
+            _ => panic!("expected Prompt::Chat"),
+        }
+        let (code, resp) = route(&post("/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":[{"type":"tool_result","text":"x"}]}]}"#),
+            &h, &p);
+        assert_eq!(code, 400, "an unsupported content part must fail loud, not drop silently: {resp}");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// `image_url`'s ONLY supported form: `image_url.url` is a `data:` URL, decoded to raw bytes
+    /// and attached as [`npu_models::ChatMedia::Image`]; the text gets a literal `<|image|>`
+    /// marker in its place, matching what the model's own chat template would render for one
+    /// image content part. A remote `http(s)://` URL is refused, never fetched.
+    #[test]
+    fn a_data_url_image_part_decodes_to_media_and_leaves_an_image_marker() {
+        let (h, j, _d, p, _sent, seen) = gen_handle(ss(&["ok"]), Duration::ZERO);
+        let png_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [1u8, 2, 3, 4]);
+        let body = format!(
+            r#"{{"messages":[{{"role":"user","content":[{{"type":"text","text":"see: "}},
+                {{"type":"image_url","image_url":{{"url":"data:image/png;base64,{png_b64}"}}}}]}}]}}"#);
+        let (code, resp) = route(&post("/v1/chat/completions", &body), &h, &p);
+        assert_eq!(code, 200, "{resp}");
+        match seen.lock().unwrap().clone().unwrap().0 {
+            Prompt::Chat(msgs) => {
+                assert_eq!(msgs[0].content, "see: <|image|>");
+                assert_eq!(msgs[0].media.len(), 1);
+                assert!(matches!(&msgs[0].media[0], npu_models::ChatMedia::Image(b) if b == &[1u8, 2, 3, 4]));
+            }
+            _ => panic!("expected Prompt::Chat"),
+        }
+
+        let (code, resp) = route(&post("/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/x.png"}}]}]}"#),
+            &h, &p);
+        assert_eq!(code, 400, "{resp}");
+        assert!(resp.text().contains("not fetched"), "{resp}");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// `input_audio`: only `format: "wav"` is supported; its base64 `data` decodes to
+    /// [`npu_models::ChatMedia::Audio`] and the text gets an `<|audio|>` marker.
+    #[test]
+    fn an_input_audio_part_requires_wav_and_decodes_to_media() {
+        let (h, j, _d, p, _sent, seen) = gen_handle(ss(&["ok"]), Duration::ZERO);
+        let wav_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [9u8, 9, 9]);
+        let body = format!(
+            r#"{{"messages":[{{"role":"user","content":[
+                {{"type":"input_audio","input_audio":{{"data":"{wav_b64}","format":"wav"}}}}]}}]}}"#);
+        let (code, resp) = route(&post("/v1/chat/completions", &body), &h, &p);
+        assert_eq!(code, 200, "{resp}");
+        match seen.lock().unwrap().clone().unwrap().0 {
+            Prompt::Chat(msgs) => {
+                assert_eq!(msgs[0].content, "<|audio|>");
+                assert!(matches!(&msgs[0].media[0], npu_models::ChatMedia::Audio(b) if b == &[9u8, 9, 9]));
+            }
+            _ => panic!("expected Prompt::Chat"),
+        }
+
+        let (code, resp) = route(&post("/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":[
+                {"type":"input_audio","input_audio":{"data":"AAAA","format":"mp3"}}]}]}"#),
+            &h, &p);
+        assert_eq!(code, 400, "{resp}");
+        assert!(resp.text().contains("wav"), "{resp}");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn completions_endpoint_uses_a_raw_untemplated_prompt() {
+        let (h, j, _d, p, _sent, seen) = gen_handle(ss(&["once", " upon", " a time"]), Duration::ZERO);
+        let (code, body) = route(&post("/v1/completions", r#"{"prompt":"Tell me a story"}"#), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(body.text()).unwrap();
+        assert_eq!(v["object"], "text_completion");
+        assert_eq!(v["choices"][0]["text"], "once upon a time");
+        match seen.lock().unwrap().clone().unwrap().0 {
+            Prompt::Raw(s) => assert_eq!(s, "Tell me a story"),
+            Prompt::Chat(_) => panic!("/v1/completions must not go through the chat template"),
+        }
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn completions_rejects_an_array_prompt_with_a_clear_400() {
+        let (h, j, _d, p, _sent, _seen) = gen_handle(ss(&["x"]), Duration::ZERO);
+        let (code, body) = route(&post("/v1/completions", r#"{"prompt":["a","b"]}"#), &h, &p);
+        assert_eq!(code, 400, "{body}");
+        assert!(body.text().contains("not supported"), "{body}");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// SSE shape: a role-only preamble, then one content delta per token (verified structurally, not
+    /// by exact string match, since `id`/`created` are per-request), then a terminal empty-delta
+    /// chunk carrying `finish_reason`. `[DONE]` itself is written by `respond_stream`, which needs a
+    /// real socket -- covered by `tests/streaming.rs`.
+    #[test]
+    fn chat_completion_sse_frames_are_role_then_content_then_finish() {
+        let (h, j, _d, p, _sent, _seen) = gen_handle(ss(&["Hello", ", ", "world"]), Duration::ZERO);
+        let (code, body) = route(&post("/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"hi"}],"stream":true}"#), &h, &p);
+        assert_eq!(code, 200);
+        let Body::Stream(s) = body else { panic!("expected a streaming body") };
+
+        let role: serde_json::Value = serde_json::from_str(&s.render_role()).unwrap();
+        assert_eq!(role["object"], "chat.completion.chunk");
+        assert_eq!(role["choices"][0]["delta"]["role"], "assistant");
+        assert!(role["choices"][0]["delta"].get("content").is_none());
+        assert!(role["choices"][0]["finish_reason"].is_null());
+
+        let mut texts = Vec::new();
+        let mut got_done = false;
+        for item in s.rx.iter() {
+            match item {
+                StreamItem::Text(t) => {
+                    let frame: serde_json::Value = serde_json::from_str(&s.render_text(&t)).unwrap();
+                    assert_eq!(frame["object"], "chat.completion.chunk");
+                    assert_eq!(frame["choices"][0]["delta"]["content"], t);
+                    assert!(frame["choices"][0]["finish_reason"].is_null());
+                    texts.push(t);
+                }
+                StreamItem::Step(_) | StreamItem::ToolCall(_) | StreamItem::Progress { .. } => {}
+                StreamItem::Done { reason, .. } => {
+                    let frame: serde_json::Value = serde_json::from_str(&s.render_done(reason)).unwrap();
+                    assert_eq!(frame["choices"][0]["finish_reason"], reason.as_str());
+                    assert_eq!(frame["choices"][0]["delta"], serde_json::json!({}));
+                    got_done = true;
+                }
+                StreamItem::Error(e) => panic!("unexpected error: {e}"),
+            }
+        }
+        assert_eq!(texts.join(""), "Hello, world");
+        assert!(got_done);
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn completions_endpoint_streams_text_deltas_with_no_role_preamble() {
+        let (h, j, _d, p, _sent, _seen) = gen_handle(ss(&["a", "b"]), Duration::ZERO);
+        let (code, body) = route(&post("/v1/completions", r#"{"prompt":"x","stream":true}"#), &h, &p);
+        assert_eq!(code, 200);
+        let Body::Stream(s) = body else { panic!("expected a streaming body") };
+        let mut saw_text = false;
+        for item in s.rx.iter() {
+            if let StreamItem::Text(t) = item {
+                let frame: serde_json::Value = serde_json::from_str(&s.render_text(&t)).unwrap();
+                assert_eq!(frame["object"], "text_completion");
+                assert_eq!(frame["choices"][0]["text"], t);
+                saw_text = true;
+            }
+        }
+        assert!(saw_text);
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// The core of the disconnect requirement: dropping the receiving end (what `respond_stream` does
+    /// on a failed write) must make the actor's next `send` fail, which is the sink's abort signal.
+    /// `tests/streaming.rs` covers the real-socket half of this (an actual TCP close).
+    #[test]
+    fn dropping_the_receiver_aborts_generation() {
+        let n = 500;
+        let tokens: Vec<String> = (0..n).map(|i| format!("t{i}")).collect();
+        let (h, j, _d, p, sent, _seen) = gen_handle(tokens, Duration::from_millis(2));
+        let (code, body) = route(&post("/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"hi"}],"stream":true}"#), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        let Body::Stream(s) = body else { panic!("expected a streaming body") };
+        let _ = s.rx.recv();
+        let _ = s.rx.recv();
+        drop(s);
+        std::thread::sleep(Duration::from_millis(200));
+        let got = sent.load(Ordering::SeqCst);
+        assert!(got < n, "generation must abort on disconnect; sent {got} of {n} tokens");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn admin_defaults_and_selection_route_generate_correctly() {
+        let (h, j, _d, p, _sent, _seen) = gen_handle(ss(&["ok"]), Duration::ZERO);
+        let (code, body) = route(&post("/admin/defaults", r#"{"capability":"generate","model":"llm"}"#), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        let cfg = Config::load(&p).unwrap();
+        assert_eq!(cfg.defaults.get(Capability::GENERATE).map(String::as_str), Some("llm"));
+        let (code, body) = route(&post("/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"hi"}]}"#), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        h.shutdown(); j.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tool_route_tests {
+    use super::generate_tests::{gen_handle, post, ss};
+    use super::*;
+    use std::time::Duration;
+
+    const WEATHER: &str = r#"{"type":"function","function":{"name":"get_weather",
+        "parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}"#;
+
+    /// An EMPTY collection requests nothing, so honouring it and ignoring it are the SAME response
+    /// and S6 does not apply. The predicate tested `!x.is_null()`, which over-fires -- and
+    /// `tools: []` is what a client sends on a plain chat with tool support switched on, so this
+    /// alone was a hard 400 on every message.
+    #[test]
+    fn an_empty_collection_is_not_a_rejection() {
+        let (h, _j, _d, p, _s, _seen) = gen_handle(ss(&["hi"]), Duration::ZERO);
+        for body in [
+            r#"{"messages":[{"role":"user","content":"hi"}],"tools":[]}"#,
+            r#"{"messages":[{"role":"user","content":"hi"}],"logit_bias":{}}"#,
+            r#"{"messages":[{"role":"user","content":"hi"}],"tool_choice":null}"#,
+            r#"{"messages":[{"role":"user","content":"hi"}],"response_format":{}}"#,
+        ] {
+            let (code, out) = route(&post("/v1/chat/completions", body), &h, &p);
+            assert_eq!(code, 200, "rejected {body}: {out}");
+        }
+    }
+
+    /// A non-empty `logit_bias` or `response_format` still cannot be honoured, and saying so is the
+    /// point of `reject_unsupported`. Narrowing the predicate must not have widened the acceptance.
+    #[test]
+    fn a_non_empty_unsupported_field_is_still_a_400() {
+        let (h, _j, _d, p, _s, _seen) = gen_handle(ss(&["hi"]), Duration::ZERO);
+        for body in [
+            r#"{"messages":[{"role":"user","content":"hi"}],"logit_bias":{"5":1}}"#,
+            r#"{"messages":[{"role":"user","content":"hi"}],"response_format":{"type":"json_object"}}"#,
+        ] {
+            assert_eq!(route(&post("/v1/chat/completions", body), &h, &p).0, 400, "accepted {body}");
+        }
+    }
+
+    /// `required` and a named function cannot be GUARANTEED without constrained decoding. Accepting
+    /// them and hoping is exactly the silent substitution this surface refuses.
+    #[test]
+    fn tool_choice_we_cannot_guarantee_is_a_400() {
+        let (h, _j, _d, p, _s, _seen) = gen_handle(ss(&["hi"]), Duration::ZERO);
+        for tc in [r#""required""#, r#"{"type":"function","function":{"name":"get_weather"}}"#] {
+            let body = format!(
+                r#"{{"messages":[{{"role":"user","content":"hi"}}],"tools":[{WEATHER}],"tool_choice":{tc}}}"#
+            );
+            assert_eq!(route(&post("/v1/chat/completions", &body), &h, &p).0, 400, "accepted {tc}");
+        }
+    }
+
+    /// `none` means the model will not call a tool, and an unrendered tools block IS that. The
+    /// engine must receive no tools -- not a flag it would have to remember to honour.
+    #[test]
+    fn tool_choice_none_reaches_the_engine_as_no_tools() {
+        let (h, _j, _d, p, _s, seen) = gen_handle(ss(&["hi"]), Duration::ZERO);
+        let body = format!(
+            r#"{{"messages":[{{"role":"user","content":"hi"}}],"tools":[{WEATHER}],"tool_choice":"none"}}"#
+        );
+        assert_eq!(route(&post("/v1/chat/completions", &body), &h, &p).0, 200);
+        let (_, params) = seen.lock().unwrap().clone().unwrap();
+        assert!(params.tools.is_empty(), "tool_choice:none still sent tools to the engine");
+    }
+
+    #[test]
+    fn declared_tools_reach_the_engine_verbatim() {
+        let (h, _j, _d, p, _s, seen) = gen_handle(ss(&["hi"]), Duration::ZERO);
+        let body = format!(r#"{{"messages":[{{"role":"user","content":"hi"}}],"tools":[{WEATHER}]}}"#);
+        assert_eq!(route(&post("/v1/chat/completions", &body), &h, &p).0, 200);
+        let (_, params) = seen.lock().unwrap().clone().unwrap();
+        assert_eq!(params.tools.len(), 1);
+        assert_eq!(params.tools[0]["function"]["name"], "get_weather");
+    }
+
+    /// The round trip a tool loop actually makes: the client sends back the assistant turn that
+    /// called, and the tool turn answering it. Both must survive into the prompt the engine sees.
+    #[test]
+    fn a_tool_result_turn_round_trips_into_the_prompt() {
+        let (h, _j, _d, p, _s, seen) = gen_handle(ss(&["ok"]), Duration::ZERO);
+        let body = format!(
+            r#"{{"messages":[
+                {{"role":"user","content":"weather?"}},
+                {{"role":"assistant","content":null,"tool_calls":[
+                    {{"id":"call_0","type":"function",
+                      "function":{{"name":"get_weather","arguments":"{{\"city\": \"Paris\"}}"}}}}]}},
+                {{"role":"tool","tool_call_id":"call_0","content":"{{\"temp_c\": 14}}"}}
+            ],"tools":[{WEATHER}]}}"#
+        );
+        let (code, out) = route(&post("/v1/chat/completions", &body), &h, &p);
+        assert_eq!(code, 200, "{out}");
+        let (prompt, _) = seen.lock().unwrap().clone().unwrap();
+        let npu_models::Prompt::Chat(msgs) = prompt else { panic!("not a chat prompt") };
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[1].tool_calls.len(), 1);
+        assert_eq!(msgs[1].tool_calls[0].name, "get_weather");
+        // Decoded from the wire's JSON STRING into an object, because that is what a template
+        // renders. Left as a string, `tojson` would emit a quoted blob.
+        assert_eq!(msgs[1].tool_calls[0].arguments, serde_json::json!({ "city": "Paris" }));
+        assert_eq!(msgs[2].tool_call_id.as_deref(), Some("call_0"));
+    }
+
+    /// `arguments` goes out as a JSON STRING, not an object: that is OpenAI's own encoding, and a
+    /// client calling JSON.parse on an object would throw.
+    #[test]
+    fn a_buffered_response_renders_openai_shaped_tool_calls() {
+        let (h, _j, _d, p, _s, _seen) = gen_handle(Vec::new(), Duration::ZERO);
+        let body = format!(r#"{{"messages":[{{"role":"user","content":"hi"}}],"tools":[{WEATHER}]}}"#);
+        let (code, out) = route(&post("/v1/chat/completions", &body), &h, &p);
+        assert_eq!(code, 200, "{out}");
+        let v: serde_json::Value = serde_json::from_str(out.text()).unwrap();
+        assert_eq!(v["choices"][0]["finish_reason"], "tool_calls");
+        let call = &v["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(call["id"], "call_0");
+        assert_eq!(call["type"], "function");
+        assert_eq!(call["function"]["name"], "get_weather");
+        assert_eq!(call["function"]["arguments"], r#"{"city":"Paris"}"#);
+        // No text and a call present -> null, which is what a client branches on to decide there
+        // is nothing to show the user.
+        assert!(v["choices"][0]["message"]["content"].is_null());
+    }
+
+    /// A plain completion must still say `content: ""` and carry no `tool_calls` key at all.
+    #[test]
+    fn a_response_with_no_calls_is_unchanged() {
+        let (h, _j, _d, p, _s, _seen) = gen_handle(ss(&["Hello"]), Duration::ZERO);
+        let (code, out) =
+            route(&post("/v1/chat/completions", r#"{"messages":[{"role":"user","content":"hi"}]}"#), &h, &p);
+        assert_eq!(code, 200, "{out}");
+        let v: serde_json::Value = serde_json::from_str(out.text()).unwrap();
+        assert_eq!(v["choices"][0]["message"]["content"], "Hello");
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+        assert!(v["choices"][0]["message"].get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn a_malformed_tool_declaration_is_a_400() {
+        let (h, _j, _d, p, _s, _seen) = gen_handle(ss(&["hi"]), Duration::ZERO);
+        for body in [
+            r#"{"messages":[{"role":"user","content":"hi"}],"tools":{"a":1}}"#,
+            r#"{"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function"}]}"#,
+        ] {
+            assert_eq!(route(&post("/v1/chat/completions", body), &h, &p).0, 400, "accepted {body}");
+        }
+    }
+
+    /// The streaming frame. `arguments` is a JSON string here too -- a client concatenates
+    /// fragments by `index` and then parses, so the two surfaces must agree on the encoding or the
+    /// same completion decodes differently depending on a flag the client set.
+    #[test]
+    fn a_streamed_tool_call_is_an_openai_delta() {
+        let (h, _j, _d, p, _s, _seen) = gen_handle(Vec::new(), Duration::ZERO);
+        let body = format!(
+            r#"{{"messages":[{{"role":"user","content":"hi"}}],"tools":[{WEATHER}],"stream":true}}"#
+        );
+        let (code, resp) = route(&post("/v1/chat/completions", &body), &h, &p);
+        assert_eq!(code, 200);
+        let Body::Stream(st) = resp else { panic!("not a stream") };
+        let mut deltas = Vec::new();
+        let mut finish = None;
+        let mut seen = 0usize;
+        for item in st.rx.iter() {
+            match item {
+                StreamItem::ToolCall(c) => {
+                    let frame: serde_json::Value =
+                        serde_json::from_str(&st.render_tool_call(&c, seen)).unwrap();
+                    seen += 1;
+                    deltas.push(frame);
+                }
+                StreamItem::Done { reason, .. } => finish = Some(reason),
+                _ => {}
+            }
+        }
+        assert_eq!(deltas.len(), 1);
+        let call = &deltas[0]["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(deltas[0]["object"], "chat.completion.chunk");
+        assert_eq!(call["index"], 0);
+        assert_eq!(call["id"], "call_0");
+        assert_eq!(call["type"], "function");
+        assert_eq!(call["function"]["name"], "get_weather");
+        assert_eq!(call["function"]["arguments"], r#"{"city":"Paris"}"#);
+        assert!(deltas[0]["choices"][0]["finish_reason"].is_null());
+        assert_eq!(finish.map(|f| f.as_str()), Some("tool_calls"));
+    }
+}
+
+/// Days since the Unix epoch to (year, month, day). Howard Hinnant's `civil_from_days`, which is
+/// the standard branch-free form of this and is here because `created_at` needs an RFC3339 stamp
+/// and nothing in the dependency set provides one.
+/// A unix timestamp as RFC3339 UTC. The Ollama surface stamps `created_at` as a string where
+/// OpenAI stamps `created` as an integer, and nothing in the dependency set formats a date.
+fn rfc3339(secs: i64) -> String {
+    let secs = secs.max(0) as u64;
+    let (h, m, sec) = ((secs % 86_400) / 3600, (secs % 3600) / 60, secs % 60);
+    let (y, mo, d) = civil_from_days((secs / 86_400) as i64);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{sec:02}Z")
+}
+
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+#[cfg(test)]
+mod ollama_route_tests {
+    use super::generate_tests::{gen_handle, post, ss};
+    use super::*;
+    use std::time::Duration;
+
+    fn get(path: &str) -> Request {
+        Request { method: "GET".into(), path: path.into(), boundary: String::new(), body: vec![] }
+    }
+
+    const WEATHER: &str = r#"{"type":"function","function":{"name":"get_weather",
+        "parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}"#;
+
+    /// A client probes `/api/version` to decide it is talking to an Ollama server at all. Nothing
+    /// else on this surface is reachable until this answers.
+    #[test]
+    fn version_identifies_the_server() {
+        let (h, _j, _d, p, _s, _seen) = gen_handle(ss(&["hi"]), Duration::ZERO);
+        let (code, body) = route(&get("/api/version"), &h, &p);
+        assert_eq!(code, 200);
+        let v: serde_json::Value = serde_json::from_str(body.text()).unwrap();
+        assert!(v["version"].as_str().unwrap().contains("xdna-engine"), "{body}");
+    }
+
+    /// Ollama has no vocabulary for an ASR or embedding model, and listing one would drop it into a
+    /// client's chat picker where every request 400s.
+    #[test]
+    fn tags_lists_only_generate_models() {
+        let (h, _j, _d, p, _s, _seen) = gen_handle(ss(&["hi"]), Duration::ZERO);
+        let (code, body) = route(&get("/api/tags"), &h, &p);
+        assert_eq!(code, 200);
+        let v: serde_json::Value = serde_json::from_str(body.text()).unwrap();
+        let models = v["models"].as_array().unwrap();
+        assert_eq!(models.len(), 1, "{body}");
+        assert_eq!(models[0]["name"], "llm");
+        assert_eq!(models[0]["model"], "llm", "Ollama clients key on `model`, not only `name`");
+    }
+
+    #[test]
+    fn show_reports_capabilities_and_404s_an_unknown_model() {
+        let (h, _j, _d, p, _s, _seen) = gen_handle(ss(&["hi"]), Duration::ZERO);
+        let (code, body) = route(&post("/api/show", r#"{"model":"llm"}"#), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(body.text()).unwrap();
+        // `completion` always; `tools` only where the template proves it, which the mock's
+        // scenario cannot, so its absence here is the honest answer rather than a gap.
+        let caps: Vec<&str> = v["capabilities"].as_array().unwrap()
+            .iter().map(|c| c.as_str().unwrap()).collect();
+        assert!(caps.contains(&"completion"), "{body}");
+        assert_eq!(route(&post("/api/show", r#"{"model":"nope"}"#), &h, &p).0, 404);
+        // `name` is the older spelling and clients still send it.
+        assert_eq!(route(&post("/api/show", r#"{"name":"llm"}"#), &h, &p).0, 200);
+    }
+
+    /// The one default that differs from OpenAI, and the one a client notices: absent `stream`
+    /// means STREAM on this surface.
+    #[test]
+    fn stream_defaults_to_true_unlike_openai() {
+        let one = |body: &str| {
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            let _ = v;
+            parse::parse_ollama_chat_request(body).unwrap().stream
+        };
+        assert!(one(r#"{"messages":[{"role":"user","content":"hi"}]}"#));
+        assert!(!one(r#"{"messages":[{"role":"user","content":"hi"},{"role":"user","content":"x"}],"stream":false}"#));
+        // ...and OpenAI's stays false, so the two parsers cannot be collapsed.
+        assert!(!parse::parse_chat_request(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap().stream);
+    }
+
+    /// Sampling lives under `options` here. Reading it from the top level would silently serve
+    /// every Ollama request at the engine's defaults instead of the client's.
+    #[test]
+    fn sampling_is_read_from_options_not_the_top_level() {
+        let p = parse::parse_ollama_chat_request(
+            r#"{"messages":[{"role":"user","content":"hi"}],
+                "options":{"temperature":0.25,"top_k":7,"top_p":0.5,"seed":42,
+                           "num_predict":16,"repeat_penalty":1.2,"stop":["END"]}}"#).unwrap();
+        assert_eq!(p.params.temperature, Some(0.25));
+        assert_eq!(p.params.top_k, Some(7));
+        assert_eq!(p.params.top_p, Some(0.5));
+        assert_eq!(p.params.seed, Some(42));
+        assert_eq!(p.params.max_tokens, Some(16));
+        assert_eq!(p.params.repetition_penalty, Some(1.2));
+        assert_eq!(p.params.stop, vec!["END".to_string()]);
+    }
+
+    /// `num_predict: -1` is Ollama's "no limit". It is the ABSENCE of a request value, not a
+    /// number -- read as one it would be a nonsense cap, and clamped to 0 it would emit nothing.
+    #[test]
+    fn num_predict_minus_one_is_unset_not_a_cap() {
+        let p = parse::parse_ollama_chat_request(
+            r#"{"messages":[{"role":"user","content":"hi"}],"options":{"num_predict":-1}}"#).unwrap();
+        assert_eq!(p.params.max_tokens, None);
+    }
+
+    /// `think` is Ollama's spelling of `enable_thinking`, and ABSENT is not the same as true --
+    /// the template distinguishes "unset" from "false" and only false is an instruction.
+    #[test]
+    fn think_maps_onto_enable_thinking_and_absent_stays_unset() {
+        let t = |b: &str| parse::parse_ollama_chat_request(b).unwrap().params.enable_thinking;
+        assert_eq!(t(r#"{"messages":[{"role":"user","content":"hi"}],"think":false}"#), Some(false));
+        assert_eq!(t(r#"{"messages":[{"role":"user","content":"hi"}],"think":true}"#), Some(true));
+        assert_eq!(t(r#"{"messages":[{"role":"user","content":"hi"}]}"#), None);
+    }
+
+    /// The buffered body is ONE object with `done: true` -- not OpenAI's `choices` array.
+    #[test]
+    fn a_buffered_chat_is_one_done_object() {
+        let (h, _j, _d, p, _s, _seen) = gen_handle(ss(&["Hello", " there"]), Duration::ZERO);
+        let (code, body) = route(
+            &post("/api/chat", r#"{"model":"llm","messages":[{"role":"user","content":"hi"}],"stream":false}"#),
+            &h, &p);
+        assert_eq!(code, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(body.text()).unwrap();
+        assert_eq!(v["message"]["role"], "assistant");
+        assert_eq!(v["message"]["content"], "Hello there");
+        assert_eq!(v["done"], true);
+        assert_eq!(v["done_reason"], "stop");
+        assert!(v.get("choices").is_none(), "leaked the OpenAI shape onto the Ollama wire");
+        assert_eq!(v["eval_count"], 2);
+        assert!(v["created_at"].as_str().unwrap().ends_with('Z'), "created_at must be RFC3339");
+    }
+
+    /// `arguments` is an OBJECT here and a JSON STRING on /v1. Getting this backwards hands the
+    /// client a quoted blob where it expects a map.
+    #[test]
+    fn a_tool_call_carries_arguments_as_an_object_not_a_string() {
+        let (h, _j, _d, p, _s, _seen) = gen_handle(Vec::new(), Duration::ZERO);
+        let body = format!(
+            r#"{{"model":"llm","stream":false,"messages":[{{"role":"user","content":"hi"}}],"tools":[{WEATHER}]}}"#);
+        let (code, out) = route(&post("/api/chat", &body), &h, &p);
+        assert_eq!(code, 200, "{out}");
+        let v: serde_json::Value = serde_json::from_str(out.text()).unwrap();
+        let args = &v["message"]["tool_calls"][0]["function"]["arguments"];
+        assert!(args.is_object(), "arguments must be an object on this wire, got {args}");
+        assert_eq!(args["city"], "Paris");
+        assert_eq!(v["message"]["tool_calls"][0]["function"]["name"], "get_weather");
+    }
+
+    /// The streaming wire: bare JSON per line, terminated by an object with `done: true`. No
+    /// `data:` prefix and no `[DONE]` -- a client parsing SSE here would read nothing at all.
+    #[test]
+    fn the_stream_is_ndjson_terminated_by_done() {
+        let (h, _j, _d, p, _s, _seen) = gen_handle(ss(&["a", "b"]), Duration::ZERO);
+        let (code, resp) = route(
+            &post("/api/chat", r#"{"model":"llm","messages":[{"role":"user","content":"hi"}]}"#), &h, &p);
+        assert_eq!(code, 200);
+        assert_eq!(resp.content_type(), "application/x-ndjson");
+        let Body::Stream(st) = resp else { panic!("not a stream") };
+        let stamp = st.created_at();
+        let (mut text, mut done) = (String::new(), None);
+        for item in st.rx.iter() {
+            match item {
+                StreamItem::Text(t) => {
+                    let line = crate::ollama::chat_chunk(&st.model, &stamp, &t);
+                    assert!(!line.starts_with("data:"), "SSE framing leaked onto the Ollama wire");
+                    let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    assert_eq!(v["done"], false);
+                    text.push_str(v["message"]["content"].as_str().unwrap());
+                }
+                StreamItem::Done { reason, report, .. } =>
+                    done = Some(crate::ollama::chat_done(&st.model, &stamp, reason, &report)),
+                _ => {}
+            }
+        }
+        assert_eq!(text, "ab");
+        let v: serde_json::Value = serde_json::from_str(&done.expect("no terminal frame")).unwrap();
+        assert_eq!(v["done"], true);
+    }
+
+    #[test]
+    fn rfc3339_formats_a_known_instant() {
+        // 1970-01-01T00:00:00Z and a date past a leap year, so the civil conversion is exercised.
+        assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339(1_700_000_000), "2023-11-14T22:13:20Z");
+    }
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::*;
+
+    /// A cancelled run must be distinguishable from a finished one. OpenAI's `finish_reason` has no
+    /// value for it, so the standard field stays standard and the truth rides beside it -- otherwise
+    /// a client whose generation an operator stopped just sees a short answer.
+    #[test]
+    fn an_aborted_stream_says_so_beside_the_standard_finish_reason() {
+        let (_tx, s) = {
+            let (tx, rx) = std::sync::mpsc::channel();
+            (tx, SseStream::new(rx, "m".into(), SseKind::Chat, false, npu_models::Cancel::new()))
+        };
+        let aborted: serde_json::Value =
+            serde_json::from_str(&s.render_done(FinishReason::Aborted)).unwrap();
+        assert_eq!(aborted["choices"][0]["finish_reason"], "stop", "the wire value stays standard");
+        assert_eq!(aborted["x_npu_finish"], "aborted");
+
+        let done: serde_json::Value =
+            serde_json::from_str(&s.render_done(FinishReason::Stop)).unwrap();
+        assert!(done.get("x_npu_finish").is_none(), "an ordinary stop must not be marked");
+    }
+
+    /// A socket that reports its client gone and accepts writes. Both halves matter: the probe must
+    /// be what decides, not a write that happens to fail.
+    struct Peer(bool);
+    impl std::io::Write for Peer {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> { Ok(b.len()) }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    impl PeerAlive for Peer {
+        fn peer_alive(&self) -> bool { self.0 }
+    }
+
+    fn stream(cancel: npu_models::Cancel) -> (std::sync::mpsc::Sender<StreamItem>, SseStream) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        (tx, SseStream::new(rx, "m".into(), SseKind::Chat, false, cancel))
+    }
+
+    /// The whole point. With nothing on the channel -- which is exactly prefill, for minutes -- no
+    /// write can fail, so the only way to learn the client left is to ASK; and asking has to reach
+    /// the generator, which is several dispatches deep in the driver and reads only this flag.
+    #[test]
+    fn a_vanished_peer_cancels_the_generation_with_no_traffic_at_all() {
+        let cancel = npu_models::Cancel::new();
+        // `_tx` is HELD: dropping it would end the wait by disconnecting the channel, which is the
+        // other exit and would make this pass for the wrong reason.
+        let (_tx, s) = stream(cancel.clone());
+        assert!(next_item(&mut Peer(false), &s).unwrap().is_none());
+        assert_eq!(cancel.reason(), Some(npu_models::CancelReason::PeerGone));
+    }
+
+    /// The control, and the one that matters more: a connection with nothing to say is the COMMON
+    /// case, and reading it as gone would kill every live generation that pauses.
+    #[test]
+    fn a_quiet_but_live_peer_is_not_cancelled() {
+        let cancel = npu_models::Cancel::new();
+        let (tx, s) = stream(cancel.clone());
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(600));
+            let _ = tx.send(StreamItem::Text("hi".into()));
+        });
+        // Spans several poll intervals, so the probe is consulted repeatedly and must keep saying
+        // "still there" rather than timing the generation out.
+        let got = next_item(&mut Peer(true), &s).unwrap();
+        assert!(matches!(got, Some(StreamItem::Text(_))), "a quiet connection was treated as gone");
+        assert!(!cancel.is_cancelled());
+    }
+
+    /// A finished generation is not a cancelled one: the actor dropping its sender is the ordinary
+    /// end, and it must not be recorded as the client leaving.
+    #[test]
+    fn a_finished_generation_ends_without_a_cancel_reason() {
+        let cancel = npu_models::Cancel::new();
+        let (tx, s) = stream(cancel.clone());
+        drop(tx);
+        assert!(next_item(&mut Peer(true), &s).unwrap().is_none());
+        assert_eq!(cancel.reason(), None);
+    }
+}

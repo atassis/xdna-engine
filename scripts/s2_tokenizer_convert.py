@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Convert fishaudio/openaudio-s1-mini's tiktoken vocab into a `tokenizer.json` the engine's
-`tokenizers` 0.20 crate can load (`Tokenizer::from_file`, `rust/npu-engine/src/llm/config.rs`).
+`tokenizers` 0.20 crate can load (`Tokenizer::from_file`, `rust/npu-models/src/llm/config.rs`).
 
 s1-mini ships `tokenizer.tiktoken` (a bare `<base64 bytes> <rank>` table -- no merges list) and
 `special_tokens.json`, never a `tokenizer.json` -- confirmed against the live `fishaudio/s1-mini`

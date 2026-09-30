@@ -6,8 +6,8 @@
 use std::path::Path;
 use std::time::Instant;
 
-use npu_engine::pipeline::Scenario;
-use npu_engine::registry;
+use npu_models::pipeline::Scenario;
+use npu_models::registry;
 
 // Reuses the shipped scenario (name "parakeet-tdt-0.6b-v3") -- do not add a second Parakeet
 // scenario file; `registry::try_build` dispatches on the name containing "parakeet".

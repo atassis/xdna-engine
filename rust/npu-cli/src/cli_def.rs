@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use clap::builder::PossibleValuesParser;
 use clap::{Parser, Subcommand, ValueEnum, ValueHint};
 use clap_complete::Shell;
-use npu_engine::capability::Capability;
+use npu_models::capability::Capability;
 
 const DECIDE_EXAMPLES: &str = "\
 Examples:
@@ -299,7 +299,7 @@ pub enum Cmd {
     ///
     /// A third configuration plane alongside `engine.toml` and these CLI flags: vars read directly
     /// by `env::var`/`var_os` across the shipped crates, none of them visible in `engine.toml` or
-    /// `--help`. This is that registry (`npu_runtime::env_flags::FLAGS`) rendered against the
+    /// `--help`. This is that registry (`npu_service::env_flags::FLAGS`) rendered against the
     /// current process environment -- report-only, changes nothing.
     Flags {
         /// Machine-readable output.
@@ -434,10 +434,10 @@ pub enum ConfigCmd {
     ///
     /// The key list is closed on purpose: an unrecognised key would produce a file that still
     /// parses and silently does nothing, which is the one failure a config typo must never have.
-    #[command(after_long_help = npu_runtime::config_doc::server_key_help_text())]
+    #[command(after_long_help = npu_service::config_doc::server_key_help_text())]
     Set {
         #[arg(value_parser = PossibleValuesParser::new(
-            npu_runtime::config_doc::SERVER_KEYS.iter().map(|(k, _)| *k).collect::<Vec<_>>()))]
+            npu_service::config_doc::SERVER_KEYS.iter().map(|(k, _)| *k).collect::<Vec<_>>()))]
         key: String,
         value: String,
     },

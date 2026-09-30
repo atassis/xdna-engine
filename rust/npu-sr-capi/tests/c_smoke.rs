@@ -18,7 +18,7 @@ fn cdylib_dir() -> Option<PathBuf> {
     None
 }
 
-/// libxdna_sr.so pulls npu-engine -> npu-onnx (onnxruntime); it needs libonnxruntime.so.1 on
+/// libxdna_sr.so pulls npu-models -> npu-onnx (onnxruntime); it needs libonnxruntime.so.1 on
 /// LD_LIBRARY_PATH at runtime (same requirement as every binary in this repo). Find one.
 fn onnxruntime_dir() -> Option<PathBuf> {
     for profile in ["debug", "release"] {

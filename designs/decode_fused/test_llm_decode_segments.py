@@ -240,7 +240,7 @@ def test_attn_global_flash_gets_a_resident_rope_f_constant_and_kv_skip_v_flag(mo
 def _assert_rope_f_undoes_forward_rotation(rope_f_bf16, hd, theta, partial):
     """rope_f (HD/2 uint32 turns, byte-reinterpreted into an HD-element bf16 buffer) must undo the
     SAME rotation verify_llm_decode.py's `rope_row` applies going forward (gated byte-for-byte
-    against rust/npu-engine/src/llm/npu_decode.rs::rope_row) -- checked against an INDEPENDENT
+    against rust/npu-models/src/llm/npu_decode.rs::rope_row) -- checked against an INDEPENDENT
     ground truth, measure_rope_poly.rope_inv_freq (already verified verbatim against
     gate_llm_reference.py's rope()), not against gen.rope_f_for_geometry a second time. A prior
     version of this check called gen.rope_f_for_geometry again as its own oracle, so a bug inside

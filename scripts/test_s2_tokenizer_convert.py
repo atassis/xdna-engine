@@ -10,7 +10,7 @@ parity with the Rust `tokenizers` 0.20 crate the engine actually embeds.
 That parity WAS checked out-of-band (not part of this suite, so it runs with no extra
 dependencies): an unrelated venv on this box already has the `tokenizers` PyPI package (0.23.2,
 same wire format) installed. Loading the produced file there via `Tokenizer.from_file` -- the
-identical call `rust/npu-engine/src/llm/config.rs` makes -- round-tripped every string below and
+identical call `rust/npu-models/src/llm/config.rs` makes -- round-tripped every string below and
 resolved `<|im_end|>`/`<|semantic:0|>`/`<|pad|>` to the same ids this suite asserts. If a
 `tokenizers` install is present wherever this suite runs, `test_real_tokenizers_library_if_available`
 repeats that check inline instead of skipping it.

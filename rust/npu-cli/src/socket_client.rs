@@ -29,7 +29,7 @@ pub fn refusal() -> anyhow::Error {
 /// generate/transcribe call; refusing when there is no service at all is `connect()` failing
 /// immediately (ECONNREFUSED/ENOENT), not a read timing out.
 fn connect() -> Option<UnixStream> {
-    let path = npu_runtime::control_socket::socket_path()?;
+    let path = npu_service::control_socket::socket_path()?;
     UnixStream::connect(path).ok()
 }
 
@@ -219,7 +219,7 @@ impl<R: BufRead> SseCall<R> {
 /// `Prompt::Chat`'s wire shape: `messages`, sent the same way an OpenAI client would build it. The
 /// CLI never sends `tool_calls`/`tool_call_id` on an outgoing turn -- those only ever come BACK from
 /// the model -- so a message is exactly its role and content.
-pub fn chat_messages_json(history: &[npu_engine::ChatMessage]) -> serde_json::Value {
+pub fn chat_messages_json(history: &[npu_models::ChatMessage]) -> serde_json::Value {
     serde_json::json!(history.iter()
         .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
         .collect::<Vec<_>>())
@@ -231,7 +231,7 @@ pub fn chat_messages_json(history: &[npu_engine::ChatMessage]) -> serde_json::Va
 /// whatever its OWN `--stats` display flag says, and streams by default the same way `npu generate`
 /// always has.
 pub fn generate_request_json(base: serde_json::Value, model: Option<&str>,
-                              params: &npu_engine::GenerateParams, stream: bool) -> serde_json::Value {
+                              params: &npu_models::GenerateParams, stream: bool) -> serde_json::Value {
     let mut v = base;
     let obj = v.as_object_mut().expect("base is always a JSON object");
     if let Some(m) = model { obj.insert("model".into(), serde_json::json!(m)); }

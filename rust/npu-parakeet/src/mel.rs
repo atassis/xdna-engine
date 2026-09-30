@@ -5,7 +5,7 @@
 //! is that graph's own initializer value, not a guess.
 //!
 //! Scope: batch=1, full-length input only (`waveforms_lens == waveforms.len()`), matching the
-//! single call site (`npu-engine/src/asr/parakeet.rs`, which always passes the whole clip's own
+//! single call site (`npu-models/src/asr/parakeet.rs`, which always passes the whole clip's own
 //! length). The graph's batch/length masking (`timemask`, the `mask` Where nodes) is dead code
 //! under that constraint and is not implemented -- a shorter `waveforms_lens` would need it back.
 //!

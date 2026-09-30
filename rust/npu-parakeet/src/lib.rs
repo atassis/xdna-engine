@@ -8,7 +8,7 @@
 //!
 //! Built to the `feat/general-engine` Encoder contract: `FastConformerEncoder` exposes
 //! `forward_last(&self, x: &Array2<f32>, valid_len: usize) -> Array2<f32>`. The thin
-//! `impl npu_engine::pipeline::Encoder` adapter + registry wiring are merge-time work
+//! `impl npu_models::pipeline::Encoder` adapter + registry wiring are merge-time work
 //! (reconcile in that branch's registry.rs); this crate stays decoupled so it builds alone.
 //! Phase 3 swaps the host matmuls for `npu_asr::ctx2` NPU dispatches.
 

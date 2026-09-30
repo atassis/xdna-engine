@@ -102,7 +102,7 @@ from math import comb
 expect = sum(comb(n_speakers, k) for k in range(max_per_frame + 1))
 assert (n_speakers, max_per_frame) == (3, 2), (
     f"checkpoint is {n_speakers} speakers / max {max_per_frame} per frame; "
-    f"npu-engine's POWERSET_3 table assumes 3/2 and must be regenerated")
+    f"npu-models's POWERSET_3 table assumes 3/2 and must be regenerated")
 assert n_classes == expect == 7, f"expected {expect} powerset classes, got {n_classes}"
 print(f"powerset: {n_speakers} speakers, max {max_per_frame}/frame -> {n_classes} classes")
 

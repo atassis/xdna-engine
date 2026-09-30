@@ -14,8 +14,8 @@
 
 use std::path::Path;
 
-use npu_engine::pipeline::Scenario;
-use npu_engine::registry;
+use npu_models::pipeline::Scenario;
+use npu_models::registry;
 
 /// Default scenario. Overridable with WHISPER_SCENARIO so the same harness can drive turbo
 /// (scenarios/asr-whisper-turbo.toml) -- the two differ only in weights and shape, not in code path.
@@ -48,7 +48,7 @@ pub fn run(argv: Vec<String>) {
     }
 }
 
-fn bench_clip(pipe: &dyn npu_engine::pipeline::AsrModel, wav_path: &str) {
+fn bench_clip(pipe: &dyn npu_models::pipeline::AsrModel, wav_path: &str) {
     let bytes = std::fs::read(&wav_path).unwrap_or_else(|e| panic!("read {wav_path}: {e}"));
     let samples = parse_wav_i16(&bytes).expect("parse 16k/mono/16-bit WAV");
     let dur_s = samples.len() as f64 / 16_000.0;

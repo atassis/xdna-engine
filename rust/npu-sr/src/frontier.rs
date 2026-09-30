@@ -252,7 +252,7 @@ mod npu_backend {
     use super::{ConvW, Feat};
     use crate::SrError;
     use ndarray::Array2;
-    use npu_engine::esm::native::{NativeKernel, NativeWeight, PAD_M};
+    use npu_models::esm::native::{NativeKernel, NativeWeight, PAD_M};
     use npu_xrt::Device;
     use std::path::Path;
     use std::rc::Rc;

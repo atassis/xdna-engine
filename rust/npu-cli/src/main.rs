@@ -1,5 +1,5 @@
-//! `npu` - the single engine entrypoint. Thin clap shell over npu-runtime (control plane) and
-//! npu-engine. Subcommands: serve, transcribe, embed, models, config, reload, bake.
+//! `npu` - the single engine entrypoint. Thin clap shell over npu-service (control plane) and
+//! npu-models. Subcommands: serve, transcribe, embed, models, config, reload, bake.
 use std::io::{BufRead, Read, Write};
 use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
@@ -20,13 +20,13 @@ use clap::{CommandFactory, Parser};
 use cli_def::{CheckpointCmd, Cli, Cmd, ConfigCmd, DecideType, ModelCmd, OutFormat, OutputFormat, SamplingArgs, SpeechFormat};
 use clap_complete::Shell;
 use std::io::IsTerminal;
-use npu_engine::telemetry::wire;
+use npu_models::telemetry::wire;
 use exit::{engine_error, Code, Tagged};
-use npu_runtime::actor::start;
-use npu_engine::capability::Capability;
-use npu_runtime::config::{Config, EvictPolicy, ModelCfg};
-use npu_runtime::http;
-use npu_runtime::loader::{EngineLoader, ModelLoader};
+use npu_service::actor::start;
+use npu_models::capability::Capability;
+use npu_service::config::{Config, EvictPolicy, ModelCfg};
+use npu_service::http;
+use npu_service::loader::{EngineLoader, ModelLoader};
 
 fn config_path(cli: &Cli) -> PathBuf { config_path_and_source(cli).0 }
 
@@ -298,7 +298,7 @@ fn preflight_serve(addr: &str) -> Result<()> {
     let sockaddr = match addr.parse() { Ok(a) => a, Err(_) => return Ok(()) };
     if TcpStream::connect_timeout(&sockaddr, Duration::from_millis(300)).is_err() {
         // Nothing listening; the address is ours to bind.
-        return if npu_engine::Engine::available() {
+        return if npu_models::Engine::available() {
             Ok(())
         } else {
             Err(Tagged(Code::Device,
@@ -339,7 +339,7 @@ fn preflight_artifacts(cfg: &Config, root: &Path) -> Result<()> {
     for m in &cfg.models {
         let p = Path::new(&m.scenario);
         let scenario_path = if p.is_absolute() { p.to_path_buf() } else { root.join(p) };
-        let Ok(sc) = npu_engine::config::ScenarioConfig::load(&scenario_path) else { continue };
+        let Ok(sc) = npu_models::config::ScenarioConfig::load(&scenario_path) else { continue };
         if sc.scenario.name == PARAKEET_SCENARIO_NAME {
             npu_parakeet::npu::preflight(root)
                 .map_err(|e| anyhow!("model {:?} ({}): {e}", m.name, sc.scenario.name))?;
@@ -390,7 +390,7 @@ fn serve(path: &Path, allow_degraded: bool) -> Result<()> {
     // request answered "actor dropped reply" while systemd showed active -- how a 5-day outage
     // went unnoticed. Refuse instead, naming each model and its cause.
     let failed: Vec<_> = handle.status().into_iter()
-        .filter(|s| s.state == npu_runtime::registry::LoadState::Failed).collect();
+        .filter(|s| s.state == npu_service::registry::LoadState::Failed).collect();
     if !failed.is_empty() {
         for s in &failed {
             eprintln!("[npu-serve] FAILED {}: {}", s.name, s.detail);
@@ -402,12 +402,12 @@ fn serve(path: &Path, allow_degraded: bool) -> Result<()> {
         }
         eprintln!("[npu-serve] --allow-degraded: binding anyway, /healthz will report 503");
     }
-    match npu_runtime::control_socket::socket_path() {
+    match npu_service::control_socket::socket_path() {
         Some(sock_path) => {
-            let listener = npu_runtime::control_socket::bind(&sock_path)
+            let listener = npu_service::control_socket::bind(&sock_path)
                 .with_context(|| format!("control socket {}", sock_path.display()))?;
             let (h, live, p) = (handle.clone(), handle.live_status(), path.to_path_buf());
-            std::thread::spawn(move || npu_runtime::control_socket::serve(listener, h, live, p));
+            std::thread::spawn(move || npu_service::control_socket::serve(listener, h, live, p));
         }
         // No RUNTIME_DIRECTORY/XDG_RUNTIME_DIR/NPU_SOCKET_ENDPOINT: the CLI's socket commands
         // (models, and every device command) simply have nothing to connect to, the same as a
@@ -480,8 +480,8 @@ fn play_wav(wav: &[u8]) -> Result<()> {
 
 /// `--flag <value>` overrides one `GenerateParams` field; an absent flag keeps the engine default
 /// (`GenerateParams::default()`, OpenAI's own defaults) -- never a CLI-chosen substitute.
-fn build_params(s: &SamplingArgs) -> Result<npu_engine::GenerateParams, String> {
-    let mut p = npu_engine::GenerateParams::default();
+fn build_params(s: &SamplingArgs) -> Result<npu_models::GenerateParams, String> {
+    let mut p = npu_models::GenerateParams::default();
     p.temperature = s.temperature;
     p.top_p = s.top_p;
     p.top_k = s.top_k;
@@ -565,31 +565,31 @@ struct Generated {
     text: String,
     /// Tool calls the model made. Echoed as JSON rather than as prose: a call is something to
     /// EXECUTE, and printing it as text would put it in the transcript as if the model had said it.
-    calls: Vec<npu_engine::ToolCall>,
-    reason: npu_engine::FinishReason,
-    report: npu_engine::GenerationReport,
+    calls: Vec<npu_models::ToolCall>,
+    reason: npu_models::FinishReason,
+    report: npu_models::GenerationReport,
 }
 
 /// `FinishReason::as_str`'s inverse. `"stop"` is the default for anything unrecognized -- the wire
 /// itself collapses `Aborted` into `"stop"` (OpenAI has no vocabulary for "the client hung up"), and
 /// a socket client draining its own stream to completion never produces `Aborted` either way.
-fn parse_finish_reason(s: &str) -> npu_engine::FinishReason {
+fn parse_finish_reason(s: &str) -> npu_models::FinishReason {
     match s {
-        "length" => npu_engine::FinishReason::Length,
-        "tool_calls" => npu_engine::FinishReason::ToolCalls,
-        _ => npu_engine::FinishReason::Stop,
+        "length" => npu_models::FinishReason::Length,
+        "tool_calls" => npu_models::FinishReason::ToolCalls,
+        _ => npu_models::FinishReason::Stop,
     }
 }
 
 /// One OpenAI-wire tool call (buffered `message.tool_calls[i]` or a streamed `delta.tool_calls[i]`
 /// fragment -- `render_tool_call`'s doc: one fragment always carries the WHOLE call, so there is no
 /// multi-fragment accumulation to do here, unlike `function.arguments` in general).
-fn tool_call_from_json(c: &serde_json::Value) -> npu_engine::ToolCall {
+fn tool_call_from_json(c: &serde_json::Value) -> npu_models::ToolCall {
     let f = &c["function"];
     let arguments = f["arguments"].as_str()
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or_else(|| serde_json::json!({}));
-    npu_engine::ToolCall {
+    npu_models::ToolCall {
         id: c["id"].as_str().unwrap_or("call_0").to_string(),
         name: f["name"].as_str().unwrap_or("").to_string(),
         arguments,
@@ -633,9 +633,9 @@ fn generated_from_buffered(v: &serde_json::Value, chat: bool) -> Result<Generate
 fn drain_sse<R: BufRead>(mut sse: socket_client::SseCall<R>, echo: bool, chat: bool,
              mut json: Option<&mut dyn Write>) -> Result<(wire::RunMeta, Generated)> {
     let mut text = String::new();
-    let mut calls: Vec<npu_engine::ToolCall> = Vec::new();
-    let mut reason = npu_engine::FinishReason::Stop;
-    let mut report: Option<npu_engine::GenerationReport> = None;
+    let mut calls: Vec<npu_models::ToolCall> = Vec::new();
+    let mut reason = npu_models::FinishReason::Stop;
+    let mut report: Option<npu_models::GenerationReport> = None;
     let mut meta: Option<wire::RunMeta> = None;
     while let Some(frame) = sse.next_frame() {
         let v = frame?;
@@ -648,7 +648,7 @@ fn drain_sse<R: BufRead>(mut sse: socket_client::SseCall<R>, echo: bool, chat: b
                 };
                 if let Some(w) = json.as_mut() {
                     writeln!(w, "{}", wire::header_line(
-                        &npu_runtime::conditions::at_start(&mm.model, mm.created), &mm))?;
+                        &npu_service::conditions::at_start(&mm.model, mm.created), &mm))?;
                 }
                 meta = Some(mm);
             }
@@ -657,7 +657,7 @@ fn drain_sse<R: BufRead>(mut sse: socket_client::SseCall<R>, echo: bool, chat: b
             bail!("{msg}");
         }
         if let Some(r) = v.get("x_npu_report") {
-            let rep: npu_engine::GenerationReport = serde_json::from_value(r.clone())?;
+            let rep: npu_models::GenerationReport = serde_json::from_value(r.clone())?;
             if let Some(w) = json.as_mut() {
                 let m = meta.as_ref().context("control socket: report arrived before any model frame")?;
                 writeln!(w, "{}", wire::prefill_line(&rep.prefill, m))?;
@@ -710,7 +710,7 @@ fn drain_sse<R: BufRead>(mut sse: socket_client::SseCall<R>, echo: bool, chat: b
 /// `/v1/chat/completions`/`/v1/completions` answer with. Returns the resolved model name (the
 /// server's echo, same as `Served::model` before this task) alongside the drained result.
 fn socket_generate(path: &str, base: serde_json::Value, model: Option<&str>,
-                    params: &npu_engine::GenerateParams, chat: bool, stream: bool, echo: bool,
+                    params: &npu_models::GenerateParams, chat: bool, stream: bool, echo: bool,
                     json: Option<&mut dyn Write>) -> Result<(String, Generated)> {
     let body = socket_client::generate_request_json(base, model, params, stream);
     if stream {
@@ -779,7 +779,7 @@ fn generate(prompt: &str, model: Option<&str>, sampling: &SamplingArgs,
         serde_json::json!({ "prompt": prompt })
     } else {
         serde_json::json!({ "messages": socket_client::chat_messages_json(
-            &[npu_engine::ChatMessage::new("user", prompt)]) })
+            &[npu_models::ChatMessage::new("user", prompt)]) })
     };
     // `--output json` follows the stream flag, the way /v1/chat/completions does: streaming means
     // NDJSON on stdout, buffered means one object printed below. In either JSON mode the text is
@@ -861,7 +861,7 @@ fn chat(opening: Option<&str>, model: Option<&str>, sampling: &SamplingArgs,
     // Code::Failure, the documented generic bucket: this closed set has no invalid-argument code,
     // and NoService (2) would tell a caller to start a server for what is a bad flag value.
     let params = build_params(sampling).map_err(|m| Tagged(Code::Failure, m))?;
-    let mut history: Vec<npu_engine::ChatMessage> = Vec::new();
+    let mut history: Vec<npu_models::ChatMessage> = Vec::new();
     let stdin = std::io::stdin();
     // Whitespace-only counts as absent: `npu chat ""` must open the REPL, not send an empty turn.
     let mut opening = opening.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
@@ -888,7 +888,7 @@ fn chat(opening: Option<&str>, model: Option<&str>, sampling: &SamplingArgs,
                 line
             }
         };
-        history.push(npu_engine::ChatMessage::new("user", line));
+        history.push(npu_models::ChatMessage::new("user", line));
         let base = serde_json::json!({ "messages": socket_client::chat_messages_json(&history) });
         // One NDJSON run per turn -- header, tokens, summary -- so a piped chat session is a
         // concatenation of run logs rather than a format of its own. Always streamed in JSON mode
@@ -905,7 +905,7 @@ fn chat(opening: Option<&str>, model: Option<&str>, sampling: &SamplingArgs,
             println!();
             print_stats_footer(&g, false);
         }
-        history.push(npu_engine::ChatMessage::new("assistant", g.text));
+        history.push(npu_models::ChatMessage::new("assistant", g.text));
     }
 }
 
@@ -1244,7 +1244,7 @@ fn artifact_precision(root: Option<&PathBuf>, decode: &str) -> Option<String> {
 fn declared(root: Option<&PathBuf>, scenario: &str) -> Declared {
     let sc = root
         .map(|r| r.join(scenario))
-        .and_then(|p| npu_engine::config::ScenarioConfig::load(&p).ok());
+        .and_then(|p| npu_models::config::ScenarioConfig::load(&p).ok());
     let scenario_max_seq = sc.as_ref().and_then(|c| c.model.as_ref().map(|m| m.max_seq));
     // Best-effort: LlmArtifact::load fails loud on an ACTIVE toolchain-stale mismatch (correct for
     // the code path that is about to DISPATCH against the ELF), but a listing must never abort just
@@ -1253,11 +1253,11 @@ fn declared(root: Option<&PathBuf>, scenario: &str) -> Declared {
     let artifact_max_seq = sc.as_ref()
         .filter(|c| !c.artifacts.decode.is_empty())
         .and_then(|c| root.map(|r| r.join(&c.artifacts.decode)))
-        .and_then(|d| npu_engine::llm::LlmArtifact::load(&d).ok())
+        .and_then(|d| npu_models::llm::LlmArtifact::load(&d).ok())
         .map(|a| a.max_seq)
         .or_else(|| {
             let c = sc.as_ref().filter(|c| !c.artifacts.resident.is_empty())?;
-            npu_engine::llm::resident_max_context(&root?.join(&c.artifacts.resident))
+            npu_models::llm::resident_max_context(&root?.join(&c.artifacts.resident))
         });
     Declared {
         // Through the canonical mapping, not the raw string: a scenario says `kind = "embeddings"`
@@ -1265,7 +1265,7 @@ fn declared(root: Option<&PathBuf>, scenario: &str) -> Declared {
         // Reporting the manifest's spelling here would make the column change vocabulary depending
         // on whether the service happened to be running.
         kind: sc.as_ref().and_then(|c| {
-            npu_engine::capability::Capability::from_scenario_kind(&c.scenario.kind).map(|k| k.0.to_string())
+            npu_models::capability::Capability::from_scenario_kind(&c.scenario.kind).map(|k| k.0.to_string())
         }),
         // The manifest wins where it speaks; the artifact answers for generate, which has no
         // [model] block to speak with.
@@ -1309,7 +1309,7 @@ fn context_cell(effective: Option<usize>, scenario_declared: Option<usize>) -> S
 /// generate-kind models with a compiled decode artifact. `None` for every other model kind -- there
 /// is nothing artifact-derived to add for an encoder-only scenario.
 fn verbose_detail(root: Option<&PathBuf>, scenario: &str) -> Option<String> {
-    let sc = npu_engine::config::ScenarioConfig::load(&root?.join(scenario)).ok()?;
+    let sc = npu_models::config::ScenarioConfig::load(&root?.join(scenario)).ok()?;
     let decode = &sc.artifacts.decode;
     if decode.is_empty() { return None; }
     let dir = root?.join(decode);
@@ -1321,16 +1321,16 @@ fn verbose_detail(root: Option<&PathBuf>, scenario: &str) -> Option<String> {
     // reachable for a genuinely stale model.
     let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("meta.json")).ok()?).ok()?;
     let toolchain_hash = meta.get("toolchain").and_then(|t| t.get("hash")).and_then(|h| h.as_str()).map(str::to_string);
-    let fresh = match npu_engine::llm::artifact::LlmArtifact::check_toolchain_freshness(&toolchain_hash, &dir) {
-        npu_engine::llm::artifact::ToolchainFreshness::Fresh { .. } => "fresh".to_string(),
-        npu_engine::llm::artifact::ToolchainFreshness::Stale { .. } => "STALE".to_string(),
-        npu_engine::llm::artifact::ToolchainFreshness::Unstamped => "unstamped".to_string(),
-        npu_engine::llm::artifact::ToolchainFreshness::Unverifiable { .. } => "unverifiable".to_string(),
+    let fresh = match npu_models::llm::artifact::LlmArtifact::check_toolchain_freshness(&toolchain_hash, &dir) {
+        npu_models::llm::artifact::ToolchainFreshness::Fresh { .. } => "fresh".to_string(),
+        npu_models::llm::artifact::ToolchainFreshness::Stale { .. } => "STALE".to_string(),
+        npu_models::llm::artifact::ToolchainFreshness::Unstamped => "unstamped".to_string(),
+        npu_models::llm::artifact::ToolchainFreshness::Unverifiable { .. } => "unverifiable".to_string(),
     };
 
     // kv_block/window_rungs need the full artifact -- degrade to `?` rather than dropping the
     // line, so a stale (or otherwise unloadable) artifact still reports what it can.
-    match npu_engine::llm::LlmArtifact::load(&dir).ok() {
+    match npu_models::llm::LlmArtifact::load(&dir).ok() {
         Some(a) => {
             let rungs = if a.window_rungs.is_empty() {
                 "none".to_string()
@@ -1611,7 +1611,7 @@ fn top(interval: f64, once: bool) -> Result<()> {
 /// command past a bound. `None` for every failure mode (no socket, refused, timed out, bad JSON) --
 /// all of them mean the same thing to a caller: no live status to show.
 fn query_control_socket() -> Option<serde_json::Value> {
-    let path = npu_runtime::control_socket::socket_path()?;
+    let path = npu_service::control_socket::socket_path()?;
     let timeout = std::time::Duration::from_secs(2);
     let mut stream = UnixStream::connect(&path).ok()?;
     stream.set_read_timeout(Some(timeout)).ok()?;
@@ -1725,7 +1725,7 @@ fn describe(m: &ModelMutation) -> String {
 /// once. So when a service is up it does the writing, and this reduces to naming the request; the
 /// local path below is for when there is no service, where there is no one to race.
 fn admin_call(m: &ModelMutation) -> (&'static str, String, String) {
-    let esc = npu_runtime::http::parse::json_escape;
+    let esc = npu_service::http::parse::json_escape;
     match m {
         ModelMutation::AddModel { name, scenario } => (
             "POST", "/admin/models".into(),
@@ -1987,7 +1987,7 @@ fn bake_by_name(path: &Path, name: &str, force: bool) -> Result<()> {
     // `scenario = "scenarios/x.toml"` is root-relative, not cwd-relative.
     let scenario_path = Path::new(&m.scenario);
     let scenario_path = if scenario_path.is_absolute() { scenario_path.to_path_buf() } else { root.join(scenario_path) };
-    let sc = npu_engine::config::ScenarioConfig::load(&scenario_path)
+    let sc = npu_models::config::ScenarioConfig::load(&scenario_path)
         .with_context(|| format!("scenario {}", m.scenario))?;
     match sc.artifacts.model_spec()? {
         Some(spec) => { let p = spec.ensure_checkpoint(&root, force)?; println!("baked: {}", p.display()); }
@@ -2058,7 +2058,7 @@ fn apply_mutation(path: &Path, m: &ModelMutation, no_reload: bool) -> Result<()>
         return Ok(());
     }
 
-    let mut doc = npu_runtime::ConfigDoc::load(path).map_err(|e| anyhow!(e))?;
+    let mut doc = npu_service::ConfigDoc::load(path).map_err(|e| anyhow!(e))?;
     let note = match m {
         ModelMutation::AddModel { name, scenario } => {
             doc.add_model(name, scenario).map_err(|e| anyhow!(e))?;
@@ -2123,12 +2123,12 @@ fn model_mutate(path: &Path, action: &ModelCmd) -> Result<()> {
 /// Every registered `NPU_*`/related env var against the LIVE process environment: whether it is
 /// currently set, its raw value if so, its truth semantics, and what it does.
 ///
-/// `npu_runtime::env_flags::FLAGS` is the single source; this only renders it. Reads with
+/// `npu_service::env_flags::FLAGS` is the single source; this only renders it. Reads with
 /// `var_os` (not `var`) so presence is detected independent of UTF-8 validity, matching the
 /// `Presence`/`IsOk`/`NotZero` sites themselves.
 fn flags_cmd(as_json: bool) -> Result<()> {
     if as_json {
-        let rows: Vec<_> = npu_runtime::env_flags::FLAGS.iter().map(|f| {
+        let rows: Vec<_> = npu_service::env_flags::FLAGS.iter().map(|f| {
             let raw = std::env::var_os(f.name);
             serde_json::json!({
                 "name": f.name,
@@ -2145,7 +2145,7 @@ fn flags_cmd(as_json: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&rows)?);
         return Ok(());
     }
-    for f in npu_runtime::env_flags::FLAGS {
+    for f in npu_service::env_flags::FLAGS {
         let raw = std::env::var_os(f.name);
         let (source, value) = match &raw {
             Some(v) => ("env", v.to_string_lossy().into_owned()),
@@ -2221,8 +2221,8 @@ fn http_req(addr: &str, method: &str, path: &str, body: &str) -> Result<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use npu_runtime::actor::start_lazy;
-    use npu_runtime::config::{Defaults, ModelCfg, ServerCfg};
+    use npu_service::actor::start_lazy;
+    use npu_service::config::{Defaults, ModelCfg, ServerCfg};
 
     fn top_doc(started: i64, extra: serde_json::Value) -> serde_json::Value {
         serde_json::json!({
@@ -2367,21 +2367,21 @@ mod tests {
     /// tell two calls apart without a real device, and to compare the CLI-over-socket path against
     /// the HTTP route byte for byte.
     struct EchoEmbed;
-    impl npu_runtime::loader::Servable for EchoEmbed {
+    impl npu_service::loader::Servable for EchoEmbed {
         fn capabilities(&self) -> Capability { Capability::EMBED }
-        fn run(&mut self, req: npu_engine::capability::Request)
-            -> Result<npu_engine::capability::Response, npu_engine::EngineError> {
+        fn run(&mut self, req: npu_models::capability::Request)
+            -> Result<npu_models::capability::Response, npu_models::EngineError> {
             match req {
-                npu_engine::capability::Request::Text(t) =>
-                    Ok(npu_engine::capability::Response::Vector(t.bytes().map(|b| b as f32).collect())),
+                npu_models::capability::Request::Text(t) =>
+                    Ok(npu_models::capability::Response::Vector(t.bytes().map(|b| b as f32).collect())),
                 other => panic!("EchoEmbed cannot serve {other:?}"),
             }
         }
     }
-    impl npu_runtime::loader::StreamServable for EchoEmbed {}
+    impl npu_service::loader::StreamServable for EchoEmbed {}
     struct EchoEmbedLoader;
     impl ModelLoader for EchoEmbedLoader {
-        fn load(&self, _cfg: &ModelCfg) -> Result<Box<dyn npu_runtime::loader::StreamServable>, npu_engine::EngineError> {
+        fn load(&self, _cfg: &ModelCfg) -> Result<Box<dyn npu_service::loader::StreamServable>, npu_models::EngineError> {
             Ok(Box::new(EchoEmbed))
         }
         fn declared_capability(&self, _cfg: &ModelCfg) -> Option<Capability> { Some(Capability::EMBED) }
@@ -2390,7 +2390,7 @@ mod tests {
     /// A real actor behind a real control socket, `XDG_RUNTIME_DIR` pointed at a fresh tempdir.
     /// Every caller of this must hold `ENV_LOCK` -- `socket_path()` reads process-global env.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    fn embed_socket_harness(port: u16) -> (npu_runtime::actor::Handle, std::thread::JoinHandle<()>, tempfile::TempDir) {
+    fn embed_socket_harness(port: u16) -> (npu_service::actor::Handle, std::thread::JoinHandle<()>, tempfile::TempDir) {
         let cfg = Config {
             server: ServerCfg { port, idle_unload_s: 0, ..Default::default() },
             defaults: Defaults::from_pairs([(Capability::EMBED, "bge".to_string())]),
@@ -2400,10 +2400,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::env::remove_var("RUNTIME_DIRECTORY");
         std::env::set_var("XDG_RUNTIME_DIR", dir.path());
-        let sock_path = npu_runtime::control_socket::socket_path().unwrap();
-        let listener = npu_runtime::control_socket::bind(&sock_path).unwrap();
+        let sock_path = npu_service::control_socket::socket_path().unwrap();
+        let listener = npu_service::control_socket::bind(&sock_path).unwrap();
         let (h2, live, cfg_path) = (handle.clone(), handle.live_status(), dir.path().join("engine.toml"));
-        std::thread::spawn(move || npu_runtime::control_socket::serve(listener, h2, live, cfg_path));
+        std::thread::spawn(move || npu_service::control_socket::serve(listener, h2, live, cfg_path));
         (handle, join, dir)
     }
 
@@ -2440,11 +2440,11 @@ mod tests {
         let via_socket = socket_client::call_json("/v1/embeddings", &body).unwrap();
 
         let cfg_path = dir.path().join("engine.toml");
-        let req = npu_runtime::http::Request {
+        let req = npu_service::http::Request {
             method: "POST".into(), path: "/v1/embeddings".into(),
             boundary: String::new(), body: body.to_string().into_bytes(),
         };
-        let (code, resp) = npu_runtime::http::route(&req, &handle, &cfg_path);
+        let (code, resp) = npu_service::http::route(&req, &handle, &cfg_path);
         assert_eq!(code, 200, "{}", resp.text());
         let via_http: serde_json::Value = serde_json::from_str(resp.text()).unwrap();
 
@@ -2459,51 +2459,51 @@ mod tests {
     /// it received: noul answers a fixed 0.75, choice/score answer the FIRST option -- enough for a
     /// wire test to prove the server parsed the CLI's body rather than echoing it untouched.
     struct EchoDecide;
-    impl npu_runtime::loader::Servable for EchoDecide {
+    impl npu_service::loader::Servable for EchoDecide {
         fn capabilities(&self) -> Capability { Capability::GENERATE }
-        fn run(&mut self, req: npu_engine::capability::Request)
-            -> Result<npu_engine::capability::Response, npu_engine::EngineError> {
+        fn run(&mut self, req: npu_models::capability::Request)
+            -> Result<npu_models::capability::Response, npu_models::EngineError> {
             let d = match req {
-                npu_engine::capability::Request::Decide(d) => d,
+                npu_models::capability::Request::Decide(d) => d,
                 other => panic!("EchoDecide cannot serve {other:?}"),
             };
             let answers = d.questions.iter().map(|q| match q.kind {
-                npu_engine::QuestionKind::Noul => npu_engine::DecideAnswer::Noul { id: q.id.clone(), p_true: 0.75 },
-                npu_engine::QuestionKind::Choice => {
+                npu_models::QuestionKind::Noul => npu_models::DecideAnswer::Noul { id: q.id.clone(), p_true: 0.75 },
+                npu_models::QuestionKind::Choice => {
                     let n = q.options.len() as f64;
-                    npu_engine::DecideAnswer::Choice {
+                    npu_models::DecideAnswer::Choice {
                         id: q.id.clone(), choice: q.options[0].0.clone(),
                         probabilities: q.options.iter().map(|(k, _)| (k.clone(), 1.0 / n)).collect(),
                         confidence: 1.0 / n,
                     }
                 }
-                npu_engine::QuestionKind::Score => {
+                npu_models::QuestionKind::Score => {
                     let n = q.options.len();
-                    npu_engine::DecideAnswer::Score {
+                    npu_models::DecideAnswer::Score {
                         id: q.id.clone(), score: 0.0,
                         probabilities: vec![1.0 / n as f64; n], confidence: 1.0 / n as f64,
                     }
                 }
             }).collect();
-            let stats = npu_engine::DecideStats {
-                questions: d.questions.iter().map(|q| npu_engine::QuestionStats {
+            let stats = npu_models::DecideStats {
+                questions: d.questions.iter().map(|q| npu_models::QuestionStats {
                     id: q.id.clone(), prompt_tokens: 7, batched_tokens: 6, stepwise_tokens: 1,
                     prefill_us: 1500, ..Default::default()
                 }).collect(),
                 ..Default::default()
             };
-            Ok(npu_engine::capability::Response::Decisions(npu_engine::Decisions { answers, stats }))
+            Ok(npu_models::capability::Response::Decisions(npu_models::Decisions { answers, stats }))
         }
     }
-    impl npu_runtime::loader::StreamServable for EchoDecide {}
+    impl npu_service::loader::StreamServable for EchoDecide {}
     struct EchoDecideLoader;
     impl ModelLoader for EchoDecideLoader {
-        fn load(&self, _cfg: &ModelCfg) -> Result<Box<dyn npu_runtime::loader::StreamServable>, npu_engine::EngineError> {
+        fn load(&self, _cfg: &ModelCfg) -> Result<Box<dyn npu_service::loader::StreamServable>, npu_models::EngineError> {
             Ok(Box::new(EchoDecide))
         }
         fn declared_capability(&self, _cfg: &ModelCfg) -> Option<Capability> { Some(Capability::GENERATE) }
     }
-    fn decide_socket_harness(port: u16) -> (npu_runtime::actor::Handle, std::thread::JoinHandle<()>, tempfile::TempDir) {
+    fn decide_socket_harness(port: u16) -> (npu_service::actor::Handle, std::thread::JoinHandle<()>, tempfile::TempDir) {
         let cfg = Config {
             server: ServerCfg { port, idle_unload_s: 0, ..Default::default() },
             defaults: Defaults::from_pairs([(Capability::GENERATE, "qwen3.5-4b".to_string())]),
@@ -2513,10 +2513,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::env::remove_var("RUNTIME_DIRECTORY");
         std::env::set_var("XDG_RUNTIME_DIR", dir.path());
-        let sock_path = npu_runtime::control_socket::socket_path().unwrap();
-        let listener = npu_runtime::control_socket::bind(&sock_path).unwrap();
+        let sock_path = npu_service::control_socket::socket_path().unwrap();
+        let listener = npu_service::control_socket::bind(&sock_path).unwrap();
         let (h2, live, cfg_path) = (handle.clone(), handle.live_status(), dir.path().join("engine.toml"));
-        std::thread::spawn(move || npu_runtime::control_socket::serve(listener, h2, live, cfg_path));
+        std::thread::spawn(move || npu_service::control_socket::serve(listener, h2, live, cfg_path));
         (handle, join, dir)
     }
 
@@ -2542,11 +2542,11 @@ mod tests {
             let body = decide_body("s", "q?", kind, opts, "qwen3.5-4b").unwrap();
             let via_socket = socket_client::call_json("/v1/systemone", &body).unwrap();
 
-            let req = npu_runtime::http::Request {
+            let req = npu_service::http::Request {
                 method: "POST".into(), path: "/v1/systemone".into(),
                 boundary: String::new(), body: body.to_string().into_bytes(),
             };
-            let (code, resp) = npu_runtime::http::route(&req, &handle, &cfg_path);
+            let (code, resp) = npu_service::http::route(&req, &handle, &cfg_path);
             assert_eq!(code, 200, "{}", resp.text());
             let via_http: serde_json::Value = serde_json::from_str(resp.text()).unwrap();
             assert_eq!(via_socket["answers"], via_http["answers"],
@@ -2568,28 +2568,28 @@ mod tests {
     }
 
     struct MockTts;
-    impl npu_runtime::loader::Servable for MockTts {
+    impl npu_service::loader::Servable for MockTts {
         fn capabilities(&self) -> Capability { Capability::TTS }
-        fn run(&mut self, req: npu_engine::capability::Request)
-            -> Result<npu_engine::capability::Response, npu_engine::EngineError> {
+        fn run(&mut self, req: npu_models::capability::Request)
+            -> Result<npu_models::capability::Response, npu_models::EngineError> {
             match req {
-                npu_engine::capability::Request::Text(_) =>
-                    Ok(npu_engine::capability::Response::Audio { pcm: vec![1, 2, 3, 4], sample_rate: 22_050 }),
-                other => Err(npu_engine::EngineError::Unsupported(other.shape().into())),
+                npu_models::capability::Request::Text(_) =>
+                    Ok(npu_models::capability::Response::Audio { pcm: vec![1, 2, 3, 4], sample_rate: 22_050 }),
+                other => Err(npu_models::EngineError::Unsupported(other.shape().into())),
             }
         }
     }
-    impl npu_runtime::loader::StreamServable for MockTts {}
+    impl npu_service::loader::StreamServable for MockTts {}
     struct MockTtsLoader;
     impl ModelLoader for MockTtsLoader {
-        fn load(&self, _cfg: &ModelCfg) -> Result<Box<dyn npu_runtime::loader::StreamServable>, npu_engine::EngineError> {
+        fn load(&self, _cfg: &ModelCfg) -> Result<Box<dyn npu_service::loader::StreamServable>, npu_models::EngineError> {
             Ok(Box::new(MockTts))
         }
         fn declared_capability(&self, _cfg: &ModelCfg) -> Option<Capability> { Some(Capability::TTS) }
     }
 
     fn tts_socket_harness(port: u16)
-        -> (npu_runtime::actor::Handle, std::thread::JoinHandle<()>, tempfile::TempDir) {
+        -> (npu_service::actor::Handle, std::thread::JoinHandle<()>, tempfile::TempDir) {
         let cfg = Config {
             server: ServerCfg { port, idle_unload_s: 0, ..Default::default() },
             defaults: Defaults::from_pairs([(Capability::TTS, "kokoro".to_string())]),
@@ -2599,10 +2599,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::env::remove_var("RUNTIME_DIRECTORY");
         std::env::set_var("XDG_RUNTIME_DIR", dir.path());
-        let sock_path = npu_runtime::control_socket::socket_path().unwrap();
-        let listener = npu_runtime::control_socket::bind(&sock_path).unwrap();
+        let sock_path = npu_service::control_socket::socket_path().unwrap();
+        let listener = npu_service::control_socket::bind(&sock_path).unwrap();
         let (h2, live, cfg_path) = (handle.clone(), handle.live_status(), dir.path().join("engine.toml"));
-        std::thread::spawn(move || npu_runtime::control_socket::serve(listener, h2, live, cfg_path));
+        std::thread::spawn(move || npu_service::control_socket::serve(listener, h2, live, cfg_path));
         (handle, join, dir)
     }
 
@@ -2688,18 +2688,18 @@ mod tests {
     fn a_device_command_outlives_a_short_timeout() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         struct SlowEmbed;
-        impl npu_runtime::loader::Servable for SlowEmbed {
+        impl npu_service::loader::Servable for SlowEmbed {
             fn capabilities(&self) -> Capability { Capability::EMBED }
-            fn run(&mut self, _req: npu_engine::capability::Request)
-                -> Result<npu_engine::capability::Response, npu_engine::EngineError> {
+            fn run(&mut self, _req: npu_models::capability::Request)
+                -> Result<npu_models::capability::Response, npu_models::EngineError> {
                 std::thread::sleep(std::time::Duration::from_secs(3));
-                Ok(npu_engine::capability::Response::Vector(vec![1.0]))
+                Ok(npu_models::capability::Response::Vector(vec![1.0]))
             }
         }
-        impl npu_runtime::loader::StreamServable for SlowEmbed {}
+        impl npu_service::loader::StreamServable for SlowEmbed {}
         struct SlowEmbedLoader;
         impl ModelLoader for SlowEmbedLoader {
-            fn load(&self, _cfg: &ModelCfg) -> Result<Box<dyn npu_runtime::loader::StreamServable>, npu_engine::EngineError> {
+            fn load(&self, _cfg: &ModelCfg) -> Result<Box<dyn npu_service::loader::StreamServable>, npu_models::EngineError> {
                 Ok(Box::new(SlowEmbed))
             }
             fn declared_capability(&self, _cfg: &ModelCfg) -> Option<Capability> { Some(Capability::EMBED) }
@@ -2714,10 +2714,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::env::remove_var("RUNTIME_DIRECTORY");
         std::env::set_var("XDG_RUNTIME_DIR", dir.path());
-        let sock_path = npu_runtime::control_socket::socket_path().unwrap();
-        let listener = npu_runtime::control_socket::bind(&sock_path).unwrap();
+        let sock_path = npu_service::control_socket::socket_path().unwrap();
+        let listener = npu_service::control_socket::bind(&sock_path).unwrap();
         let (h2, live, cfg_path) = (handle.clone(), handle.live_status(), dir.path().join("engine.toml"));
-        std::thread::spawn(move || npu_runtime::control_socket::serve(listener, h2, live, cfg_path));
+        std::thread::spawn(move || npu_service::control_socket::serve(listener, h2, live, cfg_path));
 
         let v = socket_client::call_json("/v1/embeddings", &serde_json::json!({"input": "hi"})).unwrap();
         assert!(v["data"][0]["embedding"].is_array());
@@ -2775,7 +2775,7 @@ mod tests {
     /// mode attaches to a real per-token chunk) is one.
     #[test]
     fn streaming_json_writes_a_run_log_its_own_readers_can_parse() {
-        use npu_engine::{FinishReason, GenerateUsage, GenerationReport, StepRecord};
+        use npu_models::{FinishReason, GenerateUsage, GenerationReport, StepRecord};
 
         let meta = wire::RunMeta { id: "chatcmpl-t".into(), created: 7, model: "m".into(), chat: true };
         let mut report = GenerationReport::default();
@@ -2836,7 +2836,7 @@ mod tests {
     /// scenario path can contain no spaces while a model name never does -- so name first, path last.
     #[test]
     fn model_listing_is_splittable_by_column() {
-        let cfg = npu_runtime::config::Config::from_str(
+        let cfg = npu_service::config::Config::from_str(
             "[[model]]\nname = \"whisper-turbo\"\nscenario = \"scenarios/asr-whisper-turbo.toml\"\n",
         )
         .unwrap();
@@ -2870,8 +2870,8 @@ mod tests {
         assert_eq!(pin_cell(true, Some(true), Some(true)), "yes", "honoured pins render plainly");
     }
 
-    fn pin_cfg(models: &[(&str, bool)]) -> npu_runtime::config::Config {
-        npu_runtime::config::Config {
+    fn pin_cfg(models: &[(&str, bool)]) -> npu_service::config::Config {
+        npu_service::config::Config {
             server: ServerCfg::default(),
             models: models.iter().map(|(n, r)| ModelCfg {
                 name: (*n).into(), scenario: "x".into(), resident: *r }).collect(),
@@ -2924,7 +2924,7 @@ mod tests {
     #[test]
     fn render_marks_which_models_are_pinned() {
         // No scenario/weight files exist at this root, so declared_footprint is 0 for both -- this
-        // test is about the [pinned] marker, not the overcommit warning (covered in npu_runtime's
+        // test is about the [pinned] marker, not the overcommit warning (covered in npu_service's
         // own pin_overcommit unit tests).
         let out = render(&pin_cfg(&[("a", false), ("b", true)]), Path::new("/nonexistent"));
         assert!(out.contains("model b -> x  [pinned]"), "{out}");
@@ -2941,21 +2941,21 @@ mod tests {
         std::fs::write(&p, "# keep me\n[server]\nmemory_ceiling_mb = 2048\n\n[[model]]\nname = \"a\"\nscenario = \"s.toml\"\n").unwrap();
 
         apply_mutation(&p, &ModelMutation::SetResident { model: "a", on: true }, true).unwrap();
-        assert!(npu_runtime::config::Config::load(&p).unwrap().find("a").unwrap().resident);
+        assert!(npu_service::config::Config::load(&p).unwrap().find("a").unwrap().resident);
 
         apply_mutation(&p, &ModelMutation::SetServer { key: "idle_unload_s", value: "0" }, true).unwrap();
-        let cfg = npu_runtime::config::Config::load(&p).unwrap();
+        let cfg = npu_service::config::Config::load(&p).unwrap();
         assert_eq!(cfg.server.idle_unload(), None, "0 is how idle unload is switched off");
         assert_eq!(cfg.server.memory_ceiling_mb, 2048, "an unnamed key must not move");
 
         // Re-pointing a scenario must not silently disable.
         apply_mutation(&p, &ModelMutation::AddModel { name: "a", scenario: "t.toml" }, true).unwrap();
-        let cfg = npu_runtime::config::Config::load(&p).unwrap();
+        let cfg = npu_service::config::Config::load(&p).unwrap();
         assert_eq!(cfg.find("a").unwrap().scenario, "t.toml");
         assert!(cfg.find("a").unwrap().resident);
 
         apply_mutation(&p, &ModelMutation::SetResident { model: "a", on: false }, true).unwrap();
-        assert!(!npu_runtime::config::Config::load(&p).unwrap().find("a").unwrap().resident);
+        assert!(!npu_service::config::Config::load(&p).unwrap().find("a").unwrap().resident);
 
         assert!(std::fs::read_to_string(&p).unwrap().contains("# keep me"),
             "every verb has to preserve the comments");
@@ -3037,7 +3037,7 @@ mod tests {
 
         // Confirm this actually hits the Stale-fails-loud path inside `load`, not some unrelated
         // parse failure -- otherwise this test would pass against the old, buggy code too.
-        let err = npu_engine::llm::LlmArtifact::load(&decode_dir).unwrap_err().to_string();
+        let err = npu_models::llm::LlmArtifact::load(&decode_dir).unwrap_err().to_string();
         assert!(err.contains("toolchain-stale"), "{err}");
 
         std::fs::write(dir.path().join("s.toml"), concat!(
