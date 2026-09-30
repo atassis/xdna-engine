@@ -149,6 +149,14 @@ iron_require_pin() {
   local want
   want="$(sed -n 's/^IRON_FORK_COMMIT=\([0-9a-f]\{7,\}\).*/\1/p' "$lock" 2>/dev/null | head -1)"
   [ -n "$want" ] || { echo "ERROR: no IRON_FORK_COMMIT in $lock -- refusing to build unpinned" >&2; return 1; }
+  # A buildstore replay sandbox never has .git (deliberately not a recorded input), so the
+  # orchestrator runs the git check ONCE, outside the sandbox, and hands down the sha it got --
+  # mirrors AIECC_PIN_OVERRIDE's "must name the sha" idiom. Any other non-empty value is stale.
+  if [ -n "${IRON_PIN_VERIFIED:-}" ]; then
+    [ "$IRON_PIN_VERIFIED" = "$want" ] && return 0
+    echo "ERROR: IRON_PIN_VERIFIED=$IRON_PIN_VERIFIED is stale against pin $want." >&2
+    return 1
+  fi
   git -C "$dir" cat-file -e "$want^{commit}" 2>/dev/null || {
     echo "ERROR: $dir does not have pinned IRON_FORK_COMMIT $want (fetch the fork?)" >&2; return 1; }
   git -C "$dir" merge-base --is-ancestor "$want" HEAD 2>/dev/null || {

@@ -116,6 +116,9 @@ tier1() {
   echo
   "$PY" "$REPO/scripts/gate_numeric.py" "${ARTIFACTS[@]}" \
       --dump "$(IFS=,; echo "${dumps[*]}")" --json "$SCRATCH/tier1.json" || rc=1
+  for art in "${ARTIFACTS[@]}"; do
+    "$PY" "$REPO/scripts/buildstore.py" gate-record "$art" tier1 "$rc" "$SCRATCH/tier1.json" || true
+  done
   return $rc
 }
 
@@ -139,6 +142,9 @@ tier2() {
   fi
   echo
   "$PY" "$REPO/scripts/gate_token_set.py" --ref "$REF" --npu "$NPU_JSON" --k "$K"
+  local t2rc=$?
+  "$PY" "$REPO/scripts/buildstore.py" gate-record "$DECODE_ART" tier2 "$t2rc" || true
+  return $t2rc
 }
 
 # TIER 2 through batched prefill. One reference per prompt length, because a reference IS per
