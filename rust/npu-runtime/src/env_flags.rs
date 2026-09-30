@@ -105,12 +105,12 @@ pub const FLAGS: &[Flag] = &[
               misaligned one, because blocked KV is contiguous only inside a block. Flip the \
               default once a decode+prefill pair rebuilt from current main gates it." },
     Flag { name: "NPU_RESIDENT_REUSE_KV", owner: "npu-engine", site: "npu-engine/src/llm/resident_ladder.rs",
-        semantics: IsOne, default: "false",
+        semantics: NotZero, default: "true",
         doc: "let the resident ladder (gemma4-12b) keep its caches across requests, so a chat turn \
               resumes its shared prefix instead of re-priming from 0. A resume is kept only while the \
               sliding ring still holds its window (resume_keeps_the_window), and a cache that may \
-              hold NaN is zeroed anyway. Default OFF until a reuse-vs-fresh device gate has seen a \
-              resume happen (resident-kv-prefix-reuse)." },
+              hold NaN is zeroed anyway. =0 re-primes every request from 0, the bit-exact control \
+              (a_resumed_prefix_matches_a_fresh_prime_on_device)." },
     Flag { name: "NPU_RESIDENT_NF_DUMP", owner: "npu-engine", site: "npu-engine/src/llm/resident_ladder.rs",
         semantics: Value, default: "unset",
         doc: "a file the resident ladder appends one JSON line to when a dispatch stays non-finite \

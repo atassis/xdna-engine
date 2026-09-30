@@ -142,9 +142,9 @@ pub fn read_spans(first: usize, nbw: usize, c: usize, blk: usize) -> [(usize, us
     [(b0, na), (0, nbw - na)]
 }
 
-/// `NPU_RESIDENT_REUSE_KV=1`: keep the caches across requests (default off, see the flag's entry).
+/// Keep the caches across requests unless `NPU_RESIDENT_REUSE_KV=0` (see the flag's entry).
 fn reuse_kv() -> bool {
-    std::env::var("NPU_RESIDENT_REUSE_KV").is_ok_and(|v| v == "1")
+    std::env::var("NPU_RESIDENT_REUSE_KV").ok().as_deref() != Some("0")
 }
 
 /// Whether a resume at `r` finds every sliding position its window reads, `[first(r), r)`, still in
@@ -725,7 +725,7 @@ impl DecodeStep for LadderResidentForward {
         Some(self.meta.pmax)
     }
 
-    /// With `NPU_RESIDENT_REUSE_KV=1`, keeps the caches across requests: rows past a new write
+    /// Keeps the caches across requests (`NPU_RESIDENT_REUSE_KV=0` disables): rows past a new write
     /// position are masked, and a stale finite row there contributes exactly what a zero does. A
     /// possibly-NaN cache is zeroed either way.
     fn reset(&mut self) -> Result<CacheState, EngineError> {
