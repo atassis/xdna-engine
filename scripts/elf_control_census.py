@@ -23,6 +23,21 @@ import re
 import struct
 import subprocess
 import sys
+import tempfile
+
+
+def resolve_elf(path):
+    """`path` if present, else decompress `path + ".zst"` to a temp file -- readelf and the raw
+    section reads below need a real file on disk either way."""
+    if os.path.exists(path):
+        return path
+    zst_path = path + ".zst"
+    if not os.path.exists(zst_path):
+        sys.exit(f"{path}: no such file (and no {zst_path})")
+    tmp = tempfile.NamedTemporaryFile(prefix=os.path.basename(path) + "-", delete=False)
+    subprocess.run(["zstd", "-q", "-d", "--long=27", "-c", zst_path], check=True, stdout=tmp)
+    tmp.close()
+    return tmp.name
 
 OPC = {0: "WRITE", 1: "BLOCKWRITE", 2: "BLOCKSET", 3: "MASKWRITE", 4: "MASKPOLL", 5: "NOOP",
        6: "PREEMPT", 7: "MASKPOLL_BUSY", 8: "LOADPDI", 9: "LOAD_PM_START",
@@ -168,7 +183,7 @@ def main():
     ap.add_argument("--segments", action="store_true", help="list configure shapes and their counts")
     args = ap.parse_args()
     for p in args.elf:
-        census(p, args.segments)
+        census(resolve_elf(p), args.segments)
 
 
 if __name__ == "__main__":
