@@ -1084,6 +1084,7 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
         // frequency in the text so far") and every mainstream server read this as prompt+completion.
         let mut history: Vec<u32> = prompt_ids.clone();
         let mut stopper = StopMatcher::new(params.stop.clone());
+        let mut in_channel = false;
         // Only when the caller declared tools AND this model's template says how it writes a call.
         // Absent either, the sink sees exactly the stream it saw before tool calling existed --
         // no hold-back, no scanning, byte-for-byte the old path.
@@ -1260,10 +1261,23 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
             completion_tokens += 1;
 
             let t_detok = Instant::now();
-            let text = detok.push(tok, &self.cfg.tokenizer)?;
-            let (emit, matched) = match stopper.feed(&text) {
-                StopFeed::Emit(t) => (t, false),
-                StopFeed::Matched(t) => (t, true),
+            // A reasoning-channel token stays in the cache and the ledger but is never text.
+            let hidden = match self.cfg.reasoning_channel {
+                Some((open, close)) if in_channel || tok == open => {
+                    in_channel = tok != close;
+                    true
+                }
+                _ => false,
+            };
+            let (text, emit, matched) = match hidden {
+                true => (String::new(), String::new(), false),
+                false => {
+                    let text = detok.push(tok, &self.cfg.tokenizer)?;
+                    match stopper.feed(&text) {
+                        StopFeed::Emit(t) => (text, t, false),
+                        StopFeed::Matched(t) => (text, t, true),
+                    }
+                }
             };
             let detok_us = t_detok.elapsed().as_micros() as u64;
 
@@ -2148,6 +2162,22 @@ mod tests {
         let (_, reason, usage) = gen.generate_to_string(&prompt, &params).unwrap();
         assert_eq!(reason, FinishReason::Stop);
         assert_eq!(usage.prompt_tokens, 2);
+    }
+
+    /// Reasoning-channel tokens are generated and kept in the cache, never shown: here `foo`/`bar`
+    /// stand in for Gemma-4's `<|channel>`/`<channel|>`.
+    #[test]
+    fn a_reasoning_channel_is_generated_but_not_shown() {
+        let mut cfg = build_cfg(None);
+        cfg.reasoning_channel = Some((5, 6));
+        let script = [5, 1, 6, 2, 4].iter().map(|&t| logit_for(t)).collect();
+        let mut gen = LlmGenerator::new(cfg, ScriptedDecodeStep::new(script));
+        let params = GenerateParams { max_tokens: Some(8), temperature: Some(0.0), ..GenerateParams::default() };
+        let (text, reason, usage) = gen.generate_to_string(&Prompt::Raw("hello".to_string()), &params).unwrap();
+        assert_eq!(text.trim(), "world", "only the text after the channel is visible");
+        assert_eq!(reason, FinishReason::Stop);
+        assert_eq!(usage.completion_tokens, 4, "the hidden tokens still count as generated");
+        assert_eq!(&gen.resident[1..], &[5, 1, 6, 2], "and they stay in the ledger");
     }
 
     #[test]

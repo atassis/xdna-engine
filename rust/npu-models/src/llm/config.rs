@@ -127,6 +127,9 @@ pub struct ModelConfig {
     /// The id a raw (non-chat) prompt must start with when the tokenizer's own post-processor does
     /// not write it. See [`resolve_raw_bos`].
     pub raw_bos: Option<u32>,
+    /// The special-token pair that brackets the model's reasoning channel, when its chat template
+    /// uses one (Gemma-4: `<|channel>` ... `<channel|>`). See [`resolve_reasoning_channel`].
+    pub reasoning_channel: Option<(u32, u32)>,
 }
 
 impl ModelConfig {
@@ -142,6 +145,7 @@ impl ModelConfig {
             tool_probe,
             tool_special_strip,
             raw_bos: None,
+            reasoning_channel: None,
         }
     }
 
@@ -180,6 +184,7 @@ impl ModelConfig {
         let tool_probe = probe_tools(chat_template.as_ref());
         let tool_special_strip = tool_special_strip(&tokenizer, &tool_probe);
         let raw_bos = resolve_raw_bos(&tokenizer, &tokenizer_config);
+        let reasoning_channel = resolve_reasoning_channel(&tokenizer, chat_template.as_ref());
         Ok(ModelConfig {
             tokenizer,
             chat_template,
@@ -188,6 +193,7 @@ impl ModelConfig {
             tool_probe,
             tool_special_strip,
             raw_bos,
+            reasoning_channel,
         })
     }
 
@@ -239,6 +245,15 @@ fn resolve_raw_bos(tokenizer: &Tokenizer, tokenizer_config: &serde_json::Value) 
         .map(str::to_string)
         .or_else(|| v.get("content").and_then(|c| c.as_str()).map(str::to_string)))?;
     add.then(|| tokenizer.token_to_id(&bos)).flatten()
+}
+
+/// Gemma-4 writes its reasoning as `<|channel>thought\n...<channel|>`, and after a tool result it
+/// opens one even with thinking off. The two markers are special tokens a plain decode drops, which
+/// left the channel's name, "thought", at the start of the answer. The pair counts only when both
+/// are in the vocabulary and the chat template itself writes `<|channel>`.
+fn resolve_reasoning_channel(tokenizer: &Tokenizer, tmpl: Option<&ChatTemplate>) -> Option<(u32, u32)> {
+    tmpl.filter(|t| t.source().contains("<|channel>"))?;
+    Some((tokenizer.token_to_id("<|channel>")?, tokenizer.token_to_id("<channel|>")?))
 }
 
 /// The sampling fields of a `generation_config.json`, ignoring everything else in it.
@@ -448,6 +463,20 @@ mod tests {
             &cfg, &crate::pipeline::Prompt::Raw("The capital of France is".into()), None, &[]).unwrap();
         assert_eq!(ids[0], bos);
         assert_ne!(ids[1], bos);
+    }
+
+    #[test]
+    fn the_real_gemma4_checkpoint_names_its_reasoning_channel() {
+        let dir = PathBuf::from("../../artifacts/gemma4-12b/tokenizer");
+        if !dir.join("tokenizer_config.json").exists() {
+            return;
+        }
+        let cfg = ModelConfig::load(&dir).expect("load real Gemma-4 config");
+        assert_eq!(cfg.reasoning_channel, Some((100, 101)));
+        let qwen = PathBuf::from("../../artifacts/qwen3-0.6b/tokenizer");
+        if qwen.join("tokenizer_config.json").exists() {
+            assert_eq!(ModelConfig::load(&qwen).unwrap().reasoning_channel, None);
+        }
     }
 
     /// Gemma-3's post-processor already writes `<bos>`; the raw path must not add a second one.

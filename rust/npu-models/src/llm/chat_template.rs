@@ -35,6 +35,10 @@ impl ChatTemplate {
         ChatTemplate { source, bos_token: None, eos_token: None }
     }
 
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
     pub fn with_special_tokens(mut self, bos: Option<String>, eos: Option<String>) -> Self {
         self.bos_token = bos;
         self.eos_token = eos;
