@@ -2,7 +2,7 @@ qwen3-0.6b-decode	scripts/build_llm_decode.sh qwen3-0.6b "" "$OUT"
 qwen3-0.6b-prefill	scripts/build_prefill.sh 28 256 4096 "$OUT"
 gemma3-270m-decode	scripts/build_llm_decode.sh gemma3-270m "" "$OUT"
 qwen3.5-4b-decode	scripts/build_llm_decode.sh qwen3.5-4b "" "$OUT"
-qwen3.5-4b-prefill	scripts/build_prefill.sh 32 256 4096 "$OUT"
+qwen3.5-4b-prefill	DECODE_META=artifacts/qwen3.5-4b/decode/meta.json scripts/build_prefill.sh 32 256 4096 "$OUT"
 asr-parakeet	NORECIPE
 bge-base	NORECIPE
 diarize-pyannote-community-1	NORECIPE
