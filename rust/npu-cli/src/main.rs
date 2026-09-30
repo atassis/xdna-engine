@@ -207,6 +207,19 @@ fn install_root() -> Option<PathBuf> {
     })
 }
 
+/// Per-request run logs (`NPU_TELEMETRY_LOG`) go to `<root>/runlogs` unless the caller names a
+/// directory; `npu stats` and `npu replay` read them, and a service without them cannot be audited.
+fn default_run_log(root: &Path) {
+    if std::env::var_os("NPU_TELEMETRY_LOG").is_some() {
+        return;
+    }
+    let dir = root.join("runlogs");
+    match std::fs::create_dir_all(&dir) {
+        Ok(()) => std::env::set_var("NPU_TELEMETRY_LOG", &dir),
+        Err(e) => eprintln!("[npu-serve] WARNING: run logs off, cannot create {}: {e}", dir.display()),
+    }
+}
+
 /// `root`, except that the install root wins over the working directory: the service's home is
 /// where install.sh staged it, and a dev tree is named explicitly with `XDNA_ENGINE_ROOT`.
 fn serve_root(cfg: &Config, config_path: &Path) -> Result<PathBuf> {
@@ -368,6 +381,7 @@ fn serve(path: &Path, allow_degraded: bool) -> Result<()> {
     let root = serve_root(&cfg, path)?;
     eprintln!("[npu-serve] engine root {}", root.display());
     default_xrt_ini(&root);
+    default_run_log(&root);
     preflight_artifacts(&cfg, &root)?;
     let (handle, _join) = start(cfg, Box::new(EngineLoader { root }))
         .map_err(|e| Tagged(engine_error(&e), e.to_string()))?;

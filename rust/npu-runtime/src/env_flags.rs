@@ -515,7 +515,7 @@ pub const FLAGS: &[Flag] = &[
               see why. Generous by default: a cold 15 GB load behind a running generation is real \
               work, not a fault. Lower it to make a saturated server fail fast." },
     Flag { name: "NPU_TELEMETRY_LOG", owner: "npu-runtime", site: "npu-runtime/src/run_log.rs",
-        semantics: Value, default: "unset (no run logs)",
+        semantics: Value, default: "`npu serve`: <engine root>/runlogs; elsewhere unset (no run logs)",
         doc: "directory to write one JSONL run log per generation into, named by completion id \
               (`chatcmpl-<hex>.jsonl`). Each line is a JSON object tagged by `object`: a header \
               carrying the conditions, one OpenAI stream chunk per DECODED TOKEN with an `x_npu` \
