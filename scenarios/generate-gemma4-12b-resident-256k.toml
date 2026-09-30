@@ -23,7 +23,9 @@ resident = "/mnt/data/xdna/artifacts/gemma4-12b/resident_rf48C_p7148a7"
 tokenizer_dir = "artifacts/gemma4-12b/tokenizer"
 
 [generation]
-max_tokens = 64
+# The context window, i.e. no cap of its own: a generation ends at end-of-turn, a full context or
+# the client stopping it. A request's own max_tokens still wins.
+max_tokens = 262144
 
 # Vision/audio host towers, the same checkpoint the legacy scenario reads; rows enter through
 # LadderResidentForward::set_media.

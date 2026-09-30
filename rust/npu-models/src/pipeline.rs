@@ -382,6 +382,9 @@ pub enum Chunk<'a> {
     /// appends to a String never allocates per token. May be empty: a multi-byte UTF-8 codepoint
     /// split across BPE tokens produces nothing until it completes.
     Text(&'a str),
+    /// Text the model wrote in its reasoning channel, never part of `Text`. Emitted before the
+    /// token's `Step`, like `Text`.
+    Reasoning(&'a str),
     /// What the token just produced cost. Emitted once per DECODED TOKEN, immediately after the
     /// `Text` it produced -- which is NOT once per `Text`: a token that completes no codepoint
     /// emits no text at all, and a stop-sequence flush emits text with no token behind it. A
@@ -457,7 +460,7 @@ pub trait TextGenerator {
         self.generate(prompt, params, &mut |c| {
             match c {
                 Chunk::Text(t) => out.push_str(t),
-                Chunk::Step(_) => {}
+                Chunk::Step(_) | Chunk::Reasoning(_) => {}
                 // Dropped, not rendered back into the string: this surface returns TEXT, and a
                 // caller that wants calls uses `generate` and reads them as chunks.
                 Chunk::ToolCall(_) => {}

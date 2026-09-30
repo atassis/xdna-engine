@@ -197,6 +197,15 @@ impl SseStream {
         }
     }
 
+    /// Reasoning as the `reasoning_content` delta OpenAI-compatible reasoning servers stream and
+    /// Open WebUI renders as a collapsible thinking block.
+    fn render_reasoning(&self, text: &str) -> String {
+        format!(
+            "{{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\
+             \"choices\":[{{\"index\":0,\"delta\":{{\"reasoning_content\":\"{}\"}},\"finish_reason\":null}}]}}",
+            self.id, self.created, parse::json_escape(&self.model), parse::json_escape(text))
+    }
+
     /// OpenAI's usage chunk: after the finish chunk, `choices` empty, the request's token counts.
     fn render_usage(&self, u: &npu_models::GenerateUsage) -> String {
         let object = match self.kind {
@@ -486,6 +495,7 @@ fn render_ollama_buffered(model: String, rx: std::sync::mpsc::Receiver<StreamIte
     let (reason, report) = loop {
         match rx.recv() {
             Ok(StreamItem::Text(t)) => text.push_str(&t),
+            Ok(StreamItem::Reasoning(_)) => {}
             Ok(StreamItem::ToolCall(c)) => calls.push(c),
             // A buffered caller sees nothing until the end; progress has no one to reassure.
             Ok(StreamItem::Step(_)) | Ok(StreamItem::Progress { .. }) => {}
@@ -535,10 +545,12 @@ fn render_buffered(model: String, rx: std::sync::mpsc::Receiver<StreamItem>, kin
     let mut log = crate::run_log::RunLog::open(&id);
     if let Some(l) = log.as_mut() { l.header(&meta); }
     let mut text = String::new();
+    let mut reasoning = String::new();
     let mut calls: Vec<npu_models::ToolCall> = Vec::new();
     let (reason, report) = loop {
         match rx.recv() {
             Ok(StreamItem::Text(t)) => text.push_str(&t),
+            Ok(StreamItem::Reasoning(t)) => reasoning.push_str(&t),
             Ok(StreamItem::ToolCall(c)) => calls.push(c),
             Ok(StreamItem::Step(r)) => {
                 if let Some(l) = log.as_mut() { l.line(&wire::chunk_line(&r, &meta)); }
@@ -559,6 +571,11 @@ fn render_buffered(model: String, rx: std::sync::mpsc::Receiver<StreamItem>, kin
         l.line(&wire::summary_line(&report, &meta, reason));
     }
     let mut obj = wire::completion_object_with_calls(&text, &calls, reason, &report, &meta);
+    if chat && !reasoning.is_empty() {
+        if let Some(m) = obj.pointer_mut("/choices/0/message").and_then(|m| m.as_object_mut()) {
+            m.insert("reasoning_content".to_string(), serde_json::Value::String(reasoning));
+        }
+    }
     // The full report, not just `timings`/`x_npu` (which are `Summary`, missing e.g. `prefill`):
     // this is what lets a CLI-over-socket client render the exact same stats table/footer the
     // in-process path does, from the identical `GenerationReport` -- an OpenAI-shaped client reads
@@ -1316,6 +1333,10 @@ fn respond_stream<W: Write + PeerAlive>(stream: &mut W, code: u16, s: &SseStream
                 if s.stats { continue }
                 s.render_text(&t)
             }
+            StreamItem::Reasoning(t) => match s.kind {
+                SseKind::Chat => s.render_reasoning(&t),
+                _ => continue,
+            },
             // An SSE COMMENT, not a data frame: spec-legal, ignored by every client, and it is what
             // stops a proxy timing out a prefill that produces nothing for minutes. A `data:` frame
             // would reach a strict client as an unknown object in the middle of a completion.
@@ -1395,6 +1416,7 @@ fn respond_ndjson<W: Write + PeerAlive>(stream: &mut W, code: u16, s: &SseStream
     while let Some(item) = next_item(stream, s)? {
         let line = match item {
             StreamItem::Text(t) => crate::ollama::chat_chunk(&s.model, &stamp, &t),
+            StreamItem::Reasoning(_) => continue,
             // A tool call has no other carrier on this wire, so it is never suppressed.
             StreamItem::ToolCall(c) => crate::ollama::chat_tool_call_chunk(&s.model, &stamp, &c),
             // Ollama's wire is NDJSON; it has no comment syntax to carry a heartbeat in.
@@ -1798,7 +1820,7 @@ pub mod parse {
     /// OpenAI's schema but both universal among local servers (`GenerateParams`'s own doc comment).
     /// A field absent from the body keeps `GenerateParams::default()` -- OpenAI's defaults (e.g.
     /// `temperature: 1.0`), never a silent substitution of greedy.
-    fn parse_generate_params(v: &serde_json::Value) -> Result<npu_models::GenerateParams, String> {
+    pub(crate) fn parse_generate_params(v: &serde_json::Value) -> Result<npu_models::GenerateParams, String> {
         let mut p = npu_models::GenerateParams::default();
         if let Some(x) = v.get("temperature") { p.temperature = Some(as_f32(x, "temperature")?); }
         if let Some(x) = v.get("top_p") { p.top_p = Some(as_f32(x, "top_p")?); }
@@ -1837,6 +1859,20 @@ pub mod parse {
                     other => return Err(format!(
                         "\"chat_template_kwargs.{other}\" is not supported")),
                 }
+            }
+        }
+        // OpenAI's `reasoning_effort` (Open WebUI's "Reasoning Effort"). The templates here only
+        // switch thinking on or off, so any level turns it on and `none`/`minimal` off.
+        if p.enable_thinking.is_none() {
+            match v.get("reasoning_effort").filter(|x| !x.is_null()) {
+                None => {}
+                Some(serde_json::Value::String(e)) => match e.as_str() {
+                    "none" | "minimal" => p.enable_thinking = Some(false),
+                    "low" | "medium" | "high" => p.enable_thinking = Some(true),
+                    other => return Err(format!("\"reasoning_effort\" {other:?} is not supported \
+                                                 (none, minimal, low, medium, high)")),
+                },
+                Some(_) => return Err("\"reasoning_effort\" must be a string".into()),
             }
         }
         p.stop = match v.get("stop") {
@@ -3559,7 +3595,7 @@ pub(crate) mod generate_tests {
                     assert!(frame["choices"][0]["finish_reason"].is_null());
                     texts.push(t);
                 }
-                StreamItem::Step(_) | StreamItem::ToolCall(_) | StreamItem::Progress { .. } => {}
+                StreamItem::Step(_) | StreamItem::Reasoning(_) | StreamItem::ToolCall(_) | StreamItem::Progress { .. } => {}
                 StreamItem::Done { reason, .. } => {
                     let frame: serde_json::Value = serde_json::from_str(&s.render_done(reason)).unwrap();
                     assert_eq!(frame["choices"][0]["finish_reason"], reason.as_str());
@@ -4039,6 +4075,17 @@ mod cancel_tests {
         let done: serde_json::Value =
             serde_json::from_str(&s.render_done(FinishReason::Stop)).unwrap();
         assert!(done.get("x_npu_finish").is_none(), "an ordinary stop must not be marked");
+    }
+
+    #[test]
+    fn reasoning_effort_switches_thinking_and_kwargs_still_win() {
+        let v = |t: &str| serde_json::from_str::<serde_json::Value>(t).unwrap();
+        let think = |t: &str| parse::parse_generate_params(&v(t)).map(|p| p.enable_thinking);
+        assert_eq!(think(r#"{"reasoning_effort":"medium"}"#), Ok(Some(true)));
+        assert_eq!(think(r#"{"reasoning_effort":"none"}"#), Ok(Some(false)));
+        assert_eq!(think(r#"{}"#), Ok(None));
+        assert_eq!(think(r#"{"reasoning_effort":"high","chat_template_kwargs":{"enable_thinking":false}}"#), Ok(Some(false)));
+        assert!(think(r#"{"reasoning_effort":"max"}"#).is_err());
     }
 
     /// OpenAI's closing usage chunk: `choices` empty, the three counts, and only when asked.

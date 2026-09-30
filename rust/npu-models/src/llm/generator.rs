@@ -217,6 +217,32 @@ fn counter_delta(prev: &mut Option<(u32, u32)>, now: Option<(u32, u32)>) -> (Opt
     d
 }
 
+/// Decodes one reasoning channel's tokens, less the channel's own name: Gemma-4 writes
+/// `<|channel>thought\n...`, and `thought` labels the channel rather than being part of it.
+#[derive(Default)]
+struct ChannelReader {
+    detok: IncrementalDetokenizer,
+    label_done: bool,
+    pending: String,
+}
+
+impl ChannelReader {
+    fn push(&mut self, tok: u32, tokenizer: &tokenizers::Tokenizer) -> Result<String, EngineError> {
+        let t = self.detok.push(tok, tokenizer)?;
+        if self.label_done {
+            return Ok(t);
+        }
+        self.pending.push_str(&t);
+        Ok(match self.pending.find('\n') {
+            Some(i) => {
+                self.label_done = true;
+                self.pending.split_off(i + 1)
+            }
+            None => String::new(),
+        })
+    }
+}
+
 /// Tokenize a prompt. `Prompt::Chat` renders through the model's chat template first;
 /// `Prompt::Raw` tokenizes directly. The returned length is the TRUE tokenized prompt length --
 /// never recover it later by filtering EOS out of a padded buffer: EOS doubles as the chat
@@ -1084,7 +1110,7 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
         // frequency in the text so far") and every mainstream server read this as prompt+completion.
         let mut history: Vec<u32> = prompt_ids.clone();
         let mut stopper = StopMatcher::new(params.stop.clone());
-        let mut in_channel = false;
+        let mut channel: Option<ChannelReader> = None;
         // Only when the caller declared tools AND this model's template says how it writes a call.
         // Absent either, the sink sees exactly the stream it saw before tool calling existed --
         // no hold-back, no scanning, byte-for-byte the old path.
@@ -1261,10 +1287,16 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
             completion_tokens += 1;
 
             let t_detok = Instant::now();
-            // A reasoning-channel token stays in the cache and the ledger but is never text.
+            // A reasoning-channel token stays in the cache and the ledger but is never text: what it
+            // says goes out as reasoning instead.
+            let mut reasoning = String::new();
             let hidden = match self.cfg.reasoning_channel {
-                Some((open, close)) if in_channel || tok == open => {
-                    in_channel = tok != close;
+                Some((open, close)) if channel.is_some() || tok == open => {
+                    match (tok == open, tok == close) {
+                        (true, _) => channel = Some(ChannelReader::default()),
+                        (_, true) => channel = None,
+                        _ => if let Some(c) = channel.as_mut() { reasoning = c.push(tok, &self.cfg.tokenizer)? },
+                    }
                     true
                 }
                 _ => false,
@@ -1325,7 +1357,8 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
             // alone must not see delimiters the `Text` consumer never got.
             let mut rec = rec;
             let calls = release_through(tools.as_mut(), &mut rec.emit);
-            let live = rec.emit.is_empty() || sink(Chunk::Text(&rec.emit));
+            let live = reasoning.is_empty() || sink(Chunk::Reasoning(&reasoning));
+            let live = (rec.emit.is_empty() || sink(Chunk::Text(&rec.emit))) && live;
             let live = sink(Chunk::Step(&rec)) && live;
             let live = calls.iter().fold(live, |ok, c| sink(Chunk::ToolCall(c)) && ok);
             tool_calls.extend(calls);
@@ -1876,7 +1909,7 @@ mod tests {
             match c {
                 Chunk::Step(r) => steps.push(r.clone()),
                 Chunk::Done { report: r, .. } => report = r.clone(),
-                Chunk::Text(_) | Chunk::ToolCall(_) | Chunk::Progress { .. } => {}
+                Chunk::Text(_) | Chunk::Reasoning(_) | Chunk::ToolCall(_) | Chunk::Progress { .. } => {}
             }
             true
         })
@@ -1979,7 +2012,7 @@ mod tests {
             match c {
                 Chunk::Text(t) => streamed.push_str(t),
                 Chunk::Step(r) => from_records.push_str(&r.emit),
-                Chunk::Done { .. } | Chunk::ToolCall(_) | Chunk::Progress { .. } => {}
+                Chunk::Done { .. } | Chunk::Reasoning(_) | Chunk::ToolCall(_) | Chunk::Progress { .. } => {}
             }
             true
         })
@@ -1997,7 +2030,7 @@ mod tests {
         let mut finish = None;
         gen.generate(&Prompt::Raw("hello".to_string()), &params, &mut |c| match c {
             Chunk::Text(_) => false, // abort on the very first text chunk
-            Chunk::Step(_) | Chunk::ToolCall(_) | Chunk::Progress { .. } => true,
+            Chunk::Step(_) | Chunk::Reasoning(_) | Chunk::ToolCall(_) | Chunk::Progress { .. } => true,
             Chunk::Done { reason, .. } => {
                 finish = Some(reason);
                 true
@@ -2164,8 +2197,8 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 2);
     }
 
-    /// Reasoning-channel tokens are generated and kept in the cache, never shown: here `foo`/`bar`
-    /// stand in for Gemma-4's `<|channel>`/`<channel|>`.
+    /// Reasoning-channel tokens are generated and kept in the cache, never shown as text: here
+    /// `foo`/`bar` stand in for Gemma-4's `<|channel>`/`<channel|>`.
     #[test]
     fn a_reasoning_channel_is_generated_but_not_shown() {
         let mut cfg = build_cfg(None);
@@ -2178,6 +2211,39 @@ mod tests {
         assert_eq!(reason, FinishReason::Stop);
         assert_eq!(usage.completion_tokens, 4, "the hidden tokens still count as generated");
         assert_eq!(&gen.resident[1..], &[5, 1, 6, 2], "and they stay in the ledger");
+    }
+
+    /// The channel's text reaches the sink as `Reasoning`, less its first-line label.
+    #[test]
+    fn a_reasoning_channel_streams_as_reasoning_without_its_label() {
+        let mut cfg = build_cfg(None);
+        cfg.reasoning_channel = Some((5, 6));
+        // The fixture vocab has no newline, so all of the channel is its label here; the label rule
+        // itself is checked on the real tokenizer below.
+        let script = [5, 1, 2, 6, 3, 4].iter().map(|&t| logit_for(t)).collect();
+        let mut gen = LlmGenerator::new(cfg, ScriptedDecodeStep::new(script));
+        let params = GenerateParams { max_tokens: Some(8), temperature: Some(0.0), ..GenerateParams::default() };
+        let (mut text, mut reasoning) = (String::new(), String::new());
+        gen.generate(&Prompt::Raw("hello".to_string()), &params, &mut |c| {
+            match c {
+                Chunk::Text(t) => text.push_str(t),
+                Chunk::Reasoning(t) => reasoning.push_str(t),
+                _ => {}
+            }
+            true
+        }).unwrap();
+        assert_eq!(text.trim(), "stop_word");
+        assert!(reasoning.is_empty(), "no newline yet: everything so far is the label, got {reasoning:?}");
+    }
+
+    #[test]
+    fn a_channel_reader_drops_the_label_line() {
+        let tok = tokenizers::Tokenizer::from_file("../../artifacts/gemma4-12b/tokenizer/tokenizer.json");
+        let Ok(tok) = tok else { return };
+        let ids = tok.encode("thought\nThe user asks about rivers.", false).unwrap().get_ids().to_vec();
+        let mut r = ChannelReader::default();
+        let out: String = ids.iter().map(|&t| r.push(t, &tok).unwrap()).collect();
+        assert_eq!(out, "The user asks about rivers.");
     }
 
     #[test]
@@ -2239,7 +2305,7 @@ mod tool_tests {
                     Chunk::Text(t) => text.push_str(t),
                     Chunk::ToolCall(tc) => calls.push(tc.clone()),
                     Chunk::Done { reason: r, .. } => reason = Some(r),
-                    Chunk::Step(_) | Chunk::Progress { .. } => {}
+                    Chunk::Step(_) | Chunk::Reasoning(_) | Chunk::Progress { .. } => {}
                 }
                 true
             },
@@ -2277,7 +2343,7 @@ mod tool_tests {
                     Chunk::Text(t) => text.push_str(t),
                     Chunk::ToolCall(_) => calls += 1,
                     Chunk::Done { reason: r, .. } => reason = Some(r),
-                    Chunk::Step(_) | Chunk::Progress { .. } => {}
+                    Chunk::Step(_) | Chunk::Reasoning(_) | Chunk::Progress { .. } => {}
                 }
                 true
             },
