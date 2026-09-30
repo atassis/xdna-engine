@@ -292,6 +292,26 @@ else
   archive_binary_by_build_id "$ENGINE_BIN" "installed"
 fi
 
+# ---------------------------------------------------------------------------
+# 3b. Stable onnxruntime .so (decouple the runtime from the cargo build tree)
+# ---------------------------------------------------------------------------
+# asr_serve links libonnxruntime via a RUNPATH into rust/target/.../build/npu-onnx-*/out,
+# whose symlinks point into the onnx-asr venv. `cargo clean` wipes that dir -> the service
+# can no longer find libonnxruntime.so.1. Copy the real versioned .so into a STABLE dir with
+# the SONAME symlink the loader needs, and put that dir on LD_LIBRARY_PATH in the unit. Because
+# the binary uses DT_RUNPATH (searched AFTER LD_LIBRARY_PATH), the stable dir wins -> the
+# service survives `cargo clean` and any build-tree churn.
+info "Hardening onnxruntime .so -> $STABLE_LIB_DIR"
+ORT_REAL_SO="$(find "$ONNX_ASR_VENV" -path '*/onnxruntime/capi/libonnxruntime.so.*' 2>/dev/null \
+                 | grep -E 'libonnxruntime\.so\.[0-9]' | head -n1 || true)"
+[ -n "$ORT_REAL_SO" ] || die "no libonnxruntime.so.* under $ONNX_ASR_VENV (onnx-asr venv layout changed?)."
+mkdir -p "$STABLE_LIB_DIR"
+cp -f "$ORT_REAL_SO" "$STABLE_LIB_DIR/"
+ORT_SO_BASE="$(basename "$ORT_REAL_SO")"                        # e.g. libonnxruntime.so.1.26.0
+ln -sf "$ORT_SO_BASE" "$STABLE_LIB_DIR/libonnxruntime.so.1"     # SONAME the loader needs at runtime
+ln -sf "$ORT_SO_BASE" "$STABLE_LIB_DIR/libonnxruntime.so"       # link-name (completeness)
+ok "Stable .so: $STABLE_LIB_DIR/$ORT_SO_BASE (+ SONAME symlink)"
+
 # The installed binary must RUN, in the environment a person actually has.
 #
 # Everything above this point is a preflight -- it checks what the build needs. Nothing checked what
@@ -319,28 +339,8 @@ if [ -d "$ENGINE_BIN_ARCHIVE" ]; then
   # shellcheck disable=SC2012  # names are npu-<hex>, so ls -t is safe here
   ls -t "$ENGINE_BIN_ARCHIVE"/npu-* 2>/dev/null | tail -n +11 | while read -r old; do
     rm -f "$old" && info "  pruned archived binary $(basename "$old")"
-  done
+  done || true
 fi
-
-# ---------------------------------------------------------------------------
-# 3b. Stable onnxruntime .so (decouple the runtime from the cargo build tree)
-# ---------------------------------------------------------------------------
-# asr_serve links libonnxruntime via a RUNPATH into rust/target/.../build/npu-onnx-*/out,
-# whose symlinks point into the onnx-asr venv. `cargo clean` wipes that dir -> the service
-# can no longer find libonnxruntime.so.1. Copy the real versioned .so into a STABLE dir with
-# the SONAME symlink the loader needs, and put that dir on LD_LIBRARY_PATH in the unit. Because
-# the binary uses DT_RUNPATH (searched AFTER LD_LIBRARY_PATH), the stable dir wins -> the
-# service survives `cargo clean` and any build-tree churn.
-info "Hardening onnxruntime .so -> $STABLE_LIB_DIR"
-ORT_REAL_SO="$(find "$ONNX_ASR_VENV" -path '*/onnxruntime/capi/libonnxruntime.so.*' 2>/dev/null \
-                 | grep -E 'libonnxruntime\.so\.[0-9]' | head -n1 || true)"
-[ -n "$ORT_REAL_SO" ] || die "no libonnxruntime.so.* under $ONNX_ASR_VENV (onnx-asr venv layout changed?)."
-mkdir -p "$STABLE_LIB_DIR"
-cp -f "$ORT_REAL_SO" "$STABLE_LIB_DIR/"
-ORT_SO_BASE="$(basename "$ORT_REAL_SO")"                        # e.g. libonnxruntime.so.1.26.0
-ln -sf "$ORT_SO_BASE" "$STABLE_LIB_DIR/libonnxruntime.so.1"     # SONAME the loader needs at runtime
-ln -sf "$ORT_SO_BASE" "$STABLE_LIB_DIR/libonnxruntime.so"       # link-name (completeness)
-ok "Stable .so: $STABLE_LIB_DIR/$ORT_SO_BASE (+ SONAME symlink)"
 
 # ---------------------------------------------------------------------------
 # 4. Artifacts
@@ -549,7 +549,7 @@ stage_copy() {  # name, source
   # left two dead artifacts.prev-* here. Newest survives; the rest go.
   ls -1dt "$ENGINE_ROOT/$name.prev-"* 2>/dev/null | tail -n +2 | while IFS= read -r old; do
     rm -rf -- "$old" && echo "  pruned superseded $(basename "$old")"
-  done
+  done || true
   local sz; sz="$(du -sh "$dst" 2>/dev/null | cut -f1)"
   ok "  $name copied ($sz, extents shared where the filesystem allows) <- $(readlink -f "$src")"
 }
@@ -848,7 +848,7 @@ Type=simple
 # systemd creates this on start and REMOVES it on stop, so the status file's presence is the
 # liveness signal: npu model ls needs no port, probe or timeout to read live state.
 RuntimeDirectory=npu
-# No Environment= lines: `npu serve` finds the engine root, xrt.ini and the run-log directory
+# No Environment= lines: "npu serve" finds the engine root, xrt.ini and the run-log directory
 # itself, libonnxruntime resolves through the rpath baked at build, and the HTTP port is engine.toml's.
 # Pure-Rust single binary: runs onnx preproc/decode (system onnxruntime) + the NPU encoder
 # in-process. No Python needed at runtime; cwd resolves artifacts/. (Parakeet: cwd also resolves
