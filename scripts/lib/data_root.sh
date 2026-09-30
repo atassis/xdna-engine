@@ -13,18 +13,23 @@
 # dir is also individually overridable. Nothing here CREATES a directory --
 # call xdna_mkdir first.
 REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/../.." && pwd)}"
-[ -f "$REPO/config/local.env" ] && . "$REPO/config/local.env"
-
-# A linked worktree has no config/local.env of its own (gitignored, so git
-# worktree never copies it) and no data/ dir either. Rather than mint a private
-# empty root per worktree, inherit the main checkout's data/ -- same trick
-# cache_env.sh used to play for .cache, and for the same reason: the .git FILE
-# (not `worktree list`) is what names the main checkout.
-if [ -z "${XDNA_DATA:-}" ] && [ ! -e "$REPO/data" ] && [ -f "$REPO/.git" ]; then
+# A linked worktree has no config/local.env or data/ of its own (both gitignored,
+# so git worktree never copies them): inherit the main checkout's, which the .git
+# FILE (not `worktree list`) names.
+_dr_main=""
+if [ -f "$REPO/.git" ]; then
   _dr_main="$(git -C "$REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
-  [ -n "$_dr_main" ] && [ -d "${_dr_main%/.git}/data" ] && XDNA_DATA="${_dr_main%/.git}/data"
-  unset _dr_main
+  _dr_main="${_dr_main%/.git}"
 fi
+if [ -f "$REPO/config/local.env" ]; then
+  . "$REPO/config/local.env"
+elif [ -n "$_dr_main" ] && [ -f "$_dr_main/config/local.env" ]; then
+  . "$_dr_main/config/local.env"
+fi
+if [ -z "${XDNA_DATA:-}" ] && [ ! -e "$REPO/data" ] && [ -n "$_dr_main" ] && [ -d "$_dr_main/data" ]; then
+  XDNA_DATA="$_dr_main/data"
+fi
+unset _dr_main
 
 export XDNA_DATA="${XDNA_DATA:-$REPO/data}"
 export XDNA_MODELS="${XDNA_MODELS:-$XDNA_DATA/models}"

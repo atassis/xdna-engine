@@ -16,8 +16,24 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]  # scripts/lib/data_root.py -> repo root
 
 
+def _main_checkout():
+    """The main checkout a linked worktree belongs to (its .git is a file), else None."""
+    if not (REPO / ".git").is_file():
+        return None
+    import subprocess
+    r = subprocess.run(["git", "-C", str(REPO), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                       capture_output=True, text=True)
+    return Path(r.stdout.strip()).parent if r.returncode == 0 and r.stdout.strip() else None
+
+
+_MAIN = _main_checkout()
+
+
 def _load_local_env():
+    # A worktree has no config/local.env of its own (gitignored): use the main checkout's.
     path = REPO / "config" / "local.env"
+    if not path.is_file() and _MAIN is not None:
+        path = _MAIN / "config" / "local.env"
     if not path.is_file():
         return
     for line in path.read_text().splitlines():
@@ -35,7 +51,10 @@ def _env_path(name, default):
     return Path(os.environ.get(name, str(default)))
 
 
-XDNA_DATA = _env_path("XDNA_DATA", REPO / "data")
+_default_data = REPO / "data"
+if not _default_data.exists() and _MAIN is not None and (_MAIN / "data").is_dir():
+    _default_data = _MAIN / "data"
+XDNA_DATA = _env_path("XDNA_DATA", _default_data)
 XDNA_MODELS = _env_path("XDNA_MODELS", XDNA_DATA / "models")
 XDNA_ARTIFACTS = _env_path("XDNA_ARTIFACTS", XDNA_DATA / "artifacts")
 XDNA_CACHE = _env_path("XDNA_CACHE", XDNA_DATA / "cache")

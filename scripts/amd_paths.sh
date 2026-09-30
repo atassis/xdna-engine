@@ -11,6 +11,8 @@
 # actually touches IRON (iron_require_pin/iron_require_api below fail loud, naming how
 # to set it) -- set it, or pass IRON=<dir> to a caller that reads that instead (planned:
 # IRON as a submodule). A caller that never touches IRON does not need it set.
+# Per-machine locations (XRT_SRC_DIR, AIEBU_ASM_DIR, ...) come from config/local.env.
+. "$(dirname "${BASH_SOURCE[0]:-$0}")/lib/data_root.sh"
 export IRON_DIR="${IRON_DIR:-${IRON:-}}"
 
 # The shared IRON checkout sits on whatever branch it was last left on and carries neither
