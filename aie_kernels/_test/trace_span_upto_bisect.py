@@ -43,7 +43,9 @@ UPTOS = ["b1c3", "b2c3", "b3c3", "b4c3", "b5c3", "b6c3", "conv_2", "conv_cat", "
 PROBE = "b1c2"
 EVENTS = [CoreEvent.INSTR_EVENT_0, CoreEvent.INSTR_EVENT_1, CoreEvent.LOCK_STALL,
          CoreEvent.MEMORY_STALL, CoreEvent.STREAM_STALL]
-OUT_DIR = Path("/mnt/data/xdna/traces/span")
+sys.path.insert(0, str(HERE.parents[1] / "scripts" / "lib"))
+from data_root import XDNA_DATA  # noqa: E402
+OUT_DIR = XDNA_DATA / "traces" / "span"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 try:
