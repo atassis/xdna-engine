@@ -19,6 +19,7 @@ vendor/
 models/
 # artifacts/ is regenerable: scripts/extract_block0.py + extract_blocks.py from the ONNX
 artifacts/
+/artifacts
 *.onnx
 *.xclbin
 *.bin
@@ -41,7 +42,7 @@ scripts/amd_toolchains.env
 # per-checkout data-root override (scripts/lib/data_root.sh|py); no machine path in git
 config/local.env
 # default XDNA_DATA root (models/artifacts/cache/build/scratch/cas/qlab/logs)
-/data/
+/data
 
 # stray aircc output if a build is ever run with CWD=repo-root (real output goes to artifacts/)
 /air.mlir
