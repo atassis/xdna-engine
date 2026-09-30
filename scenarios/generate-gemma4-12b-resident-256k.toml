@@ -19,7 +19,7 @@ name = "gemma4-12b-resident-256k"
 # 4096..65536 -- past that, `LadderResidentForward::prefill` declines and the generator's
 # per-token loop finishes priming through the f1 ladder alone.
 [artifacts]
-resident = "/mnt/data/xdna/artifacts/gemma4-12b/resident_rf48C_p7148a7"
+resident = "artifacts/gemma4-12b/resident_rf48C_p7148a7"
 tokenizer_dir = "artifacts/gemma4-12b/tokenizer"
 
 [generation]
