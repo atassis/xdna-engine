@@ -748,10 +748,6 @@ impl DecodeStep for LadderResidentForward {
         reuse_kv()
     }
 
-    /// A ring write span starts at any position (`write_spans`), as every decode step's does.
-    fn prefill_resume_granule(&self) -> Option<usize> {
-        Some(1)
-    }
 
     fn provenance(&self) -> ArmProvenance {
         self.provenance.clone()
