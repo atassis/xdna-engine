@@ -5,7 +5,7 @@ edition = "2021"
 description = "C ABI over the npu-models library (in-process embedding from any language)"
 
 [lib]
-name = "npu_models"
+name = "npu_engine"
 crate-type = ["cdylib", "staticlib"]
 
 [dependencies]

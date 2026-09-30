@@ -85,15 +85,15 @@ thread-local `npu_last_error()` string rather than unwinding into C.
 
 **Control plane** (multi-model, config-driven, the same actor the HTTP server uses):
 
-- `NpuRuntime *npu_service_start(const char *config_path)` -- loads the config and reconciles
+- `NpuRuntime *npu_runtime_start(const char *config_path)` -- loads the config and reconciles
   its models
-- `char *npu_service_transcribe(NpuRuntime *rt, const char *model, const int16_t *pcm, size_t n, uint32_t sample_rate)`
+- `char *npu_runtime_transcribe(NpuRuntime *rt, const char *model, const int16_t *pcm, size_t n, uint32_t sample_rate)`
   -- `model` NULL selects the configured default for ASR
-- `int npu_service_embed(NpuRuntime *rt, const char *model, const char *text, float *out, size_t out_cap)`
-- `int npu_service_reload(NpuRuntime *rt)` -- re-reads the config file and reconciles
-- `char *npu_service_models_json(NpuRuntime *rt)` -- the same JSON shape as `GET /v1/models`
+- `int npu_runtime_embed(NpuRuntime *rt, const char *model, const char *text, float *out, size_t out_cap)`
+- `int npu_runtime_reload(NpuRuntime *rt)` -- re-reads the config file and reconciles
+- `char *npu_runtime_models_json(NpuRuntime *rt)` -- the same JSON shape as `GET /v1/models`
   below
-- `void npu_service_stop(NpuRuntime *rt)`
+- `void npu_runtime_stop(NpuRuntime *rt)`
 
 ## HTTP server
 

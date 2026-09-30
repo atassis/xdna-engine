@@ -77,12 +77,12 @@ const char *npu_last_error(void);
 /**
  * Start the control plane from a config TOML path (reconciles its models). NULL on error.
  */
-struct NpuRuntime *npu_service_start(const char *config_path);
+struct NpuRuntime *npu_runtime_start(const char *config_path);
 
 /**
  * ASR through the control plane (model name or NULL for the configured default). Caller frees.
  */
-char *npu_service_transcribe(struct NpuRuntime *rt,
+char *npu_runtime_transcribe(struct NpuRuntime *rt,
                              const char *model,
                              const int16_t *pcm,
                              uintptr_t n,
@@ -91,7 +91,7 @@ char *npu_service_transcribe(struct NpuRuntime *rt,
 /**
  * Embedding through the control plane. Pass a buffer; returns the embedding length (>= written), or -1.
  */
-int npu_service_embed(struct NpuRuntime *rt,
+int npu_runtime_embed(struct NpuRuntime *rt,
                       const char *model,
                       const char *text,
                       float *out,
@@ -100,17 +100,17 @@ int npu_service_embed(struct NpuRuntime *rt,
 /**
  * Re-read the config file and reconcile. Returns 0 on success, -1 on error.
  */
-int npu_service_reload(struct NpuRuntime *rt);
+int npu_runtime_reload(struct NpuRuntime *rt);
 
 /**
  * Model statuses as a JSON list (malloc'd; free with npu_string_free). NULL on error.
  */
-char *npu_service_models_json(struct NpuRuntime *rt);
+char *npu_runtime_models_json(struct NpuRuntime *rt);
 
 /**
  * Stop the control plane and free the handle.
  */
-void npu_service_stop(struct NpuRuntime *rt);
+void npu_runtime_stop(struct NpuRuntime *rt);
 
 #ifdef __cplusplus
 }  // extern "C"
