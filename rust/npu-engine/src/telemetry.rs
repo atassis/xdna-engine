@@ -109,6 +109,9 @@ impl StepRecord {
 pub struct PrefillRecord {
     /// Prompt length in tokens.
     pub tokens: u32,
+    /// Leading positions already in the cache from an earlier request, not primed again.
+    #[serde(default)]
+    pub reused: u32,
     /// Positions primed by the batched prefill path.
     pub batched: u32,
     /// Positions walked one at a time through `step`, including the final position, which always
@@ -526,7 +529,7 @@ mod tests {
             steps,
             generate_us,
             usage: GenerateUsage { prompt_tokens: 8, completion_tokens: 4 },
-            prefill: PrefillRecord { tokens: 8, batched: 0, stepwise: 8, us: 1_000, dispatches: None },
+            prefill: PrefillRecord { tokens: 8, reused: 0, batched: 0, stepwise: 8, us: 1_000, dispatches: None },
             ..GenerationReport::default()
         }
     }
@@ -615,7 +618,7 @@ mod tests {
     #[test]
     fn first_dispatch_is_prefill_when_the_request_primed_a_prompt_else_the_first_step() {
         let mut r = report(vec![step(0, 90_000, 80), step(1, 20, 5)]);
-        r.prefill = PrefillRecord { tokens: 8, batched: 0, stepwise: 8, us: 4_000, dispatches: None };
+        r.prefill = PrefillRecord { tokens: 8, reused: 0, batched: 0, stepwise: 8, us: 4_000, dispatches: None };
         assert_eq!(r.first_dispatch_us(), Some(4_000), "prefill wall time when there was a prompt");
 
         r.prefill = PrefillRecord::default();

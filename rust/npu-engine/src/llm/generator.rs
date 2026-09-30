@@ -75,12 +75,6 @@ pub trait DecodeStep {
         false
     }
 
-    /// The position granule a batched prefill may resume on. The default is the batch itself:
-    /// blocked KV is contiguous only inside one (see [`batched_resume_point`]).
-    fn prefill_resume_granule(&self) -> Option<usize> {
-        self.prefill_batch()
-    }
-
     /// Whether this backend carries state that absorbs every token and has no position to mask
     /// (Gated DeltaNet's `S` and conv window). Only such a backend can share a primed prefix
     /// between decide questions by snapshot; a positional KV cache shares through the ledger.
@@ -236,7 +230,9 @@ fn counter_delta(prev: &mut Option<(u32, u32)>, now: Option<(u32, u32)>) -> (Opt
 /// `S % M == 0` made sufficient; an arbitrary resume point reintroduces the straddle.
 ///
 /// Rounding down costs at most `batch - 1` re-primed positions, which rewrite what is already
-/// there. `None` is the per-token path, which writes one position per `kv_off` and needs no
+/// there. It also keeps a resumed prompt's pieces on the same grid a fresh prime cuts: pieces
+/// starting elsewhere reorder the arithmetic and changed greedy text on the resident forward
+/// (2026-09-30, a resume at 4 of 2481). `None` is the per-token path, which writes one position per `kv_off` and needs no
 /// alignment at all.
 fn batched_resume_point(reused: usize, batch: Option<usize>) -> usize {
     match batch {
@@ -751,7 +747,7 @@ impl<D: DecodeStep> LlmGenerator<D> {
         let reused = self.decode.resume_limit(
             common_prefix_len_with_media(&self.resident, &self.resident_media, ids, &Default::default()).min(batchable));
         let batched_from = match reuse_on_batched_prefill() || self.decode.batched_resume_gated() {
-            true => batched_resume_point(reused, self.decode.prefill_resume_granule()),
+            true => batched_resume_point(reused, self.decode.prefill_batch()),
             false => 0,
         };
         self.resident.clear();
@@ -1145,7 +1141,7 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
         // The per-token path has no such constraint: `step` writes one position at its own
         // `kv_off`, so it resumes at `reused` exactly.
         let batched_from = match reuse_on_batched_prefill() || self.decode.batched_resume_gated() {
-            true => batched_resume_point(reused, self.decode.prefill_resume_granule()),
+            true => batched_resume_point(reused, self.decode.prefill_batch()),
             // Off: the batched path re-primes from zero exactly as it did before the ledger, so
             // main's behaviour on that path is byte-identical to today's.
             false => 0,
@@ -1157,6 +1153,7 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
         self.resident.clear();
         self.resident_media.clear();
         let mut primed = reused;
+        let mut reused_from = reused;
         // `prefill_batch()` is the CAPABILITY probe -- `Some` means a batched prefill artifact is
         // loaded. Its `M` no longer gates the decision: `prime()` pads a partial chunk itself, and
         // paying for the padding beats paying for the dispatches. The THRESHOLD is a different
@@ -1175,6 +1172,7 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
             // group of dispatches instead of after the whole prompt.
             let stride = batch * PREFILL_CHUNKS_PER_CHECK;
             let mut at = batched_from;
+            reused_from = batched_from;
             while at < batchable {
                 let end = (at + stride).min(batchable);
                 let now = self.decode.prefill(&prompt_ids[..end], at)?;
@@ -1207,7 +1205,8 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
         let (prefill_dispatches, _) = counter_delta(&mut counters, self.decode.counters());
         let prefill = PrefillRecord {
             tokens: prompt_tokens,
-            batched: primed as u32,
+            reused: reused_from as u32,
+            batched: (primed - reused_from) as u32,
             stepwise: (prefilled - primed) as u32,
             us: prefill_us,
             dispatches: prefill_dispatches,
