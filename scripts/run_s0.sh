@@ -21,9 +21,12 @@ while IFS=$'\t' read -r name cmd; do
   { [ -z "$name" ] || [ "${name:0:1}" = "#" ]; } && continue
   d="$S0/$name"
   if [ "$cmd" = "NORECIPE" ]; then echo "[s0] $name: NORECIPE, skipped"; mkdir -p "$d"; touch "$d/NORECIPE"; continue; fi
-  mkdir -p "$d/work" "$d/out"
+  mkdir -p "$d/work" "$d/out" "$d/npu-cache"
   echo "[s0] $name"
+  # Cold: a fresh kernel PCH/object cache per recipe and no ccache; KEEP_WORK already defeats
+  # IRON's mtime MLIR cache and AIE_AIECC_CACHE=0 the whole-aiecc cache.
   OUT="$d/out" BUILDPROF_DIR="$d/aiecc-logs" KEEP_WORK="$d/work" \
+    NPU_CACHE_HOME="$d/npu-cache" CCACHE_DISABLE=1 \
     systemd-run --user --scope --quiet -p MemoryMax=12G \
     nice -n 10 /usr/bin/time -v -o "$d/time.txt" bash -c "cd '$REPO' && $cmd" > "$d/build.log" 2>&1
   echo "rc=$?" >> "$d/time.txt"
