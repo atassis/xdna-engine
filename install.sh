@@ -588,7 +588,8 @@ stage_served_artifacts() {
   local linked=0 missing=0
   while IFS= read -r rel; do
     [ -n "$rel" ] || continue
-    local sub="${rel#artifacts/}" src="$ENGINE_ARTIFACTS/$sub" link="$new/$sub"
+    local sub="${rel#artifacts/}"
+    local src="$ENGINE_ARTIFACTS/$sub" link="$new/$sub"
     if [ ! -e "$src" ]; then
       warn "  served artifact missing under \$ENGINE_ARTIFACTS: $sub (from $src) -- not linked, the engine-config preflight below will refuse any scenario that needs it"
       missing=$((missing + 1))
