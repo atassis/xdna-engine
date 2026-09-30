@@ -1954,7 +1954,26 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # time, so re-declaring it here would claim a calibration this build did not do.
         _mdt, _mgs = _qmf["dtype"], int(_qmf["group_size"])
         _dump_spec = precision.Spec(dtype=_mdt, group_size=_mgs)
+        # BUGFIX (feat/gemma3-270m-qat-int4): this loop used to run over ALL THREE sites
+        # unconditionally whenever PACKED was non-empty at all, so a dump that packs only
+        # mlp/attn_o (qkv left as plain f32 in the .npy tree, per dump_llm_weights.py's own
+        # EXP_LEAVES default) silently forced PRECISION_PLAN["qkv"] to the mlp/attn_o dtype too --
+        # then the "else" branch further down (`elif key in qkv_keys and _spec("qkv").quantized`)
+        # live-quantized q/k/v with scale_kind="none" (plain symmetric, NOT the dump's own
+        # full_range/clip_search choice) even though no q/k/v byte was ever packed. Gate per site
+        # on whether THAT site actually has a tensor in PACKED, not on PACKED being truthy at all.
+        _site_present = {
+            "mlp": any(".mlp." in n for n in PACKED),
+            "attn_o": any(".self_attn.o_proj." in n or ".out_proj." in n for n in PACKED),
+            "qkv": any(t in n for n in PACKED for t in
+                      (".self_attn.q_proj.", ".self_attn.k_proj.", ".self_attn.v_proj.",
+                       "in_proj_qkv", "in_proj_z")),
+        }
+        _adopted_sites = []
         for _site in ("mlp", "attn_o", "qkv"):
+            if not _site_present[_site]:
+                continue
+            _adopted_sites.append(_site)
             _cur = PRECISION_PLAN.get(_site, precision.BF16_SPEC)
             if _cur.quantized and (_cur.dtype, _cur.group_size) != (_mdt, _mgs):
                 raise SystemExit(
@@ -1972,7 +1991,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                     f"format. Drop 'head' from the plan to take the dump's, or re-dump at the "
                     f"format you want.")
             PRECISION_PLAN["head"] = _dump_spec
-        print(f"[gen] packed dump is the authority: {_mdt} g{_mgs} at mlp/attn_o/qkv"
+        print(f"[gen] packed dump is the authority: {_mdt} g{_mgs} at {'/'.join(_adopted_sites)}"
              + ("+head" if _head_packed else ""))
 
     def load_norm(name):
