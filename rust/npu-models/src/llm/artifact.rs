@@ -3404,4 +3404,22 @@ mod tests {
         let err = read_elf_bytes(&elf).unwrap_err().to_string();
         assert!(err.contains("decode.elf"), "{err}");
     }
+
+    /// `elf_exists` is the presence check resident/whisper loaders pair with `read_elf_bytes` --
+    /// it must agree with `read_elf_bytes` on all three shapes a build now produces.
+    #[test]
+    fn elf_exists_covers_zst_only_plain_only_and_neither() {
+        let dir = tempfile::tempdir().unwrap();
+        let elf = dir.path().join("projout.elf");
+        assert!(!elf_exists(&elf));
+
+        fs::write(dir.path().join("projout.elf.zst"), b"garbage").unwrap();
+        assert!(elf_exists(&elf), "zst-only must count as present");
+
+        fs::write(&elf, b"plain").unwrap();
+        assert!(elf_exists(&elf), "plain-and-zst must count as present");
+
+        fs::remove_file(dir.path().join("projout.elf.zst")).unwrap();
+        assert!(elf_exists(&elf), "plain-only must count as present");
+    }
 }
