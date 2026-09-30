@@ -38,14 +38,17 @@ from collections import OrderedDict
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))), "scripts", "lib"))
 from gemm_tile_registry import Registry, key_of  # noqa: E402
+from data_root import XDNA_SCRATCH  # noqa: E402
 from llm_decode_spec import (  # noqa: E402
     BD_STRIDE_MAX, SPECS, gemm_tile_census, gemm_tile_grid, largest_valid_tile_n,
 )
 
 HERE = Path(__file__).resolve().parent
 ARM_GEN = HERE / "gen_gemm_tile_arm.py"
-DEFAULT_OUT = Path("/mnt/data/xdna/scratch/gemm_sweep")
+DEFAULT_OUT = XDNA_SCRATCH / "gemm_sweep"
 
 # The grid to BUILD from, when the legal set is not capped. Coarser than the census grid on
 # purpose: the census answers "what is legal" over everything the microkernel admits, the build
