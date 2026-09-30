@@ -66,7 +66,7 @@ def main():
         return 0
     for p in (xclbin, insts):
         if not os.path.exists(p):
-            sys.exit(f"missing {p} -- build: source ../xdna-engine/scripts/iron_env.sh && "
+            sys.exit(f"missing {p} -- build: source scripts/iron_env.sh && "
                      f"make -C tools/experiments/probes -f Makefile.raspill NPU2=1 HOLD={a.hold} all")
     instr = np.fromfile(insts, dtype=np.uint32)
 

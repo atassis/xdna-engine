@@ -2,7 +2,7 @@
 #
 # FUSED depthwise-conv1d -> SiLU xclbin (conv-module step 3+4). Two kernel objects on
 # two core stages in ONE design: dwconv1d.cc (FIR, f32 out) + silu_brick.cc (silu). Build:
-#   source ../xdna-engine/scripts/iron_env.sh
+#   source ../../scripts/iron_env.sh
 #   make -f Makefile.dwsilu NPU2=1 cols=8 build/final_dwconv_silu_1024x400.xclbin
 # Produces final_dwconv_silu_1024x400.xclbin + insts_dwconv_silu_1024x400.txt.
 # (Both kernel .cc live in aie_kernels/aie2p after sync_kernels.sh; one VPATH covers them.)

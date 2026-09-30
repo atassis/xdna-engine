@@ -2,7 +2,7 @@
 #
 # On-chip COMPUTE-tile transpose xclbin (conv-module Task 0.1). ONE kernel object
 # (transpose_tile.cc, element transpose in-core) on `cols` cores. Build e.g.:
-#   source ../xdna-engine/scripts/iron_env.sh
+#   source ../../scripts/iron_env.sh
 #   # forward [D=1024,T=400] -> [T,D], bf16:
 #   make -f Makefile.transpose NPU2=1 M=1024 N=400 mb=8 cols=8 dt=bf16 \
 #        build/final_transpose_1024x400_bf16.xclbin

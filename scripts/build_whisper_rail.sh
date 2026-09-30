@@ -11,7 +11,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SPEC="${1:?usage: build_whisper_rail.sh <spec> <OUT_DIR>}"
 OUT="${2:?usage: build_whisper_rail.sh <spec> <OUT_DIR>}"
 WEIGHTS="${WEIGHTS:-$REPO/artifacts/$SPEC/weights}"
-PY="${VENV_IRON:-$REPO/../xdna-engine/.venv-iron}/bin/python"
+PY="${VENV_IRON:-$REPO/.venv-iron}/bin/python"
 if [ ! -f "$WEIGHTS/model.decoder.embed_positions.weight.npy" ]; then
     HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}" "$PY" "$REPO/scripts/dump_llm_weights.py" --spec "$SPEC" --out "$WEIGHTS"
 fi

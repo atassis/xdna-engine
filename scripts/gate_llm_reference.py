@@ -514,7 +514,7 @@ def run_hf(model_id, prompt, prompt_ids, n_tokens, k, dtype):
         raise SystemExit(
             f"ERROR: {e}. The hf backend needs transformers+torch, which are NOT in .venv-iron and "
             f"must not be added to it -- that is the toolchain env. Use the export venv:\n"
-            f"  ../xdna-engine/.venv-export/bin/python scripts/gate_llm_reference.py --backend hf ...")
+            f"  .venv-export/bin/python scripts/gate_llm_reference.py --backend hf ...")
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     tok = AutoTokenizer.from_pretrained(model_id)
     ids = tok(prompt, return_tensors="pt").input_ids

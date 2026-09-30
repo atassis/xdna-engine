@@ -15,11 +15,11 @@ CLEAN + accurate: EVEN 0 / ODD 0, rel-L2 << 7e-3 (below the bf16-tanh floor).
 ABI mirrors silu_iron.py: opcode 3, instr[gid1,cacheable], in[gid3], out[gid4].
 
 Usage (NPU must be QUIESCED):
-  build:  source ../xdna-engine/scripts/iron_env.sh
+  build:  source scripts/iron_env.sh
           rm -f <layernorm>/build/silu_brick.o
           make -C <layernorm> -f Makefile.silu2 NPU2=1 rows=1024 cols=400 silu_mode=8 \
                build/final_silu_1024x400.xclbin
-  run:    ../xdna-engine/.venv-iron/bin/python scripts/run_silu_probe.py \
+  run:    .venv-iron/bin/python scripts/run_silu_probe.py \
                --xclbin <layernorm>/build/final_silu_1024x400.xclbin \
                --insts  <layernorm>/build/insts_silu_1024x400.txt --rows 1024 --cols 400
 """
