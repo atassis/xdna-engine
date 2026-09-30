@@ -6,7 +6,7 @@ build <recipe>... [--recipes TSV] [--out-root DIR] [--no-hit]: take the recipe's
 stored actions newest-first for a hit, else run the recipe under the recorder and store the
 result. TSV format matches run_s0.sh: tab-separated, `#` comments, NORECIPE skipped.
 """
-import argparse, hashlib, json, os, pathlib, shutil, subprocess, sys, time
+import argparse, datetime, glob, hashlib, json, os, pathlib, shutil, subprocess, sys, time
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "buildstore"))
@@ -167,6 +167,67 @@ def cmd_build(args):
     record.save_statcache(str(statcache))
 
 
+def _driver_srcversion():
+    path = os.environ.get("BUILDSTORE_DRIVER_FILE", "/sys/module/amdxdna/srcversion")
+    try:
+        return pathlib.Path(path).read_text().strip()
+    except OSError:
+        return None
+
+
+def _firmware_version():
+    override = os.environ.get("BUILDSTORE_FW_FILE")
+    paths = [override] if override else sorted(
+        glob.glob("/sys/bus/pci/drivers/amdxdna/0000:*/fw_version"))
+    for p in paths:
+        try:
+            return pathlib.Path(p).read_text().strip()
+        except OSError:
+            continue
+    return None
+
+
+def cmd_gate_record(args):
+    """Record a device gate result keyed by artifact IDENTITY, not path or pin -- never fails
+    a gate: a broken artifact dir or an unreadable driver/fw file is a WARNING, not an error."""
+    try:
+        cas = pathlib.Path(os.environ.get("BUILDSTORE_CAS", "/mnt/data/xdna/cas"))
+        ident = identity.of(args.artifact_dir)
+        rec = {
+            "result": "pass" if int(args.rc) == 0 else "fail",
+            "json": pathlib.Path(args.json_file).read_text()
+                if args.json_file and os.path.isfile(args.json_file) else None,
+            "driver": _driver_srcversion(),
+            "firmware": _firmware_version(),
+            "date": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
+        path = cas / "gates" / ident / f"{args.gate}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.tmp{os.getpid()}")
+        tmp.write_text(json.dumps(rec, sort_keys=True))
+        os.replace(tmp, path)
+    except Exception as e:  # noqa: BLE001 -- recording must never fail a gate
+        print(f"gate-record: WARNING: {e}", file=sys.stderr)
+
+
+def cmd_gate_status(args):
+    """VALID when identity + driver + firmware all match the current system, STALE <what
+    moved> otherwise, NONE when this identity has no recorded gate at all."""
+    cas = pathlib.Path(os.environ.get("BUILDSTORE_CAS", "/mnt/data/xdna/cas"))
+    ident = identity.of(args.artifact_dir)
+    gdir = cas / "gates" / ident
+    files = sorted(gdir.glob("*.json")) if gdir.is_dir() else []
+    if not files:
+        print("NONE")
+        return
+    driver_now, fw_now = _driver_srcversion(), _firmware_version()
+    for f in files:
+        rec = json.loads(f.read_text())
+        stale = [n for n, now in (("driver", driver_now), ("firmware", fw_now))
+                 if rec.get(n) != now]
+        print(f"STALE {f.stem} {' '.join(stale)}" if stale else f"VALID {f.stem}")
+
+
 def main(argv=None):
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -175,9 +236,20 @@ def main(argv=None):
     b.add_argument("--recipes", type=pathlib.Path, default=None)
     b.add_argument("--out-root", required=True)
     b.add_argument("--no-hit", action="store_true")
+    gr = sub.add_parser("gate-record")
+    gr.add_argument("artifact_dir")
+    gr.add_argument("gate")
+    gr.add_argument("rc")
+    gr.add_argument("json_file", nargs="?")
+    gs = sub.add_parser("gate-status")
+    gs.add_argument("artifact_dir")
     args = p.parse_args(argv)
     if args.cmd == "build":
         cmd_build(args)
+    elif args.cmd == "gate-record":
+        cmd_gate_record(args)
+    elif args.cmd == "gate-status":
+        cmd_gate_status(args)
 
 
 if __name__ == "__main__":
