@@ -53,3 +53,15 @@ def test_xdna_cache_resolved_and_baked_in(tmp_path):
     a = cli(tmp_path, "build", "fake", "--recipes", str(tsv), "--out-root", str(tmp_path / "o"))
     assert a.startswith("BUILT fake ")
     assert (tmp_path / "o" / "fake" / "o").read_text().strip() == "/resolved/by/cache_env"
+
+def test_mlir_aie_instance_resolved_and_baked_in(tmp_path):
+    """toolchain_up.sh's cached branch is gated on [ -e ]/[ -L ] probes that succeed against
+    real files a replay sandbox can't see (same class as the other two). build() must resolve
+    the instance dir once and put its CONCRETE path in the manifest env."""
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "toolchain_up.sh").write_text('#!/bin/bash\necho /resolved/instance\n')
+    tsv = tmp_path / "r.tsv"
+    tsv.write_text('fake\techo "$MLIR_AIE_INSTANCE" > "$OUT/o"\n')
+    a = cli(tmp_path, "build", "fake", "--recipes", str(tsv), "--out-root", str(tmp_path / "o"))
+    assert a.startswith("BUILT fake ")
+    assert (tmp_path / "o" / "fake" / "o").read_text().strip() == "/resolved/instance"

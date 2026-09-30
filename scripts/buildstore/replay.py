@@ -83,6 +83,14 @@ def build_plan(manifest_path, scratch):
     if xdna_cache:
         furniture += glob.glob(os.path.join(xdna_cache, "mlir-distro", "*", "mlir", "bin",
                                             "mlir-tblgen"))
+    # The whole built toolchain instance: content-addressed by toolchain.lock's LOCKHASH
+    # (buildstore.py's resolve_mlir_aie_instance), so its tree is furniture, not per-file
+    # inputs -- its every internal existence probe is otherwise the same unhooked-probe class
+    # as mlir-tblgen above, and there are too many of them (aie-translate, vendored symlinks,
+    # backfill markers) to track one by one.
+    instance = m["env"].get("MLIR_AIE_INSTANCE")
+    if instance and os.path.isdir(instance):
+        furniture.append(instance)
     symlinks = {"/lib64": "usr/lib", "/lib": "usr/lib", "/bin": "usr/bin", "/sbin": "usr/bin"}
     symlinks.update(m["links"])
     # ld.so resolves a DT_NEEDED soname through ld.so.cache to a *symlink* path (e.g.

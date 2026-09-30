@@ -49,6 +49,26 @@ def resolve_xdna_cache(repo, env):
         env["XDNA_CACHE"] = r.stdout.strip()
 
 
+def resolve_mlir_aie_instance(repo, env):
+    """toolchain_up.sh's cached-instance branch is gated entirely by [ -e ]/[ -L ] probes
+    (aie-translate, vendored-tool symlinks, ...) that succeed against real files a shim's
+    probe hooks never log (they only log ENOENT). A replay sandbox then takes the wrong,
+    mutating branch. The instance is content-addressed by toolchain.lock's LOCKHASH (already
+    deterministic, same reasoning as decision 3's cache roots), so it is resolved once here and
+    replay.py furnishes the WHOLE tree instead of tracking it probe-by-probe."""
+    if "MLIR_AIE_INSTANCE" in env:
+        return
+    script = pathlib.Path(repo) / "scripts" / "toolchain_up.sh"
+    if not script.is_file():
+        return
+    r = subprocess.run(["bash", str(script)], cwd=repo, env=env, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"toolchain_up.sh failed for {repo}: {r.stderr.strip()}")
+    lines = r.stdout.strip().splitlines()
+    if lines:
+        env["MLIR_AIE_INSTANCE"] = lines[-1]
+
+
 def iron_pin_verified(repo, env):
     """Run amd_paths.sh's iron_require_pin ONCE, outside any replay sandbox (which never has
     .git -- see the function's own comment), and return the sha it verified. None for a repo
@@ -98,6 +118,7 @@ def cmd_build(args):
             env = record.hermetic_env(os.environ, record.allowlist())
             env["REPO"] = str(repo)
             resolve_xdna_cache(repo, env)
+            resolve_mlir_aie_instance(repo, env)
             want = iron_pin_verified(repo, env)
             if want:
                 env["IRON_PIN_VERIFIED"] = want

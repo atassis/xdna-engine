@@ -59,6 +59,24 @@ def test_replay_furnishes_venv_python_and_mlir_distro(tmp_path):
     assert r.returncode == 0
 
 
+def test_replay_furnishes_whole_mlir_aie_instance(tmp_path):
+    """The instance is content-addressed (buildstore.py keys it via MLIR_AIE_INSTANCE), so
+    replay furnishes its WHOLE tree rather than tracking each internal existence probe --
+    there are too many (aie-translate, vendored symlinks, backfill markers) to name one by
+    one, unlike the single-file venv-python/mlir-tblgen cases."""
+    inst = tmp_path / "instance" / "build" / "bin"; inst.mkdir(parents=True)
+    (inst / "aie-translate").write_text("bin")
+    out = tmp_path / "out"; out.mkdir()
+    script = f'[ -e "$MLIR_AIE_INSTANCE/build/bin/aie-translate" ] && echo ok > {out}/o'
+    cmd = ["bash", "-c", script]
+    m = record.run(cmd, cwd=tmp_path, env={"PATH": "/usr/bin:/bin",
+                                          "MLIR_AIE_INSTANCE": str(tmp_path / "instance")},
+                   out_roots=[out], work_roots=[], cache_roots=[])
+    mf = tmp_path / "m.json"; mf.write_text(json.dumps(m))
+    r = subprocess.run([str(HERE / "replay_bwrap.sh"), str(mf), str(out), str(tmp_path / "r")])
+    assert r.returncode == 0
+
+
 def test_replay_scales_past_bwrap_9000_arg_limit(tmp_path):
     # bwrap 0.13.0 aborts at ~9000 args (one --ro-bind pair per recorded path); a real recipe
     # (gemma3-270m-decode) records ~9.6k. Synthesize >9000 recorded reads and check replay
