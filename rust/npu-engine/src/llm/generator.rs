@@ -360,7 +360,13 @@ pub fn tokenize_prompt(
         .tokenizer
         .encode(text, add_special_tokens)
         .map_err(|e| EngineError::Load(format!("tokenize prompt: {e}")))?;
-    Ok(enc.get_ids().to_vec())
+    let mut ids = enc.get_ids().to_vec();
+    if let (Prompt::Raw(_), Some(bos)) = (prompt, cfg.raw_bos) {
+        if ids.first() != Some(&bos) {
+            ids.insert(0, bos);
+        }
+    }
+    Ok(ids)
 }
 
 /// [`tokenize_prompt`]'s `Prompt::Chat` arm, plus the media placeholder expansion

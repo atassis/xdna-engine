@@ -124,6 +124,9 @@ pub struct ModelConfig {
     /// Special tokens to delete from generated text, non-empty only when this model's tool-call
     /// syntax is itself written in special tokens. See [`special_tokens_outside`].
     pub tool_special_strip: Vec<String>,
+    /// The id a raw (non-chat) prompt must start with when the tokenizer's own post-processor does
+    /// not write it. See [`resolve_raw_bos`].
+    pub raw_bos: Option<u32>,
 }
 
 impl ModelConfig {
@@ -138,6 +141,7 @@ impl ModelConfig {
             checkpoint_defaults: GenerationDefaults::default(),
             tool_probe,
             tool_special_strip,
+            raw_bos: None,
         }
     }
 
@@ -175,6 +179,7 @@ impl ModelConfig {
 
         let tool_probe = probe_tools(chat_template.as_ref());
         let tool_special_strip = tool_special_strip(&tokenizer, &tool_probe);
+        let raw_bos = resolve_raw_bos(&tokenizer, &tokenizer_config);
         Ok(ModelConfig {
             tokenizer,
             chat_template,
@@ -182,6 +187,7 @@ impl ModelConfig {
             checkpoint_defaults,
             tool_probe,
             tool_special_strip,
+            raw_bos,
         })
     }
 
@@ -217,6 +223,22 @@ fn probe_tools(tmpl: Option<&ChatTemplate>) -> ToolProbe {
             sample: String::new(),
         },
     }
+}
+
+/// `tokenizer_config.json`'s `add_bos_token` when it states one, else the transformers class
+/// default: true for the Gemma and Llama tokenizers, which apply it at load time rather than in
+/// `tokenizer.json`. Gemma-4 ships neither the flag nor a BOS-writing post-processor, so reading
+/// `tokenizer.json` alone drops the `<bos>` every Gemma sequence was trained to start with.
+fn resolve_raw_bos(tokenizer: &Tokenizer, tokenizer_config: &serde_json::Value) -> Option<u32> {
+    let class_default = matches!(
+        tokenizer_config.get("tokenizer_class").and_then(|v| v.as_str()),
+        Some("GemmaTokenizer" | "GemmaTokenizerFast" | "LlamaTokenizer" | "LlamaTokenizerFast")
+    );
+    let add = tokenizer_config.get("add_bos_token").and_then(|v| v.as_bool()).unwrap_or(class_default);
+    let bos = tokenizer_config.get("bos_token").and_then(|v| v.as_str()
+        .map(str::to_string)
+        .or_else(|| v.get("content").and_then(|c| c.as_str()).map(str::to_string)))?;
+    add.then(|| tokenizer.token_to_id(&bos)).flatten()
 }
 
 /// The sampling fields of a `generation_config.json`, ignoring everything else in it.
@@ -396,6 +418,51 @@ mod tests {
         });
         assert_eq!(syn.payload.name(), "named-dsl");
         assert_eq!(probe.reason, crate::llm::tool_syntax::ProbeReason::Recovered);
+    }
+
+    #[test]
+    fn raw_bos_follows_add_bos_token_then_the_tokenizer_class_default() {
+        let tok = tiny_tokenizer(&[("<unk>", 0), ("<bos>", 2)]);
+        let gemma = serde_json::json!({"tokenizer_class": "GemmaTokenizer", "bos_token": "<bos>"});
+        assert_eq!(resolve_raw_bos(&tok, &gemma), Some(2));
+        let off = serde_json::json!({"tokenizer_class": "GemmaTokenizer", "bos_token": "<bos>", "add_bos_token": false});
+        assert_eq!(resolve_raw_bos(&tok, &off), None);
+        let qwen = serde_json::json!({"tokenizer_class": "Qwen2Tokenizer", "bos_token": null});
+        assert_eq!(resolve_raw_bos(&tok, &qwen), None);
+        let unknown_bos = serde_json::json!({"add_bos_token": true, "bos_token": "<s>"});
+        assert_eq!(resolve_raw_bos(&tok, &unknown_bos), None);
+    }
+
+    /// Gemma-4's `tokenizer.json` post-processor adds nothing, so without `raw_bos` a raw prompt
+    /// reaches the model with no `<bos>` and degenerates from the first token.
+    #[test]
+    fn the_real_gemma4_raw_prompt_starts_with_bos_exactly_once() {
+        let dir = PathBuf::from("../../artifacts/gemma4-12b/tokenizer");
+        if !dir.join("tokenizer_config.json").exists() {
+            return; // artifacts are not always present in a bare checkout
+        }
+        let cfg = ModelConfig::load(&dir).expect("load real Gemma-4 config");
+        let bos = cfg.tokenizer.token_to_id("<bos>").unwrap();
+        assert_eq!(cfg.raw_bos, Some(bos));
+        let ids = crate::llm::generator::tokenize_prompt(
+            &cfg, &crate::pipeline::Prompt::Raw("The capital of France is".into()), None, &[]).unwrap();
+        assert_eq!(ids[0], bos);
+        assert_ne!(ids[1], bos);
+    }
+
+    /// Gemma-3's post-processor already writes `<bos>`; the raw path must not add a second one.
+    #[test]
+    fn the_real_gemma3_raw_prompt_is_not_given_a_second_bos() {
+        let dir = PathBuf::from("../../artifacts/gemma3-270m/tokenizer");
+        if !dir.join("tokenizer_config.json").exists() {
+            return;
+        }
+        let cfg = ModelConfig::load(&dir).expect("load real Gemma-3 config");
+        let bos = cfg.tokenizer.token_to_id("<bos>").unwrap();
+        let ids = crate::llm::generator::tokenize_prompt(
+            &cfg, &crate::pipeline::Prompt::Raw("hello".into()), None, &[]).unwrap();
+        assert_eq!(ids[0], bos);
+        assert_ne!(ids[1], bos);
     }
 
     /// A model with no chat template at all cannot be TOLD about tools, which is a different fact
