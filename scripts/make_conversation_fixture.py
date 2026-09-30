@@ -19,8 +19,8 @@ import numpy as np
 OUT = "artifacts/pyannote/fixtures"
 os.makedirs(OUT, exist_ok=True)
 SR = 16000
-A_SRC, A_SPEECH = "artifacts/wer_clips/en_01.wav", (1.07, 5.57)
-B_SRC, B_SPEECH = "artifacts/wer_clips/ru_02.wav", (1.83, 6.04)
+A_SRC, A_SPEECH = "tests/data/wer_clips/en_01.wav", (1.07, 5.57)
+B_SRC, B_SPEECH = "tests/data/wer_clips/ru_02.wav", (1.83, 6.04)
 
 def read(p):
     with wave.open(p) as w:

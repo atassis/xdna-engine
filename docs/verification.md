@@ -159,7 +159,7 @@ when the two runs did not compute the same thing or ran under different power mo
   single-tenant -- stop `xdna-engine.service` and confirm `/dev/accel/accel0` is free
   (`fuser /dev/accel/accel0`) first, the way `scripts/lever3_determinism_gate.sh` does.
 - End-to-end WER: start the service (`npu serve` or the systemd unit), then
-  `scripts/wer_eval.py --clips artifacts/wer_clips` (or `--no-service` to smoke-test just
+  `scripts/wer_eval.py --clips tests/data/wer_clips` (or `--no-service` to smoke-test just
   the CPU oracle path, no NPU needed).
 - Determinism gate for a decode-path change: `scripts/lever3_determinism_gate.sh`,
   adjusted for the artifacts you are comparing.

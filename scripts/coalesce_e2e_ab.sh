@@ -12,7 +12,7 @@ set -u
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$WT"
 W3="$WT/rust/target/release/npu-dev"
 LDLIB=~/.local/lib/npu-asr
-CLIP="$WT/artifacts/wer_clips/en_01.wav"
+CLIP="$WT/tests/data/wer_clips/en_01.wav"
 TS="$(date +%Y%m%d_%H%M%S)"; LOG="$WT/artifacts/coalesce_e2e_ab_${TS}.log"
 mkdir -p "$WT/artifacts"; : > "$LOG"
 log(){ echo -e "$*" | tee -a "$LOG"; }

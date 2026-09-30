@@ -9,7 +9,7 @@ is given -- the second isolates encoder-format error from ground-truth transcrip
 int8_wer_eval.py method, generalized to Whisper).
 
 Usage:
-  python scripts/whisper_wer_from_hidden.py --model whisper-turbo --clips artifacts/wer_clips_large \
+  python scripts/whisper_wer_from_hidden.py --model whisper-turbo --clips tests/data/wer_clips_large \
       --hidden artifacts/whisper-turbo/enc_fp32_large --label turbo-fp32 --out /tmp/turbo_fp32.json \
       [--baseline-hyps /tmp/turbo_fp32.json]
 """

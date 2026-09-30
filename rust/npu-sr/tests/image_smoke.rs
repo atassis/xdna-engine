@@ -16,7 +16,7 @@ fn upscales_synthetic_image_cpu() {
         return;
     }
     std::env::set_current_dir(&root).unwrap();
-    let mut eng = SrEngine::load("artifacts/espcn/espcn.json", false).unwrap();
+    let mut eng = SrEngine::load("scenarios/schedules/espcn.json", false).unwrap();
     let (w, h) = (16, 16);
     let rgb: Vec<u8> = (0..w * h * 3).map(|i| (i % 256) as u8).collect();
     let (out, ow, oh) = eng.upscale_rgb8(&rgb, w, h).unwrap();

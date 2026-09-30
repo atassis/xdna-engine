@@ -3,7 +3,7 @@
 import json, re, unicodedata, os, numpy as np, soundfile as sf
 from pathlib import Path
 from transformers import pipeline
-CLIPS = Path("artifacts/wer_clips"); MODEL = os.environ.get("WHISPER_MODEL", "openai/whisper-small")
+CLIPS = Path("tests/data/wer_clips"); MODEL = os.environ.get("WHISPER_MODEL", "openai/whisper-small")
 _PUNCT = re.compile(r"[^\w\s]", re.UNICODE); _WS = re.compile(r"\s+")
 def normalize(t):
     t = unicodedata.normalize("NFC", t or "").lower()

@@ -31,7 +31,7 @@ fn upscales_generated_clip_cpu() {
         .unwrap();
     assert!(st.success(), "ffmpeg gen failed");
 
-    let mut eng = npu_sr::SrEngine::load("artifacts/espcn/espcn.json", false).unwrap();
+    let mut eng = npu_sr::SrEngine::load("scenarios/schedules/espcn.json", false).unwrap();
     let stats = eng.upscale_file(&inp, &outp).unwrap();
     assert_eq!(stats.frames, 5, "expected 5 frames, got {}", stats.frames);
     assert!(outp.exists());

@@ -18,7 +18,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # wer_clips (refs.json + wavs) are gitignored; they live in the main worktree's artifacts.
 CLIPS = os.environ.get("WER_CLIPS") or next(
     (d for d in [os.path.join(REPO, "artifacts", "wer_clips"),
-                 "$REPO/artifacts/wer_clips"]
+                 "$REPO/tests/data/wer_clips"]
      if os.path.isfile(os.path.join(d, "refs.json"))),
     os.path.join(REPO, "artifacts", "wer_clips"))
 MODEL = "nemo-parakeet-tdt-0.6b-v3"

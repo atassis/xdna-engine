@@ -28,7 +28,7 @@ fn cpu_edsr_matches_torch_oracle() {
     let (lr_h, lr_w) = (ls[ls.len() - 2], ls[ls.len() - 1]);
     let (sr_h, sr_w) = (ss[ss.len() - 2], ss[ss.len() - 1]);
 
-    let mut eng = SrEngine::load("artifacts/edsr/edsr.json", false).unwrap();
+    let mut eng = SrEngine::load("scenarios/schedules/edsr.json", false).unwrap();
     // gate_lr is already [1,3,H,W] row-major = planar [3,H,W].
     let planar: Vec<f32> = lr.iter().cloned().collect();
     let (out, ow, oh) = eng.upscale_planar_rgb(&planar, lr_w, lr_h).unwrap();

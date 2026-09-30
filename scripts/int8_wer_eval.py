@@ -4,7 +4,7 @@
 Builds a CPU pipeline that swaps ONLY the encoder: standalone encoder ONNX
 ([1,64,1600] mel + length -> encoded[1,768,400]) -> transpose -> onnx-asr RNNT
 greedy decode (reusing model.asr._decoding + _decode_tokens). Runs every clip in
-artifacts/wer_clips through each encoder variant and reports:
+tests/data/wer_clips through each encoder variant and reports:
   - WER(variant vs reference)
   - WER(int8 vs fp32-encoder hypothesis)  <- isolates quantization error
 

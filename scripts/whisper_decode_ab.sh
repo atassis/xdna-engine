@@ -16,7 +16,7 @@ NPU_DEV_BIN="${NPU_DEV_BIN:-$(cd "$REPO/rust" && cargo metadata --format-version
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')/release/npu-dev}"
 mkdir -p "$OUT"
 mapfile -t CLIPS < <(python3 -c 'import json,sys; print("\n".join(sorted(json.load(open(sys.argv[1])))))' \
-    "$REPO/artifacts/wer_clips/refs.json")
+    "$REPO/tests/data/wer_clips/refs.json")
 { xrt-smi examine 2>/dev/null | grep -i "power mode" || echo "power mode: unreadable"
   powerprofilesctl get 2>/dev/null || true; } > "$OUT/conditions.txt"
 cd "$REPO"
@@ -28,6 +28,6 @@ for ((r = 0; r < ROUNDS; r++)); do
         IFS=: read -r -a parts <<< "${arm#*=}"
         echo "[ab] round $r arm $name" >&2
         env WHISPER_SCENARIO="${parts[0]}" WHISPER_TIMING=1 NPU_DEBUG_TOKEN_IDS=1 "${parts[@]:1}" \
-            "$NPU_DEV_BIN" whisper-e2e "${CLIPS[@]/#/artifacts/wer_clips/}" > "$OUT/r${r}_$name.log" 2>&1
+            "$NPU_DEV_BIN" whisper-e2e "${CLIPS[@]/#/tests/data/wer_clips/}" > "$OUT/r${r}_$name.log" 2>&1
     done
 done

@@ -14,7 +14,7 @@ set -u
 . "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/_npu_services.sh" || exit 1   # unit names + asserted quiesce
 cd "$(dirname "$0")/.."
 REPO="$(pwd)"
-CLIP="${1:-$REPO/artifacts/wer_clips/en_01.wav}"
+CLIP="${1:-$REPO/tests/data/wer_clips/en_01.wav}"
 LIBDIR="$REPO/rust/target/release/build/npu-onnx-d479791e01d0bb48/out"
 BIN="$REPO/rust/target/release/npu-dev"
 # baseline first, then the byte-cut variants in increasing aggressiveness.

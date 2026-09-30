@@ -231,9 +231,9 @@ GAP #5 was a FALSE ALARM: the clips the install test (Step 11) and the 4-clip A/
 (Step 12) read are COMMITTED to git, so a clean clone already has them -- there is no fetch
 step and no network needed here.
 ```bash
-git ls-files artifacts/wer_clips/   # 24 tracked files, verify present in your clone
+git ls-files tests/data/wer_clips/   # 24 tracked files, verify present in your clone
 ```
-- **Already present from the clone:** `artifacts/wer_clips/{en_01..en_04,ru_01..ru_13}.wav`
+- **Already present from the clone:** `tests/data/wer_clips/{en_01..en_04,ru_01..ru_13}.wav`
   (17 wavs) + `refs.json` + `SOURCE.md` + the baseline JSONs
   (`parakeet_eval_results.json`, `int8_eval_results.json`, `whisper_*`, `*_oracle.json`).
 - **Note:** `scripts/fetch_wer_clips.py` still exists to REGENERATE the clips from FLEURS
@@ -306,7 +306,7 @@ to the shipped baseline:
 ```bash
 for c in en_01 en_02 en_03 ru_02; do
   echo "== $c =="
-  curl -fsS -F "file=@artifacts/wer_clips/$c.wav" \
+  curl -fsS -F "file=@tests/data/wer_clips/$c.wav" \
     http://127.0.0.1:11434/v1/audio/transcriptions
   echo
 done
@@ -334,7 +334,7 @@ automated from a clean clone.
 | `artifacts/parakeet/{preprocessor,decoder_joint,vocab}` | Step 6 `fetch_models.sh` (`prep_parakeet_artifacts`) | AUTO. |
 | `models/parakeet/encoder-model.onnx(.data)` | Step 6 `fetch_models.sh` (`prep_parakeet_models`) | AUTO -- `cp -L`-derefs from the HF snapshot under original names (GAP #1 CLOSED). |
 | `artifacts/parakeet/encoder/` (weight checkpoint) | Step 7.a `extract_parakeet_encoder.py` | AUTO -- input now auto-produced by Step 6. |
-| `artifacts/wer_clips/*.wav` + `refs.json` + baseline JSONs | TRACKED IN VCS (committed) | AUTO -- present from the clone, no fetch step (GAP #5 was a false alarm; `fetch_wer_clips.py` only regenerates). |
+| `tests/data/wer_clips/*.wav` + `refs.json` + baseline JSONs | TRACKED IN VCS (committed) | AUTO -- present from the clone, no fetch step (GAP #5 was a false alarm; `fetch_wer_clips.py` only regenerates). |
 | `models/gigaam_v3_encoder_static.onnx` + `models/quant/*` | Step 10 (optional) | AUTO (optional scenario). |
 | Parakeet resident xclbins + insts (under `mlir-aie/.../whole_array/build/`) | Step 9 `build_parakeet_kernels.sh` | AUTO (needs Step 4 green). |
 | `rust/target/` release binaries + onnxruntime lib | Step 11 `install.sh` | AUTO (fetches onnxruntime during build). |
@@ -411,7 +411,7 @@ automated from a clean clone.
   fallback, not the primary.
 
 ### GAP #5 -- WER clips "never fetched by the chain"  [MEDIUM -- CLOSED, was a false alarm]
-- **Verdict:** NOT a gap. `git ls-files artifacts/wer_clips/` returns 24 TRACKED files -- all
+- **Verdict:** NOT a gap. `git ls-files tests/data/wer_clips/` returns 24 TRACKED files -- all
   17 wavs (`en_01..en_04`, `ru_01..ru_13`), `refs.json`, `SOURCE.md`, and the baseline JSONs
   (`parakeet_eval_results.json`, `int8_eval_results.json`, `whisper_npu_wer_{npu,onnx}.json`,
   `whisper_small_oracle.json`). A clean clone ALREADY has them; the Step 11/12 gates and the

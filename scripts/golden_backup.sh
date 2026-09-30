@@ -6,7 +6,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$REPO/scripts/cache_env.sh"   # -> XDNA_CACHE
 DST="${GOLDEN_HOME:-$XDNA_CACHE/goldens}"; mkdir -p "$DST"
 WB="$REPO/mlir-aie/programming_examples/basic/matrix_multiplication/whole_array/build"
-MAN="$REPO/artifacts/goldens/manifest.tsv"
+MAN="$REPO/tests/data/goldens/manifest.tsv"
 for x in final_512x800x3072_64x32x96_8c_modalsilu.xclbin \
          final_512x800x3072_64x32x96_8c_modalgelu.xclbin; do
   [ -f "$WB/$x" ] || { echo "missing $x"; exit 1; }

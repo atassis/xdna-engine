@@ -13,7 +13,7 @@ import onnx_asr
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CLIPS = next((d for d in [os.path.join(REPO, "artifacts", "wer_clips"),
-              "$REPO/artifacts/wer_clips"]
+              "$REPO/tests/data/wer_clips"]
              if os.path.isfile(os.path.join(d, "refs.json"))), None)
 
 def read_wav(p):

@@ -3,7 +3,7 @@
 
 Drives the Rust engine end-to-end (NPU encoder + whichever decoder the running service was
 launched with): POSTs each WAV to /v1/audio/transcriptions, scores the returned text vs
-artifacts/wer_clips/refs.json. The decoder backend is selected by the env the service was
+tests/data/wer_clips/refs.json. The decoder backend is selected by the env the service was
 launched with (NPU_DECODE=1 => on-NPU per-token decoder; unset => ONNX). This harness does NOT
 itself open the NPU — it only talks HTTP, so it is safe to run alongside a single-tenant service.
 
@@ -53,7 +53,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default="http://127.0.0.1:11434/v1/audio/transcriptions")
     ap.add_argument("--model", default="whisper-small")
-    ap.add_argument("--clips", default="artifacts/wer_clips")
+    ap.add_argument("--clips", default="tests/data/wer_clips")
     ap.add_argument("--label", default="run")
     ap.add_argument("--out", default=None)
     ap.add_argument("--limit", type=int, default=None)

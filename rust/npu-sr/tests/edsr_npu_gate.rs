@@ -34,10 +34,10 @@ fn npu_edsr_matches_cpu_and_oracle() {
     let (lr_h, lr_w) = (ls[ls.len() - 2], ls[ls.len() - 1]);
     let planar: Vec<f32> = lr.iter().cloned().collect();
 
-    let mut cpu = SrEngine::load("artifacts/edsr/edsr.json", false).unwrap();
+    let mut cpu = SrEngine::load("scenarios/schedules/edsr.json", false).unwrap();
     let (out_cpu, _, _) = cpu.upscale_planar_rgb(&planar, lr_w, lr_h).unwrap();
 
-    let mut npu = SrEngine::load("artifacts/edsr/edsr.json", true).unwrap();
+    let mut npu = SrEngine::load("scenarios/schedules/edsr.json", true).unwrap();
     let (out_npu, _, _) = npu.upscale_planar_rgb(&planar, lr_w, lr_h).unwrap();
 
     let sr_v: Vec<f32> = sr_ref.iter().cloned().collect();

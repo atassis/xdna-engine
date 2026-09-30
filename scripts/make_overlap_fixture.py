@@ -23,8 +23,8 @@ os.makedirs(OUT, exist_ok=True)
 SR = 16000
 
 # Speech bounds MEASURED with `npu diarize` on each clip, not guessed from file length.
-A = {"path": "artifacts/wer_clips/en_02.wav", "speech": (0.71, 7.16)}
-B = {"path": "artifacts/wer_clips/ru_02.wav", "speech": (1.83, 6.04)}
+A = {"path": "tests/data/wer_clips/en_02.wav", "speech": (0.71, 7.16)}
+B = {"path": "tests/data/wer_clips/ru_02.wav", "speech": (1.83, 6.04)}
 B_SPEECH_STARTS_AT = 4.0        # where B's speech should begin, inside A's speech
 
 def read(path):

@@ -9,7 +9,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PORT="${NPU_PORT:-11434}"
 BASE="http://127.0.0.1:$PORT"
-CLIP="${1:-$REPO/artifacts/wer_clips/ru_01.wav}"
+CLIP="${1:-$REPO/tests/data/wer_clips/ru_01.wav}"
 
 echo "==> waiting for $BASE/healthz"
 for i in $(seq 1 60); do

@@ -335,7 +335,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bench", action="store_true")
     ap.add_argument("--gate", type=float, default=0.08)
-    ap.add_argument("--clip", default="artifacts/wer_clips/en_01.wav",
+    ap.add_argument("--clip", default="tests/data/wer_clips/en_01.wav",
                     help="wav clip for a real non-trivial decode; '' uses the encoder ref npy")
     ap.add_argument("--dump-weights", action="store_true",
                     help="extract decoder weights to artifacts/parakeet/decoder/weights/ for the Rust port")

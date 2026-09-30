@@ -33,8 +33,8 @@ WDIR=$WT/artifacts/whisper-small/whisper_decoder
 ENC=$WT/artifacts/whisper-small/refs/encoded.npy
 GEN=$WT/designs/decode_fused
 PROBE=$WT/rust/target/debug/npu-dev
-CLIP_EN=$WT/artifacts/wer_clips/en_01.wav
-CLIP_RU=$WT/artifacts/wer_clips/ru_01.wav
+CLIP_EN=$WT/tests/data/wer_clips/en_01.wav
+CLIP_RU=$WT/tests/data/wer_clips/ru_01.wav
 LOG=$WT/artifacts/fused_testsuite.log
 mkdir -p "$WT/artifacts"; : > "$LOG"
 
@@ -141,7 +141,7 @@ run "test -f $WT/scripts/_whisper_decode_attn_wer_run.sh && bash $WT/scripts/_wh
 
 section "6. OTHER MODELS (best-effort; skipped cleanly if env/deps absent)"
 note "Parakeet full-transcription WER (needs onnx_asr venv):"
-run "test -x $PARAKEET_PY && (cd $WT && $PARAKEET_PY scripts/parakeet_npu_wer.py npu artifacts/wer_clips) || echo 'parakeet venv/onnx_asr absent — skipped'"
+run "test -x $PARAKEET_PY && (cd $WT && $PARAKEET_PY scripts/parakeet_npu_wer.py npu tests/data/wer_clips) || echo 'parakeet venv/onnx_asr absent — skipped'"
 note "Embeddings (bge-base) e2e latency:"
 run "test -f $WT/scripts/_esm_latency.sh && bash $WT/scripts/_esm_latency.sh scenarios/bge-base.toml 11436 bge || echo 'embeddings harness skipped'"
 note "ESM-2 native e2e latency:"
