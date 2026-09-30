@@ -1,15 +1,9 @@
 #!/usr/bin/env bash
 # Are the aie_api headers kernels COMPILE against the ones toolchain.lock PINS?
 #
-# They are not, and that is the point of this check. `toolchain_up.sh:_link_include_dirs` symlinks
-# `$INST/build/include/aie_api` at the mlir_aie WHEEL (`setup_kernel_env.sh` hardcodes its version),
-# while `toolchain.lock` pins `mlir-aie/third_party/aie_api` through MLIR_AIE_FORK_COMMIT. Those two
-# are structurally decoupled: bumping the fork commit moves the pinned headers and leaves the linked
-# ones exactly where they were, with no error and a green lock.
-#
-# So this does NOT assert the two are equal -- repointing the symlink is a measured behaviour change,
-# not a cleanup, and belongs to whoever is willing to re-gate the kernels behind it. It RATCHETS:
-# the divergence is recorded in a baseline and any CHANGE to it fails, whichever direction it moves.
+# They should be: toolchain_up.sh links `$INST/build/include/aie_api` at the instance's own pinned
+# tree. It RATCHETS rather than asserting equality:
+# the state is recorded in a baseline and any CHANGE to it fails, whichever direction it moves.
 # A pin bump that shifts the headers under the kernels then announces itself here instead of being
 # discovered later by grepping a stale copy and drawing a conclusion about the wrong tree.
 #
