@@ -13,8 +13,8 @@ class _FakeResp:
 
 def test_transcribe_returns_text_and_latency(monkeypatch):
     monkeypatch.setattr(requests, "post", lambda *a, **k: _FakeResp())
-    # bench/__init__.py is a real, openable file in the worktree.
-    text, dt = transcribe("u", "bench/__init__.py", "m")
+    # tools/bench/__init__.py is a real, openable file in the worktree.
+    text, dt = transcribe("u", "tools/bench/__init__.py", "m")
     assert text == "hi"
     assert isinstance(dt, float)
     assert dt >= 0
@@ -23,7 +23,7 @@ def test_transcribe_returns_text_and_latency(monkeypatch):
 def test_backend_transcribe_method(monkeypatch):
     monkeypatch.setattr(requests, "post", lambda *a, **k: _FakeResp())
     b = Backend("x", "u", "m")
-    text, dt = b.transcribe("bench/__init__.py")
+    text, dt = b.transcribe("tools/bench/__init__.py")
     assert text == "hi"
     assert isinstance(dt, float)
 

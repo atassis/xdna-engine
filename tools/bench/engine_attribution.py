@@ -20,7 +20,7 @@ Reading:
   decode on NPU   -> both low; the host is blocked/idle waiting on the accelerator
 
 Usage:
-    bench/engine_attribution.py --model qwen3:4b --port 11439 --gen-tokens 128
+    tools/bench/engine_attribution.py --model qwen3:4b --port 11439 --gen-tokens 128
 """
 import argparse
 import json

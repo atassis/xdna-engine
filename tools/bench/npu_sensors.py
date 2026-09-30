@@ -7,8 +7,8 @@ drifts within a single sweep). The driver already exposes a power sensor through
 it is simply not surfaced through hwmon, so nothing reads it. This is that reader.
 
 Usage:
-    python bench/npu_sensors.py            # one sample, all sensors
-    python bench/npu_sensors.py --watch 20 # sample once a second for 20 s (does it TRACK load?)
+    python tools/bench/npu_sensors.py            # one sample, all sensors
+    python tools/bench/npu_sensors.py --watch 20 # sample once a second for 20 s (does it TRACK load?)
 
 Exposing the same sensor through hwmon is a separable upstream follow-on; it is NOT a
 prerequisite for using the number here.

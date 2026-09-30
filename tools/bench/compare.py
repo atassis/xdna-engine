@@ -8,7 +8,7 @@ peak RSS, and CPU-idle fraction. Aggregates EN/RU mean WER, median latency,
 mean J/clip, peak RAM, mean CPU-idle%.
 
 Usage (from worktree root, with $VENV):
-    $VENV bench/compare.py --backends ours,flm --scenario scenarios/asr-whisper-small.toml
+    $VENV tools/bench/compare.py --backends ours,flm --scenario scenarios/asr-whisper-small.toml
 
 CRITICAL: stop voxd.service before running; this script restarts it at the end.
 """
@@ -32,8 +32,8 @@ from bench.energy import EnergyMeter, readable
 from bench.sysmetrics import CpuSampler, peak_rss_kb
 from bench.backends import FLM, ours
 
-ROOT = Path(__file__).resolve().parent.parent
-RESULTS_DIR = ROOT / "bench" / "results"
+ROOT = Path(__file__).resolve().parent.parent.parent
+RESULTS_DIR = ROOT / "tools" / "bench" / "results"
 LIB = os.path.expanduser("~/.local/lib/xdna-engine")
 OUR_PORT = 11435
 
