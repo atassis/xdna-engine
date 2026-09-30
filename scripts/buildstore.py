@@ -2,9 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """CLI over scripts/buildstore/{record,store,identity}.py.
 
-build <recipe>... [--recipes TSV] [--out-root DIR] [--no-hit]: take the recipe's lock, check
-stored actions newest-first for a hit, else run the recipe under the recorder and store the
-result. TSV format matches run_s0.sh: tab-separated, `#` comments, NORECIPE skipped.
+build <recipe>...|--all [--recipes TSV] [--out-root DIR] [--no-hit] [--report FILE]: take each
+recipe's lock, check stored actions newest-first for a hit, else run it under the recorder and
+store the result. TSV format matches run_s0.sh: tab-separated, `#` comments, NORECIPE skipped.
+--report writes {recipe: {identity, tree, status, seconds, peak_rss_kb}}; with --report, one
+recipe's failure is a FAILED line, not an abort (only --all uses this in practice).
+
+gate-record/gate-status: device gate results keyed by artifact identity + driver + firmware.
+repin-report A.json B.json: compare two `build --report` outputs by identity.
 """
 import argparse, datetime, glob, hashlib, json, os, pathlib, shutil, subprocess, sys, time
 
@@ -97,6 +102,64 @@ def parse_time_v(path):
     return wall, peak
 
 
+def _build_one(name, cmd, repo, s, out_root, no_hit):
+    """Build (or hit) one recipe. Returns {status: HIT|BUILT, identity, tree, seconds,
+    peak_rss_kb}. Raises on failure -- the caller (cmd_build) decides whether that aborts the
+    whole run (explicit recipe list) or is recorded as one FAILED line (--all --report)."""
+    t0 = time.time()
+    with s.lock(name):
+        argv = ["bash", "-c", f"cd {repo} && {cmd}"]
+        env = record.hermetic_env(os.environ, record.allowlist())
+        env["REPO"] = str(repo)
+        resolve_xdna_cache(repo, env)
+        resolve_mlir_aie_instance(repo, env)
+        want = iron_pin_verified(repo, env)
+        if want:
+            env["IRON_PIN_VERIFIED"] = want
+
+        staging = pathlib.Path(s.root) / "staging" / name
+        out = staging / "out"
+        work = staging / "work"
+        npu_cache = pathlib.Path(s.root) / "caches" / name / "npu_cache"
+        ccache_dir = pathlib.Path(s.root) / "caches" / name / "ccache"
+        env["OUT"] = str(out)
+        env["KEEP_WORK"] = str(work)
+        env["XDNA_BLOB_POOL"] = "0"
+        env["NPU_CACHE_HOME"] = str(npu_cache)
+        env["CCACHE_DIR"] = str(ccache_dir)
+        cache_roots = [npu_cache, ccache_dir]
+        if env.get("XDNA_CACHE"):
+            cache_roots.append(pathlib.Path(env["XDNA_CACHE"]) / "kobj")
+
+        if not no_hit:
+            hit = next((a for a in s.actions(name)
+                       if record.check(a["manifest"], env=env, argv=argv) == []), None)
+            if hit is not None:
+                s.materialize(hit["tree"], out_root / name)
+                return {"status": "HIT", "identity": hit["identity"], "tree": hit["tree"],
+                        "seconds": time.time() - t0, "peak_rss_kb": None}
+
+        shutil.rmtree(staging, ignore_errors=True)
+        out.mkdir(parents=True)
+        work.mkdir(parents=True)
+        npu_cache.mkdir(parents=True, exist_ok=True)
+        ccache_dir.mkdir(parents=True, exist_ok=True)
+        time_file = staging / "time.txt"
+        manifest = record.run(argv, cwd=repo, env=env, out_roots=[out], work_roots=[work],
+                              cache_roots=cache_roots, time_file=time_file)
+        wall, peak_kb = parse_time_v(time_file)
+
+        tree = s.put_tree(out)
+        ident = identity.of(out)
+        key = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
+        s.put_action(name, key, {"manifest": manifest, "tree": tree, "identity": ident,
+                                 "timings": {"wall": wall, "peak_rss_kb": peak_kb}})
+        s.materialize(tree, out_root / name)
+        shutil.rmtree(staging, ignore_errors=True)
+        return {"status": "BUILT", "identity": ident, "tree": tree,
+                "seconds": time.time() - t0, "peak_rss_kb": peak_kb}
+
+
 def cmd_build(args):
     cas = pathlib.Path(os.environ.get("BUILDSTORE_CAS", "/mnt/data/xdna/cas"))
     repo = pathlib.Path(os.environ.get("BUILDSTORE_REPO", str(WS / "xdna-engine")))
@@ -106,65 +169,55 @@ def cmd_build(args):
     statcache = cas / "statcache.json"
     record.load_statcache(str(statcache))
     out_root = pathlib.Path(args.out_root)
+    names = [n for n, c in recipes.items() if c != "NORECIPE"] if args.all else args.recipe
 
-    for name in args.recipe:
+    report = {}
+    for name in names:
         cmd = recipes.get(name)
         if cmd is None or cmd == "NORECIPE":
             print(f"SKIP {name} NORECIPE")
             continue
-        t0 = time.time()
-        with s.lock(name):
-            argv = ["bash", "-c", f"cd {repo} && {cmd}"]
-            env = record.hermetic_env(os.environ, record.allowlist())
-            env["REPO"] = str(repo)
-            resolve_xdna_cache(repo, env)
-            resolve_mlir_aie_instance(repo, env)
-            want = iron_pin_verified(repo, env)
-            if want:
-                env["IRON_PIN_VERIFIED"] = want
-
-            staging = cas / "staging" / name
-            out = staging / "out"
-            work = staging / "work"
-            npu_cache = cas / "caches" / name / "npu_cache"
-            ccache_dir = cas / "caches" / name / "ccache"
-            env["OUT"] = str(out)
-            env["KEEP_WORK"] = str(work)
-            env["XDNA_BLOB_POOL"] = "0"
-            env["NPU_CACHE_HOME"] = str(npu_cache)
-            env["CCACHE_DIR"] = str(ccache_dir)
-            cache_roots = [npu_cache, ccache_dir]
-            if env.get("XDNA_CACHE"):
-                cache_roots.append(pathlib.Path(env["XDNA_CACHE"]) / "kobj")
-
-            if not args.no_hit:
-                hit = next((a for a in s.actions(name)
-                           if record.check(a["manifest"], env=env, argv=argv) == []), None)
-                if hit is not None:
-                    s.materialize(hit["tree"], out_root / name)
-                    print(f"HIT {name} {hit['identity']} {time.time() - t0:.2f}")
-                    continue
-
-            shutil.rmtree(staging, ignore_errors=True)
-            out.mkdir(parents=True)
-            work.mkdir(parents=True)
-            npu_cache.mkdir(parents=True, exist_ok=True)
-            ccache_dir.mkdir(parents=True, exist_ok=True)
-            time_file = staging / "time.txt"
-            manifest = record.run(argv, cwd=repo, env=env, out_roots=[out], work_roots=[work],
-                                  cache_roots=cache_roots, time_file=time_file)
-            wall, peak_kb = parse_time_v(time_file)
-
-            tree = s.put_tree(out)
-            ident = identity.of(out)
-            key = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
-            s.put_action(name, key, {"manifest": manifest, "tree": tree, "identity": ident,
-                                     "timings": {"wall": wall, "peak_rss_kb": peak_kb}})
-            s.materialize(tree, out_root / name)
-            shutil.rmtree(staging, ignore_errors=True)
-            print(f"BUILT {name} {ident} {time.time() - t0:.2f} {peak_kb}")
+        try:
+            r = _build_one(name, cmd, repo, s, out_root, args.no_hit)
+        except Exception as e:  # noqa: BLE001 -- --all must not abort on one recipe's failure
+            if not args.report:
+                raise
+            print(f"FAILED {name} {e}")
+            report[name] = {"status": "FAILED", "identity": None, "tree": None,
+                            "seconds": None, "peak_rss_kb": None}
+            continue
+        print(f"{r['status']} {name} {r['identity']} {r['seconds']:.2f}"
+              + (f" {r['peak_rss_kb']}" if r["status"] == "BUILT" else ""))
+        report[name] = r
 
     record.save_statcache(str(statcache))
+    if args.report:
+        pathlib.Path(args.report).write_text(json.dumps(report, sort_keys=True, indent=2))
+
+
+def cmd_repin_report(args):
+    """One line per recipe comparing two `build --report` JSONs by IDENTITY: IDENTICAL (its
+    gates, keyed by identity, already apply -- nothing to carry over by hand), CHANGED <n
+    files>, or FAILED. Ends with a device-work summary. Always exits 0: a repin report is
+    information, never a gate."""
+    a = json.loads(pathlib.Path(args.report_a).read_text())
+    b = json.loads(pathlib.Path(args.report_b).read_text())
+    cas = pathlib.Path(os.environ.get("BUILDSTORE_CAS", "/mnt/data/xdna/cas"))
+    s = store.Store(cas)
+    device_work = []
+    for name in sorted(set(a) | set(b)):
+        ra, rb = a.get(name), b.get(name)
+        if not ra or not rb or ra["status"] == "FAILED" or rb["status"] == "FAILED":
+            print(f"FAILED {name}")
+            continue
+        if ra["identity"] == rb["identity"]:
+            print(f"IDENTICAL {name}")
+            continue
+        ta, tb = s.tree(ra["tree"]), s.tree(rb["tree"])
+        diff = sorted(p for p in set(ta) | set(tb) if ta.get(p) != tb.get(p))
+        print(f"CHANGED {name} {len(diff)} files differ: {', '.join(diff)}")
+        device_work.append(name)
+    print(f"device work: {', '.join(device_work)}")
 
 
 def _driver_srcversion():
@@ -232,10 +285,12 @@ def main(argv=None):
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd", required=True)
     b = sub.add_parser("build")
-    b.add_argument("recipe", nargs="+")
+    b.add_argument("recipe", nargs="*")
     b.add_argument("--recipes", type=pathlib.Path, default=None)
     b.add_argument("--out-root", required=True)
     b.add_argument("--no-hit", action="store_true")
+    b.add_argument("--all", action="store_true")
+    b.add_argument("--report", type=pathlib.Path, default=None)
     gr = sub.add_parser("gate-record")
     gr.add_argument("artifact_dir")
     gr.add_argument("gate")
@@ -243,13 +298,20 @@ def main(argv=None):
     gr.add_argument("json_file", nargs="?")
     gs = sub.add_parser("gate-status")
     gs.add_argument("artifact_dir")
+    rp = sub.add_parser("repin-report")
+    rp.add_argument("report_a")
+    rp.add_argument("report_b")
     args = p.parse_args(argv)
     if args.cmd == "build":
+        if not args.all and not args.recipe:
+            p.error("build: give a recipe name or --all")
         cmd_build(args)
     elif args.cmd == "gate-record":
         cmd_gate_record(args)
     elif args.cmd == "gate-status":
         cmd_gate_status(args)
+    elif args.cmd == "repin-report":
+        cmd_repin_report(args)
 
 
 if __name__ == "__main__":
