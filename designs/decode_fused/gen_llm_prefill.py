@@ -127,7 +127,7 @@ import newstack_compat  # noqa: F401,E402 -- MUST precede iron imports
 from iron.common import AIEContext  # noqa: E402
 from iron.common.kv_layout import KVLayout  # noqa: E402
 from elf_dispatch_compat import OperatorSequence, load_elf  # noqa: E402
-from elf_zst import write_elf  # noqa: E402
+from elf_zst import read_elf, write_elf  # noqa: E402
 from iron.operators.gemm.op import GEMM  # noqa: E402
 from iron.operators.rms_norm.op import RMSNorm  # noqa: E402
 from iron.operators.rope.op import RoPE  # noqa: E402
@@ -2562,8 +2562,8 @@ def main():
         import hashlib
         elf_path = os.path.join(os.path.dirname(dec_meta_path),
                                 json.load(open(dec_meta_path))["elf"])
-        md5 = (hashlib.md5(open(elf_path, "rb").read()).hexdigest()
-               if os.path.isfile(elf_path) else None)
+        md5 = (hashlib.md5(read_elf(elf_path)).hexdigest()
+               if os.path.isfile(elf_path) or os.path.isfile(elf_path + ".zst") else None)
         dec_ref = {"meta": os.path.abspath(dec_meta_path), "elf_md5": md5,
                    "reserved_bytes": dims["reserved"]}
 
