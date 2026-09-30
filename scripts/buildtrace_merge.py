@@ -120,19 +120,24 @@ def prof_call_tree(path, depth=5):
 
 
 def build_forest(events):
-    """Nest events into a nesting forest by time-containment alone (pass spans run on a
-    different tid than their enclosing edge span by design -- see ProfileTrace.h -- so
-    containment cannot be a per-tid stack; it is purely [ts, ts+dur) interval nesting)."""
-    ordered = sorted(events, key=lambda e: (e["ts"], -e["dur"]))
-    roots = []
-    stack = []  # (end_ts, children_list)
-    for e in ordered:
-        start = e["ts"]
-        while stack and stack[-1][0] <= start:
-            stack.pop()
-        node = {"event": e, "children": []}
-        (stack[-1][1] if stack else roots).append(node)
-        stack.append((start + e["dur"], node["children"]))
+    """One level: edge/task spans (no args.pass -- aiecc scheduler tasks, incl. kcc/generator
+    rows) are flat siblings, never nested into one another -- two edges/items legitimately
+    overlap under -j>1 parallelism, which is concurrency, not containment. A pass span (has
+    args.pass) is attached to the tightest-fitting edge whose [ts, ts+dur) contains it (its
+    own tid differs from that edge's by design -- see ProfileTrace.h -- so containment has to
+    be time-based, not a per-tid stack); an edge with no attributable passes is a leaf."""
+    edges = [e for e in events if "pass" not in e.get("args", {})]
+    passes = [e for e in events if "pass" in e.get("args", {})]
+    roots = [{"event": e, "children": []} for e in edges]
+    for p in passes:
+        candidates = [n for n in roots
+                     if n["event"]["ts"] <= p["ts"]
+                     and p["ts"] + p["dur"] <= n["event"]["ts"] + n["event"]["dur"]]
+        if not candidates:
+            continue
+        best = min(candidates, key=lambda n: n["event"]["dur"])
+        best["children"].append({"event": p, "children": []})
+    roots.sort(key=lambda n: n["event"]["ts"])
     return roots
 
 
