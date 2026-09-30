@@ -218,8 +218,18 @@ _build_aie_translate() {
   ninja -C "$INST/build" aie-translate >&2
 }
 
+# Build the vendored aiebu-asm (third_party/aiebu submodule) instead of requiring AIEBU_ASM_DIR to
+# point at a hand-built binary. No-op on a pin that predates the submodule, so this stays safe across
+# a repin boundary in either direction.
+_build_vendored_aiebu_asm() {
+  [ -e "$INST/build/bin/aiebu-asm" ] && return 0
+  ninja -C "$INST/build" -t targets 2>/dev/null | grep -q '^aiebu-asm:' || return 0
+  ninja -C "$INST/build" aiebu-asm >&2
+}
+
 if [ -f "$PYPKG" ] && grep -q "def resolve_program(self, device_name" "$PYPKG"; then
   _build_aie_translate  # backfill the fork-built aie-translate (else it stays the stale wheel symlink)
+  _build_vendored_aiebu_asm  # backfill aiebu-asm on a pin that has since gained third_party/aiebu
   _link_vendored_tools   # backfill vendored tools into already-built instances
   _link_include_dirs     # backfill include/ symlinks (aie_api + aie_kernels)
   _wire_peano_lit        # backfill the lit peano path (else `REQUIRES: peano` tests silently skip)
@@ -308,6 +318,7 @@ _apply_kernel_compile_speedups
 _recognise_gorgon_point
 ln -sfn "$INST/build/bin" "$INST/bin"
 _build_aie_translate
+_build_vendored_aiebu_asm
 _link_vendored_tools
 touch "$INST"                                          # record last-used before GC (protects it as newest)
 gc_instances "${TOOLCHAIN_HOME:-$XDNA_CACHE/instances}" "${TOOLCHAIN_KEEP:-4}" "$INST"
