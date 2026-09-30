@@ -43,8 +43,16 @@ ShimBo*     shim_bo_subbuffer(ShimBo* parent, size_t size, size_t offset);
 void        shim_bo_free(ShimBo*);
 int         shim_bo_write(ShimBo*, const void* src, size_t nbytes, size_t offset); /* 0 ok */
 int         shim_bo_read (ShimBo*, void* dst, size_t nbytes, size_t offset);
+void*       shim_bo_map  (ShimBo*);  /* host mapping, lives as long as the BO; NULL on error */
 int         shim_bo_sync_to_device(ShimBo*);
 int         shim_bo_sync_from_device(ShimBo*);
+
+/* Import a dma-buf fd as a device BO: xrt::bo(device, fd), the amdxdna is_import_bo() path proven
+ * for NPU dispatch by the GPU<->NPU probes (docs/probes/import_bo_dispatch.cpp,
+ * gpu_npu_roundtrip.cpp). Does not take ownership of fd (XRT dup()s it internally). NULL on failure. */
+ShimBo*     shim_bo_import(ShimDevice*, int fd);
+/* Size of a BO in bytes, 0 on error -- lets a caller learn an imported buffer's real size. */
+size_t      shim_bo_size(ShimBo*);
 
 /* whole_array / matmul host ABI: kernel(opcode, instr, instr_count, A, B, C, tmp, trace).
  * Creates a run, dispatches, waits for completion. 0 on success. */

@@ -6,6 +6,21 @@ use std::ffi::{c_char, c_int, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 
+/// Padded-frame geometry a `layout: "frame"` fsr1 backend expects, for a zero-copy dma-buf caller
+/// that builds its own buffers. See [`xdna_sr_frame_layout`].
+#[repr(C)]
+pub struct XdnaSrFrameLayout {
+    pub in_w: usize,
+    pub in_h: usize,
+    pub in_pad_w: usize,
+    pub in_pad_h: usize,
+    pub in_pad_x: usize,
+    pub in_pad_y: usize,
+    pub out_pad_w: usize,
+    pub out_pad_h: usize,
+    pub scale: usize,
+}
+
 thread_local! { static LAST_ERROR: RefCell<CString> = RefCell::new(CString::new("").unwrap()); }
 fn set_error(m: impl Into<String>) {
     let c = CString::new(m.into()).unwrap_or_else(|_| CString::new("error").unwrap());
@@ -112,6 +127,157 @@ pub unsafe extern "C" fn xdna_sr_process_rgb8(
     }));
     r.unwrap_or_else(|_| {
         set_error("panic in xdna_sr_process_rgb8");
+        -1
+    })
+}
+
+/// Upscale one BGRA8 frame (DRM ARGB8888 byte order: B, G, R, A in memory). Rows are `in_stride`
+/// / `out_stride` bytes apart; `out_rgba` holds at least (h*scale-1)*out_stride + w*scale*4 bytes
+/// (`out_cap`). Output alpha is 0xff. Returns 0 on success (writing out_w/out_h if non-null).
+#[no_mangle]
+pub unsafe extern "C" fn xdna_sr_process_bgra8(
+    h: *mut XdnaSr,
+    in_bgra: *const u8,
+    w: usize,
+    height: usize,
+    in_stride: usize,
+    out_bgra: *mut u8,
+    out_stride: usize,
+    out_cap: usize,
+    out_w: *mut usize,
+    out_h: *mut usize,
+) -> c_int {
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        let Some(h) = (unsafe { h.as_mut() }) else {
+            set_error("handle is null");
+            return -1;
+        };
+        if in_bgra.is_null() || out_bgra.is_null() || w == 0 || height == 0 || in_stride < w * 4 {
+            set_error("null buffer, empty frame, or in_stride < w*4");
+            return -1;
+        }
+        let src = unsafe { std::slice::from_raw_parts(in_bgra, (height - 1) * in_stride + w * 4) };
+        let dst = unsafe { std::slice::from_raw_parts_mut(out_bgra, out_cap) };
+        match h.0.upscale_bgra8(src, w, height, in_stride, dst, out_stride) {
+            Ok((ow, oh)) => {
+                unsafe {
+                    if !out_w.is_null() {
+                        *out_w = ow;
+                    }
+                    if !out_h.is_null() {
+                        *out_h = oh;
+                    }
+                }
+                0
+            }
+            Err(e) => {
+                set_error(e.to_string());
+                -1
+            }
+        }
+    }));
+    r.unwrap_or_else(|_| {
+        set_error("panic in xdna_sr_process_bgra8");
+        -1
+    })
+}
+
+/// Fills `*out` with the loaded backend's padded-frame geometry and returns 0 if it takes padded
+/// BGRA frames (fsr1 frame layout); <0 (e.g. a conv-net or tiled-fsr1 schedule) otherwise.
+#[no_mangle]
+pub unsafe extern "C" fn xdna_sr_frame_layout(h: *const XdnaSr, out: *mut XdnaSrFrameLayout) -> c_int {
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        let Some(h) = (unsafe { h.as_ref() }) else {
+            set_error("handle is null");
+            return -1;
+        };
+        if out.is_null() {
+            set_error("out is null");
+            return -1;
+        }
+        match h.0.frame_layout() {
+            Ok(l) => {
+                unsafe {
+                    *out = XdnaSrFrameLayout {
+                        in_w: l.in_w,
+                        in_h: l.in_h,
+                        in_pad_w: l.in_pad_w,
+                        in_pad_h: l.in_pad_h,
+                        in_pad_x: l.in_pad_x,
+                        in_pad_y: l.in_pad_y,
+                        out_pad_w: l.out_pad_w,
+                        out_pad_h: l.out_pad_h,
+                        scale: l.scale,
+                    };
+                }
+                0
+            }
+            Err(e) => {
+                set_error(e.to_string());
+                -1
+            }
+        }
+    }));
+    r.unwrap_or_else(|_| {
+        set_error("panic in xdna_sr_frame_layout");
+        -1
+    })
+}
+
+/// Zero-copy dispatch: `in_fd`/`out_fd` are dma-buf fds of BGRA8 buffers laid out per
+/// Bytes per pixel of the frame layout's planes: 4 for BGRA, 1 for the NV12 Y plane (the caller
+/// fills the chroma plane of its output buffer itself). <0 without a frame-layout backend.
+#[no_mangle]
+pub unsafe extern "C" fn xdna_sr_frame_bytes_per_px(h: *const XdnaSr) -> c_int {
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        let Some(h) = (unsafe { h.as_ref() }) else {
+            set_error("handle is null");
+            return -1;
+        };
+        match h.0.frame_bytes_per_px() {
+            Ok(b) => b as c_int,
+            Err(e) => {
+                set_error(e.to_string());
+                -1
+            }
+        }
+    }));
+    r.unwrap_or_else(|_| {
+        set_error("panic in xdna_sr_frame_bytes_per_px");
+        -1
+    })
+}
+
+/// `xdna_sr_frame_layout` (in: producer-filled INCLUDING the edge-replicated padding; out: the full
+/// padded output). Imports and caches each fd (by the dma-buf's inode). Blocking: returns after the
+/// NPU finished. `*out_fence_fd` is set to -1 (reserved for an async version). <0 on error.
+#[no_mangle]
+pub unsafe extern "C" fn xdna_sr_process_dmabuf(
+    h: *mut XdnaSr,
+    in_fd: c_int,
+    out_fd: c_int,
+    out_fence_fd: *mut c_int,
+) -> c_int {
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        let Some(h) = (unsafe { h.as_mut() }) else {
+            set_error("handle is null");
+            return -1;
+        };
+        if !out_fence_fd.is_null() {
+            unsafe {
+                *out_fence_fd = -1;
+            }
+        }
+        match h.0.process_dmabuf(in_fd, out_fd) {
+            Ok(()) => 0,
+            Err(e) => {
+                set_error(e.to_string());
+                -1
+            }
+        }
+    }));
+    r.unwrap_or_else(|_| {
+        set_error("panic in xdna_sr_process_dmabuf");
         -1
     })
 }

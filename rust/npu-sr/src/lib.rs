@@ -5,6 +5,8 @@ pub mod schedule;
 pub mod color;
 pub mod frontier;
 pub mod pipeline;
+pub mod fsr1;
+pub mod fsr1_frame;
 
 use std::path::Path;
 
@@ -32,9 +34,12 @@ pub struct Plane {
 }
 
 /// The SR engine. Holds device resources -> NOT Send/Sync; the caller serializes (NPU single-tenant).
-pub struct SrEngine {
-    sched: schedule::Schedule,
-    frontier: frontier::Frontier,
+/// The schedule JSON's `kind` picks the backend: a conv net over the brick vocabulary (the
+/// default, ESPCN/EDSR) or `fsr1`, a fixed-function exported design.
+pub enum SrEngine {
+    Net { sched: schedule::Schedule, frontier: frontier::Frontier },
+    Fsr1(fsr1::Fsr1Engine),
+    Fsr1Frame(fsr1_frame::Fsr1FrameEngine),
 }
 
 /// Paths [`SrEngine::load_with`] resolves itself, replacing the schedule's own CWD-relative
@@ -62,17 +67,38 @@ impl SrEngine {
     /// (CWD-relative, dev-checkout-only) paths. See [`LoadOverrides`].
     pub fn load_with(schedule_path: impl AsRef<Path>, use_npu: bool, overrides: LoadOverrides)
         -> Result<SrEngine, SrError> {
-        let mut sched = schedule::Schedule::load(schedule_path.as_ref())?;
+        let path = schedule_path.as_ref();
+        if schedule::kind(path)? == schedule::Kind::Fsr1 {
+            if !use_npu {
+                return Err(SrError::Load("fsr1 has no CPU backend".into()));
+            }
+            let dir = path.parent().unwrap_or(Path::new("."));
+            if matches!(schedule::layout(path)?.as_deref(), Some("frame" | "frame_y")) {
+                let cfg: fsr1_frame::Fsr1FrameConfig = schedule::load_json(path)?;
+                return Ok(SrEngine::Fsr1Frame(fsr1_frame::Fsr1FrameEngine::load(cfg, dir)?));
+            }
+            let cfg: fsr1::Fsr1Config = schedule::load_json(path)?;
+            return Ok(SrEngine::Fsr1(fsr1::Fsr1Engine::load(cfg, dir)?));
+        }
+        let mut sched = schedule::Schedule::load(path)?;
         if let Some(ckpt) = overrides.checkpoint {
             sched.checkpoint = ckpt.to_string_lossy().into_owned();
         }
         let frontier = frontier::Frontier::build(&sched, use_npu, overrides.wa_dir)?;
-        Ok(SrEngine { sched, frontier })
+        Ok(SrEngine::Net { sched, frontier })
+    }
+
+    fn net(&mut self) -> Result<(&schedule::Schedule, &mut frontier::Frontier), SrError> {
+        match self {
+            SrEngine::Net { sched, frontier } => Ok((sched, frontier)),
+            SrEngine::Fsr1(_) | SrEngine::Fsr1Frame(_) => Err(SrError::Frame("fsr1 takes RGB8/BGRA8 frames only".into())),
+        }
     }
 
     /// Upscale one luma plane by the schedule's scale factor. The per-frame ABI (the ffmpeg filter uses this).
     pub fn upscale_plane(&mut self, y: &Plane) -> Result<Plane, SrError> {
-        self.frontier.run(&self.sched, y)
+        let (sched, frontier) = self.net()?;
+        frontier.run(sched, y)
     }
 
     /// Upscale an interleaved RGB8 image. Y-only nets (ESPCN): SR the luma + bicubic chroma. RGB nets
@@ -82,10 +108,15 @@ impl SrEngine {
         if rgb.len() != w * h * 3 {
             return Err(SrError::Frame(format!("rgb len {} != {}*{}*3", rgb.len(), w, h)));
         }
-        match self.sched.input {
+        let (sched, frontier) = match self {
+            SrEngine::Fsr1(f) => return f.upscale_rgb8(rgb, w, h),
+            SrEngine::Fsr1Frame(f) => return f.upscale_rgb8(rgb, w, h),
+            SrEngine::Net { sched, frontier } => (&*sched, frontier),
+        };
+        match sched.input {
             schedule::InputMode::Y => {
                 let (y, cb, cr) = color::rgb8_to_ycbcr(rgb, w, h);
-                let sr_y = self.upscale_plane(&y)?;
+                let sr_y = frontier.run(sched, &y)?;
                 let (ow, oh) = (sr_y.w, sr_y.h);
                 let sr_cb = color::bicubic(&cb, ow, oh);
                 let sr_cr = color::bicubic(&cr, ow, oh);
@@ -99,7 +130,7 @@ impl SrEngine {
                     planar[w * h + i] = rgb[3 * i + 1] as f32 / 255.0;
                     planar[2 * w * h + i] = rgb[3 * i + 2] as f32 / 255.0;
                 }
-                let out = self.frontier.run_feat_planar(&self.sched, planar, 3, h, w)?;
+                let out = frontier.run_feat_planar(sched, planar, 3, h, w)?;
                 let (oc, oh, ow, data) = out;
                 if oc != 3 {
                     return Err(SrError::Frame(format!("rgb net produced {oc} channels, want 3")));
@@ -116,9 +147,71 @@ impl SrEngine {
         }
     }
 
+    /// Upscale a BGRA8 frame (DRM ARGB8888 byte order) with row strides, writing dst alpha 0xff.
+    /// FSR1 packs and unpacks BGRA directly; conv nets go through `upscale_rgb8`.
+    pub fn upscale_bgra8(&mut self, src: &[u8], w: usize, h: usize, src_stride: usize,
+                         dst: &mut [u8], dst_stride: usize) -> Result<(usize, usize), SrError> {
+        match self {
+            SrEngine::Fsr1(f) => return f.upscale_bgra8(src, w, h, src_stride, dst, dst_stride),
+            SrEngine::Fsr1Frame(f) => return f.upscale_bgra8(src, w, h, src_stride, dst, dst_stride),
+            SrEngine::Net { .. } => {}
+        }
+        if src.len() < (h.max(1) - 1) * src_stride + w * 4 {
+            return Err(SrError::Frame(format!("src: {} bytes for {w}x{h} at stride {src_stride}", src.len())));
+        }
+        let mut rgb = vec![0u8; w * h * 3];
+        for y in 0..h {
+            for x in 0..w {
+                let s = &src[y * src_stride + 4 * x..];
+                rgb[3 * (y * w + x)..3 * (y * w + x) + 3].copy_from_slice(&[s[2], s[1], s[0]]);
+            }
+        }
+        let (out, ow, oh) = self.upscale_rgb8(&rgb, w, h)?;
+        if dst.len() < (oh.max(1) - 1) * dst_stride + ow * 4 {
+            return Err(SrError::Frame(format!("dst: {} bytes for {ow}x{oh} at stride {dst_stride}", dst.len())));
+        }
+        for y in 0..oh {
+            for x in 0..ow {
+                let p = &out[3 * (y * ow + x)..];
+                dst[y * dst_stride + 4 * x..y * dst_stride + 4 * x + 4].copy_from_slice(&[p[2], p[1], p[0], 0xff]);
+            }
+        }
+        Ok((ow, oh))
+    }
+
+    /// Padded-frame geometry for a zero-copy dma-buf caller. Only the `Fsr1Frame` backend supports
+    /// this (see [`fsr1_frame::FrameLayout`]).
+    pub fn frame_layout(&self) -> Result<fsr1_frame::FrameLayout, SrError> {
+        match self {
+            SrEngine::Fsr1Frame(f) => Ok(f.frame_layout()),
+            _ => Err(SrError::Frame("dma-buf zero-copy needs the fsr1 frame-layout backend".into())),
+        }
+    }
+
+    /// Bytes per pixel of the frame-layout backend's planes: 4 (BGRA) or 1 (the NV12 Y plane).
+    pub fn frame_bytes_per_px(&self) -> Result<usize, SrError> {
+        match self {
+            SrEngine::Fsr1Frame(f) => Ok(f.bytes_per_px()),
+            _ => Err(SrError::Frame("dma-buf zero-copy needs the fsr1 frame-layout backend".into())),
+        }
+    }
+
+    /// Zero-copy dispatch over dma-buf fds; see [`fsr1_frame::Fsr1FrameEngine::process_dmabuf`].
+    pub fn process_dmabuf(&mut self, in_fd: std::os::raw::c_int, out_fd: std::os::raw::c_int)
+        -> Result<(), SrError> {
+        match self {
+            SrEngine::Fsr1Frame(f) => f.process_dmabuf(in_fd, out_fd),
+            _ => Err(SrError::Frame("dma-buf zero-copy needs the fsr1 frame-layout backend".into())),
+        }
+    }
+
     /// The schedule's integer scale factor (e.g. 3 for ESPCN x3).
     pub fn scale(&self) -> usize {
-        self.sched.scale
+        match self {
+            SrEngine::Net { sched, .. } => sched.scale,
+            SrEngine::Fsr1(f) => f.scale(),
+            SrEngine::Fsr1Frame(f) => f.scale(),
+        }
     }
 
     /// RGB f32 planar path: [3,H,W] row-major in [0,1] -> ([3,oH,oW], oW, oH). For RGB nets (EDSR);
@@ -128,7 +221,8 @@ impl SrEngine {
         if planar.len() != 3 * w * h {
             return Err(SrError::Frame(format!("planar len {} != 3*{}*{}", planar.len(), w, h)));
         }
-        let (oc, oh, ow, data) = self.frontier.run_feat_planar(&self.sched, planar.to_vec(), 3, h, w)?;
+        let (sched, frontier) = self.net()?;
+        let (oc, oh, ow, data) = frontier.run_feat_planar(sched, planar.to_vec(), 3, h, w)?;
         if oc != 3 {
             return Err(SrError::Frame(format!("rgb net produced {oc} channels, want 3")));
         }

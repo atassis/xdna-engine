@@ -1183,11 +1183,13 @@ dependencies = [
 name = "npu-sr"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "ndarray",
  "ndarray-npy",
  "npu-models",
  "npu-weights",
  "npu-xrt",
+ "rayon",
  "serde",
  "serde_json",
  "tempfile",

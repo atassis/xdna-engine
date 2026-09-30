@@ -504,8 +504,11 @@ extern "C" {
     fn shim_bo_free(b: *mut CBo);
     fn shim_bo_write(b: *mut CBo, src: *const c_void, n: usize, off: usize) -> c_int;
     fn shim_bo_read(b: *mut CBo, dst: *mut c_void, n: usize, off: usize) -> c_int;
+    fn shim_bo_map(b: *mut CBo) -> *mut c_void;
     fn shim_bo_sync_to_device(b: *mut CBo) -> c_int;
     fn shim_bo_sync_from_device(b: *mut CBo) -> c_int;
+    fn shim_bo_import(d: *mut CDevice, fd: c_int) -> *mut CBo;
+    fn shim_bo_size(b: *mut CBo) -> usize;
     #[allow(clippy::too_many_arguments)]
     fn shim_run_matmul8(
         k: *mut CKernel,
@@ -970,6 +973,21 @@ impl Device {
         } else {
             self.bo_bytes.set(self.bo_bytes.get() + nbytes as u64);
             Ok(Bo { ptr, nbytes, counted: Some(self.bo_bytes.clone()) })
+        }
+    }
+
+    /// Import a dma-buf fd as a device BO for zero-copy dispatch -- `xrt::bo(device, fd)`, the
+    /// amdxdna `is_import_bo()` path proven by the GPU<->NPU probes
+    /// (`import_bo_dispatch.cpp`, `gpu_npu_roundtrip.cpp`). Not counted against
+    /// [`Device::resident_bo_bytes`]: the memory belongs to whoever exported the fd, not to this
+    /// device. `fd` is not consumed or closed (XRT dup()s it internally).
+    pub fn import_bo(&self, fd: c_int) -> Result<Bo> {
+        let ptr = unsafe { shim_bo_import(self.ptr, fd) };
+        if ptr.is_null() {
+            Err(format!("import_bo(fd={fd}): {}", last_error()))
+        } else {
+            let nbytes = unsafe { shim_bo_size(ptr) };
+            Ok(Bo { ptr, nbytes, counted: None })
         }
     }
 
@@ -1626,6 +1644,16 @@ impl Bo {
         }
     }
 
+    /// The BO's host mapping, `nbytes()` long and valid for the BO's lifetime. Writes still need
+    /// `sync_to_device`, reads `sync_from_device`, exactly as with `write_bytes`/`read_bytes`.
+    pub fn map(&self) -> Result<*mut u8> {
+        let p = unsafe { shim_bo_map(self.ptr) };
+        if p.is_null() {
+            Err(format!("bo_map: {}", last_error()))
+        } else {
+            Ok(p as *mut u8)
+        }
+    }
     pub fn sync_to_device(&self) -> Result<()> {
         let r = unsafe { shim_bo_sync_to_device(self.ptr) };
         if r != 0 {
