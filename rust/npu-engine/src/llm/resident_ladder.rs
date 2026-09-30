@@ -659,6 +659,14 @@ impl LadderResidentForward {
         }
     }
 
+    fn zero_caches(&mut self) -> Result<(), EngineError> {
+        self.kb.write_bytes(&vec![0u8; self.meta.cache_bytes]).map_err(|e| EngineError::Device(format!("zero caches: {e}")))?;
+        self.kb.sync_to_device().map_err(|e| EngineError::Device(format!("sync caches: {e}")))?;
+        self.high_water = 0;
+        self.poisoned = false;
+        Ok(())
+    }
+
     /// The input row at `pos`: the tower's row where media was scattered, else the text embedding.
     fn embed_at(&mut self, token: u32, pos: usize) -> Result<Vec<u16>, EngineError> {
         match self.media.row(pos) {
@@ -724,10 +732,7 @@ impl DecodeStep for LadderResidentForward {
         if !self.poisoned && reuse_kv() {
             return Ok(CacheState::Retained);
         }
-        self.kb.write_bytes(&vec![0u8; self.meta.cache_bytes]).map_err(|e| EngineError::Device(format!("zero caches on reset: {e}")))?;
-        self.kb.sync_to_device().map_err(|e| EngineError::Device(format!("sync caches on reset: {e}")))?;
-        self.high_water = 0;
-        self.poisoned = false;
+        self.zero_caches()?;
         Ok(CacheState::Cleared)
     }
 
@@ -941,5 +946,45 @@ mod tests {
         let largest_f2 = meta_rungs.iter().filter(|r| r.nt == 2).map(|r| r.keys).max().unwrap();
         assert_eq!(largest_f1, 262144);
         assert_eq!(largest_f2, 65536);
+    }
+    /// Device gate (`NPU_LLM_DEVICE_GATE=1`, under `npu_lock.sh queue --`; `NPU_RESIDENT_DIR` overrides
+    /// the build): a prompt resumed on the retained cache after another that shares its first 150
+    /// tokens gives the same logits, bit for bit, as the same prompt primed on a zeroed cache.
+    #[test]
+    fn a_resumed_prefix_matches_a_fresh_prime_on_device() {
+        if std::env::var("NPU_LLM_DEVICE_GATE").is_err() {
+            eprintln!("SKIP: set NPU_LLM_DEVICE_GATE=1 to run (opens the NPU device -- wrap with npu_lock.sh queue --)");
+            return;
+        }
+        let dir = std::env::var("NPU_RESIDENT_DIR")
+            .unwrap_or_else(|_| "/mnt/data/xdna/artifacts/gemma4-12b/resident_rf48C_p7148a7".to_string());
+        let dev = Rc::new(Device::open(0).expect("open the NPU"));
+        let mut f = LadderResidentForward::open(&dev, Path::new(&dir)).expect("open the resident forward");
+        let ids = |seed: u32, n: usize| (0..n as u32).map(|i| 1000 + (i * 7919 + seed * 104729) % 200_000).collect::<Vec<u32>>();
+        let p = ids(1, 200);
+        let mut q = p[..150].to_vec();
+        q.extend(ids(2, 61));
+        let prime = |f: &mut LadderResidentForward, t: &[u32], from: usize| -> Vec<f32> {
+            let at = f.prefill(t, from).expect("prefill").max(from);
+            let mut logits = Vec::new();
+            for (i, &tok) in t.iter().enumerate().skip(at) {
+                logits = f.step(tok, i).expect("step");
+            }
+            logits
+        };
+        prime(&mut f, &p, 0);
+        assert_eq!(f.resume_limit(150), 150, "no wrap at these lengths, the resume must be kept");
+        let resumed = prime(&mut f, &q, 150);
+        f.zero_caches().unwrap();
+        // The same piece boundary at 150 as the resumed run, so only the cache's history differs.
+        f.prefill(&q[..151], 0).expect("prefill to 150");
+        let fresh = prime(&mut f, &q, 150);
+        let differ = |a: &[f32], b: &[f32]| a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+        assert_eq!(differ(&resumed, &fresh), 0, "resumed vs fresh logits differ");
+        // Negative control: the same resume over a cache holding a different prefix must differ.
+        f.zero_caches().unwrap();
+        prime(&mut f, &ids(3, 200), 0);
+        let wrong = prime(&mut f, &q, 150);
+        assert!(differ(&wrong, &fresh) > 0, "a resume over the wrong prefix matched: the check cannot fail");
     }
 }
