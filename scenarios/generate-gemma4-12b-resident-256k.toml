@@ -24,3 +24,8 @@ tokenizer_dir = "artifacts/gemma4-12b/tokenizer"
 
 [generation]
 max_tokens = 64
+
+# Vision/audio host towers, the same checkpoint the legacy scenario reads; rows enter through
+# LadderResidentForward::set_media.
+[multimodal]
+tower_checkpoint = "artifacts/gemma4-12b-qat/checkpoint"
