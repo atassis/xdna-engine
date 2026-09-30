@@ -74,4 +74,4 @@ esac
 WORK="$(disk_backed_mktemp)"; trap 'rm -rf "$WORK"' EXIT; mkdir -p "$OUT"
 echo "=== building batched $WHAT B=$B -> $OUT (work=$WORK) ==="
 ( cd "$WORK" && "$VENV_IRON/bin/python" "$GEN" --weights "$WEIGHTS" $ARGS --out "$OUT" )
-echo "[build] done: $OUT  (elf=$(du -h "$OUT"/*.elf | cut -f1))"
+echo "[build] done: $OUT  (elf=$(du -h "$OUT"/*.elf* | cut -f1))"

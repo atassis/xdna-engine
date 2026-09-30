@@ -41,9 +41,9 @@ echo "[gate] build wall: $((t1 - t0)) s  (rc=$rc)"
 
 sp_tag="_sp"; nopdi_tag="_nopdi"
 OUT="$REPO/artifacts/decode_batched_B128_L${NL}${sp_tag}${nopdi_tag}"
-ELF="$(ls "$OUT"/*.elf 2>/dev/null | head -1)"
+ELF="$(ls "$OUT"/*.elf* 2>/dev/null | head -1)"
 [ -n "$ELF" ] || { echo "GATE FAIL: no ELF in $OUT"; exit 3; }
-GOT="$(sha256sum "$ELF" | awk '{print $1}')"
+GOT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["sha256"])' "$OUT/meta.json")"
 echo "[gate] ELF=$ELF"
 echo "[gate] sha256=$GOT"
 if [ "$NL" = "1" ] && [ "$GOT" = "$REF_SHA" ]; then
