@@ -167,6 +167,12 @@ impl RingValid {
     }
 }
 
+fn open_rung(boot: &ElfResident, name: &str, bos: [&Bo; 4]) -> Result<ElfResident, EngineError> {
+    let kern = boot.open_named(&format!("main:{name}")).map_err(|e| EngineError::Load(format!("open_named {name}: {e}")))?;
+    kern.bind(&bos).map_err(|e| EngineError::Load(format!("bind {name}: {e}")))?;
+    Ok(kern)
+}
+
 /// Copy a `u1` `.npy` file's data into `bo` at `off` straight from a mapping of the file, so a
 /// weight never passes through the heap (the 0.53 GB head used to, as one buffer).
 fn fill_from_npy(bo: &Bo, off: usize, path: &Path) -> Result<(), EngineError> {
@@ -497,6 +503,8 @@ pub struct LadderResidentForward {
     sb: Bo,
     kb: Bo,
     boot: ElfResident,
+    /// Opened on first use: XRT holds ~70-90 MB of host memory per open rung (measured 2026-09-30,
+    /// about one copy of the 77 MB ELF each), and a short chat touches two or three of nine.
     rungs: HashMap<String, ElfResident>,
     /// What a resume is measured against ([`RingValid::keeps_the_window`]).
     ring_valid: RingValid,
@@ -536,11 +544,12 @@ impl LadderResidentForward {
         let boot = dev.open_elf_resident(&elf, Some(&format!("main:{}", meta.boot))).map_err(|e| EngineError::Load(format!("open_elf_resident (boot): {e}")))?;
         boot.bind(&[&xb, &ob, &sb, &sb, &sb]).map_err(|e| EngineError::Load(format!("bind boot: {e}")))?;
 
+        // The smallest decode and prefill rungs serve every request; the rest open on first use.
         let mut rungs = HashMap::new();
-        for r in &meta.rungs {
-            let kern = boot.open_named(&format!("main:{}", r.name)).map_err(|e| EngineError::Load(format!("open_named {}: {e}", r.name)))?;
-            kern.bind(&[&xb, &ob, &sb, &kb]).map_err(|e| EngineError::Load(format!("bind {}: {e}", r.name)))?;
-            rungs.insert(r.name.clone(), kern);
+        for nt in [1, 2] {
+            if let Some(r) = meta.rungs.iter().find(|r| r.nt == nt) {
+                rungs.insert(r.name.clone(), open_rung(&boot, &r.name, [&xb, &ob, &sb, &kb])?);
+            }
         }
 
         let provenance = build_provenance(&meta.dir, &elf, meta.largest_keys(1));
@@ -596,7 +605,11 @@ impl LadderResidentForward {
 
         self.boot.dispatch().map_err(EngineError::Device)?;
 
-        let kern = self.rungs.get(rung_name).ok_or_else(|| EngineError::Load(format!("no rung `{rung_name}` bound")))?;
+        if !self.rungs.contains_key(rung_name) {
+            let kern = open_rung(&self.boot, rung_name, [&self.xb, &self.ob, &self.sb, &self.kb])?;
+            self.rungs.insert(rung_name.to_string(), kern);
+        }
+        let kern = &self.rungs[rung_name];
         let unit = self.meta.param_unit_bytes;
         let write_param = |name: &str, byte_value: RingParam| -> Result<(), EngineError> {
             let idx = *self.meta.scratchpad_params.get(name).ok_or_else(|| EngineError::Load(format!("meta.json: no scratchpad param `{name}`")))?;
