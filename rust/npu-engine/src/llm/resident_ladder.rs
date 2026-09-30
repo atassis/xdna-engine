@@ -987,4 +987,42 @@ mod tests {
         let wrong = prime(&mut f, &q, 150);
         assert!(differ(&wrong, &fresh) > 0, "a resume over the wrong prefix matched: the check cannot fail");
     }
+
+    /// Bench (`NPU_LLM_DEVICE_GATE=1 NPU_RESIDENT_BENCH=1`): the boot dispatch alone, a decode step
+    /// (boot + f1), and batched prefill per token, at each `NPU_RESIDENT_BENCH_P` prompt length.
+    #[test]
+    fn bench_boot_decode_and_prefill_on_device() {
+        if std::env::var("NPU_LLM_DEVICE_GATE").is_err() || std::env::var("NPU_RESIDENT_BENCH").is_err() {
+            eprintln!("SKIP: set NPU_LLM_DEVICE_GATE=1 NPU_RESIDENT_BENCH=1 (opens the NPU device)");
+            return;
+        }
+        let dir = std::env::var("NPU_RESIDENT_DIR")
+            .unwrap_or_else(|_| "/mnt/data/xdna/artifacts/gemma4-12b/resident_rf48C_p7148a7".to_string());
+        let lens: Vec<usize> = std::env::var("NPU_RESIDENT_BENCH_P").unwrap_or_else(|_| "4096".into())
+            .split(',').map(|v| v.parse().unwrap()).collect();
+        let dev = Rc::new(Device::open(0).expect("open the NPU"));
+        let mut f = LadderResidentForward::open(&dev, Path::new(&dir)).expect("open the resident forward");
+        let median = |mut v: Vec<f64>| { v.sort_by(|a, b| a.partial_cmp(b).unwrap()); v[v.len() / 2] };
+        let boots: Vec<f64> = (0..20).map(|_| {
+            let t = std::time::Instant::now();
+            f.boot.dispatch().unwrap();
+            t.elapsed().as_secs_f64() * 1e3
+        }).collect();
+        println!("BENCH boot median {:.2} ms (min {:.2})", median(boots.clone()), boots.iter().cloned().fold(f64::MAX, f64::min));
+        for p in lens {
+            f.zero_caches().unwrap();
+            let ids: Vec<u32> = (0..p as u32).map(|i| 1000 + (i * 7919) % 200_000).collect();
+            let t = std::time::Instant::now();
+            let at = f.prefill(&ids, 0).expect("prefill");
+            let pre = t.elapsed().as_secs_f64();
+            let mut steps = Vec::new();
+            for i in at..at + 24 {
+                let t = std::time::Instant::now();
+                f.step(ids[i % p], i).expect("step");
+                steps.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            println!("BENCH P {p}: prefill {at} tok in {pre:.1} s = {:.2} ms/tok; decode step median {:.1} ms (min {:.1})",
+                     pre * 1e3 / at as f64, median(steps.clone()), steps.iter().cloned().fold(f64::MAX, f64::min));
+        }
+    }
 }
