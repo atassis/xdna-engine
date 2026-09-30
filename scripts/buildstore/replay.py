@@ -57,9 +57,26 @@ def _bind_whole(root, p, writable=False):
         _mount(p, tgt, None, MS_BIND | MS_REMOUNT | MS_RDONLY)
 
 
+def _recover_pyc_sources(reads):
+    """CPython validates a cached .pyc against its SOURCE's mtime (a stat, unhooked on success)
+    without necessarily opening the source at all, so a fresh-cache import records only the
+    .pyc read -- the .py itself is missing from "reads" even though CPython's own loader
+    requires it to be present. Recover it from any recorded __pycache__ entry."""
+    extra = set()
+    for p in reads:
+        d, name = os.path.split(p)
+        if os.path.basename(d) != "__pycache__" or not name.endswith(".pyc"):
+            continue
+        mod = name.split(".")[0]
+        src = os.path.join(os.path.dirname(d), mod + ".py")
+        if os.path.exists(src):
+            extra.add(src)
+    return extra
+
+
 def build_plan(manifest_path, scratch):
     m = json.load(open(manifest_path))
-    files = set(m["reads"])
+    files = set(m["reads"]) | _recover_pyc_sources(m["reads"])
     dirs = set(m["dirs"])
     # Furniture (replay_base.txt), never a build input: bound whole, same as before.
     base = {l.strip() for l in (HERE / "replay_base.txt").read_text().splitlines()

@@ -1,6 +1,6 @@
 import json, pathlib, subprocess, sys
 HERE = pathlib.Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(HERE)); import identity, record
+sys.path.insert(0, str(HERE)); import identity, record, replay
 
 def test_replay_passes_on_full_manifest_and_fails_on_a_dropped_read(tmp_path):
     (tmp_path / "a.h").write_text("1"); out = tmp_path / "out"; out.mkdir()
@@ -79,6 +79,21 @@ def test_replay_furnishes_whole_mlir_aie_instance(tmp_path):
     mf = tmp_path / "m.json"; mf.write_text(json.dumps(m))
     r = subprocess.run([str(HERE / "replay_bwrap.sh"), str(mf), str(out), str(tmp_path / "r")])
     assert r.returncode == 0
+
+
+def test_recover_pyc_sources(tmp_path):
+    """A module imported from a warm __pycache__ .pyc never has its .py source opened (CPython
+    validates the cache against the source's mtime -- a stat, unhooked on success), so no
+    manifest records the source either way. build_plan's recovery must add it back from the
+    .pyc's own path, and must not invent a source that does not actually exist on disk."""
+    pkg = tmp_path / "pkg"; (pkg / "__pycache__").mkdir(parents=True)
+    (pkg / "helper.py").write_text("X = 1\n")
+    (pkg / "__pycache__" / "helper.cpython-314.pyc").write_bytes(b"\x00")
+    (pkg / "__pycache__" / "ghost.cpython-314.pyc").write_bytes(b"\x00")  # no ghost.py on disk
+    reads = {str(pkg / "__pycache__" / "helper.cpython-314.pyc"),
+             str(pkg / "__pycache__" / "ghost.cpython-314.pyc")}
+    recovered = replay._recover_pyc_sources(reads)
+    assert recovered == {str(pkg / "helper.py")}
 
 
 def test_replay_scales_past_bwrap_9000_arg_limit(tmp_path):
