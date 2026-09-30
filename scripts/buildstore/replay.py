@@ -10,11 +10,14 @@ unbounded. Binding a whole directory in one mount is deliberately never done for
 path: each recorded file/dir is bound individually, so unread siblings stay invisible.
 
 usage: replay.py <manifest.json> <recorded-out-dir> <scratch>
-exit 0 = same bytes; anything else = the manifest is not sufficient.
+exit 0 = same identity.py identity (device bytes; drops meta.json provenance); anything else =
+the manifest is not sufficient. A byte diff excluding meta.json is printed as extra info.
 """
 import ctypes, ctypes.util, json, os, pathlib, shutil, subprocess, sys
 
 HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import identity  # noqa: E402
 MS_RDONLY, MS_BIND, MS_REMOUNT = 1, 4096, 32
 _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
 
@@ -170,8 +173,18 @@ def main(argv):
     if not out_root.is_dir():
         print(f"replay: writable output root missing: {out_root}", file=sys.stderr)
         return 1
-    return subprocess.run(["diff", "-r", str(ref), str(out_root)],
-                          stdout=subprocess.DEVNULL).returncode
+    # Compare by IDENTITY, not bytes: meta.json's generator git provenance (commit, dirty flag)
+    # is not reproducible inside the sandbox, and identity.py already excludes exactly those
+    # keys as not describing device bytes. A byte diff of everything else is kept as info.
+    ref_id, out_id = identity.of(ref), identity.of(out_root)
+    if ref_id == out_id:
+        return 0
+    print(f"replay: identity differs ({ref_id} != {out_id})", file=sys.stderr)
+    diff = subprocess.run(["diff", "-r", "-x", "meta.json", str(ref), str(out_root)],
+                          capture_output=True, text=True)
+    if diff.stdout:
+        print(diff.stdout, file=sys.stderr, end="")
+    return 1
 
 
 if __name__ == "__main__":

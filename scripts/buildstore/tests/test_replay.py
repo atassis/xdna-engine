@@ -1,6 +1,6 @@
 import json, pathlib, subprocess, sys
 HERE = pathlib.Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(HERE)); import record
+sys.path.insert(0, str(HERE)); import identity, record
 
 def test_replay_passes_on_full_manifest_and_fails_on_a_dropped_read(tmp_path):
     (tmp_path / "a.h").write_text("1"); out = tmp_path / "out"; out.mkdir()
@@ -12,6 +12,29 @@ def test_replay_passes_on_full_manifest_and_fails_on_a_dropped_read(tmp_path):
     assert r.returncode == 0
     del m["reads"][str(tmp_path / "a.h")]; mf.write_text(json.dumps(m))
     r = subprocess.run([str(HERE / "replay_bwrap.sh"), str(mf), str(out), str(tmp_path / "r2")])
+    assert r.returncode != 0
+
+
+def test_replay_compares_by_identity_not_bytes(tmp_path):
+    """meta.json's generator provenance is git state, not reproducible in the sandbox --
+    identity.py already drops it. Replay must pass on a run whose meta.json differs ONLY in
+    that field, and still catch a real content change (non-provenance key)."""
+    out = tmp_path / "out"; out.mkdir()
+    script = (f'echo -n fixed > {out}/f; '
+              f'printf \'{{"toolchain": {{"x": %s}}, "k": 1}}\' "$RANDOM" > {out}/meta.json')
+    cmd = ["bash", "-c", script]
+    m = record.run(cmd, cwd=tmp_path, env={"PATH": "/usr/bin:/bin"}, out_roots=[out],
+                   work_roots=[], cache_roots=[])
+    ref_id = identity.of(out)
+    mf = tmp_path / "m.json"; mf.write_text(json.dumps(m))
+    r = subprocess.run([str(HERE / "replay_bwrap.sh"), str(mf), str(out), str(tmp_path / "r")])
+    assert r.returncode == 0
+    assert identity.of(out) == ref_id            # ref dir is untouched by replay
+
+    # A real content change (not provenance) must still be caught.
+    (out / "f").write_text("mutated")
+    assert identity.of(out) != ref_id
+    r = subprocess.run([str(HERE / "replay_bwrap.sh"), str(mf), str(out), str(tmp_path / "r3")])
     assert r.returncode != 0
 
 
