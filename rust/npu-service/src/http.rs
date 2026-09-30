@@ -119,9 +119,16 @@ pub struct SseStream {
     /// Render frames from the per-token records instead of the plain text items, and close with a
     /// summary frame. Off, the stream is byte-for-byte what it was before telemetry existed.
     stats: bool,
+    /// `stream_options.include_usage`: OpenAI's closing `choices: []` + `usage` chunk.
+    usage: bool,
 }
 
 impl SseStream {
+    fn with_usage(mut self, usage: bool) -> SseStream {
+        self.usage = usage;
+        self
+    }
+
     fn new(
         rx: std::sync::mpsc::Receiver<StreamItem>,
         model: String,
@@ -134,7 +141,7 @@ impl SseStream {
             SseKind::Completion => "cmpl",
             SseKind::OllamaChat => "ollama",
         };
-        SseStream { rx, id: gen_id(prefix), created: unix_now(), model, kind, stats, cancel }
+        SseStream { rx, id: gen_id(prefix), created: unix_now(), model, kind, stats, cancel, usage: false }
     }
 
     /// The identity every rendered line shares, so the SSE frames and the run log cannot disagree
@@ -188,6 +195,19 @@ impl SseStream {
             // builds it from `StreamItem::Done` directly rather than through this.
             SseKind::OllamaChat => String::new(),
         }
+    }
+
+    /// OpenAI's usage chunk: after the finish chunk, `choices` empty, the request's token counts.
+    fn render_usage(&self, u: &npu_models::GenerateUsage) -> String {
+        let object = match self.kind {
+            SseKind::Completion => "text_completion",
+            _ => "chat.completion.chunk",
+        };
+        format!(
+            "{{\"id\":\"{}\",\"object\":\"{object}\",\"created\":{},\"model\":\"{}\",\"choices\":[],\
+             \"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":{},\"total_tokens\":{}}}}}",
+            self.id, self.created, parse::json_escape(&self.model),
+            u.prompt_tokens, u.completion_tokens, u.prompt_tokens + u.completion_tokens)
     }
 
     /// RFC3339 for the Ollama surface, which stamps `created_at` as a string where OpenAI stamps
@@ -389,7 +409,7 @@ fn chat_completions(req: &Request, handle: &Handle) -> Response {
         Err(e) => return engine_err(&e),
     };
     if parsed.stream {
-        (200, Body::Stream(SseStream::new(served.value, served.model, SseKind::Chat, parsed.stats, cancel)))
+        (200, Body::Stream(SseStream::new(served.value, served.model, SseKind::Chat, parsed.stats, cancel).with_usage(parsed.usage)))
     } else {
         render_buffered(served.model, served.value, SseKind::Chat)
     }
@@ -493,7 +513,7 @@ fn completions(req: &Request, handle: &Handle) -> Response {
         Err(e) => return engine_err(&e),
     };
     if parsed.stream {
-        (200, Body::Stream(SseStream::new(served.value, served.model, SseKind::Completion, parsed.stats, cancel)))
+        (200, Body::Stream(SseStream::new(served.value, served.model, SseKind::Completion, parsed.stats, cancel).with_usage(parsed.usage)))
     } else {
         render_buffered(served.model, served.value, SseKind::Completion)
     }
@@ -1322,6 +1342,9 @@ fn respond_stream<W: Write + PeerAlive>(stream: &mut W, code: u16, s: &SseStream
                 // for a caller that asked -- OpenAI gates its own trailing usage chunk the same way,
                 // because a strict client is entitled to be surprised by an unknown `object`.
                 stream.write_all(format!("data: {}\n\n", s.render_done(reason)).as_bytes())?;
+                if s.usage {
+                    stream.write_all(format!("data: {}\n\n", s.render_usage(&report.usage)).as_bytes())?;
+                }
                 if !s.stats { continue }
                 // A CLI-over-socket client always requests `stats` (see `npu-cli`'s socket client)
                 // regardless of its OWN `--stats` display flag, precisely to get this: the full
@@ -1514,6 +1537,8 @@ pub mod parse {
         /// 2026-09-09 over a 64-token qwen3-0.6b completion: 354 B/token with it, 182 without), and a
         /// client that did not ask for them should not pay to carry them.
         pub stats: bool,
+        /// `stream_options.include_usage`.
+        pub usage: bool,
     }
 
     /// `stream_options: {"include_stats": true}`, spelled after OpenAI's own `include_usage` so it
@@ -1523,6 +1548,10 @@ pub mod parse {
         v.get("stream_options").and_then(|o| o.get("include_stats")).and_then(|b| b.as_bool())
             .or_else(|| v.get("x_npu_stats").and_then(|b| b.as_bool()))
             .unwrap_or(false)
+    }
+
+    pub fn wants_usage(v: &serde_json::Value) -> bool {
+        v.get("stream_options").and_then(|o| o.get("include_usage")).and_then(|b| b.as_bool()).unwrap_or(false)
     }
 
     /// `/v1/chat/completions`: the full `messages` array (system prompt + history, not just the last
@@ -1564,7 +1593,7 @@ pub mod parse {
         let stream = v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
         reject_unsupported(&v, false)?;
         Ok(ParsedGenerate { model, prompt: npu_models::Prompt::Chat(chat), params, stream,
-                            stats: wants_stats(&v) })
+                            stats: wants_stats(&v), usage: wants_usage(&v) })
     }
 
     /// The declared `tools`, after `tool_choice` has had its say.
@@ -1674,7 +1703,7 @@ pub mod parse {
         params.validate()?;
 
         let stream = v.get("stream").and_then(|s| s.as_bool()).unwrap_or(true);
-        Ok(ParsedGenerate { model, prompt: npu_models::Prompt::Chat(chat), params, stream, stats: false })
+        Ok(ParsedGenerate { model, prompt: npu_models::Prompt::Chat(chat), params, stream, stats: false, usage: false })
     }
 
     /// A message's `content`: a plain string, or OpenAI's multi-part array form. `text` parts
@@ -1762,7 +1791,7 @@ pub mod parse {
         let stream = v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
         reject_unsupported(&v, true)?;
         Ok(ParsedGenerate { model, prompt: npu_models::Prompt::Raw(prompt), params, stream,
-                            stats: wants_stats(&v) })
+                            stats: wants_stats(&v), usage: wants_usage(&v) })
     }
 
     /// The shared sampling surface: OpenAI's fields plus `top_k`/`repetition_penalty`, neither in
@@ -1890,16 +1919,13 @@ pub mod parse {
                     .into())
             }
         }
-        // `stream_options` used to be rejected whole. It carries `include_stats` now, so the
-        // rejection narrows to the keys inside it rather than disappearing: `include_usage` is a
-        // real OpenAI feature this server does not emit, and quietly accepting it would be exactly
-        // the silent no-op this function exists to prevent.
+        // Only the keys this server honours; any other would be a silent no-op.
         if let Some(o) = v.get("stream_options").filter(|x| !x.is_null()) {
             let Some(o) = o.as_object() else { return Err("\"stream_options\" must be an object".into()) };
             for k in o.keys() {
-                if k != "include_stats" {
+                if k != "include_stats" && k != "include_usage" {
                     return Err(format!("\"stream_options.{k}\" is not supported \
-                                        (this server honours \"include_stats\")"));
+                                        (this server honours \"include_stats\" and \"include_usage\")"));
                 }
             }
         }
@@ -4013,6 +4039,23 @@ mod cancel_tests {
         let done: serde_json::Value =
             serde_json::from_str(&s.render_done(FinishReason::Stop)).unwrap();
         assert!(done.get("x_npu_finish").is_none(), "an ordinary stop must not be marked");
+    }
+
+    /// OpenAI's closing usage chunk: `choices` empty, the three counts, and only when asked.
+    #[test]
+    fn include_usage_closes_the_stream_with_openais_usage_chunk() {
+        let (_tx, s) = {
+            let (tx, rx) = std::sync::mpsc::channel();
+            (tx, SseStream::new(rx, "m".into(), SseKind::Chat, false, npu_models::Cancel::new()).with_usage(true))
+        };
+        let u: serde_json::Value = serde_json::from_str(&s.render_usage(
+            &npu_models::GenerateUsage { prompt_tokens: 7, completion_tokens: 3 })).unwrap();
+        assert_eq!(u["object"], "chat.completion.chunk");
+        assert_eq!(u["choices"], serde_json::json!([]));
+        assert_eq!(u["usage"], serde_json::json!({"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}));
+        let v = |t: &str| serde_json::from_str::<serde_json::Value>(t).unwrap();
+        assert!(parse::wants_usage(&v(r#"{"stream_options":{"include_usage":true}}"#)));
+        assert!(!parse::wants_usage(&v(r#"{"stream_options":{"include_stats":true}}"#)));
     }
 
     /// A socket that reports its client gone and accepts writes. Both halves matter: the probe must
