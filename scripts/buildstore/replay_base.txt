@@ -1,0 +1,7 @@
+/etc/ld.so.cache
+/etc/localtime
+/etc/nsswitch.conf
+/etc/passwd
+/etc/group
+/usr/share/zoneinfo
+/usr/lib/locale
