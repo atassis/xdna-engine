@@ -42,3 +42,26 @@ def test_materialize_falls_back_to_copy_when_hardlink_unavailable(tmp_path, monk
     assert (dst / "a").read_bytes() == b"x"
     assert os.stat(dst / "a").st_mode & 0o777 == 0o444
     monkeypatch.setattr(os, "link", real_link)
+
+def test_materialize_refuses_a_symlink_dst(tmp_path):
+    s = store.Store(tmp_path / "cas")
+    src = tmp_path / "src"; src.mkdir(); (src / "a").write_bytes(b"x")
+    tid = s.put_tree(src)
+    target = tmp_path / "elsewhere"; target.mkdir()
+    link = tmp_path / "dst"; link.symlink_to(target)
+    try:
+        s.materialize(tid, link)
+        assert False, "expected an OSError"
+    except OSError:
+        pass
+    assert link.is_symlink() and link.resolve() == target        # untouched, not leaked as a dir
+
+def test_rm_removes_symlink_without_touching_its_target(tmp_path):
+    target = tmp_path / "t"; target.mkdir(); (target / "f").write_text("x")
+    link = tmp_path / "l"; link.symlink_to(target)
+    store._rm(link)
+    assert not link.exists() and not link.is_symlink()
+    assert target.is_dir() and (target / "f").read_text() == "x"
+    d = tmp_path / "d"; d.mkdir(); (d / "f").write_text("x")
+    store._rm(d)
+    assert not d.exists()

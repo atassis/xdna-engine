@@ -3,6 +3,14 @@
 import contextlib, fcntl, hashlib, json, os, pathlib, shutil, stat, threading
 
 
+def _rm(path):
+    """Remove `path` whether it is a symlink or a real directory tree."""
+    if path.is_symlink():
+        path.unlink()
+    else:
+        shutil.rmtree(path, ignore_errors=True)
+
+
 def _atomic_write(path, data: bytes, mode=0o444):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.tmp{os.getpid()}.{threading.get_ident()}")
@@ -54,8 +62,10 @@ class Store:
     def materialize(self, tid, dst):
         """Put tree `tid` at `dst` (replaced whole): hardlink when on one filesystem, else copy."""
         dst = pathlib.Path(dst)
+        if dst.is_symlink():
+            raise IsADirectoryError(f"materialize target is a symlink, refusing to replace it: {dst}")
         tmp = dst.with_name(f".{dst.name}.tmp{os.getpid()}")
-        shutil.rmtree(tmp, ignore_errors=True)
+        _rm(tmp)
         for rel, (sha, x) in self.tree(tid).items():
             out = tmp / rel
             out.parent.mkdir(parents=True, exist_ok=True)
@@ -68,10 +78,10 @@ class Store:
                 shutil.copyfile(obj, out)
                 os.chmod(out, 0o555 if x else 0o444)
         old = dst.with_name(f".{dst.name}.old{os.getpid()}")
-        if dst.exists():
+        if dst.exists() or dst.is_symlink():
             os.replace(dst, old)
         os.replace(tmp, dst)
-        shutil.rmtree(old, ignore_errors=True)
+        _rm(old)
 
     def put_action(self, recipe, key, record):
         _atomic_write(self.root / "actions" / recipe / f"{key}.json",
