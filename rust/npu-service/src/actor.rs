@@ -391,6 +391,7 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
                                 let mut sink = |c: Chunk<'_>| -> bool {
                                     let item = match c {
                                         Chunk::Text(t) => StreamItem::Text(t.to_string()),
+                                        Chunk::Reasoning(t) => StreamItem::Reasoning(t.to_string()),
                                         Chunk::Step(r) => StreamItem::Step(r.clone()),
                                         Chunk::ToolCall(c) => StreamItem::ToolCall(c.clone()),
                                         Chunk::Progress { prefilled, total } =>
