@@ -38,8 +38,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use ndarray::Array1;
-use ndarray_npy::read_npy;
 use npu_xrt::{Bo, Device, ElfResident, FLAG_HOST_ONLY};
 
 use crate::api::EngineError;
@@ -167,6 +165,47 @@ impl RingValid {
     pub fn keeps_the_window(self, r: usize, window: usize) -> bool {
         r == 0 || (ring_read_first(r, window) >= self.lo && r <= self.hi)
     }
+}
+
+/// Copy a `u1` `.npy` file's data into `bo` at `off` straight from a mapping of the file, so a
+/// weight never passes through the heap (the 0.53 GB head used to, as one buffer).
+fn fill_from_npy(bo: &Bo, off: usize, path: &Path) -> Result<(), EngineError> {
+    let err = |e: String| EngineError::Load(format!("{}: {e}", path.display()));
+    let f = fs::File::open(path).map_err(|e| err(e.to_string()))?;
+    // SAFETY: read-only mapping of an installed artifact; a concurrent truncation would be a
+    // corrupted install, which every other blob read already shares.
+    let map = unsafe { memmap2::Mmap::map(&f) }.map_err(|e| err(e.to_string()))?;
+    let data = npy_u8_data(&map).map_err(err)?;
+    bo.sub(off, data.len()).map_err(|e| err(format!("sub at {off}: {e}")))?
+        .write_bytes(&map[data]).map_err(|e| err(format!("write: {e}")))
+}
+
+/// The data range of a C-order `u1` `.npy` (format 1.x-3.x), checked against its shape.
+pub fn npy_u8_data(b: &[u8]) -> Result<std::ops::Range<usize>, String> {
+    if b.len() < 10 || &b[..6] != b"\x93NUMPY" {
+        return Err("not an .npy file".into());
+    }
+    let (hlen, start) = match b[6] {
+        1 => (u16::from_le_bytes([b[8], b[9]]) as usize, 10),
+        2 | 3 if b.len() >= 12 => (u32::from_le_bytes([b[8], b[9], b[10], b[11]]) as usize, 12),
+        v => return Err(format!("unsupported .npy version {v}")),
+    };
+    let header = b.get(start..start + hlen).ok_or("truncated .npy header")?;
+    let header = std::str::from_utf8(header).map_err(|_| "non-UTF-8 .npy header")?;
+    if !header.contains("'descr': '|u1'") && !header.contains("'descr': '<u1'") {
+        return Err(format!("not a u1 array: {}", header.trim()));
+    }
+    if !header.contains("'fortran_order': False") {
+        return Err("fortran-order .npy".into());
+    }
+    let shape = header.split("'shape': (").nth(1).and_then(|r| r.split(')').next()).ok_or("no shape")?;
+    let n = shape.split(',').map(str::trim).filter(|d| !d.is_empty())
+        .try_fold(1usize, |n, d| d.parse::<usize>().map(|d| n * d)).map_err(|_| format!("bad shape ({shape})"))?;
+    let data = start + hlen..start + hlen + n;
+    if data.end != b.len() {
+        return Err(format!("shape ({shape}) is {n} bytes, file holds {}", b.len() - start - hlen));
+    }
+    Ok(data)
 }
 
 /// What `npu stats` names this build by: the ELF's content hash, the toolchain instance it was built
@@ -483,21 +522,13 @@ impl LadderResidentForward {
         // Every layer's weight stream, then the head's, go into %s ONCE here -- resident for the
         // model's whole lifetime; every cache starts zeroed in %k.
         for li in 0..meta.nlayer {
-            let weight_path = meta.weight_dir.join(format!("w{li}.npy"));
-            let wbytes: Array1<u8> = read_npy(&weight_path).map_err(|e| EngineError::Load(format!("read {}: {e}", weight_path.display())))?;
-            let wbytes = wbytes.into_raw_vec_and_offset().0;
             let woff = *meta.layer_weight_off.get(&li).ok_or_else(|| EngineError::Load(format!("meta.json: no layer_weight_off for layer {li}")))?;
-            sb.sub(woff, wbytes.len()).map_err(|e| EngineError::Load(format!("sb.sub weight[{li}]: {e}")))?
-                .write_bytes(&wbytes).map_err(|e| EngineError::Load(format!("write weight[{li}]: {e}")))?;
+            fill_from_npy(&sb, woff, &meta.weight_dir.join(format!("w{li}.npy")))?;
         }
         kb.write_bytes(&vec![0u8; meta.cache_bytes]).map_err(|e| EngineError::Load(format!("zero caches: {e}")))?;
         kb.sync_to_device().map_err(|e| EngineError::Load(format!("sync caches: {e}")))?;
 
-        let head_weight_path = meta.dir.join("w_head.npy");
-        let head_weight: ndarray::ArrayD<u8> = read_npy(&head_weight_path).map_err(|e| EngineError::Load(format!("read {}: {e}", head_weight_path.display())))?;
-        let head_weight_bytes = head_weight.into_raw_vec_and_offset().0;
-        sb.sub(meta.head_off, head_weight_bytes.len()).map_err(|e| EngineError::Load(format!("sb.sub head: {e}")))?
-            .write_bytes(&head_weight_bytes).map_err(|e| EngineError::Load(format!("write head weight: {e}")))?;
+        fill_from_npy(&sb, meta.head_off, &meta.dir.join("w_head.npy"))?;
 
         sb.sync_to_device().map_err(|e| EngineError::Load(format!("sync scratch: {e}")))?;
 
@@ -818,6 +849,25 @@ mod tests {
         assert_eq!(p.fusion_flags, ["RF_ATTN_H=1", "RF_FAST=1", "rlayer_design", "m", "g", "h", "nbw=20"]);
         assert_eq!(p.max_seq, Some(262144));
         assert_eq!(p.artifact_hash.as_deref().map(str::len), Some(12));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn npy_u8_data_finds_the_bytes_numpy_wrote_and_refuses_the_rest() {
+        let dir = std::env::temp_dir().join(format!("npy-u8-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let (a, b, f) = (dir.join("a.npy"), dir.join("b.npy"), dir.join("f.npy"));
+        ndarray_npy::write_npy(&a, &ndarray::Array1::<u8>::from_iter(0..200)).unwrap();
+        ndarray_npy::write_npy(&b, &ndarray::Array2::<u8>::from_shape_fn((3, 5), |(i, j)| (i * 5 + j) as u8)).unwrap();
+        ndarray_npy::write_npy(&f, &ndarray::Array1::<f32>::zeros(4)).unwrap();
+        let bytes = fs::read(&a).unwrap();
+        let r = npy_u8_data(&bytes).unwrap();
+        assert_eq!(&bytes[r], (0..200).collect::<Vec<u8>>().as_slice());
+        let bytes = fs::read(&b).unwrap();
+        assert_eq!(&bytes[npy_u8_data(&bytes).unwrap()], (0..15).collect::<Vec<u8>>().as_slice());
+        assert!(npy_u8_data(&fs::read(&f).unwrap()).unwrap_err().contains("not a u1"));
+        let bytes = fs::read(&a).unwrap();
+        assert!(npy_u8_data(&bytes[..bytes.len() - 1]).is_err(), "a truncated file must be refused");
         fs::remove_dir_all(&dir).unwrap();
     }
 
