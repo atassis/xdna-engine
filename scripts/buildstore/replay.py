@@ -31,23 +31,44 @@ def _mount(src, tgt, fstype, flags):
         raise OSError(e, f"mount {fstype or 'bind'} {src} -> {tgt}: {os.strerror(e)}")
 
 
-def _ro_bind(root, p):
+def _bind_file(root, p):
+    """Bind one recorded FILE read-only. Never a directory: that would expose every sibling,
+    read or not (the Peano-dir case -- see module docstring)."""
     tgt = root / p.lstrip("/")
-    if os.path.isdir(p):
-        tgt.mkdir(parents=True, exist_ok=True)
-    else:
-        tgt.parent.mkdir(parents=True, exist_ok=True)
-        tgt.touch()
+    tgt.parent.mkdir(parents=True, exist_ok=True)
+    tgt.touch()
+    _mount(p, tgt, None, MS_BIND)
+    _mount(p, tgt, None, MS_BIND | MS_REMOUNT | MS_RDONLY)
+
+
+def _bind_whole(root, p):
+    """Bind a whole real path (furniture only -- not a recorded build input)."""
+    tgt = root / p.lstrip("/")
+    (tgt.mkdir(parents=True, exist_ok=True) if os.path.isdir(p)
+     else (tgt.parent.mkdir(parents=True, exist_ok=True), tgt.touch()))
     _mount(p, tgt, None, MS_BIND)
     _mount(p, tgt, None, MS_BIND | MS_REMOUNT | MS_RDONLY)
 
 
 def build_plan(manifest_path, scratch):
     m = json.load(open(manifest_path))
+    files = set(m["reads"])
+    dirs = set(m["dirs"])
+    # Furniture (replay_base.txt), never a build input: bound whole, same as before.
     base = {l.strip() for l in (HERE / "replay_base.txt").read_text().splitlines()
             if l.strip() and not l.startswith("#")}
-    ro = [p for p in sorted(set(m["reads"]) | set(m["dirs"]) | base, key=len)
-          if os.path.exists(p)]
+    base -= files | dirs
+    files = sorted((p for p in files if os.path.exists(p)), key=len)
+    dirs = sorted((p for p in dirs if os.path.exists(p)), key=len)
+    furniture = [p for p in sorted(base, key=len) if os.path.exists(p)]
+    # build_llm_decode.sh/build_prefill.sh/gate_llm.sh etc probe `[ -x "$VENV_IRON/bin/python" ]`
+    # (VENV_IRON defaults to "$REPO/.venv-iron") before running anything -- a stat(2)/access(2)
+    # check rec_preload.c's open-based hooks never see, so no manifest records it either way.
+    repo = m["env"].get("REPO")
+    if repo:
+        venv_python = os.path.join(repo, ".venv-iron", "bin", "python")
+        if os.path.exists(venv_python):
+            furniture.append(venv_python)
     symlinks = {"/lib64": "usr/lib", "/lib": "usr/lib", "/bin": "usr/bin", "/sbin": "usr/bin"}
     symlinks.update(m["links"])
     # ld.so resolves a DT_NEEDED soname through ld.so.cache to a *symlink* path (e.g.
@@ -63,8 +84,25 @@ def build_plan(manifest_path, scratch):
         real = os.path.realpath(path)
         if path != real and real in reads:
             symlinks[path] = real
-    return {"ro": ro, "rw": list(m["writable"]), "cwd": m["cwd"], "env": m["env"],
-            "symlinks": symlinks, "argv": m["argv"], "scratch": str(scratch)}
+    # A PATH-searched name (bash's "awk" -> gawk) or a venv shim (".venv-iron/bin/python" ->
+    # /usr/bin/python3.14) is chased by the KERNEL inside execve/openat -- rec_preload.c's hooks
+    # see only the resolved target, never the symlink hop, so the given name is missing from
+    # "reads" even though its target was recorded. Recover it: any symlink sibling, in a
+    # directory a recorded read already lives in, whose target resolves to a recorded read.
+    for d in {os.path.dirname(p) for p in reads}:
+        try:
+            entries = os.scandir(d)
+        except OSError:
+            continue
+        with entries:
+            for e in entries:
+                full = e.path
+                if full not in reads and full not in symlinks and os.path.islink(full) \
+                        and os.path.realpath(full) in reads:
+                    symlinks[full] = os.readlink(full)
+    return {"files": files, "dirs": dirs, "furniture": furniture, "rw": list(m["writable"]),
+            "cwd": m["cwd"], "env": m["env"], "symlinks": symlinks, "argv": m["argv"],
+            "scratch": str(scratch)}
 
 
 def apply_and_exec(plan):
@@ -74,37 +112,22 @@ def apply_and_exec(plan):
     root.mkdir(parents=True, exist_ok=True)
     _mount("tmpfs", root, "tmpfs", 0)
 
-    # plan["ro"] is sorted shortest-first; a recorded directory and a recorded file under it
-    # both appear when the dir was listed and the file was read -- bind only the outermost one,
-    # the inner path is already visible through it.
-    bound_dirs = []
-    for p in plan["ro"]:
-        if any(p == d or p.startswith(d.rstrip("/") + "/") for d in bound_dirs):
-            continue
-        _ro_bind(root, p)
-        if os.path.isdir(p):
-            bound_dirs.append(p)
-
+    # A recorded "dirs" entry (its listing was read) gets a plain tmpfs directory, never a bind
+    # of the real one -- same reason as _bind_file. Left writable, not locked ro: a non-recursive
+    # self-bind would shadow the individual file mounts already placed inside it. The
+    # anti-vacuous invariant only needs the listing to hide unread siblings, not read-only.
+    for p in plan["dirs"]:
+        (root / p.lstrip("/")).mkdir(parents=True, exist_ok=True)
+    for p in plan["files"]:
+        _bind_file(root, p)
     for p in plan["rw"]:
         real = scratch / "rw" / p.lstrip("/")
         real.mkdir(parents=True, exist_ok=True)
-        tgt = root / p.lstrip("/")
-        tgt.mkdir(parents=True, exist_ok=True)
-        _mount(real, tgt, None, MS_BIND)
-
+        (root / p.lstrip("/")).mkdir(parents=True, exist_ok=True)
     (root / "proc").mkdir(parents=True, exist_ok=True)
-    _mount("proc", root / "proc", "proc", 0)
-
     (root / "dev").mkdir(parents=True, exist_ok=True)
-    for name in DEV_NODES:
-        src = pathlib.Path("/dev") / name
-        if src.exists():
-            (root / "dev" / name).touch()
-            _mount(src, root / "dev" / name, None, MS_BIND)
-
     (root / "tmp").mkdir(parents=True, exist_ok=True)
-    _mount("tmpfs", root / "tmp", "tmpfs", 0)
-
+    (root / plan["cwd"].lstrip("/")).mkdir(parents=True, exist_ok=True)
     for given, target in plan["symlinks"].items():
         link = root / given.lstrip("/")
         link.parent.mkdir(parents=True, exist_ok=True)
@@ -112,8 +135,20 @@ def apply_and_exec(plan):
             continue
         os.symlink(target, link)
 
-    cwd = root / plan["cwd"].lstrip("/")
-    cwd.mkdir(parents=True, exist_ok=True)
+    for p in plan["furniture"]:
+        _bind_whole(root, p)
+    for p in plan["rw"]:
+        real = scratch / "rw" / p.lstrip("/")
+        _mount(real, root / p.lstrip("/"), None, MS_BIND)
+
+    _mount("proc", root / "proc", "proc", 0)
+    for name in DEV_NODES:
+        src = pathlib.Path("/dev") / name
+        if src.exists():
+            (root / "dev" / name).touch()
+            _mount(src, root / "dev" / name, None, MS_BIND)
+    _mount("tmpfs", root / "tmp", "tmpfs", 0)
+
     os.chroot(root)
     os.chdir(plan["cwd"])
     os.execvpe(plan["argv"][0], plan["argv"], plan["env"])
