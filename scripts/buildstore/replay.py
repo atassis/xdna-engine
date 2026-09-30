@@ -97,13 +97,24 @@ def build_plan(manifest_path, scratch):
                                         "bin", "python")):
             if os.path.exists(venv_python):
                 furniture.append([venv_python, False])
-    # toolchain_up.sh's `[ -e "$MLIR_DISTRO_ABS/bin/mlir-tblgen" ]` is the same unhooked-probe
-    # class: on the cached-instance fast path the file is never opened, only stat-tested, so no
-    # manifest records it either. Bind whichever mlir-distro trees are actually provisioned.
+    # toolchain_up.sh's `[ -e "$MLIR_DISTRO_ABS/bin/mlir-tblgen" ]` probe is unhooked-on-success
+    # like the others, AND the instance's own python/aie/dialects/*.py are themselves symlinks
+    # INTO this tree (vendored generated MLIR Python sources) -- a furnitured instance dir alone
+    # still resolves those to a target nothing bound. Furnish the whole mlir-distro/<wheel> tree.
     xdna_cache = m["env"].get("XDNA_CACHE")
     if xdna_cache:
-        furniture += [[p, False] for p in glob.glob(os.path.join(
-            xdna_cache, "mlir-distro", "*", "mlir", "bin", "mlir-tblgen"))]
+        # Both the alias path (XDNA_CACHE may itself be a symlink, e.g. a worktree's shared
+        # cache) and its realpath: an embedded symlink's stored target is an absolute string
+        # fixed at creation time, so it may name either form independent of which one the
+        # recipe's own env happens to use.
+        seen = set()
+        for p in glob.glob(os.path.join(xdna_cache, "mlir-distro", "*")):
+            if not os.path.isdir(p):
+                continue
+            for variant in (p, os.path.realpath(p)):
+                if variant not in seen:
+                    seen.add(variant)
+                    furniture.append([variant, False])
     # The whole built toolchain instance: content-addressed by toolchain.lock's LOCKHASH
     # (buildstore.py's resolve_mlir_aie_instance), so its tree is furniture, not per-file
     # inputs -- its every internal existence probe is otherwise the same unhooked-probe class

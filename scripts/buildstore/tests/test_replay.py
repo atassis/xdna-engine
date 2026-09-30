@@ -96,6 +96,27 @@ def test_recover_pyc_sources(tmp_path):
     assert recovered == {str(pkg / "helper.py")}
 
 
+def test_replay_furnishes_mlir_distro_through_a_symlinked_cache(tmp_path):
+    """The instance's python/aie/dialects/*.py are themselves symlinks into the mlir-distro
+    tree, whose embedded ABSOLUTE target is fixed at creation time and may name the resolved
+    path even when XDNA_CACHE itself is an alias (a worktree's shared-cache symlink, per
+    cache_env.sh) -- so both forms must be furnished, not just the one XDNA_CACHE names."""
+    real_cache = tmp_path / "real_cache"
+    (real_cache / "mlir-distro" / "wheel" / "mlir" / "bin").mkdir(parents=True)
+    (real_cache / "mlir-distro" / "wheel" / "mlir" / "bin" / "mlir-tblgen").write_text("bin")
+    alias_cache = tmp_path / "alias_cache"
+    alias_cache.symlink_to(real_cache)
+    out = tmp_path / "out"; out.mkdir()
+    real_target = real_cache / "mlir-distro" / "wheel" / "mlir" / "bin" / "mlir-tblgen"
+    script = f'[ -e "{real_target}" ] && echo ok > {out}/o'   # as a dialect .py's symlink would resolve
+    cmd = ["bash", "-c", script]
+    m = record.run(cmd, cwd=tmp_path, env={"PATH": "/usr/bin:/bin", "XDNA_CACHE": str(alias_cache)},
+                   out_roots=[out], work_roots=[], cache_roots=[])
+    mf = tmp_path / "m.json"; mf.write_text(json.dumps(m))
+    r = subprocess.run([str(HERE / "replay_bwrap.sh"), str(mf), str(out), str(tmp_path / "r")])
+    assert r.returncode == 0
+
+
 def test_replay_scales_past_bwrap_9000_arg_limit(tmp_path):
     # bwrap 0.13.0 aborts at ~9000 args (one --ro-bind pair per recorded path); a real recipe
     # (gemma3-270m-decode) records ~9.6k. Synthesize >9000 recorded reads and check replay
