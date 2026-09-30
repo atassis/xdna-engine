@@ -54,7 +54,16 @@ def census(path):
 
 def rewrite(cfg_path, out_path):
     cfg = json.load(open(cfg_path))
+    cfg_dir = os.path.dirname(os.path.abspath(cfg_path))
     for k in cfg["xrt-kernels"]:
+        # aiecc writes every *_file path relative to cfg_path's own directory;
+        # absolutize now, since out_path (below) may land somewhere else.
+        for p in k["PDIs"]:
+            p["PDI_file"] = os.path.join(cfg_dir, p["PDI_file"])
+        for i in k.get("instance", []):
+            for field in ("TXN_ctrl_code_file", "ctrl_packet_file", "patch_info_file"):
+                if i.get(field):
+                    i[field] = os.path.join(cfg_dir, i[field])
         if k["name"] == "main":
             continue
         own = k["name"] + ".pdi"
