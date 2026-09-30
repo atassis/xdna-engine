@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # install.sh -- install the `s2say` CLI for the current user.
 #
-#   cli/install.sh                     install to ~/.local/bin, write ~/.config/s2say/config
-#   cli/install.sh --prefix ~/opt      install elsewhere
-#   cli/install.sh --uninstall
+#   tools/s2say/install.sh                     install to ~/.local/bin, write ~/.config/s2say/config
+#   tools/s2say/install.sh --prefix ~/opt      install elsewhere
+#   tools/s2say/install.sh --uninstall
 #
 # USER-LEVEL ONLY, no sudo anywhere. It installs a launcher into $PREFIX/bin and records the
 # resolved model/binary paths in a config file, so the installed command keeps working if the
@@ -25,7 +25,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WS="$(cd "$HERE/../.." && pwd)"
+WS="$(cd "$HERE/../../.." && pwd)"
 BIN_DIR="$PREFIX/bin"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/s2say"
 TARGET="$BIN_DIR/s2say"
@@ -61,7 +61,7 @@ Something above is missing. Nothing was installed.
   model     : place the GGUF at s2.cpp/models/ (or point S2_MODEL at it)
 
 Or override any of them and re-run, e.g.
-  S2_MODEL=/path/to/model.gguf cli/install.sh
+  S2_MODEL=/path/to/model.gguf tools/s2say/install.sh
 MSG
   exit 1
 fi
@@ -74,7 +74,7 @@ for p in paplay pw-play aplay; do command -v "$p" >/dev/null && { PLAYER="$p"; b
 mkdir -p "$BIN_DIR" "$CONFIG_DIR"
 # _CFG suffixes so an env var of the plain name still wins at run time (see s2say's resolution order).
 cat > "$CONFIG_DIR/config" <<EOF
-# Written by cli/install.sh on $(date -Iseconds). Edit freely.
+# Written by tools/s2say/install.sh on $(date -Iseconds). Edit freely.
 # s2say resolves: environment  ->  this file  ->  repo-relative defaults.
 S2_BIN_CFG="$S2_BIN"
 S2_MODEL_CFG="$S2_MODEL"
