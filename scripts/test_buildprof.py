@@ -122,6 +122,7 @@ def test_stage_of_known_real_edges():
     assert s("{0}.pdi") == "package"
     assert s("objects_{0}.o") == "per-core"
     assert s("noCtrlPktSeqs") == "control-code"
+    assert s("gemma3_270m_decode_kvt256_rb4_shared.elf") == "package"  # caller-named full ELF
     assert s("elfs_{0}.elf") == "per-core"
     assert s("preBakedElfs_{0}.elf") == "per-core"
     assert s("probeElfs_{0}.elf") == "per-core"

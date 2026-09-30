@@ -48,7 +48,7 @@ STAGE_RULES = [
     }, (
         "kernels_", "memtopology_", "partition_", "merged_partition_",
         "input_aie_partition_", "cdo_", "bif_", "full_elf_",
-    ), (".pdi",)),
+    ), (".pdi", ".elf", ".xclbin")),
 ]
 ROW = re.compile(r"^\s*(\d+)\s+(\S+)\s+(\S+)\s+(\S.*)$")
 
