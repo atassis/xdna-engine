@@ -1412,11 +1412,14 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
         // exactly that sequence -- it is the prompt ids with each accepted token pushed -- and it
         // is truncated to `pos` because the last sampled token was never fed back through `step`,
         // so its position holds nothing.
-        // A prefill that stopped early primed fewer positions than `pos` counts, and a ledger that
-        // OVERSTATES the cache is the silent-wrong-answer path this field's doc warns about: the
-        // next request would reuse positions that hold nothing. Dropping it costs one re-prime.
+        // A prefill that stopped early holds exactly `[0, prefilled)`: a ledger claiming more would
+        // answer the next request from positions that hold nothing. Keeping that much lets a resent
+        // long prompt resume where it was cancelled instead of re-priming from 0.
         match prefill_stopped {
-            true => { self.resident.clear(); self.resident_media.clear(); }
+            true => {
+                self.resident = prompt_ids[..prefilled].to_vec();
+                self.resident_media = media_fps.into_iter().filter(|&(p, _)| p < prefilled).collect();
+            }
             false => {
                 self.resident = history;
                 self.resident.truncate(pos);
@@ -2396,9 +2399,9 @@ mod tool_tests {
 
     /// The ledger must never outlive what was primed. A prefill stopped at dispatch 3 primed 3
     /// positions; a ledger claiming 20 would answer the NEXT request from cache lines holding
-    /// nothing -- fluently, with no error. So the next run must re-prime the whole prompt.
+    /// nothing -- fluently, with no error. It keeps exactly those 3, so the resend walks 17.
     #[test]
-    fn an_aborted_prefill_leaves_no_ledger_for_the_next_request() {
+    fn an_aborted_prefill_keeps_only_what_it_primed() {
         let dispatches = std::rc::Rc::new(std::cell::Cell::new(0));
         let cancel = crate::cancel::Cancel::new();
         let decode =
@@ -2411,12 +2414,12 @@ mod tool_tests {
         assert_eq!(reason, FinishReason::Aborted);
         assert_eq!(dispatches.get(), 3);
 
-        // Same prompt again, nothing cancelled. With a ledger left behind it would reuse the prefix
-        // and prime almost nothing; correct behaviour is to walk all 20 positions again.
+        // Same prompt again, nothing cancelled: it resumes at 3 and primes the other 17.
+        assert_eq!(gen.resident.len(), 3, "the ledger must hold exactly the primed positions");
         dispatches.set(0);
         let (_, reason, _) = gen.generate_to_string(&long_prompt(), &base).unwrap();
         assert_ne!(reason, FinishReason::Aborted, "nothing cancelled the second run");
-        assert!(dispatches.get() >= 20, "re-primed only {} of 20 positions -- a stale ledger survived", dispatches.get());
+        assert_eq!(dispatches.get(), 17, "the 17 prompt positions the abort left unprimed");
     }
 }
 
