@@ -1,0 +1,8 @@
+# scripts/buildstore/hermetic_env.txt -- the environment a recipe may see; values are key inputs.
+PATH
+HOME
+LANG
+XDNA_CACHE
+MLIR_AIE_INSTANCE
+PEANO_INSTALL_DIR
+IRON_DIR
