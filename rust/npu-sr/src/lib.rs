@@ -6,7 +6,10 @@ pub mod color;
 pub mod frontier;
 pub mod pipeline;
 pub mod fsr1;
+pub mod layout;
+#[cfg(npu_sr_fsr1)]
 pub mod fsr1_frame;
+#[cfg(npu_sr_fsr1)]
 pub mod fsr1_rt;
 
 use std::path::Path;
@@ -40,8 +43,10 @@ pub struct Plane {
 pub enum SrEngine {
     Net { sched: schedule::Schedule, frontier: frontier::Frontier },
     Fsr1(fsr1::Fsr1Engine),
+    #[cfg(npu_sr_fsr1)]
     Fsr1Frame(fsr1_frame::Fsr1FrameEngine),
     /// One design for every frame shape and scale; see [`SrEngine::load_scaled`].
+    #[cfg(npu_sr_fsr1)]
     Fsr1Rt(fsr1_rt::Fsr1RtEngine),
 }
 
@@ -77,8 +82,13 @@ impl SrEngine {
             }
             let dir = path.parent().unwrap_or(Path::new("."));
             if matches!(schedule::layout(path)?.as_deref(), Some("frame" | "frame_y")) {
-                let cfg: fsr1_frame::Fsr1FrameConfig = schedule::load_json(path)?;
-                return Ok(SrEngine::Fsr1Frame(fsr1_frame::Fsr1FrameEngine::load(cfg, dir)?));
+                #[cfg(npu_sr_fsr1)]
+                {
+                    let cfg: fsr1_frame::Fsr1FrameConfig = schedule::load_json(path)?;
+                    return Ok(SrEngine::Fsr1Frame(fsr1_frame::Fsr1FrameEngine::load(cfg, dir)?));
+                }
+                #[cfg(not(npu_sr_fsr1))]
+                return Err(SrError::Load("FSR1 frame backends are not built into this engine".into()));
             }
             let cfg: fsr1::Fsr1Config = schedule::load_json(path)?;
             return Ok(SrEngine::Fsr1(fsr1::Fsr1Engine::load(cfg, dir)?));
@@ -95,9 +105,30 @@ impl SrEngine {
     /// tiled-table one (`frame_rt.json`), or the directory holding it. The scale is picked from the
     /// sizes among the export's (FSR1: 1, 3/2, 5/3, 2, 3), within a source pixel; anything else is
     /// declined. `sharpness`: FSR1's RCAS in stops, 0 the sharpest; ignored by other designs.
+    #[cfg(npu_sr_fsr1)]
     pub fn load_scaled(export: impl AsRef<Path>, in_w: usize, in_h: usize, out_w: usize, out_h: usize,
                        sharpness: f64) -> Result<SrEngine, SrError> {
         Ok(SrEngine::Fsr1Rt(fsr1_rt::Fsr1RtEngine::load(export.as_ref(), in_w, in_h, out_w, out_h, sharpness)?))
+    }
+
+    #[cfg(not(npu_sr_fsr1))]
+    pub fn load_scaled(_export: impl AsRef<Path>, _in_w: usize, _in_h: usize, _out_w: usize, _out_h: usize,
+                       _sharpness: f64) -> Result<SrEngine, SrError> {
+        Err(SrError::Load("FSR1 frame backends are not built into this engine".into()))
+    }
+
+    /// The scale P/Q an `fsr1_rt`-style export at `path` would pick for `in` -> `out`, if any; no
+    /// device. `None` when the FSR1 backends are not built into this engine.
+    pub fn scale_supported(path: &Path, in_w: usize, in_h: usize, out_w: usize, out_h: usize) -> Option<(usize, usize)> {
+        #[cfg(npu_sr_fsr1)]
+        {
+            fsr1_rt::Fsr1RtEngine::supported(path, in_w, in_h, out_w, out_h)
+        }
+        #[cfg(not(npu_sr_fsr1))]
+        {
+            let _ = (path, in_w, in_h, out_w, out_h);
+            None
+        }
     }
 
     /// Change the frame shape (any supported scale and size) and sharpness of a
@@ -105,14 +136,16 @@ impl SrEngine {
     pub fn configure(&mut self, in_w: usize, in_h: usize, out_w: usize, out_h: usize, sharpness: f64)
         -> Result<(), SrError> {
         match self {
+            #[cfg(npu_sr_fsr1)]
             SrEngine::Fsr1Rt(f) => f.configure(in_w, in_h, out_w, out_h, sharpness),
             _ => Err(SrError::Frame("only the one-design fsr1 backend changes shape at runtime".into())),
         }
     }
 
     /// The one-design backend's padded buffers, output size and scale.
-    pub fn rt_layout(&self) -> Result<fsr1_rt::RtLayout, SrError> {
+    pub fn rt_layout(&self) -> Result<layout::RtLayout, SrError> {
         match self {
+            #[cfg(npu_sr_fsr1)]
             SrEngine::Fsr1Rt(f) => Ok(f.layout()),
             _ => Err(SrError::Frame("no one-design fsr1 backend".into())),
         }
@@ -121,7 +154,7 @@ impl SrEngine {
     fn net(&mut self) -> Result<(&schedule::Schedule, &mut frontier::Frontier), SrError> {
         match self {
             SrEngine::Net { sched, frontier } => Ok((sched, frontier)),
-            SrEngine::Fsr1(_) | SrEngine::Fsr1Frame(_) | SrEngine::Fsr1Rt(_) => Err(SrError::Frame("fsr1 takes RGB8/BGRA8 frames only".into())),
+            _ => Err(SrError::Frame("fsr1 takes RGB8/BGRA8 frames only".into())),
         }
     }
 
@@ -140,7 +173,9 @@ impl SrEngine {
         }
         let (sched, frontier) = match self {
             SrEngine::Fsr1(f) => return f.upscale_rgb8(rgb, w, h),
+            #[cfg(npu_sr_fsr1)]
             SrEngine::Fsr1Frame(f) => return f.upscale_rgb8(rgb, w, h),
+            #[cfg(npu_sr_fsr1)]
             SrEngine::Fsr1Rt(f) => return f.upscale_rgb8(rgb, w, h),
             SrEngine::Net { sched, frontier } => (&*sched, frontier),
         };
@@ -184,7 +219,9 @@ impl SrEngine {
                          dst: &mut [u8], dst_stride: usize) -> Result<(usize, usize), SrError> {
         match self {
             SrEngine::Fsr1(f) => return f.upscale_bgra8(src, w, h, src_stride, dst, dst_stride),
+            #[cfg(npu_sr_fsr1)]
             SrEngine::Fsr1Frame(f) => return f.upscale_bgra8(src, w, h, src_stride, dst, dst_stride),
+            #[cfg(npu_sr_fsr1)]
             SrEngine::Fsr1Rt(f) => return f.upscale_bgra8(src, w, h, src_stride, dst, dst_stride),
             SrEngine::Net { .. } => {}
         }
@@ -212,17 +249,19 @@ impl SrEngine {
     }
 
     /// Padded-frame geometry for a zero-copy dma-buf caller. Only the `Fsr1Frame` backend supports
-    /// this (see [`fsr1_frame::FrameLayout`]).
-    pub fn frame_layout(&self) -> Result<fsr1_frame::FrameLayout, SrError> {
+    /// this (see [`layout::FrameLayout`]).
+    pub fn frame_layout(&self) -> Result<layout::FrameLayout, SrError> {
         match self {
+            #[cfg(npu_sr_fsr1)]
             SrEngine::Fsr1Frame(f) => Ok(f.frame_layout()),
+            #[cfg(npu_sr_fsr1)]
             SrEngine::Fsr1Rt(f) => {
                 let l = f.layout();
                 if l.scale_den != 1 {
                     return Err(SrError::Frame(format!(
                         "scale {}/{} has no integer form: use the one-design layout (rt_layout)", l.scale_num, l.scale_den)));
                 }
-                Ok(fsr1_frame::FrameLayout {
+                Ok(layout::FrameLayout {
                     in_w: l.in_w, in_h: l.in_h, in_pad_w: l.in_pad_w, in_pad_h: l.in_pad_h, in_pad_x: l.in_pad_x,
                     in_pad_y: l.in_pad_y, out_pad_w: l.out_pad_w, out_pad_h: l.out_pad_h, scale: l.scale_num,
                 })
@@ -234,7 +273,9 @@ impl SrEngine {
     /// Bytes per pixel of the frame-layout backend's planes: 4 (BGRA) or 1 (the NV12 Y plane).
     pub fn frame_bytes_per_px(&self) -> Result<usize, SrError> {
         match self {
+            #[cfg(npu_sr_fsr1)]
             SrEngine::Fsr1Frame(f) => Ok(f.bytes_per_px()),
+            #[cfg(npu_sr_fsr1)]
             SrEngine::Fsr1Rt(_) => Ok(1),
             _ => Err(SrError::Frame("dma-buf zero-copy needs the fsr1 frame-layout backend".into())),
         }
@@ -244,7 +285,9 @@ impl SrEngine {
     pub fn process_dmabuf(&mut self, in_fd: std::os::raw::c_int, out_fd: std::os::raw::c_int)
         -> Result<(), SrError> {
         match self {
+            #[cfg(npu_sr_fsr1)]
             SrEngine::Fsr1Frame(f) => f.process_dmabuf(in_fd, out_fd),
+            #[cfg(npu_sr_fsr1)]
             SrEngine::Fsr1Rt(f) => f.process_dmabuf(in_fd, out_fd),
             _ => Err(SrError::Frame("dma-buf zero-copy needs the fsr1 frame-layout backend".into())),
         }
@@ -255,8 +298,10 @@ impl SrEngine {
         match self {
             SrEngine::Net { sched, .. } => sched.scale,
             SrEngine::Fsr1(f) => f.scale(),
+            #[cfg(npu_sr_fsr1)]
             SrEngine::Fsr1Frame(f) => f.scale(),
             // 0 for a scale with no integer form (3/2, 5/3): `rt_layout` has P/Q.
+            #[cfg(npu_sr_fsr1)]
             SrEngine::Fsr1Rt(f) => {
                 let l = f.layout();
                 if l.scale_den == 1 { l.scale_num } else { 0 }
