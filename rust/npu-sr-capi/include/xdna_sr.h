@@ -14,7 +14,7 @@
 typedef struct XdnaSr XdnaSr;
 
 /**
- * Padded-frame geometry of an FSR1 Y engine at any scale, for a zero-copy dma-buf caller. The
+ * Padded-frame geometry of a one-design Y engine at any scale, for a zero-copy dma-buf caller. The
  * input plane is in_pad_w x in_pad_h bytes with the frame at (in_pad_x, in_pad_y), the rest
  * edge-replicated by the producer; the output plane is out_pad_w x out_pad_h bytes with the valid
  * out_w x out_h at its top left. 1 byte per pixel (the NV12 Y plane). Scale is scale_num/scale_den.
@@ -66,32 +66,35 @@ int xdna_sr_available(void);
 struct XdnaSr *xdna_sr_create(const char *schedule_path, int use_npu);
 
 /**
- * 1 if FSR1 has a scale for `in` -> `out` (1, 3/2, 5/3, 2 or 3, each axis within a source
- * pixel), writing it to *num / *den if non-null; else 0. No device needed.
+ * 1 if the one-design export at `export_path` (as for `xdna_sr_create_scaled`) has a scale for
+ * `in` -> `out`, writing it to *num / *den if non-null; else 0. Reads the export's json only, no
+ * device.
  */
-int xdna_sr_fsr1_scale(uintptr_t in_w,
-                       uintptr_t in_h,
-                       uintptr_t out_w,
-                       uintptr_t out_h,
-                       uintptr_t *num,
-                       uintptr_t *den);
+int xdna_sr_scale_supported(const char *export_path,
+                            uintptr_t in_w,
+                            uintptr_t in_h,
+                            uintptr_t out_w,
+                            uintptr_t out_h,
+                            uintptr_t *num,
+                            uintptr_t *den);
 
 /**
- * FSR1 on the NV12 Y plane for `in` -> `out` from the one-design export (`export_path`: its
- * fsr1_rt.json or the directory holding it); the scale comes from the sizes (see
- * `xdna_sr_fsr1_scale`). `sharpness`: RCAS in stops, 0 the sharpest. Query the buffers with
- * `xdna_sr_layout`, dispatch with `xdna_sr_process_dmabuf`, change shape with
- * `xdna_sr_configure`. NULL on error (an unsupported scale included; see `xdna_sr_last_error`).
+ * A one-design upscaler on the NV12 Y plane for `in` -> `out`: `export_path` is FSR1's export
+ * (fsr1_rt.json) or another design's tiled-table export (frame_rt.json), or the directory holding
+ * it; the scale comes from the sizes (see `xdna_sr_scale_supported`). `sharpness`: FSR1's RCAS in
+ * stops, 0 the sharpest (ignored by other designs). Query the buffers with `xdna_sr_layout`,
+ * dispatch with `xdna_sr_process_dmabuf`, change shape with `xdna_sr_configure`. NULL on error
+ * (an unsupported scale included; see `xdna_sr_last_error`).
  */
-struct XdnaSr *xdna_sr_create_fsr1(const char *export_path,
-                                   uintptr_t in_w,
-                                   uintptr_t in_h,
-                                   uintptr_t out_w,
-                                   uintptr_t out_h,
-                                   float sharpness);
+struct XdnaSr *xdna_sr_create_scaled(const char *export_path,
+                                     uintptr_t in_w,
+                                     uintptr_t in_h,
+                                     uintptr_t out_w,
+                                     uintptr_t out_h,
+                                     float sharpness);
 
 /**
- * Switch an `xdna_sr_create_fsr1` engine to another frame shape (any supported scale and size)
+ * Switch an `xdna_sr_create_scaled` engine to another frame shape (any supported scale and size)
  * and sharpness without reloading the design. The layout changes: query it again. 0, or <0 on
  * error (the engine keeps its previous shape).
  */
@@ -103,14 +106,14 @@ int xdna_sr_configure(struct XdnaSr *h,
                       float sharpness);
 
 /**
- * Fills `*out` for an `xdna_sr_create_fsr1` engine (any scale) or a frame-layout schedule
+ * Fills `*out` for an `xdna_sr_create_scaled` engine (any scale) or a frame-layout schedule
  * (integer scale); 0, or <0 for other backends.
  */
 int xdna_sr_layout(const struct XdnaSr *h, struct XdnaSrLayout *out);
 
 /**
- * The integer scale factor of the loaded net (e.g. 3), 0 for an FSR1 engine at a scale with no
- * integer form (3/2, 5/3: see `xdna_sr_layout`), or -1 on error.
+ * The integer scale factor of the loaded net (e.g. 3), 0 for a one-design engine at a scale with
+ * no integer form (3/2, 5/3: see `xdna_sr_layout`), or -1 on error.
  */
 int xdna_sr_scale(const struct XdnaSr *h);
 

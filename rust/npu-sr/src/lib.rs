@@ -41,7 +41,7 @@ pub enum SrEngine {
     Net { sched: schedule::Schedule, frontier: frontier::Frontier },
     Fsr1(fsr1::Fsr1Engine),
     Fsr1Frame(fsr1_frame::Fsr1FrameEngine),
-    /// One design for every frame shape and scale; see [`SrEngine::load_fsr1`].
+    /// One design for every frame shape and scale; see [`SrEngine::load_scaled`].
     Fsr1Rt(fsr1_rt::Fsr1RtEngine),
 }
 
@@ -91,16 +91,17 @@ impl SrEngine {
         Ok(SrEngine::Net { sched, frontier })
     }
 
-    /// FSR1 (Y plane) for `in` -> `out` from the one-design export (`fsr1_rt.json` or its
-    /// directory). The scale is picked from the sizes (1, 3/2, 5/3, 2 or 3, within a source pixel);
-    /// anything else is declined. `sharpness`: RCAS stops, 0 the sharpest.
-    pub fn load_fsr1(export: impl AsRef<Path>, in_w: usize, in_h: usize, out_w: usize, out_h: usize,
-                     sharpness: f64) -> Result<SrEngine, SrError> {
+    /// A one-design upscaler (Y plane) for `in` -> `out`: FSR1's export (`fsr1_rt.json`) or a
+    /// tiled-table one (`frame_rt.json`), or the directory holding it. The scale is picked from the
+    /// sizes among the export's (FSR1: 1, 3/2, 5/3, 2, 3), within a source pixel; anything else is
+    /// declined. `sharpness`: FSR1's RCAS in stops, 0 the sharpest; ignored by other designs.
+    pub fn load_scaled(export: impl AsRef<Path>, in_w: usize, in_h: usize, out_w: usize, out_h: usize,
+                       sharpness: f64) -> Result<SrEngine, SrError> {
         Ok(SrEngine::Fsr1Rt(fsr1_rt::Fsr1RtEngine::load(export.as_ref(), in_w, in_h, out_w, out_h, sharpness)?))
     }
 
     /// Change the frame shape (any supported scale and size) and sharpness of a
-    /// [`SrEngine::load_fsr1`] engine without reloading the design.
+    /// [`SrEngine::load_scaled`] engine without reloading the design.
     pub fn configure(&mut self, in_w: usize, in_h: usize, out_w: usize, out_h: usize, sharpness: f64)
         -> Result<(), SrError> {
         match self {

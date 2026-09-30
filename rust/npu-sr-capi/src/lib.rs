@@ -21,7 +21,7 @@ pub struct XdnaSrFrameLayout {
     pub scale: usize,
 }
 
-/// Padded-frame geometry of an FSR1 Y engine at any scale, for a zero-copy dma-buf caller. The
+/// Padded-frame geometry of a one-design Y engine at any scale, for a zero-copy dma-buf caller. The
 /// input plane is in_pad_w x in_pad_h bytes with the frame at (in_pad_x, in_pad_y), the rest
 /// edge-replicated by the producer; the output plane is out_pad_w x out_pad_h bytes with the valid
 /// out_w x out_h at its top left. 1 byte per pixel (the NV12 Y plane). Scale is scale_num/scale_den.
@@ -86,36 +86,45 @@ pub unsafe extern "C" fn xdna_sr_create(schedule_path: *const c_char, use_npu: c
     })
 }
 
-/// 1 if FSR1 has a scale for `in` -> `out` (1, 3/2, 5/3, 2 or 3, each axis within a source
-/// pixel), writing it to *num / *den if non-null; else 0. No device needed.
+/// 1 if the one-design export at `export_path` (as for `xdna_sr_create_scaled`) has a scale for
+/// `in` -> `out`, writing it to *num / *den if non-null; else 0. Reads the export's json only, no
+/// device.
 #[no_mangle]
-pub unsafe extern "C" fn xdna_sr_fsr1_scale(in_w: usize, in_h: usize, out_w: usize, out_h: usize,
-                                            num: *mut usize, den: *mut usize) -> c_int {
-    catch_unwind(|| match npu_sr::fsr1_rt::pick_scale(in_w, in_h, out_w, out_h) {
-        Some((p, q)) => {
-            unsafe {
-                if !num.is_null() {
-                    *num = p;
-                }
-                if !den.is_null() {
-                    *den = q;
-                }
-            }
-            1
+pub unsafe extern "C" fn xdna_sr_scale_supported(export_path: *const c_char, in_w: usize, in_h: usize,
+                                                 out_w: usize, out_h: usize, num: *mut usize,
+                                                 den: *mut usize) -> c_int {
+    catch_unwind(AssertUnwindSafe(|| {
+        if export_path.is_null() {
+            return 0;
         }
-        None => 0,
-    })
+        let Ok(p) = (unsafe { CStr::from_ptr(export_path) }).to_str() else { return 0 };
+        match npu_sr::fsr1_rt::Fsr1RtEngine::supported(std::path::Path::new(p), in_w, in_h, out_w, out_h) {
+            Some((a, b)) => {
+                unsafe {
+                    if !num.is_null() {
+                        *num = a;
+                    }
+                    if !den.is_null() {
+                        *den = b;
+                    }
+                }
+                1
+            }
+            None => 0,
+        }
+    }))
     .unwrap_or(0)
 }
 
-/// FSR1 on the NV12 Y plane for `in` -> `out` from the one-design export (`export_path`: its
-/// fsr1_rt.json or the directory holding it); the scale comes from the sizes (see
-/// `xdna_sr_fsr1_scale`). `sharpness`: RCAS in stops, 0 the sharpest. Query the buffers with
-/// `xdna_sr_layout`, dispatch with `xdna_sr_process_dmabuf`, change shape with
-/// `xdna_sr_configure`. NULL on error (an unsupported scale included; see `xdna_sr_last_error`).
+/// A one-design upscaler on the NV12 Y plane for `in` -> `out`: `export_path` is FSR1's export
+/// (fsr1_rt.json) or another design's tiled-table export (frame_rt.json), or the directory holding
+/// it; the scale comes from the sizes (see `xdna_sr_scale_supported`). `sharpness`: FSR1's RCAS in
+/// stops, 0 the sharpest (ignored by other designs). Query the buffers with `xdna_sr_layout`,
+/// dispatch with `xdna_sr_process_dmabuf`, change shape with `xdna_sr_configure`. NULL on error
+/// (an unsupported scale included; see `xdna_sr_last_error`).
 #[no_mangle]
-pub unsafe extern "C" fn xdna_sr_create_fsr1(export_path: *const c_char, in_w: usize, in_h: usize,
-                                             out_w: usize, out_h: usize, sharpness: f32) -> *mut XdnaSr {
+pub unsafe extern "C" fn xdna_sr_create_scaled(export_path: *const c_char, in_w: usize, in_h: usize,
+                                               out_w: usize, out_h: usize, sharpness: f32) -> *mut XdnaSr {
     let r = catch_unwind(AssertUnwindSafe(|| {
         if export_path.is_null() {
             set_error("export_path is null");
@@ -125,7 +134,7 @@ pub unsafe extern "C" fn xdna_sr_create_fsr1(export_path: *const c_char, in_w: u
             set_error("export_path is not valid UTF-8");
             return ptr::null_mut();
         };
-        match SrEngine::load_fsr1(p, in_w, in_h, out_w, out_h, sharpness as f64) {
+        match SrEngine::load_scaled(p, in_w, in_h, out_w, out_h, sharpness as f64) {
             Ok(e) => Box::into_raw(Box::new(XdnaSr(e))),
             Err(e) => {
                 set_error(e.to_string());
@@ -134,12 +143,12 @@ pub unsafe extern "C" fn xdna_sr_create_fsr1(export_path: *const c_char, in_w: u
         }
     }));
     r.unwrap_or_else(|_| {
-        set_error("panic in xdna_sr_create_fsr1");
+        set_error("panic in xdna_sr_create_scaled");
         ptr::null_mut()
     })
 }
 
-/// Switch an `xdna_sr_create_fsr1` engine to another frame shape (any supported scale and size)
+/// Switch an `xdna_sr_create_scaled` engine to another frame shape (any supported scale and size)
 /// and sharpness without reloading the design. The layout changes: query it again. 0, or <0 on
 /// error (the engine keeps its previous shape).
 #[no_mangle]
@@ -164,7 +173,7 @@ pub unsafe extern "C" fn xdna_sr_configure(h: *mut XdnaSr, in_w: usize, in_h: us
     })
 }
 
-/// Fills `*out` for an `xdna_sr_create_fsr1` engine (any scale) or a frame-layout schedule
+/// Fills `*out` for an `xdna_sr_create_scaled` engine (any scale) or a frame-layout schedule
 /// (integer scale); 0, or <0 for other backends.
 #[no_mangle]
 pub unsafe extern "C" fn xdna_sr_layout(h: *const XdnaSr, out: *mut XdnaSrLayout) -> c_int {
@@ -204,8 +213,8 @@ pub unsafe extern "C" fn xdna_sr_layout(h: *const XdnaSr, out: *mut XdnaSrLayout
     })
 }
 
-/// The integer scale factor of the loaded net (e.g. 3), 0 for an FSR1 engine at a scale with no
-/// integer form (3/2, 5/3: see `xdna_sr_layout`), or -1 on error.
+/// The integer scale factor of the loaded net (e.g. 3), 0 for a one-design engine at a scale with
+/// no integer form (3/2, 5/3: see `xdna_sr_layout`), or -1 on error.
 #[no_mangle]
 pub unsafe extern "C" fn xdna_sr_scale(h: *const XdnaSr) -> c_int {
     catch_unwind(AssertUnwindSafe(|| {
