@@ -18,6 +18,8 @@ import runpy
 import sys
 import sysconfig
 
+_WRITTEN = object()  # marks a variable the step set before reading it
+
 
 def _sha(path):
     h = hashlib.sha256()
@@ -33,6 +35,7 @@ def _record(manifest, script, args):
     stdlib = os.path.realpath(sysconfig.get_paths()["stdlib"])
     environ_cls = type(os.environ)
     orig_getitem, orig_copy = environ_cls.__getitem__, environ_cls.copy
+    orig_setitem = environ_cls.__setitem__
     copying = [False]
 
     def getitem(self, key):
@@ -40,11 +43,16 @@ def _record(manifest, script, args):
             value = orig_getitem(self, key)
         except KeyError:
             if not copying[0]:
-                env_reads[key] = None
+                env_reads.setdefault(key, None)
             raise
+        # Only the first read is an input: a later one may see a value the step set itself.
         if not copying[0]:
-            env_reads[key] = value
+            env_reads.setdefault(key, value)
         return value
+
+    def setitem(self, key, value):
+        env_reads.setdefault(key, _WRITTEN)
+        orig_setitem(self, key, value)
 
     def copy(self):
         copying[0] = True
@@ -64,6 +72,7 @@ def _record(manifest, script, args):
 
     if sabotage != "env":
         environ_cls.__getitem__, environ_cls.copy = getitem, copy
+        environ_cls.__setitem__ = setitem
     sys.addaudithook(hook)
     sys.argv = [script, *args]
     sys.path.insert(0, os.path.dirname(os.path.abspath(script)))
@@ -74,6 +83,7 @@ def _record(manifest, script, args):
         code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
     finally:
         environ_cls.__getitem__, environ_cls.copy = orig_getitem, orig_copy
+        environ_cls.__setitem__ = orig_setitem
     if code != 0:
         return code
     modules = {os.path.realpath(m.__file__) for m in list(sys.modules.values())
@@ -85,6 +95,7 @@ def _record(manifest, script, args):
             if in_stdlib or not os.path.isfile(p):
                 continue
             files[p] = _sha(p)
+    env_reads = {k: v for k, v in env_reads.items() if v is not _WRITTEN}
     doc = {"argv": [os.path.abspath(script), *args], "python": sys.version,
            "env": env_reads, "files": files}
     with open(manifest, "w") as f:

@@ -13,6 +13,10 @@ HERE = Path(__file__).resolve().parent
 REC = HERE / "record_inputs.py"
 
 GEN = """import os, helper
+os.environ.setdefault("GEN_DEFAULTED", "4")
+int(os.environ["GEN_DEFAULTED"])
+os.environ["GEN_ASSIGNED"] = "x"
+os.environ["GEN_ASSIGNED"]
 v = os.environ.get("GEN_FLAG", "0")
 if os.environ.get("GEN_COPY_ENV"):
     os.environ.copy()
@@ -95,3 +99,19 @@ def test_sabotaged_file_recording_misses_the_data_change(tmp_path):
     _record(_project(tmp_path), RECORD_INPUTS_SABOTAGE="files")
     (tmp_path / "data.txt").write_text("changed")
     assert _check(tmp_path).returncode == 0
+
+
+def test_self_defaulted_env_is_not_an_input(tmp_path):
+    _record(_project(tmp_path))
+    assert _check(tmp_path).returncode == 0          # GEN_DEFAULTED absent outside, as recorded
+
+
+def test_externally_set_defaulted_env_is_an_input(tmp_path):
+    _record(_project(tmp_path))
+    r = _check(tmp_path, GEN_DEFAULTED="8")
+    assert r.returncode == 1 and "GEN_DEFAULTED" in r.stdout
+
+
+def test_env_assigned_before_read_is_not_an_input(tmp_path):
+    _record(_project(tmp_path))
+    assert _check(tmp_path, GEN_ASSIGNED="outside").returncode == 0
