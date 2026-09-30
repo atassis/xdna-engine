@@ -13,13 +13,13 @@
 # (FORK_AIE_API below); that is the atassis/aie_api feat/adf-free-cascade tree.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WS="$(cd "$HERE/../../../../.." && pwd)"        # workspace root
-FORK_AIE_API="$WS/aie_api-fork/include"          # cascade.hpp lives here
-MLIR_AIE="$WS/mlir-aie"
+REPO="$(cd "$HERE/../../.." && pwd)"
+: "${FORK_AIE_API:?set FORK_AIE_API to the aie_api fork's include/ dir (cascade.hpp)}"
+MLIR_AIE="${MLIR_AIE:-$REPO/mlir-aie}"          # the in-repo submodule
 TEST_LIB="$MLIR_AIE/runtime_lib/test_lib"
 
 echo "== [0/3] environment =="
-source "$WS/xdna-engine/scripts/iron_env.sh"     # sets PEANO_INSTALL_DIR, AIECC_PATH, PATH
+source "$REPO/scripts/iron_env.sh"     # sets PEANO_INSTALL_DIR, AIECC_PATH, PATH
 CXX="$PEANO_INSTALL_DIR/bin/clang++"
 AIECC="${AIECC_PATH:-aiecc.py}"
 echo "  peano: $CXX"

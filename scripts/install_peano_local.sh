@@ -62,11 +62,11 @@
 # a human alias symlink, which is also what keeps toolchain.lock's by-path rollback prose valid.
 #
 # Env overrides:
-#   PEANO_LOCAL_HOME   install root   (default: <workspace>/.cache/peano-local)
+#   PEANO_LOCAL_HOME   install root   (default: $XDNA_CACHE/peano-local)
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WS="$(cd "$REPO/.." && pwd)"
-PEANO_LOCAL_HOME="${PEANO_LOCAL_HOME:-$WS/.cache/peano-local}"
+. "$REPO/scripts/lib/data_root.sh"   # -> XDNA_CACHE
+PEANO_LOCAL_HOME="${PEANO_LOCAL_HOME:-$XDNA_CACHE/peano-local}"
 VENV_PKGS="$REPO/.venv-iron/lib/python3.14/site-packages"
 VENV_LINK="$VENV_PKGS/llvm-aie"
 

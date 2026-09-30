@@ -25,7 +25,6 @@ while [[ $# -gt 0 ]]; do
 done
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WS="$(cd "$HERE/../../.." && pwd)"
 BIN_DIR="$PREFIX/bin"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/s2say"
 TARGET="$BIN_DIR/s2say"
@@ -36,11 +35,10 @@ if [[ "$UNINSTALL" == 1 ]]; then
   exit 0
 fi
 
-S2_BIN="${S2_BIN:-$WS/s2.cpp/build-cpu/s2}"
-S2_MODEL="${S2_MODEL:-$WS/s2.cpp/models/s2-pro-q6_k.gguf}"
-S2_TOKENIZER="${S2_TOKENIZER:-$WS/s2.cpp/models/tokenizer.json}"
+S2_BIN="${S2_BIN:-}"
+S2_MODEL="${S2_MODEL:-}"
+S2_TOKENIZER="${S2_TOKENIZER:-}"
 
-echo "workspace  $WS"
 missing=0
 for pair in "s2 binary:$S2_BIN" "model:$S2_MODEL" "tokenizer:$S2_TOKENIZER"; do
   label="${pair%%:*}"; path="${pair#*:}"

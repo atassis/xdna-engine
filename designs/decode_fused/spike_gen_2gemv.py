@@ -12,7 +12,7 @@ numpy golden, so `npu-dev fused-elf` can load the ELF through our NEW `shim_run_
 correctly on device — WITHOUT any device access here (compile + golden are host-only).
 
 Run inside the IRON env:
-    cd $WS/amd/IRON && source ironenv/bin/activate
+    cd $IRON_DIR && source ironenv/bin/activate
     python <this>  --out <worktree>/artifacts/fused_spike
 
 Outputs (in --out): spike2gemv.elf, input_arena.bin, scratch_arena.bin, golden_output.bin, meta.json

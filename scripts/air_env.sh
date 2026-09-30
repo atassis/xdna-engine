@@ -8,8 +8,10 @@
 #
 # Proven (2026-06-19): attn_decode_npu2.py LOWERS to AIR MLIR at Whisper self-attn shapes
 # (--nkv 12 --n 64 --seq-len 448 --k 768 = 12 heads x 448 x 64). See log/2026-06/p0b-resident-attn-spike.md.
-. "$(dirname "${BASH_SOURCE[0]}")/amd_paths.sh"   # -> XDNA_WS (relocatable workspace root)
-AIR="${AIR:-$XDNA_WS/mlir-air}"                    # the mlir-air checkout (was a dead ~/mlir-air path)
+if [ -z "${AIR:-}" ]; then
+  echo "ERROR: AIR is not set. Point it at your mlir-air checkout: export AIR=/path/to/mlir-air" >&2
+  return 1 2>/dev/null || exit 1
+fi
 export PEANO_INSTALL_DIR="$AIR/airenv/lib/python3.12/site-packages/llvm-aie"
 export PYTHONPATH="$AIR/install/python:$AIR/airenv/lib/python3.12/site-packages${PYTHONPATH:+:$PYTHONPATH}"
 export PATH="$AIR/install/bin:$AIR/airenv/bin:$PATH"

@@ -44,7 +44,7 @@ export CCACHE_COMPRESS="${CCACHE_COMPRESS:-1}"
 # flags differ per build dir -> every new tree is a full cold miss even with a warm cache. With it,
 # a second tree (or a nuked+reconfigured one) REPLAYS from cache instead of recompiling. sloppiness
 # lets locale/time-macro/include-mtime differences still hit (standard for a shared LLVM ccache).
-export CCACHE_BASEDIR="${CCACHE_BASEDIR:-$XDNA_WS}"
+export CCACHE_BASEDIR="${CCACHE_BASEDIR:-$REPO}"
 export CCACHE_SLOPPINESS="${CCACHE_SLOPPINESS:-locale,time_macros,include_file_ctime,include_file_mtime,pch_defines}"
 mkdir -p "$CCACHE_DIR" 2>/dev/null || true
 

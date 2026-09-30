@@ -11,15 +11,12 @@
 #     the run BEFORE python, and the harness printed nothing -- it read as an empty run rather
 #     than a broken toolchain.
 #
-#   * the VENV has to be borrowed, because not every worktree has one (this one does not). It
-#     carries the python deps (ml_dtypes for the bf16 host dtypes) and the Peano install.
-#
-# So: instance from here, venv from wherever one exists. Override either with
-# BRICK_VENV=/path/to/.venv-iron if you need a specific one.
+#   * the VENV carries the python deps (ml_dtypes for the bf16 host dtypes) and the Peano
+#     install; it lives at $REPO/.venv-iron. Override with BRICK_VENV=/path/to/.venv-iron
+#     if this worktree does not have one of its own (a worktree's own venv is phase 3).
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
-WS="$(cd "$REPO/.." && pwd)"
 PROG="${1:?usage: run.sh <verify_xxx.py>}"
 
 # The NPU is single-tenant, so device runs must be serialised across every checkout on the
@@ -38,14 +35,9 @@ fi
 INST="$("$REPO/scripts/toolchain_up.sh")"
 [ -n "$INST" ] || { echo "run.sh: empty instance dir from toolchain_up.sh" >&2; exit 1; }
 
-# Venv: first one that actually exists, unless told otherwise.
-VENV="${BRICK_VENV:-}"
-if [ -z "$VENV" ]; then
-  for c in "$REPO/.venv-iron" "$WS"/*/.venv-iron; do
-    [ -x "$c/bin/python" ] && { VENV="$c"; break; }
-  done
-fi
-[ -n "$VENV" ] || { echo "run.sh: no .venv-iron found; set BRICK_VENV" >&2; exit 1; }
+# Venv: this worktree's, unless told otherwise.
+VENV="${BRICK_VENV:-$REPO/.venv-iron}"
+[ -x "$VENV/bin/python" ] || { echo "run.sh: no .venv-iron found; set BRICK_VENV" >&2; exit 1; }
 
 echo "[run.sh] instance $INST" >&2
 echo "[run.sh] venv     $VENV" >&2

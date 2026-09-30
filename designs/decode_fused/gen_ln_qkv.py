@@ -16,7 +16,7 @@ the golden = matrix_bf16 @ bf16(LN(x)). The affine-fold correctness (golden + bi
 is asserted here at generation time.
 
 Run inside IRON env (aiebu-asm on PATH):
-    cd $WS/amd/IRON && source ironenv/bin/activate
+    cd $IRON_DIR && source ironenv/bin/activate
     python <this> --weights <wt>/artifacts/whisper-small/whisper_decoder --layer 0 --out <wt>/artifacts/fused_ln_qkv
 """
 import argparse

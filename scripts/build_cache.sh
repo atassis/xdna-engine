@@ -9,12 +9,12 @@
 #   scripts/build_cache.sh --gc [--dry-run]       # remove trees whose branch no longer exists
 #
 # Env overrides:
-#   BUILD_CACHE_HOME   where the build-* trees live (default: <workspace>/.cache)
+#   BUILD_CACHE_HOME   where the build-* trees live (default: $XDNA_CACHE)
 #   ALIVE_BRANCHES     space-separated branch names to treat as live, bypassing git (testing)
 set -uo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-WS="$(cd "$REPO/.." && pwd)"
-HOME_DIR="${BUILD_CACHE_HOME:-$WS/.cache}"
+. "$REPO/scripts/lib/data_root.sh"   # -> XDNA_CACHE
+HOME_DIR="${BUILD_CACHE_HOME:-$XDNA_CACHE}"
 MODE=list; DRY=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -31,7 +31,7 @@ _alive() {   # branch name -> "live" | "orphan"
     case " $ALIVE_BRANCHES " in *" $b "*) echo live; return 0 ;; esac
     echo orphan; return 0
   fi
-  for r in "$WS/mlir-aie" "$REPO/mlir-aie" "$WS/llvm-aie" "$REPO"; do
+  for r in "$REPO/mlir-aie" "${LLVM_AIE_SRC:-}" "$REPO"; do
     [ -d "$r" ] || continue
     git -C "$r" rev-parse --verify -q "$b" >/dev/null 2>&1 && { echo live; return 0; }
   done
