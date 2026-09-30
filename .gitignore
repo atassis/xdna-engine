@@ -1,8 +1,11 @@
 # python
 .venv/
 .venv-iron/
+.venv-export/
 __pycache__/
 *.pyc
+.pytest_cache/
+.ruff_cache/
 
 # local wheelhouse for the un-fetchable mlir_aie toolchain wheel (~290MB); repacked from the
 # uv archive cache by scripts/build_wheelhouse.sh, never committed.
@@ -63,3 +66,6 @@ tools/experiments/probes/build*/
 /.cargo/
 
 scratch/
+
+# regenerated per pytest run
+tests_latest.csv
