@@ -460,7 +460,7 @@ impl RawResidentForward {
         let embed = EmbedHeadPack::open(&meta.embedding_store)?;
         let fnorm = load_final_norm(&meta.embedding_store)?;
 
-        let elf = std::fs::read(meta.elf_path()).map_err(|e| EngineError::Load(format!("read {}: {e}", meta.elf_path().display())))?;
+        let elf = crate::llm::artifact::read_elf_bytes(&meta.elf_path())?;
         let boot = dev
             .open_elf_resident(&elf, Some(&format!("main:{}", meta.boot)))
             .map_err(|e| EngineError::Load(format!("open_elf_resident (boot): {e}")))?;

@@ -224,7 +224,8 @@ struct Stack {
 
 impl Stack {
     fn open(dev: &Device, dims: Dims) -> Stack {
-        let elf = std::fs::read(Path::new(&build_dir()).join("design.elf")).expect("read design.elf");
+        let elf = npu_models::llm::artifact::read_elf_bytes(&Path::new(&build_dir()).join("design.elf"))
+            .expect("read design.elf");
         let boot = dev.open_elf_resident(&elf, Some("main:boot")).expect("open_elf_resident(boot)");
         let mut names = vec!["p1".to_string(), "p2".to_string()];
         names.push(format!("g1w{}", dims.seg_nb));

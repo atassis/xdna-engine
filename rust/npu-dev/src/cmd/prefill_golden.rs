@@ -99,7 +99,7 @@ pub fn run(argv: Vec<String>) {
     let dir = argv.get(1).cloned().expect("usage: prefill_golden_probe <prefill_dir>");
     let dir = Path::new(&dir);
     let meta: Meta = serde_json::from_slice(&read(&dir.join("meta.json"))).expect("meta.json");
-    let elf = read(&dir.join(&meta.elf));
+    let elf = npu_models::llm::artifact::read_elf_bytes(&dir.join(&meta.elf)).expect("read elf");
     let nl = meta.dims.get("layers").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
     println!("artifact {}  {} layers  scratch {:.2} GB", dir.display(), nl,
              meta.scratch_size as f64 / 1e9);

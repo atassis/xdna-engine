@@ -717,8 +717,8 @@ fn end_load_phase(arena: &FusedArena, what: &str, mut sc: LoadScope) -> Result<(
 
 impl ProjOutElf {
     fn load(dev: &Rc<Device>, dir: &Path, _w: &WhisperDecoderWeights) -> Result<Self, EngineError> {
-        let elf = std::fs::read(dir.join("projout.elf"))
-            .map_err(|e| EngineError::Load(format!("read projout.elf: {e} (run scripts/build_projout_elf.sh)")))?;
+        let elf = crate::llm::artifact::read_elf_bytes(&dir.join("projout.elf"))
+            .map_err(|e| EngineError::Load(format!("{e} (run scripts/build_projout_elf.sh)")))?;
         let meta: serde_json::Value = serde_json::from_slice(
             &std::fs::read(dir.join("meta.json"))
                 .map_err(|e| EngineError::Load(format!("read projout meta.json: {e}")))?,
@@ -997,8 +997,8 @@ impl FusedDecoder {
         fused_dir: &Path,
         shared: Option<Rc<SharedCtxA>>,
     ) -> Result<Self, EngineError> {
-        let base_elf = std::fs::read(fused_dir.join("decode.elf"))
-            .map_err(|e| EngineError::Load(format!("read decode.elf: {e} (run gen_decode.py --layers 12)")))?;
+        let base_elf = crate::llm::artifact::read_elf_bytes(&fused_dir.join("decode.elf"))
+            .map_err(|e| EngineError::Load(format!("{e} (run gen_decode.py --layers 12)")))?;
         let meta: serde_json::Value = serde_json::from_slice(
             &std::fs::read(fused_dir.join("meta.json"))
                 .map_err(|e| EngineError::Load(format!("read meta.json: {e}")))?,
@@ -1177,7 +1177,7 @@ impl FusedDecoder {
             let dir = std::env::var("NPU_DECODE_PROJOUT_ELF_DIR")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|_| fused_dir.parent().unwrap_or(fused_dir).join("projout_elf"));
-            if dir.join("projout.elf").exists() {
+            if crate::llm::artifact::elf_exists(&dir.join("projout.elf")) {
                 Some(ProjOutElf::load(dev, &dir, &w)?)
             } else {
                 eprintln!(
@@ -1769,8 +1769,8 @@ impl BatchedFusedDecoder {
     /// meta.json (with a `scratchpad` block + dims.B/T), buffers/<name>.bin. `shared` = the encoder's
     /// resident ctx2 kernel (Some → O1 NPU cross-K/V fold; None → host f32 fold).
     pub fn new(w: Rc<WhisperDecoderWeights>, dev: &Rc<Device>, dir: &Path, shared: Option<Rc<SharedCtxA>>) -> Result<Self, EngineError> {
-        let base_elf = std::fs::read(dir.join("decode_b.elf"))
-            .map_err(|e| EngineError::Load(format!("read decode_b.elf: {e} (gen_decode_batched.py --scratchpad)")))?;
+        let base_elf = crate::llm::artifact::read_elf_bytes(&dir.join("decode_b.elf"))
+            .map_err(|e| EngineError::Load(format!("{e} (gen_decode_batched.py --scratchpad)")))?;
         let meta: serde_json::Value = serde_json::from_slice(
             &std::fs::read(dir.join("meta.json"))
                 .map_err(|e| EngineError::Load(format!("read meta.json: {e}")))?,

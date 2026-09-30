@@ -127,7 +127,7 @@ pub fn run(argv: Vec<String>) {
     println!("[fused_elf_probe] artifacts: {}", dir.display());
 
     let meta: Meta = serde_json::from_slice(&read(&dir.join("meta.json"))).expect("parse meta.json");
-    let mut elf = read(&dir.join(&meta.elf));
+    let mut elf = npu_models::llm::artifact::read_elf_bytes(&dir.join(&meta.elf)).expect("read elf");
     // Per-token ELF patch (KV write offset + softmax mask) if this block has a cache.
     if let Some(ps) = &meta.patch {
         let patcher = FusedElfPatcher::build(&elf, &ps.kv_cache_offsets, ps.head_dim);
@@ -256,7 +256,7 @@ pub fn run(argv: Vec<String>) {
         for _ in 0..iters { arena.dispatch(kern).unwrap(); }
         let disp_ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
         // (c) full per-token (patch host buffer + reload + sync_input + dispatch + sync_out)
-        let base = read(&dir.join(&meta.elf));
+        let base = npu_models::llm::artifact::read_elf_bytes(&dir.join(&meta.elf)).expect("read elf");
         let patcher = meta.patch.as_ref().map(|ps| FusedElfPatcher::build(&base, &ps.kv_cache_offsets, ps.head_dim));
         let t = Instant::now();
         for step in 0..iters {

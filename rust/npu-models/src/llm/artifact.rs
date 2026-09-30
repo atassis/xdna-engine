@@ -1811,6 +1811,17 @@ impl LlmArtifact {
     }
 }
 
+/// Whether `path` or its `.zst` sibling exists -- the presence check to pair with
+/// `read_elf_bytes`, since the plain file is no longer guaranteed to exist.
+pub fn elf_exists(path: &Path) -> bool {
+    if path.is_file() {
+        return true;
+    }
+    let mut zst_path = path.as_os_str().to_owned();
+    zst_path.push(".zst");
+    Path::new(&zst_path).is_file()
+}
+
 /// Read a control-code ELF, transparently decompressing `<path>.zst` when `path` itself is
 /// absent. Builds write `.zst` only; a plain `path` present anyway (a stale build, a hand-copied
 /// artifact) wins so a partial/corrupt `.zst` never shadows it.
