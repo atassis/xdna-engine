@@ -59,3 +59,50 @@ def test_shim_propagates_failure(tmp_path):
     r = _run(tmp_path, ["aie.mlir"], FAKE_RC="3")
     assert r.returncode == 3
     assert "rc: 3" in next((tmp_path / "logs").glob("aiecc-*.log")).read_text()
+
+
+import importlib.util
+
+
+def _summ():
+    spec = importlib.util.spec_from_file_location("bps", HERE / "buildprof_summarize.py")
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def test_stage_of_classifies_edges():
+    s = _summ().stage_of
+    assert s("placed.mlir") == "front"
+    assert s("lowered_main_core_0_2.mlir") == "per-core"
+    assert s("opted_main_core_0_2.ll") == "per-core"
+    assert s("npu_dma_lowered.mlir") == "control-code"
+    assert s("npu_materialized_2.mlir") == "control-code"
+    assert s("full.elf") == "package"
+    assert s("partition_main.json") == "package"
+    assert s("something_new") == "other"
+
+
+def test_parse_profile_rows(tmp_path):
+    _run(tmp_path, ["aie.mlir"])
+    log = next((tmp_path / "logs").glob("aiecc-*.log"))
+    rows = _summ().parse_profile(log.read_text())
+    assert rows == [("placed.mlir", 120, 110.0), ("lowered_main_core_0_2.mlir", 3000, 400.0),
+                    ("npu_dma_lowered.mlir", 9000, 900.0), ("full.elf", 40, 900.0)]
+
+
+def test_summarize_artifact_dir(tmp_path):
+    art = tmp_path / "s0" / "qwen3-0.6b-decode"
+    art.mkdir(parents=True)
+    _run(art, ["aie.mlir"])                       # writes art/logs/aiecc-*.log
+    (art / "logs").rename(art / "aiecc-logs")
+    (art / "time.txt").write_text(
+        "\tElapsed (wall clock) time (h:mm:ss or m:ss): 1:00.00\n"
+        "\tMaximum resident set size (kbytes): 2048000\nrc=0\n")
+    out = _summ().summarize(tmp_path / "s0")
+    lines = out.strip().splitlines()
+    assert lines[0] == "artifact\tstage\tms\tpeak_mib"
+    assert "qwen3-0.6b-decode\tcontrol-code\t9000\t900.0" in lines
+    assert "qwen3-0.6b-decode\tper-core\t3000\t400.0" in lines
+    assert "qwen3-0.6b-decode\tTOTAL_WALL\t60000\t2000.0" in lines
+    assert any(l.startswith("qwen3-0.6b-decode\tOUTSIDE_AIECC\t") for l in lines)
