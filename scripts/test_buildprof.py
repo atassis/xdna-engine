@@ -61,6 +61,36 @@ def test_shim_propagates_failure(tmp_path):
     assert "rc: 3" in next((tmp_path / "logs").glob("aiecc-*.log")).read_text()
 
 
+# aiecc's --resume allow-list (CommandLineOptions.h resumePassthroughKind) does not include
+# --profile: `--resume` plus any other graph-shaping flag is a hard error. This fake mirrors that.
+FAKE_AIECC_RESUME_GUARD = """#!/usr/bin/env bash
+resume=0 profile=0
+for a in "$@"; do
+  case "$a" in --resume|--resume=*) resume=1 ;; esac
+  [ "$a" = "--profile" ] && profile=1
+done
+if [ "$resume" = 1 ] && [ "$profile" = 1 ]; then
+  echo "aiecc: --resume rejects other arguments: --profile" >&2
+  exit 1
+fi
+exit 0
+"""
+
+
+def _fake_resume_guard(tmp_path):
+    p = tmp_path / "aiecc"
+    p.write_text(FAKE_AIECC_RESUME_GUARD)
+    p.chmod(p.stat().st_mode | stat.S_IEXEC)
+    return p
+
+
+def test_shim_passes_resume_through_unmodified(tmp_path):
+    e = dict(os.environ, BUILDPROF_REAL_AIECC=str(_fake_resume_guard(tmp_path)),
+             BUILDPROF_DIR=str(tmp_path / "logs"))
+    r = subprocess.run([str(SHIM), "--resume=m.json"], env=e, capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
 import importlib.util
 
 
