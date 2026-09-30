@@ -115,3 +115,16 @@ def test_externally_set_defaulted_env_is_an_input(tmp_path):
 def test_env_assigned_before_read_is_not_an_input(tmp_path):
     _record(_project(tmp_path))
     assert _check(tmp_path, GEN_ASSIGNED="outside").returncode == 0
+
+
+def test_retargeted_symlink_is_a_miss(tmp_path):
+    _project(tmp_path)
+    (tmp_path / "data_a.txt").write_text("hello")
+    (tmp_path / "data_b.txt").write_text("other")
+    (tmp_path / "data.txt").unlink()
+    (tmp_path / "data.txt").symlink_to("data_a.txt")
+    _record(tmp_path)
+    (tmp_path / "data.txt").unlink()
+    (tmp_path / "data.txt").symlink_to("data_b.txt")   # data_a.txt itself is untouched
+    r = _check(tmp_path)
+    assert r.returncode == 1 and "data.txt" in r.stdout

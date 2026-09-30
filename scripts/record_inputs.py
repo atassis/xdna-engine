@@ -31,7 +31,7 @@ def _sha(path):
 
 def _record(manifest, script, args):
     sabotage = os.environ.get("RECORD_INPUTS_SABOTAGE", "")
-    env_reads, opened_r, opened_w = {}, set(), set()
+    env_reads, opened_r, opened_w, links = {}, set(), set(), {}
     stdlib = os.path.realpath(sysconfig.get_paths()["stdlib"])
     environ_cls = type(os.environ)
     orig_getitem, orig_copy = environ_cls.__getitem__, environ_cls.copy
@@ -64,7 +64,10 @@ def _record(manifest, script, args):
     def hook(event, a):
         if event != "open" or not isinstance(a[0], (str, bytes)):
             return
-        path = os.path.realpath(os.fsdecode(a[0]))
+        opened = os.path.abspath(os.fsdecode(a[0]))
+        path = os.path.realpath(opened)
+        if opened != path:
+            links[opened] = path
         mode, flags = a[1], a[2]
         writing = (mode is not None and any(c in mode for c in "wax+")) or (
             mode is None and flags & (os.O_WRONLY | os.O_RDWR))
@@ -97,7 +100,8 @@ def _record(manifest, script, args):
             files[p] = _sha(p)
     env_reads = {k: v for k, v in env_reads.items() if v is not _WRITTEN}
     doc = {"argv": [os.path.abspath(script), *args], "python": sys.version,
-           "env": env_reads, "files": files}
+           "env": env_reads, "files": files,
+           "links": {o: t for o, t in links.items() if t in files}}
     with open(manifest, "w") as f:
         json.dump(doc, f, indent=1, sort_keys=True)
     return 0
@@ -110,6 +114,10 @@ def _changes(doc):
     for k, v in doc["env"].items():
         if os.environ.get(k) != v:
             out.append(f"env {k}")
+    # A symlink re-pointed at another file changes the input even if its old target did not.
+    for opened, target in doc.get("links", {}).items():
+        if os.path.realpath(opened) != target:
+            out.append(f"link {opened}")
     for p, h in doc["files"].items():
         if not os.path.isfile(p) or _sha(p) != h:
             out.append(f"file {p}")
