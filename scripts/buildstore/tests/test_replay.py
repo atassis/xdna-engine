@@ -38,6 +38,27 @@ def test_replay_compares_by_identity_not_bytes(tmp_path):
     assert r.returncode != 0
 
 
+def test_replay_furnishes_venv_python_and_mlir_distro(tmp_path):
+    """Two unhooked-probe classes (existence-tested, never opened, so no manifest records them):
+    the .venv-iron fallback and toolchain_up.sh's `[ -e mlir-tblgen ]` cached-instance gate. A
+    recipe that itself probes for them must see them in the sandbox too."""
+    repo = tmp_path / "repo"; venv = repo / ".venv-iron" / "bin"; venv.mkdir(parents=True)
+    (venv / "python").write_text("#!/bin/sh\necho ok\n"); (venv / "python").chmod(0o755)
+    cache = tmp_path / "cache"; tblgen_dir = cache / "mlir-distro" / "x" / "mlir" / "bin"
+    tblgen_dir.mkdir(parents=True); (tblgen_dir / "mlir-tblgen").write_text("bin"); (tblgen_dir / "mlir-tblgen").chmod(0o755)
+    out = tmp_path / "out"; out.mkdir()
+    script = (f'[ -x "$REPO/.venv-iron/bin/python" ] && '
+              f'[ -e "$XDNA_CACHE/mlir-distro/x/mlir/bin/mlir-tblgen" ] && '
+              f'echo ok > {out}/o')
+    cmd = ["bash", "-c", script]
+    m = record.run(cmd, cwd=tmp_path, env={"PATH": "/usr/bin:/bin", "REPO": str(repo),
+                                          "XDNA_CACHE": str(cache)},
+                   out_roots=[out], work_roots=[], cache_roots=[])
+    mf = tmp_path / "m.json"; mf.write_text(json.dumps(m))
+    r = subprocess.run([str(HERE / "replay_bwrap.sh"), str(mf), str(out), str(tmp_path / "r")])
+    assert r.returncode == 0
+
+
 def test_replay_scales_past_bwrap_9000_arg_limit(tmp_path):
     # bwrap 0.13.0 aborts at ~9000 args (one --ro-bind pair per recorded path); a real recipe
     # (gemma3-270m-decode) records ~9.6k. Synthesize >9000 recorded reads and check replay

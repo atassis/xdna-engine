@@ -13,7 +13,7 @@ usage: replay.py <manifest.json> <recorded-out-dir> <scratch>
 exit 0 = same identity.py identity (device bytes; drops meta.json provenance); anything else =
 the manifest is not sufficient. A byte diff excluding meta.json is printed as extra info.
 """
-import ctypes, ctypes.util, json, os, pathlib, shutil, subprocess, sys
+import ctypes, ctypes.util, glob, json, os, pathlib, shutil, subprocess, sys
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -69,9 +69,20 @@ def build_plan(manifest_path, scratch):
     # check rec_preload.c's open-based hooks never see, so no manifest records it either way.
     repo = m["env"].get("REPO")
     if repo:
-        venv_python = os.path.join(repo, ".venv-iron", "bin", "python")
-        if os.path.exists(venv_python):
-            furniture.append(venv_python)
+        # build_llm_decode.sh's own fallback ("$REPO/.venv-iron" -> "$WS/xdna-engine/.venv-iron",
+        # WS = dirname(REPO)) is the same kind of probe: bind whichever one exists, as furniture.
+        for venv_python in (os.path.join(repo, ".venv-iron", "bin", "python"),
+                            os.path.join(os.path.dirname(repo), "xdna-engine", ".venv-iron",
+                                        "bin", "python")):
+            if os.path.exists(venv_python):
+                furniture.append(venv_python)
+    # toolchain_up.sh's `[ -e "$MLIR_DISTRO_ABS/bin/mlir-tblgen" ]` is the same unhooked-probe
+    # class: on the cached-instance fast path the file is never opened, only stat-tested, so no
+    # manifest records it either. Bind whichever mlir-distro trees are actually provisioned.
+    xdna_cache = m["env"].get("XDNA_CACHE")
+    if xdna_cache:
+        furniture += glob.glob(os.path.join(xdna_cache, "mlir-distro", "*", "mlir", "bin",
+                                            "mlir-tblgen"))
     symlinks = {"/lib64": "usr/lib", "/lib": "usr/lib", "/bin": "usr/bin", "/sbin": "usr/bin"}
     symlinks.update(m["links"])
     # ld.so resolves a DT_NEEDED soname through ld.so.cache to a *symlink* path (e.g.
