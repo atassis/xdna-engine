@@ -7,6 +7,7 @@ pub mod frontier;
 pub mod pipeline;
 pub mod fsr1;
 pub mod fsr1_frame;
+pub mod fsr1_rt;
 
 use std::path::Path;
 
@@ -40,6 +41,8 @@ pub enum SrEngine {
     Net { sched: schedule::Schedule, frontier: frontier::Frontier },
     Fsr1(fsr1::Fsr1Engine),
     Fsr1Frame(fsr1_frame::Fsr1FrameEngine),
+    /// One design for every frame shape and scale; see [`SrEngine::load_scaled`].
+    Fsr1Rt(fsr1_rt::Fsr1RtEngine),
 }
 
 /// Paths [`SrEngine::load_with`] resolves itself, replacing the schedule's own CWD-relative
@@ -88,10 +91,37 @@ impl SrEngine {
         Ok(SrEngine::Net { sched, frontier })
     }
 
+    /// A one-design upscaler (Y plane) for `in` -> `out`: FSR1's export (`fsr1_rt.json`) or a
+    /// tiled-table one (`frame_rt.json`), or the directory holding it. The scale is picked from the
+    /// sizes among the export's (FSR1: 1, 3/2, 5/3, 2, 3), within a source pixel; anything else is
+    /// declined. `sharpness`: FSR1's RCAS in stops, 0 the sharpest; ignored by other designs.
+    pub fn load_scaled(export: impl AsRef<Path>, in_w: usize, in_h: usize, out_w: usize, out_h: usize,
+                       sharpness: f64) -> Result<SrEngine, SrError> {
+        Ok(SrEngine::Fsr1Rt(fsr1_rt::Fsr1RtEngine::load(export.as_ref(), in_w, in_h, out_w, out_h, sharpness)?))
+    }
+
+    /// Change the frame shape (any supported scale and size) and sharpness of a
+    /// [`SrEngine::load_scaled`] engine without reloading the design.
+    pub fn configure(&mut self, in_w: usize, in_h: usize, out_w: usize, out_h: usize, sharpness: f64)
+        -> Result<(), SrError> {
+        match self {
+            SrEngine::Fsr1Rt(f) => f.configure(in_w, in_h, out_w, out_h, sharpness),
+            _ => Err(SrError::Frame("only the one-design fsr1 backend changes shape at runtime".into())),
+        }
+    }
+
+    /// The one-design backend's padded buffers, output size and scale.
+    pub fn rt_layout(&self) -> Result<fsr1_rt::RtLayout, SrError> {
+        match self {
+            SrEngine::Fsr1Rt(f) => Ok(f.layout()),
+            _ => Err(SrError::Frame("no one-design fsr1 backend".into())),
+        }
+    }
+
     fn net(&mut self) -> Result<(&schedule::Schedule, &mut frontier::Frontier), SrError> {
         match self {
             SrEngine::Net { sched, frontier } => Ok((sched, frontier)),
-            SrEngine::Fsr1(_) | SrEngine::Fsr1Frame(_) => Err(SrError::Frame("fsr1 takes RGB8/BGRA8 frames only".into())),
+            SrEngine::Fsr1(_) | SrEngine::Fsr1Frame(_) | SrEngine::Fsr1Rt(_) => Err(SrError::Frame("fsr1 takes RGB8/BGRA8 frames only".into())),
         }
     }
 
@@ -111,6 +141,7 @@ impl SrEngine {
         let (sched, frontier) = match self {
             SrEngine::Fsr1(f) => return f.upscale_rgb8(rgb, w, h),
             SrEngine::Fsr1Frame(f) => return f.upscale_rgb8(rgb, w, h),
+            SrEngine::Fsr1Rt(f) => return f.upscale_rgb8(rgb, w, h),
             SrEngine::Net { sched, frontier } => (&*sched, frontier),
         };
         match sched.input {
@@ -154,6 +185,7 @@ impl SrEngine {
         match self {
             SrEngine::Fsr1(f) => return f.upscale_bgra8(src, w, h, src_stride, dst, dst_stride),
             SrEngine::Fsr1Frame(f) => return f.upscale_bgra8(src, w, h, src_stride, dst, dst_stride),
+            SrEngine::Fsr1Rt(f) => return f.upscale_bgra8(src, w, h, src_stride, dst, dst_stride),
             SrEngine::Net { .. } => {}
         }
         if src.len() < (h.max(1) - 1) * src_stride + w * 4 {
@@ -184,6 +216,17 @@ impl SrEngine {
     pub fn frame_layout(&self) -> Result<fsr1_frame::FrameLayout, SrError> {
         match self {
             SrEngine::Fsr1Frame(f) => Ok(f.frame_layout()),
+            SrEngine::Fsr1Rt(f) => {
+                let l = f.layout();
+                if l.scale_den != 1 {
+                    return Err(SrError::Frame(format!(
+                        "scale {}/{} has no integer form: use the one-design layout (rt_layout)", l.scale_num, l.scale_den)));
+                }
+                Ok(fsr1_frame::FrameLayout {
+                    in_w: l.in_w, in_h: l.in_h, in_pad_w: l.in_pad_w, in_pad_h: l.in_pad_h, in_pad_x: l.in_pad_x,
+                    in_pad_y: l.in_pad_y, out_pad_w: l.out_pad_w, out_pad_h: l.out_pad_h, scale: l.scale_num,
+                })
+            }
             _ => Err(SrError::Frame("dma-buf zero-copy needs the fsr1 frame-layout backend".into())),
         }
     }
@@ -192,6 +235,7 @@ impl SrEngine {
     pub fn frame_bytes_per_px(&self) -> Result<usize, SrError> {
         match self {
             SrEngine::Fsr1Frame(f) => Ok(f.bytes_per_px()),
+            SrEngine::Fsr1Rt(_) => Ok(1),
             _ => Err(SrError::Frame("dma-buf zero-copy needs the fsr1 frame-layout backend".into())),
         }
     }
@@ -201,6 +245,7 @@ impl SrEngine {
         -> Result<(), SrError> {
         match self {
             SrEngine::Fsr1Frame(f) => f.process_dmabuf(in_fd, out_fd),
+            SrEngine::Fsr1Rt(f) => f.process_dmabuf(in_fd, out_fd),
             _ => Err(SrError::Frame("dma-buf zero-copy needs the fsr1 frame-layout backend".into())),
         }
     }
@@ -211,6 +256,11 @@ impl SrEngine {
             SrEngine::Net { sched, .. } => sched.scale,
             SrEngine::Fsr1(f) => f.scale(),
             SrEngine::Fsr1Frame(f) => f.scale(),
+            // 0 for a scale with no integer form (3/2, 5/3): `rt_layout` has P/Q.
+            SrEngine::Fsr1Rt(f) => {
+                let l = f.layout();
+                if l.scale_den == 1 { l.scale_num } else { 0 }
+            }
         }
     }
 
