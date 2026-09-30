@@ -98,7 +98,7 @@ pub unsafe extern "C" fn xdna_sr_scale_supported(export_path: *const c_char, in_
             return 0;
         }
         let Ok(p) = (unsafe { CStr::from_ptr(export_path) }).to_str() else { return 0 };
-        match npu_sr::fsr1_rt::Fsr1RtEngine::supported(std::path::Path::new(p), in_w, in_h, out_w, out_h) {
+        match SrEngine::scale_supported(std::path::Path::new(p), in_w, in_h, out_w, out_h) {
             Some((a, b)) => {
                 unsafe {
                     if !num.is_null() {
