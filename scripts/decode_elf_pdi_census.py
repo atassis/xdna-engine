@@ -20,9 +20,23 @@ kernel needs its own PDI (to stay individually dispatchable) and nothing else, w
 assembles -- so a rewrite is gated by comparing sections against the baseline ELF, never
 by the assembler exiting 0.
 """
-import collections, hashlib, json, os, re, subprocess, sys
+import collections, hashlib, json, os, re, subprocess, sys, tempfile
 
 SEC = re.compile(r"\s*\[\s*\d+\]\s+(\S+)\s+\S+\s+[0-9a-f]+\s+([0-9a-f]+)\s+([0-9a-f]+)")
+
+
+def resolve_elf(path):
+    """`path` if present, else decompress `path + ".zst"` to a temp file and return that -- readelf
+    needs a real file on disk either way."""
+    if os.path.exists(path):
+        return path
+    zst_path = path + ".zst"
+    if not os.path.exists(zst_path):
+        sys.exit(f"{path}: no such file (and no {zst_path})")
+    tmp = tempfile.NamedTemporaryFile(prefix=os.path.basename(path) + "-", delete=False)
+    subprocess.run(["zstd", "-q", "-d", "--long=27", "-c", zst_path], check=True, stdout=tmp)
+    tmp.close()
+    return tmp.name
 
 
 def sections(path):
@@ -94,6 +108,6 @@ if __name__ == "__main__":
     if sys.argv[1:2] == ["--rewrite"]:
         rewrite(sys.argv[2], sys.argv[3])
     else:
-        got = [census(p) for p in sys.argv[1:]]
+        got = [census(resolve_elf(p)) for p in sys.argv[1:]]
         if len(got) == 2:
             sys.exit(0 if compare(*got) else 1)

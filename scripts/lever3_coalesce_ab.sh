@@ -80,8 +80,8 @@ fi
 #          difference is the coalesced transposes (gen_decode.py has both deep-C params + lever-3 (i)+(1)).
 # =========================================================================================
 log "\n################  STEP 0 — build coalesced ELF (new 1.3.2 stack)  ################"
-if [ ! -f "$BASE_DIR/decode.elf" ]; then
-  log "[ERR] baseline ELF missing: $BASE_DIR/decode.elf (deep-C resident baseline — build via scripts/build_deepc_decode.sh 12). Aborting."; exit 1
+if [ ! -f "$BASE_DIR/decode.elf" ] && [ ! -f "$BASE_DIR/decode.elf.zst" ]; then
+  log "[ERR] baseline ELF missing: $BASE_DIR/decode.elf(.zst) (deep-C resident baseline — build via scripts/build_deepc_decode.sh 12). Aborting."; exit 1
 fi
 # The lever-3 transpose num_batches change is a COMMIT on the fork (with the deep-C base + the rest).
 # Gate on the symbol, not a branch name -- see iron_require_api in amd_paths.sh. build_deepc_decode.sh
@@ -94,7 +94,7 @@ fi
 log "[iron] IRON on $iron_at (API surface verified)"
 log "[build] building coalesced 12-layer ELF -> $COAL_DIR via build_deepc_decode.sh (compile-only) ..."
 if bash "$WT/scripts/build_deepc_decode.sh" 12 "$COAL_DIR" >>"$LOG" 2>&1; then
-  log "[build] coalesced ELF OK: $(ls -la "$COAL_DIR/decode.elf" | awk '{print $5" bytes"}')"
+  log "[build] coalesced ELF OK: $(ls -la "$COAL_DIR/decode.elf.zst" | awk '{print $5" bytes"}')"
 else
   log "[ERR] coalesced ELF build FAILED — see log above. Aborting."; exit 1
 fi

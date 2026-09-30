@@ -23,7 +23,7 @@ trap 'restart; echo "[done] log: $LOG"' EXIT
 ENC="$WT/mlir-aie/programming_examples/basic/matrix_multiplication/whole_array/build/final_512x800x3072_64x32x96_8c_modalsilu.xclbin"
 [ -f "$ENC" ] || { log "[ERR] encoder xclbin missing: $ENC"; exit 1; }
 for d in fused_decode12 fd12_cross fd12_self; do
-  [ -f "$WT/artifacts/$d/decode.elf" ] || { log "[ERR] missing ELF: artifacts/$d/decode.elf"; exit 1; }
+  [ -f "$WT/artifacts/$d/decode.elf" ] || [ -f "$WT/artifacts/$d/decode.elf.zst" ] || { log "[ERR] missing ELF: artifacts/$d/decode.elf(.zst)"; exit 1; }
 done
 
 # RAPL for energy (best-effort, no interactive sudo).

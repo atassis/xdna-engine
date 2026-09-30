@@ -26,9 +26,8 @@ beep(){ ( speaker-test -t sine -f 1000 -l 1 >/dev/null 2>&1 & local p=$!; sleep 
 trap 'restart; beep; log "[done] log: $LOG"' EXIT
 
 # preflight (run-only: artifacts + bins must already exist)
-for f in "$E2E" "$M1_DIR/decode.elf"; do
-  [ -e "$f" ] || { log "FATAL missing (prebuild first): $f"; exit 1; }
-done
+[ -e "$E2E" ] || { log "FATAL missing (prebuild first): $E2E"; exit 1; }
+[ -e "$M1_DIR/decode.elf" ] || [ -e "$M1_DIR/decode.elf.zst" ] || { log "FATAL missing (prebuild first): $M1_DIR/decode.elf(.zst)"; exit 1; }
 
 log "================ M=1 DECODE BENCH  $TS ================"
 log "host: $(uname -srm)"

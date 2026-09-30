@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # Add `<name>.elf.zst` beside every `*.elf` under the given artifact dirs, without a rebuild.
-# The plain `.elf` is left in place -- this only ADDS the compressed sibling. Skips anything under
-# a `build/` path component -- aiecc's own intermediate work-dir ELFs, not the shipped artifact.
+# Skips anything under a `build/` path component -- aiecc's own intermediate work-dir ELFs, not
+# the shipped artifact.
 #
 #   scripts/compress_artifact_elfs.sh <artifact_dir> [<artifact_dir>...]
+#   KEEP_PLAIN=1 scripts/compress_artifact_elfs.sh <artifact_dir>   # add the .zst, keep the .elf
 #
 # Each `.elf.zst` is decompressed right back and compared byte-for-byte against the source before
 # being counted as a success; a mismatch removes the `.zst` and fails the run rather than leaving
-# a bad compressed copy next to a good plain one.
+# a bad compressed copy next to a good plain one. On success the plain `.elf` is then removed
+# (every engine/gate path reads `.zst` transparently -- see elf_zst.py, artifact::read_elf_bytes)
+# unless KEEP_PLAIN=1.
 set -euo pipefail
 
 if [ "$#" -eq 0 ]; then
@@ -46,8 +49,9 @@ for root in "$@"; do
     mv "$tmp" "$zst"
     before=$(stat -c%s "$elf")
     after=$(stat -c%s "$zst")
-    LC_NUMERIC=C printf 'ok %s (%d -> %d, %.1fx)\n' "$elf" "$before" "$after" \
-      "$(LC_NUMERIC=C awk "BEGIN{print $before/$after}")"
+    [ -n "${KEEP_PLAIN:-}" ] || rm -f "$elf"
+    LC_NUMERIC=C printf 'ok %s (%d -> %d, %.1fx)%s\n' "$elf" "$before" "$after" \
+      "$(LC_NUMERIC=C awk "BEGIN{print $before/$after}")" "$([ -n "${KEEP_PLAIN:-}" ] || echo ", plain removed")"
     ok=$((ok + 1))
   done < <(find "$root" -type f -name '*.elf' -not -path '*/build/*' -print0)
 done

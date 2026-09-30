@@ -30,7 +30,7 @@ mkdir -p "$OUT"
 
 [ -x "$BIN" ] || { echo "[ERR] missing $BIN (cargo build --release -p npu-dev)"; exit 1; }
 for d in "$BASE" "$TR"; do
-  [ -f "$d/decode.elf" ] || { echo "[ERR] missing $d/decode.elf"; exit 1; }
+  [ -f "$d/decode.elf" ] || [ -f "$d/decode.elf.zst" ] || { echo "[ERR] missing $d/decode.elf(.zst)"; exit 1; }
 done
 # Refuse a comparison whose arms differ in more than the self-V cache.
 LADDER="${LADDER:-0}" python3 - "$BASE" "$TR" <<'PY' || exit 1

@@ -85,8 +85,8 @@ fi
 MLIR="$(find "$FROZEN_DIR/work" -maxdepth 2 -name 'decode_b*.mlir' ! -path '*.prj*' -printf '%s %p\n' 2>/dev/null | sort -rn | head -1 | awk '{print $2}')"
 if [ -n "$MLIR" ]; then cp "$MLIR" "$FROZEN_DIR/decode_b_frozen.mlir"; echo "[freeze] froze MLIR: $MLIR -> decode_b_frozen.mlir ($(du -h "$FROZEN_DIR/decode_b_frozen.mlir"|cut -f1))"; else echo "[freeze] WARN: no decode_b*.mlir found under work/"; find "$FROZEN_DIR/work" -name '*.mlir' | head; fi
 
-ELF="$FROZEN_DIR/out/decode_b.elf"
+ELF="$FROZEN_DIR/out/decode_b.elf.zst"
 [ -f "$ELF" ] || { echo "FREEZE FAIL: no ELF"; exit 3; }
-echo "[freeze] ELF sha256=$(sha256sum "$ELF" | awk '{print $1}')"
+echo "[freeze] ELF sha256=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["sha256"])' "$FROZEN_DIR/out/meta.json")"
 echo "[freeze] phase timers -> $AIECC_PHASE_TIMERS_FILE"
 echo "FREEZE DONE"

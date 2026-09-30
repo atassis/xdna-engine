@@ -49,6 +49,7 @@ import newstack_compat  # noqa: F401 -- MUST precede iron imports (new-mlir-aie 
 import pyxrt
 from aie.utils.hostruntime.xrtruntime.tensor import XRTTensor
 from elf_dispatch_compat import FullELFCallable
+from elf_zst import read_elf
 from param_scratchpad_compat import get_parameter_scratchpad
 
 BF16 = ml_dtypes.bfloat16
@@ -73,7 +74,7 @@ class Arm:
         self.meta = json.loads((self.dir / "meta.json").read_text())
         self.params = self.meta["scratchpad"]["params"]
         dev, seq = self.meta["kernel_name"].split(":")
-        elf = np.frombuffer((self.dir / self.meta["elf"]).read_bytes(), dtype=np.uint32)
+        elf = np.frombuffer(read_elf(str(self.dir / self.meta["elf"])), dtype=np.uint32)
         self.callable_ = FullELFCallable(elf, device_name=dev, sequence_name=seq)
 
         isz, osz, ssz = (self.meta[k] for k in ("input_size", "output_size", "scratch_size"))

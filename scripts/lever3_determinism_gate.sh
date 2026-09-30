@@ -40,7 +40,7 @@ trap 'restart; echo "[done] $OUT"' EXIT
 
 [ -x "$W3" ] || { echo "[ERR] missing $W3"; exit 1; }
 for d in fused_decode12 fused_decode12_xcross; do
-  [ -f "$WT/artifacts/$d/decode.elf" ] || { echo "[ERR] missing artifacts/$d/decode.elf"; exit 1; }
+  [ -f "$WT/artifacts/$d/decode.elf" ] || [ -f "$WT/artifacts/$d/decode.elf.zst" ] || { echo "[ERR] missing artifacts/$d/decode.elf(.zst)"; exit 1; }
 done
 
 log "[svc] stopping xdna-engine (single-tenant)"

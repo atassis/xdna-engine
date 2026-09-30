@@ -35,7 +35,7 @@ ENC="$WT/mlir-aie/programming_examples/basic/matrix_multiplication/whole_array/b
 [ -f "$ENC" ] || { log "[ERR] encoder xclbin missing: $ENC — fix: rm -rf mlir-aie && ln -s <main>/mlir-aie mlir-aie"; exit 1; }
 [ -x "$SERVE" ] || { log "[build] engine_serve missing — building ..."; ( cd "$WT/rust" && cargo build -p npu-models --release --bin engine_serve ) >>"$LOG" 2>&1 || { log "[ERR] build failed"; exit 1; }; }
 for d in fused_decode12 fd12_cross fd12_self; do
-  [ -f "$WT/artifacts/$d/decode.elf" ] || { log "[ERR] missing ELF: artifacts/$d/decode.elf (build the isolation variants first)"; exit 1; }
+  [ -f "$WT/artifacts/$d/decode.elf" ] || [ -f "$WT/artifacts/$d/decode.elf.zst" ] || { log "[ERR] missing ELF: artifacts/$d/decode.elf(.zst) (build the isolation variants first)"; exit 1; }
 done
 
 log "[svc] quiescing (single-tenant) ..."; npu_svc_stop || exit 1
