@@ -1,25 +1,19 @@
 #!/usr/bin/env bash
-# amd_paths.sh -- single relocatable anchor for the AMD/Xilinx upstream checkouts.
-#
-# SOURCE this from any script that needs the IRON / XRT / mlir-air checkouts. It
-# derives the umbrella-workspace root from THIS file's own location (the upstream
-# checkouts live as siblings of the engine repo under the workspace), so the whole
-# tree is RELOCATABLE -- no hardcoded $HOME/absolute paths. Every var is overridable
+# amd_paths.sh -- single anchor for the AMD/Xilinx upstream checkouts (IRON / XRT /
+# mlir-air). SOURCE this from any script that needs them. Every var is overridable
 # from the environment (export IRON_DIR=... before sourcing to point elsewhere).
 #
 #   source "$(dirname "${BASH_SOURCE[0]}")/amd_paths.sh"
 #   ... use "$IRON_DIR" / "$XRT_SRC_DIR" / "$MLIR_AIR_DIR" / "$AIEBU_ASM_DIR"
 #
-# Layout it assumes:  <workspace>/{xdna-engine/scripts/amd_paths.sh, IRON, XRT-src, mlir-air, ...}
-#                     (upstream checkouts are flat siblings of the engine repo at the workspace root)
+# No default location: these checkouts sit wherever the caller's box put them, and a
+# public clone of this repo names no such layout. IRON_DIR is REQUIRED by anything that
+# actually touches IRON (iron_require_pin/iron_require_api below fail loud, naming how
+# to set it) -- set it, or pass IRON=<dir> to a caller that reads that instead (planned:
+# IRON as a submodule). A caller that never touches IRON does not need it set.
+export IRON_DIR="${IRON_DIR:-${IRON:-}}"
 
-# workspace root = parent of the engine repo (this file lives in <engine>/scripts/)
-XDNA_WS="${XDNA_WS:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/../.." && pwd)}"
-export XDNA_WS
-
-# IRON_DIR points at the INTEGRATION STACK, not the bare fork checkout.
-#
-# The shared $XDNA_WS/IRON checkout sits on whatever branch it was last left on and carries neither
+# The shared IRON checkout sits on whatever branch it was last left on and carries neither
 # iron/operators/tmatvec/ nor iron/common/quant.py -- both imported at module scope by
 # designs/decode_fused/gen_llm_decode.py. So the documented build command for the LLM decode failed
 # at import with the default resolution, and every caller had to know to pass IRON=<worktree>.
@@ -29,9 +23,6 @@ export XDNA_WS
 # onto upstream/devel deb6e1e with all carries applied and gated -- device-free tests, bf16-oracle
 # parity, DDR bytes, interleaved timing, and a byte-identical decode ELF against the pre-rebase
 # build. See the journal task iron-back-onto-the-integration-stack-model.
-#
-# Still overridable: `IRON=<dir>` on any caller, or IRON_DIR in the environment.
-export IRON_DIR="${IRON_DIR:-$XDNA_WS/wt-iron-integ}"
 
 # amd/IRON's two aiecc rules default AIECC_JOBS to '1', so every design's per-core
 # compiles run one at a time. On the 24-core encoder-MHA design that is 7.7 s against
@@ -72,12 +63,11 @@ if command -v ccache >/dev/null 2>&1; then
     *) export CCACHE_SLOPPINESS="${CCACHE_SLOPPINESS},time_macros" ;;
   esac
 fi
-export XRT_SRC_DIR="${XRT_SRC_DIR:-$XDNA_WS/XRT-src}"
-export AIEBU_ASM_DIR="${AIEBU_ASM_DIR:-$XRT_SRC_DIR/src/runtime_src/core/common/aiebu/build/Release/src/cpp/utils/asm}"
-
-# mlir-air / llvm-aie are NOT defaulted here: in setup_amd_toolchains.sh an EMPTY
-# MLIR_AIR_DIR/LLVM_AIE_DIR is the "do not patch this repo" gate. Their canonical
-# location (when you do opt in) is $XDNA_WS/{mlir-air,llvm-aie}.
+# XRT_SRC_DIR/MLIR_AIR_DIR/LLVM_AIE_DIR are NOT defaulted here, same reason as
+# IRON_DIR above -- no assumed sibling layout. An empty MLIR_AIR_DIR/LLVM_AIE_DIR
+# also doubles as setup_amd_toolchains.sh's "do not patch this repo" gate.
+export XRT_SRC_DIR="${XRT_SRC_DIR:-}"
+export AIEBU_ASM_DIR="${AIEBU_ASM_DIR:-${XRT_SRC_DIR:+$XRT_SRC_DIR/src/runtime_src/core/common/aiebu/build/Release/src/cpp/utils/asm}}"
 
 # iron_require_api -- gate the shared IRON checkout on the API SURFACE the caller needs,
 # NOT on a branch name. Branch names have drifted twice (xdna2-asr -> integration-stack) and
@@ -95,6 +85,7 @@ export AIEBU_ASM_DIR="${AIEBU_ASM_DIR:-$XRT_SRC_DIR/src/runtime_src/core/common/
 iron_require_api() {
   local label="$1"; shift
   local dir="${IRON:-$IRON_DIR}"
+  [ -n "$dir" ] || { echo "ERROR: IRON_DIR is not set. Point it at your IRON checkout: export IRON_DIR=/path/to/IRON" >&2; return 1; }
   local on spec f sym missing=0
   on="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
   for spec in "$@"; do
@@ -145,6 +136,7 @@ PYEOF
 # An ABSENT pin is not a pass -- a lock that forgot the key must not read as unlocked.
 iron_require_pin() {
   local dir="${IRON:-$IRON_DIR}"
+  [ -n "$dir" ] || { echo "ERROR: IRON_DIR is not set. Point it at your IRON checkout: export IRON_DIR=/path/to/IRON" >&2; return 1; }
   local lock="${IRON_LOCK:-$(dirname "${BASH_SOURCE[0]:-$0}")/../toolchain.lock}"
   local want
   want="$(sed -n 's/^IRON_FORK_COMMIT=\([0-9a-f]\{7,\}\).*/\1/p' "$lock" 2>/dev/null | head -1)"
@@ -177,7 +169,7 @@ iron_require_pin() {
 #
 # AIECC_PIN_OVERRIDE must NAME the sha it accepts, so it cannot be exported once and forgotten:
 # it goes stale the moment the binary changes. An absent sha is not a pass.
-# Captured when this file is SOURCED, like XDNA_WS above: inside a function BASH_SOURCE resolves
+# Captured when this file is SOURCED: inside a function BASH_SOURCE resolves
 # against however the caller spelled the source path, so a relative `. scripts/amd_paths.sh` lost
 # the repo root and the check failed closed on a lock it simply could not find.
 _AMD_PATHS_DIR="${_AMD_PATHS_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)}"

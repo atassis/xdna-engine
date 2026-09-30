@@ -39,8 +39,13 @@ V layout too and the gate stops isolating the self cache.
 import argparse
 import gc
 import json
+import os
 import sys
 from pathlib import Path
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))), "scripts", "lib"))
+from data_root import XDNA_ARTIFACTS  # noqa: E402
 
 import ml_dtypes
 import numpy as np
@@ -193,8 +198,7 @@ def main():
     ap.add_argument("--tr", required=True, help="build dir of the --coalesce-self-tr arm")
     ap.add_argument("--base", required=True, help="build dir of the baseline arm")
     ap.add_argument("--steps", type=int, default=64, help="tokens to advance (0 = the full width)")
-    ap.add_argument("--weights", default="/mnt/data/xdna/artifacts/whisper-small/"
-                                         "whisper_decoder",
+    ap.add_argument("--weights", default=str(XDNA_ARTIFACTS / "whisper-small" / "whisper_decoder"),
                     help="decoder weights, for the token-argmax report; skipped when absent")
     # The cache is seeded with num_preceding columns, so the first token lands at an ODD column
     # whenever num_preceding is odd. That is a resume, not a cold start, and it is the case a

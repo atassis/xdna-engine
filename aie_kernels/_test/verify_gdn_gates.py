@@ -16,12 +16,14 @@ import numpy as np
 
 BRICK_DIR = Path(__file__).parent.parent / "gdn-gates"
 BRICK_CC = str(BRICK_DIR / "gdn_gates.cc")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts" / "lib"))
+from data_root import XDNA_ARTIFACTS  # noqa: E402
 N = 32
 # Every element within 2^-12 of the f64 golden: 8x under the bf16 resolution of the activations
 # around the gates. aie2p emulates f32 vector multiplies through bf16 (kb/aie2p-f32-elementwise-is-
 # emulated-via-bf16), and the exp/log1p chain measures 8.5e-5 on device, not the polynomials' 2e-7.
 GATE = 2.0 ** -12
-CKPT = "/mnt/data/xdna/artifacts/qwen3.5-4b/hf"
+CKPT = str(XDNA_ARTIFACTS / "qwen3.5-4b" / "hf")
 STACK = 3392  # aiecc's measurement of this core's frame; it refuses to build below it
 
 

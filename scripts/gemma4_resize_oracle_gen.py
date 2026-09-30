@@ -12,7 +12,7 @@ actually shrink, so `tvF.resize(..., antialias=True)`'s output is a genuine pari
 MUST run under the gemma4-oracle venv (transformers 5.17.0 + torch + torchvision).
 
   python scripts/gemma4_resize_oracle_gen.py \\
-      --checkpoint-dir /mnt/data/xdna/artifacts/gemma4-12b-qat/checkpoint \\
+      --checkpoint-dir $XDNA_ARTIFACTS/gemma4-12b-qat/checkpoint \\
       --image-size 1200x1600 --out <dir>
 """
 import argparse

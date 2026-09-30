@@ -6,7 +6,7 @@
 #
 # Idempotent. Run it once per new worktree, and again after adding a store entry.
 #
-# Anchors, overridable in the env, mirroring cache_env.sh:
+# Anchors, overridable in the env (defaults derive from XDNA_DATA, see lib/data_root.sh):
 #   XDNA_ARTIFACT_STORE  weights/goldens/refs shared by every worktree
 #   XDNA_MODEL_STORE     the models/ tree
 #   XDNA_BUILD_ROOT      parent of the per-worktree Cargo target dirs
@@ -16,10 +16,11 @@
 # evict each other's fingerprints for the workspace-local crates. Reuse ACROSS worktrees
 # is sccache's job (rustc-wrapper in ~/.cargo/config.toml), which needs neither.
 set -euo pipefail
+. "$(dirname "${BASH_SOURCE[0]}")/lib/data_root.sh"   # -> XDNA_ARTIFACT_STORE, XDNA_MODEL_STORE, XDNA_BUILD_ROOT
 
-store="${XDNA_ARTIFACT_STORE:-/mnt/data/xdna/artifacts}"
-models="${XDNA_MODEL_STORE:-/mnt/data/xdna/models}"
-build_root="${XDNA_BUILD_ROOT:-/mnt/data/xdna/build}"
+store="$XDNA_ARTIFACT_STORE"
+models="$XDNA_MODEL_STORE"
+build_root="$XDNA_BUILD_ROOT"
 
 root="$(git rev-parse --show-toplevel)"
 name="$(basename "$root")"

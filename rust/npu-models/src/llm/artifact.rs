@@ -3379,7 +3379,10 @@ mod tests {
         let elf = dir.path().join("decode.elf");
         // A real ELF from a served artifact when this dev box has one, else a synthetic stand-in
         // (repeated content so zstd actually shrinks it, like a real control-code stream does).
-        let original = fs::read("/mnt/data/xdna/artifacts/gemma3-270m/decode_p8c684/decode.elf")
+        let artifacts_dir = std::env::var("XDNA_ARTIFACTS").map(std::path::PathBuf::from).unwrap_or_else(|_| {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/artifacts")
+        });
+        let original = fs::read(artifacts_dir.join("gemma3-270m/decode_p8c684/decode.elf"))
             .unwrap_or_else(|_| b"\x7fELF-fixture-".repeat(4096));
         let mut zst = std::io::Cursor::new(Vec::new());
         {

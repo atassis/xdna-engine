@@ -5,7 +5,7 @@
 # GEMV/transpose/etc. (mirror layer_norm/op.py) and looping this over every decode op.
 #
 # Run (production stack):
-#   PYTHONPATH=designs/decode_fused:$WS/amd/IRON \
+#   PYTHONPATH=designs/decode_fused:$IRON_DIR \
 #   .venv-iron/bin/python scripts/decode_trace_probe.py
 # Needs the NPU free (stop npu-asr first).
 import glob

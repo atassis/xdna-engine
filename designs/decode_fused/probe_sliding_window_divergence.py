@@ -38,7 +38,7 @@ predates Gemma-4 support upstream:
         --index-url https://download.pytorch.org/whl/cpu && \\
         /path/.venv-hfref/bin/pip install "transformers>=4.58" accelerate
 
-    HF_HOME=/mnt/data/cache/huggingface HF_HUB_OFFLINE=1 scripts/jobq.sh --mem 8G --class build -- \\
+    HF_HUB_OFFLINE=1 scripts/jobq.sh --mem 8G --class build -- \\
         /path/.venv-hfref/bin/python designs/decode_fused/probe_sliding_window_divergence.py
 """
 import argparse

@@ -17,7 +17,8 @@ set -a; . "$REPO/toolchain.lock"; set +a
 MLIR_AIE="$REPO/mlir-aie"
 . "$REPO/scripts/amd_paths.sh"       # -> IRON_DIR (relocatable; env-overridable)
 IRON="${IRON:-$IRON_DIR}"
-MLIR_AIR="${MLIR_AIR:-$XDNA_WS/mlir-air}"   # was a dead ~/mlir-air path; XDNA_WS from amd_paths.sh above
+# No assumed sibling-checkout layout; report_fork prints "MISSING checkout" if unset/absent.
+MLIR_AIR="${MLIR_AIR:-}"
 FETCH="${REFRESH_FETCH:-1}"
 
 hr(){ printf '%s\n' "------------------------------------------------------------------------"; }
@@ -58,7 +59,8 @@ echo "Lock pins:  MLIR_AIE_FORK_COMMIT=${MLIR_AIE_FORK_COMMIT:0:12}  PEANO_DIST=
 
 report_fork "$MLIR_AIE" xdna2-asr upstream/main "mlir-aie (Xilinx)"
 report_fork "$IRON"     integration-stack origin/devel  "amd/IRON"   # xdna2-asr is its stale predecessor
-report_fork "$MLIR_AIR" main      origin/main    "mlir-air (Xilinx, PRs live on branches)"
+[ -n "$MLIR_AIR" ] && report_fork "$MLIR_AIR" main origin/main "mlir-air (Xilinx, PRs live on branches)" \
+  || { hr; echo "### mlir-air (Xilinx, PRs live on branches)"; echo "  MLIR_AIR not set, skipping"; }
 
 hr
 echo "### Peano / llvm-aie wheel pin"

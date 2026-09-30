@@ -34,7 +34,8 @@ if ! command -v aiebu-asm >/dev/null 2>&1; then
   done
   unset _d
 fi
-# HuggingFace: make the shared big-partition cache explicit (default ~/.cache/huggingface is symlinked
-# to /mnt/data). Respects an existing override; guarantees every HF flow reuses the one cache, no dup.
+# HuggingFace: make the shared cache explicit even when unset (some boxes symlink
+# ~/.cache/huggingface to bigger storage). Respects an existing override; guarantees every
+# HF flow reuses the one cache, no dup.
 export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
 export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"

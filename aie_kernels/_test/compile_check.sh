@@ -21,14 +21,11 @@ REPO="$(cd "$HERE/../.." && pwd)"
 INST="$("$REPO/scripts/toolchain_up.sh")"
 [ -n "$INST" ] || { echo "compile_check: empty instance dir from toolchain_up.sh" >&2; exit 1; }
 
-# Peano lives in a venv, same borrowing rule as run.sh (not every worktree has one).
+# Peano lives in this worktree's venv (a worktree's own venv is phase 3; not invented here).
 PE="${PEANO_INSTALL_DIR:-}"
 if [ -z "$PE" ]; then
-  WS="$(cd "$REPO/.." && pwd)"
-  for c in "$REPO/.venv-iron" "$WS"/*/.venv-iron; do
-    for p in "$c"/lib/python*/site-packages/llvm-aie; do
-      [ -x "$p/bin/clang++" ] && { PE="$p"; break 2; }
-    done
+  for p in "$REPO/.venv-iron"/lib/python*/site-packages/llvm-aie; do
+    [ -x "$p/bin/clang++" ] && { PE="$p"; break; }
   done
 fi
 [ -x "$PE/bin/clang++" ] || { echo "compile_check: no Peano clang++; set PEANO_INSTALL_DIR" >&2; exit 1; }

@@ -15,7 +15,7 @@
 # worktree of origin/integration-stack instead of editing the shared checkout.
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WS="$(cd "$REPO/.." && pwd)"
+. "$REPO/scripts/lib/data_root.sh"    # -> XDNA_CACHE
 SPEC="${1:?usage: build_llm_decode.sh <spec> [LAYERS] [OUT]}"
 LAYERS="${2:-}"
 OUT="${3:-$REPO/artifacts/$SPEC/decode${LAYERS:+_l$LAYERS}}"
@@ -23,7 +23,6 @@ OUT="$(realpath -m "$OUT")"
 . "$REPO/scripts/require_disk_backed.sh"
 require_disk_backed "$OUT" "OUT (the built artifact)" || exit 1
 VENV_IRON="${VENV_IRON:-$REPO/.venv-iron}"
-[ -x "$VENV_IRON/bin/python" ] || VENV_IRON="$WS/xdna-engine/.venv-iron"
 . "$REPO/scripts/amd_paths.sh"        # -> IRON_DIR, AIEBU_ASM_DIR (relocatable; env-overridable)
 IRON="${IRON:-$IRON_DIR}"
 WEIGHTS="${WEIGHTS:-$REPO/artifacts/$SPEC/weights}"
@@ -87,7 +86,7 @@ export AIE_DEVICE="${AIE_DEVICE:-npu2}"   # build off the device lock; see gen_l
 if [ -n "${KEEP_WORK:-}" ]; then
     WORK="$KEEP_WORK"; mkdir -p "$WORK"; echo "[build] keeping intermediates in $WORK"
 else
-    WORK="${BUILD_CACHE:-${XDNA_CACHE:-/mnt/data/xdna/cache}/llm-build/$SPEC}"
+    WORK="${BUILD_CACHE:-$XDNA_CACHE/llm-build/$SPEC}"
     mkdir -p "$WORK"
 fi
 # Serialise builds sharing one dir. The cache is shared BY DESIGN (kernel objects do not depend on

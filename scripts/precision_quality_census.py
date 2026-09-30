@@ -23,7 +23,7 @@ because group quantization is per-row, so a row chunk sees exactly what the kern
 
   IRON=<wt-iron-integ> scripts/jobq.sh --mem 6G --class build -- \\
       .venv-iron/bin/python scripts/precision_quality_census.py \\
-      --weights /mnt/data/xdna/artifacts/gemma4-12b/weights --spec gemma4-12b --layers 0-5
+      --weights $XDNA_ARTIFACTS/gemma4-12b/weights --spec gemma4-12b --layers 0-5
 """
 import argparse
 import json

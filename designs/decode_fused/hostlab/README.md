@@ -62,7 +62,7 @@ Two things the perplexity number specifically deserves:
     bias_probe.py     splits a format's matvec error into its coherent and incoherent parts
     make_corpora.py   builds the four-genre corpus set
 
-Corpora and run outputs live under `$QLAB_WORK` (default `/mnt/data/qlab`), not in the repo: a
+Corpora and run outputs live under `$QLAB_WORK` (default `$XDNA_DATA/qlab`), not in the repo: a
 6000-position full-vocab logprob memmap is 3.6 GB.
 
 ## Environment

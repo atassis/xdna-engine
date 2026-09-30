@@ -42,7 +42,7 @@
 #                                               # (validates the kill-if: warm one-file edit <5 min)
 #
 # Overrides (env):
-#   LLVM_AIE_SRC   llvm-aie checkout (default: <workspace>/llvm-aie)
+#   LLVM_AIE_SRC   llvm-aie checkout (required: no assumed sibling-checkout layout)
 #   BUILD_DIR      build tree        (default: $LLVM_AIE_SRC/build-fast)
 #   FB_LINK_JOBS   parallel link jobs (default 6; lower on tight RAM to avoid OOM)
 #   FB_LLVM_PROJECTS  project list   (default "clang;lld")
@@ -53,7 +53,10 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=/dev/null
 . "$REPO/scripts/fast_build_env.sh"
 
-LLVM_AIE_SRC="${LLVM_AIE_SRC:-$XDNA_WS/llvm-aie}"
+if [ -z "${LLVM_AIE_SRC:-}" ]; then
+  echo "ERROR: LLVM_AIE_SRC is not set. Point it at your llvm-aie checkout." >&2
+  exit 1
+fi
 BUILD_DIR="${BUILD_DIR:-$LLVM_AIE_SRC/build-fast}"
 # Default target set: the tools a Peano dist actually invokes. With dylib they all share
 # libLLVM.so, so this is cheap on the incremental path.

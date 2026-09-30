@@ -21,7 +21,9 @@ from dump_fish_ar_weights import (  # noqa: E402
 )
 
 S2_GGUF = os.environ.get("S2_GGUF_PATH", os.path.join(_HERE, "..", "s2.cpp", "models", "s2-pro-q6_k.gguf"))
-_S1 = glob.glob("/mnt/data/cache/huggingface/hub/models--fishaudio--openaudio-s1-mini/snapshots/*/model.pth")
+_HF_HOME = os.environ.get("HF_HOME", os.path.join(os.path.expanduser("~"), ".cache", "huggingface"))
+_S1 = glob.glob(os.path.join(_HF_HOME, "hub",
+                              "models--fishaudio--openaudio-s1-mini", "snapshots", "*", "model.pth"))
 S1_PTH = os.environ.get("S1_MINI_PTH", _S1[0] if _S1 else "")
 
 needs_s2 = pytest.mark.skipif(not os.path.exists(S2_GGUF), reason=f"no S2-Pro GGUF at {S2_GGUF}")

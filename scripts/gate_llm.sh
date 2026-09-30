@@ -38,19 +38,13 @@
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WS="$(cd "$REPO/.." && pwd)"
+. "$REPO/scripts/lib/data_root.sh"   # -> XDNA_SCRATCH
 VENV_IRON="${VENV_IRON:-$REPO/.venv-iron}"
-[ -x "$VENV_IRON/bin/python" ] || VENV_IRON="$WS/xdna-engine/.venv-iron"
 PY="$VENV_IRON/bin/python"
 [ -x "$PY" ] || { echo "ERROR: no iron venv python at $PY"; exit 2; }
 
-SCRATCH="${GATE_DUMP_ROOT:-/mnt/data/xdna/scratch/prefill/gate}"
+SCRATCH="${GATE_DUMP_ROOT:-$XDNA_SCRATCH/prefill/gate}"
 SPEC="${GATE_SPEC:-qwen3-0.6b}"   # defined here: WEIGHTS/DECODE_ART below derive from it
-# Derived from $REPO and $SPEC, not hardcoded: the previous default was
-# "$WS/artifacts-qwen3-0.6b/weights" -- a hyphen where a path separator belongs, anchored at the
-# workspace rather than the repo, and pinning one spec while $SPEC exists. It resolves to a
-# directory that has never existed, so --tier2 died in numpy and printed "-> FAIL", which reads
-# as a parity failure rather than a setup error.
 WEIGHTS="${WEIGHTS:-$REPO/artifacts/$SPEC/weights}"
 REF="${GATE_REF:-$REPO/tests/refs/qwen3-0.6b/gate_ref_n32.json}"
 NPU_JSON="${GATE_NPU:-$SCRATCH/npu_tokens.json}"
@@ -60,7 +54,7 @@ DECODE_ART="${DECODE_ART:-$REPO/artifacts/$SPEC/decode}"
 # Default Tier 1 subjects: the two BLOCK artifacts. Deliberately not the 28-layer stack -- bf16
 # rounding compounds down a deep stack, so its `xout` is Tier 2's question, not Tier 1's. Its
 # layer-0 KV slabs ARE Tier 1 subjects; add the artifact to GATE_ARTIFACTS and pass --tensors.
-DEFAULT_ARTIFACTS="/mnt/data/xdna/scratch/prefill/mlp_m256 /mnt/data/xdna/scratch/prefill/attn_m256_s2048"
+DEFAULT_ARTIFACTS="$XDNA_SCRATCH/prefill/mlp_m256 $XDNA_SCRATCH/prefill/attn_m256_s2048"
 read -r -a ARTIFACTS <<<"${GATE_ARTIFACTS:-$DEFAULT_ARTIFACTS}"
 
 MODE=""; JUDGE_ONLY=0; EXTRA=()
@@ -152,7 +146,7 @@ tier2() {
 # without the per-token control a failure cannot be attributed to batching rather than to the rail.
 tier2_prefill() {
   local refdir="${GATE_PREFILL_REFS:-$REPO/tests/refs/$SPEC/prefill}"
-  local pre="${PREFILL_ART:-/mnt/data/xdna/scratch/prefill/full_l28_m256_s2048}"
+  local pre="${PREFILL_ART:-$XDNA_SCRATCH/prefill/full_l28_m256_s2048}"
   # The decode half is a property of the PREFILL artifact, not a default: the two ELFs share one
   # arena, so a prefill built against a different decode build has different scratch offsets and
   # cannot be bound at all. The artifact records the pairing it was built against; read it. (This
@@ -171,7 +165,7 @@ EOP
     [ "$paired" = "$DECODE_ART" ] || echo "[tier2p] pairing: using the decode artifact this prefill was built against: $paired"
     DECODE_ART="$paired"
   fi
-  local out="${GATE_DUMP_ROOT:-/mnt/data/xdna/scratch/prefill/gate}/tier2p"
+  local out="${GATE_DUMP_ROOT:-$XDNA_SCRATCH/prefill/gate}/tier2p"
   # Ask cargo where it puts binaries. rust/.cargo/config.toml redirects target-dir off /home, so
   # a hardcoded $REPO/rust/target silently misses -- and the DEVICE STEP then does nothing while
   # the judge below replays whatever dumps already existed, reporting stale PASSes.

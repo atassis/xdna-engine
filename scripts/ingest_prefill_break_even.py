@@ -15,7 +15,7 @@ checks that and refuses to write a number it does not trust), so `fixed_ms / per
 crossover, no curve-fit needed.
 
     bash scripts/time_prefill.sh 3 3 4,8,12,16,20,24,28,32,48,64   # writes into $OUT
-    python3 scripts/ingest_prefill_break_even.py --timing-dir /mnt/data/xdna/scratch/prefill/timing \\
+    python3 scripts/ingest_prefill_break_even.py --timing-dir $XDNA_SCRATCH/prefill/timing \\
         --prefill-art artifacts/qwen3-0.6b/prefill4096
 
 Reads every `r*_arm0.log` (pertok) / `r*_arm1.log` (batched) in --timing-dir -- time_prefill.sh's

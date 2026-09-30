@@ -13,9 +13,8 @@
 # Usage: bash scripts/build_pyxrt_py314.sh   (idempotent; overwrites the venv .so)
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WS="$(cd "$REPO/.." && pwd)"
 VENV_IRON="${VENV_IRON:-$REPO/.venv-iron}"
-XRT_SRC="${XRT_SRC:-$WS/XRT-src}"
+: "${XRT_SRC:?set XRT_SRC to your XRT source checkout}"
 SRC="$XRT_SRC/src/python/pybind11/src/pyxrt.cpp"
 SITE="$VENV_IRON/lib/python3.14/site-packages"
 OUT="$SITE/pyxrt.cpython-314-x86_64-linux-gnu.so"

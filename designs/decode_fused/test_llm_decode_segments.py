@@ -19,15 +19,20 @@ Run inside the IRON env:
 """
 import dataclasses
 import os
+import sys
 
 import numpy as np
 import pytest
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))), "scripts", "lib"))
+from data_root import XDNA_ARTIFACTS  # noqa: E402
+
 gen = pytest.importorskip("gen_llm_decode")
 
 SPEC = "gemma3-270m"
-WEIGHTS = "/mnt/data/xdna/artifacts/gemma3-270m/weights"
-WEIGHTS_G4 = "/mnt/data/xdna/artifacts/gemma4-12b/weights_int4g32qat_hf"
+WEIGHTS = str(XDNA_ARTIFACTS / "gemma3-270m" / "weights")
+WEIGHTS_G4 = str(XDNA_ARTIFACTS / "gemma4-12b" / "weights_int4g32qat_hf")
 LAYERS = 6
 
 pytestmark = pytest.mark.skipif(

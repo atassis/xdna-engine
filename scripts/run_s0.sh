@@ -3,15 +3,16 @@
 # S0: cold-build every recipe in a TSV once, serially, with per-stage aiecc profiles.
 # usage: run_s0.sh <recipes.tsv> [s0-dir]    (instance from MLIR_AIE_INSTANCE)
 #
-# REPO defaults to the MAIN xdna-engine checkout, not this worktree: recipes read gitignored
-# inputs (weights, .venv-iron, artifacts/) that a worktree does not carry. Override REPO to build
-# from a different checkout of the same commit.
+# REPO defaults to this checkout. Recipes read gitignored inputs (weights, .venv-iron,
+# artifacts/) that a worktree may not carry -- override REPO to build from a checkout
+# that has them.
 set -uo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
-WS="$(cd "$here/../.." && pwd)"
-REPO="${REPO:-$WS/xdna-engine}"
+REPO="${REPO:-$(cd "$here/.." && pwd)}"
+. "$here/lib/data_root.sh"   # -> XDNA_SCRATCH, XDNA_DATA
 recipes="${1:?usage: run_s0.sh <recipes.tsv> [s0-dir]}"
-S0="${2:-/mnt/data/xdna/scratch/s0/$(date +%Y%m%d-%H%M)}"
+S0="${2:-$XDNA_SCRATCH/s0/$(date +%Y%m%d-%H%M)}"
+xdna_mkdir "$XDNA_DATA"
 . "$here/amd_paths.sh"
 aiecc_resolve "${MLIR_AIE_INSTANCE:?set MLIR_AIE_INSTANCE to the pinned instance}" || exit 1
 : "${PEANO_INSTALL_DIR:?set PEANO_INSTALL_DIR explicitly; aiecc falls back to \$PATH otherwise}"
@@ -21,9 +22,9 @@ while IFS=$'\t' read -r name cmd; do
   { [ -z "$name" ] || [ "${name:0:1}" = "#" ]; } && continue
   d="$S0/$name"
   if [ "$cmd" = "NORECIPE" ]; then echo "[s0] $name: NORECIPE, skipped"; mkdir -p "$d"; touch "$d/NORECIPE"; continue; fi
-  avail_kb=$(df -kP /mnt/data | awk 'NR==2 {print $4}')
+  avail_kb=$(df -kP "$XDNA_DATA" | awk 'NR==2 {print $4}')
   if [ "${avail_kb:-0}" -lt $((8 * 1024 * 1024)) ]; then
-    echo "[s0] $name: skipped, /mnt/data under 8 GB free (${avail_kb} KB)"; continue
+    echo "[s0] $name: skipped, $XDNA_DATA under 8 GB free (${avail_kb} KB)"; continue
   fi
   mkdir -p "$d/work" "$d/out" "$d/npu-cache"
   echo "[s0] $name"
@@ -39,7 +40,7 @@ while IFS=$'\t' read -r name cmd; do
   echo "rc=$?" >> "$d/time.txt"
   # Keep each design's aiecc input (relative path, so multiple designs per build stay
   # distinct); everything else under work/out/npu-cache/blobs is multi-GB build scratch
-  # that filled /mnt/data once (2026-09-30) and is not needed after the mlir copy.
+  # that has filled $XDNA_DATA before and is not needed after the mlir copy.
   mkdir -p "$d/mlir"
   (cd "$d/work" 2>/dev/null && find . -path '*/aie.mlir' -exec bash -c \
     'mkdir -p "$1/mlir/$(dirname "$0")" && cp "$0" "$1/mlir/$0"' {} "$d" \; )

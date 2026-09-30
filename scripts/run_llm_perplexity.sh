@@ -19,13 +19,11 @@
 # invites another tenant in between two things you are comparing.
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WS="$(cd "$REPO/.." && pwd)"
 SPEC="${1:?usage: run_llm_perplexity.sh <spec> <corpus> <out-prefix> [MAX_TOKENS]}"
 CORPUS="${2:?corpus}"
 OUTP="${3:?out-prefix}"
 MAXTOK="${4:-2000}"
 VENV_IRON="${VENV_IRON:-$REPO/.venv-iron}"
-[ -x "$VENV_IRON/bin/python" ] || VENV_IRON="$WS/xdna-engine/.venv-iron"
 . "$REPO/scripts/amd_paths.sh"
 IRON="${IRON:-$IRON_DIR}"
 WEIGHTS="${WEIGHTS:-$REPO/artifacts/$SPEC/weights}"

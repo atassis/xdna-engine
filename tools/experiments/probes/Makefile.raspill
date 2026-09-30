@@ -6,7 +6,7 @@
 # in-place from tools/experiments/probes/.
 #
 # Prereq: source the fork toolchain env first (PEANO_INSTALL_DIR + aiecc on PATH):
-#   source ../../../xdna-engine/scripts/iron_env.sh
+#   source ../../../scripts/iron_env.sh
 # Build (both variants):
 #   make -f Makefile.raspill NPU2=1 HOLD=1 all   # REPRO   (xv held across call)
 #   make -f Makefile.raspill NPU2=1 HOLD=0 all   # CONTROL (nothing held)

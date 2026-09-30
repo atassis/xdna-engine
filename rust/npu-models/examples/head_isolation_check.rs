@@ -5,7 +5,7 @@
 //! of re-running a full generation to guess at the fault.
 //!
 //! Requires RF_BRIDGE_PY/RF_BRIDGE_PYTHON/RF_BRIDGE_PYTHONPATH (see resident_raw.rs's module doc)
-//! and RF_BUILD_DIR (default /mnt/data/xdna/scratch/rf/build/rls1).
+//! and RF_BUILD_DIR (default: this checkout's own <repo>/data/scratch/rf/build/rls1).
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -60,7 +60,9 @@ impl Drop for Bridge {
 }
 
 fn build_dir() -> String {
-    std::env::var("RF_BUILD_DIR").unwrap_or_else(|_| "/mnt/data/xdna/scratch/rf/build/rls1".to_string())
+    std::env::var("RF_BUILD_DIR").unwrap_or_else(|_| {
+        format!("{}/../../data/scratch/rf/build/rls1", env!("CARGO_MANIFEST_DIR"))
+    })
 }
 
 fn main() {

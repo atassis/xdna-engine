@@ -7,7 +7,7 @@
 //!   curl -s 127.0.0.1:11434/v1/models  # every model state must be "unloaded"
 //!
 //!   ELF_ZST_DEVICE=1 cargo test -p npu-models --test elf_zst_device -- --nocapture --test-threads=1
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use npu_models::llm::generator::DecodeStep;
@@ -20,7 +20,12 @@ fn zst_only_decode_dir_matches_plain_elf_dir() {
         eprintln!("skip: set ELF_ZST_DEVICE=1 (opens the NPU; single-tenant)");
         return;
     }
-    let served = Path::new("/mnt/data/xdna/artifacts/gemma3-270m/decode_p8c684");
+    // XDNA_ARTIFACTS overrides; default is this checkout's own <repo>/data/artifacts.
+    let artifacts_dir = std::env::var("XDNA_ARTIFACTS").map(PathBuf::from).unwrap_or_else(|_| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/artifacts")
+    });
+    let served = artifacts_dir.join("gemma3-270m/decode_p8c684");
+    let served = served.as_path();
     let zst_only = Path::new(env!("CARGO_TARGET_TMPDIR")).join("gemma3-270m-zst-only");
 
     // Build the zst-only copy fresh every run: everything but decode.elf (which becomes

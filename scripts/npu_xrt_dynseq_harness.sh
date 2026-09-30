@@ -51,12 +51,13 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WORKSPACE="$(cd "$SCRIPT_DIR/../.." && pwd)"
+REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
+. "$REPO/scripts/lib/data_root.sh"   # -> XDNA_CACHE
 
-MLIR_AIE_SRC="${MLIR_AIE_SRC:-$WORKSPACE/wt-dynseq}"
-INSTANCE="${INSTANCE:-$WORKSPACE/.cache/instances/303c90318dd6}"
-PEANO="${PEANO:-$WORKSPACE/xdna-engine/.venv-iron/lib/python3.14/site-packages/llvm-aie}"
-VENV_PY="${VENV_PY:-$WORKSPACE/xdna-engine/.venv-iron/bin/python}"
+: "${MLIR_AIE_SRC:?set MLIR_AIE_SRC to the mlir-aie checkout carrying the dyn-seq passes}"
+INSTANCE="${INSTANCE:-$XDNA_CACHE/instances/303c90318dd6}"
+PEANO="${PEANO:-$REPO/.venv-iron/lib/python3.14/site-packages/llvm-aie}"
+VENV_PY="${VENV_PY:-$REPO/.venv-iron/bin/python}"
 CXX="${CXX:-clang++}"
 WORK="${WORK:-/tmp/dynseq-harness}"
 

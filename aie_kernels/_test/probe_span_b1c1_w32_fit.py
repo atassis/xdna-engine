@@ -43,7 +43,9 @@ from trace_span_net import summarize  # noqa: E402
 WIDTH, HEIGHTS, TRIALS, CLOCK = 32, [64, 128, 192, 256], 5, 1.8e9
 EVENTS = [CoreEvent.INSTR_EVENT_0, CoreEvent.INSTR_EVENT_1, CoreEvent.LOCK_STALL,
          CoreEvent.MEMORY_STALL, CoreEvent.STREAM_STALL]
-OUT_DIR = Path("/mnt/data/xdna/traces/span")
+sys.path.insert(0, str(HERE.parents[1] / "scripts" / "lib"))
+from data_root import XDNA_DATA  # noqa: E402
+OUT_DIR = XDNA_DATA / "traces" / "span"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 NEW_KW = {"depths": {"b1c1": 4}, "data_sizes": {"b1c1": 4160},

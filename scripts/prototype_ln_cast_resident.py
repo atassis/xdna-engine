@@ -11,8 +11,8 @@ Chain:  x[f32] --(ctxln xclbin)--> bo_ln[f32, device-resident] --(cast xclbin)--
 Gate: device bf16 output within 1 bf16 ULP of host LN_2pass(x) (the LN reference),
 proving the intermediate survived device-side and both hw-contexts co-resident.
 
-Run (NPU free, from MAIN worktree):
-  .venv-iron/bin/python ../xdna-engine-ln/scripts/prototype_ln_cast_resident.py --rows 512 --cols 1024
+Run (NPU free):
+  .venv-iron/bin/python scripts/prototype_ln_cast_resident.py --rows 512 --cols 1024
 """
 import argparse, os, sys
 import numpy as np

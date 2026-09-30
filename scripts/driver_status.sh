@@ -19,8 +19,8 @@
 #   scripts/driver_status.sh --verbose  # also list the commits in each bucket
 set -uo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-WS="$(cd "$REPO/.." && pwd)"
-DRV="${XDNA_DRIVER_SRC:-$WS/xdna-driver}"
+. "$REPO/scripts/lib/data_root.sh"   # -> XDNA_CACHE
+DRV="${XDNA_DRIVER_SRC:-}"
 VERBOSE=0; [ "${1:-}" = "--verbose" ] && VERBOSE=1
 
 log() { echo "[driver_status] $*"; }
@@ -31,12 +31,12 @@ log() { echo "[driver_status] $*"; }
 # future kernel update and pacman can uninstall it cleanly.
 emit_command() {
   local drv="$DRV" jobs; jobs=$(( $(nproc) / 2 )); [ "$jobs" -lt 1 ] && jobs=1
-  local pyb_venv="$WS/.cache/pybind11-venv"
+  local pyb_venv="$XDNA_CACHE/pybind11-venv"
   local pyb_cmake="$pyb_venv/lib/python3.14/site-packages/pybind11/share/cmake/pybind11"
   cat <<EOF
 
   --- prerequisites (once per checkout) ---
-  git -C $drv submodule update --init --recursive --reference $WS/XRT-src xrt
+  git -C $drv submodule update --init --recursive --reference ${XRT_SRC_DIR:-<path-to-XRT-src-checkout>} xrt
   python3 -m venv $pyb_venv && $pyb_venv/bin/pip install -q pybind11==2.13.6
   # xrt/src/python does find_package(pybind11 2.6.0 REQUIRED) and nothing on this box provides it.
 

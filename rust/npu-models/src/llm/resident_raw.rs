@@ -777,14 +777,24 @@ mod tests {
         assert_eq!(&words[32..48], &words[0..16]);
     }
 
-    fn store_dir() -> PathBuf {
-        let dir = std::env::var("RESIDENT_STORE_DIR").unwrap_or_else(|_| "/mnt/data/xdna/artifacts/gemma4-12b/store".to_string());
-        PathBuf::from(dir)
+    fn store_dir() -> Option<PathBuf> {
+        let dir = std::env::var_os("RESIDENT_STORE_DIR").map(PathBuf::from).unwrap_or_else(|| {
+            std::env::var_os("XDNA_DATA").map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data"))
+                .join("artifacts/gemma4-12b/store")
+        });
+        if dir.join("manifest.json").is_file() {
+            Some(dir)
+        } else {
+            eprintln!("skip: no gemma4-12b store at {} (set RESIDENT_STORE_DIR or XDNA_DATA)", dir.display());
+            None
+        }
     }
 
     #[test]
     fn embed_row_bf16_is_finite_and_the_right_width_against_the_real_store() {
-        let mut embed = EmbedHeadPack::open(&store_dir()).expect("open the real embedding store");
+        let Some(dir) = store_dir() else { return };
+        let mut embed = EmbedHeadPack::open(&dir).expect("open the real embedding store");
         assert_eq!(embed.hidden(), 3840);
         for &token in &[0u32, 1, 23391, 262143] {
             let bits = embed.embed_row_bf16(token).expect("dequant a real row");
@@ -797,7 +807,8 @@ mod tests {
 
     #[test]
     fn final_norm_is_the_right_width_against_the_real_store() {
-        let w = load_final_norm(&store_dir()).expect("load the real final_norm");
+        let Some(dir) = store_dir() else { return };
+        let w = load_final_norm(&dir).expect("load the real final_norm");
         assert_eq!(w.len(), 3840);
         assert!(w.iter().all(|v| v.is_finite()));
     }
@@ -835,7 +846,8 @@ mod tests {
             let raw = resp["x"].as_str().expect("x field");
             crate::llm::resident_raw::tests_b64::decode(raw)
         };
-        let mut embed = EmbedHeadPack::open(&store_dir()).expect("open the real embedding store");
+        let Some(dir) = store_dir() else { return };
+        let mut embed = EmbedHeadPack::open(&dir).expect("open the real embedding store");
         let got = embed.embed_row_bf16(23391).expect("dequant row 23391");
         assert_eq!(got, want_bits, "Rust embed_row_bf16 disagrees with the bridge oracle");
     }

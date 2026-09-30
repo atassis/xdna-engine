@@ -36,6 +36,9 @@ import sys
 
 import numpy as np
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
+from data_root import XDNA_QLAB  # noqa: E402
+
 HF_REPO = {"qwen3-0.6b": "Qwen/Qwen3-0.6B"}
 # The formats the fold is worth doing for. It is a no-op at bf16 (the alpha search picks 0), so
 # the caller states the format they intend to quantize to and the scale is optimised for it.
@@ -56,7 +59,7 @@ def main():
                     help="directory holding wq_formats.py/awq.py (the quality lab)")
     a = ap.parse_args()
 
-    sys.path.insert(0, a.lab or os.environ.get("QLAB_DIR", "/mnt/data/xdna/qlab"))
+    sys.path.insert(0, a.lab or os.environ.get("QLAB_DIR", str(XDNA_QLAB)))
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from awq import apply_awq                     # noqa: E402  the measured implementation

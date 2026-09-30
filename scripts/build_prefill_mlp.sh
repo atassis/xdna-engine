@@ -6,16 +6,12 @@
 #   bash scripts/build_prefill_mlp.sh [BATCH] [OUT_DIR]
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WS="$(cd "$REPO/.." && pwd)"
+. "$REPO/scripts/lib/data_root.sh"   # -> XDNA_SCRATCH
 BATCH="${1:-256}"
-OUT="${2:-/mnt/data/xdna/scratch/prefill/mlp_m$BATCH}"
+OUT="${2:-$XDNA_SCRATCH/prefill/mlp_m$BATCH}"
 VENV_IRON="${VENV_IRON:-$REPO/.venv-iron}"
-[ -x "$VENV_IRON/bin/python" ] || VENV_IRON="$WS/xdna-engine/.venv-iron"
 . "$REPO/scripts/amd_paths.sh"
 IRON="${IRON:-$IRON_DIR}"
-# $REPO/artifacts/<spec>, not "$WS/artifacts-<spec>" -- the latter has a hyphen where a path
-# separator belongs and is anchored at the workspace; it resolves to a directory that has
-# never existed, so the build died on a missing weight rather than on a clear message.
 WEIGHTS="${WEIGHTS:-$REPO/artifacts/qwen3-0.6b/weights}"
 GEN="$REPO/designs/decode_fused/gen_llm_prefill_mlp.py"
 
@@ -38,7 +34,7 @@ export AIE_DEVICE="${AIE_DEVICE:-npu2}"   # build off the device lock; see gen_l
 [ -x "$AIECC_PATH" ] || { echo "ERROR: instance aiecc missing at $AIECC_PATH"; exit 1; }
 
 # Build artifacts go to NVMe, never the tmpfs scratchpad.
-WORK="${KEEP_WORK:-/mnt/data/xdna/scratch/prefill/build_m$BATCH}"
+WORK="${KEEP_WORK:-$XDNA_SCRATCH/prefill/build_m$BATCH}"
 mkdir -p "$WORK" "$OUT"
 cd "$WORK"
 exec "$VENV_IRON/bin/python" "$GEN" --spec qwen3-0.6b --weights "$WEIGHTS" --out "$OUT" --batch "$BATCH"

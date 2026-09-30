@@ -2,9 +2,9 @@
 //! `decoder_joint.onnx` via `onnx_init.rs`, no onnxruntime) vs real onnxruntime running the same
 //! graph over a fixed synthetic trajectory, captured by `scripts/gen_cpu_glue_fixtures.py`.
 //!
-//! Requires the real model file at `artifacts/parakeet/decoder_joint.onnx` (symlinked to
-//! `/mnt/data/xdna/artifacts/parakeet/`, gitignored) -- skips with a message if absent instead of
-//! failing, since it is not a repo artifact.
+//! Requires the real model file at `artifacts/parakeet/decoder_joint.onnx` (or $XDNA_ARTIFACTS,
+//! gitignored) -- skips with a message if absent instead of failing, since it is not a repo
+//! artifact.
 //!
 //! Tolerance: 1e-4 relative L2 per step. This is the SAME arithmetic (embedding lookup, 2-layer
 //! LSTM, two linear projections, ReLU, one more linear) in f32 on both sides, so the only

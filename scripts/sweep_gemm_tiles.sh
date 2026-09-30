@@ -14,14 +14,13 @@
 # a spread, not a ranking, and MAX_PER_SHAPE=0 removes it.
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WS="$(cd "$REPO/.." && pwd)"
+. "$REPO/scripts/lib/data_root.sh"   # -> XDNA_SCRATCH
 BATCH="${BATCH:-256}"; SEQ="${SEQ:-2048}"
-OUT="${OUT:-/mnt/data/xdna/scratch/gemm_sweep/$(date +%Y%m%d)_m${BATCH}_s${SEQ}}"
+OUT="${OUT:-$XDNA_SCRATCH/gemm_sweep/$(date +%Y%m%d)_m${BATCH}_s${SEQ}}"
 MAX_PER_SHAPE="${MAX_PER_SHAPE:-16}"
 VENV_IRON="${VENV_IRON:-$REPO/.venv-iron}"
-[ -x "$VENV_IRON/bin/python" ] || VENV_IRON="$WS/xdna-engine/.venv-iron"
 . "$REPO/scripts/amd_paths.sh"
-IRON="${IRON:-$WS/wt-iron-causal}"
+IRON="${IRON:-$IRON_DIR}"
 SWEEP="$REPO/designs/decode_fused/sweep_gemm_tiles.py"
 
 # PLAN=1 is pure arithmetic over the tiling rules -- no IRON, no toolchain, no venv.

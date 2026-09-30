@@ -11,9 +11,9 @@
 # the arms can differ in SOURCE as well as in the flag under test -- which is the confound that cost
 # this project a day (a 06-29 kernel in a 09-03 A/B).
 #
-# The canonical IRON tree is whatever amd_paths.sh resolves IRON_DIR to (default $XDNA_WS/IRON),
-# NOT the PR worktrees. Override with IRON_DIR=... to build an arm against a different tree -- and
-# the stamp will say so, which is the point.
+# The canonical IRON tree is whatever amd_paths.sh resolves IRON_DIR to (REQUIRED, no
+# assumed sibling layout), NOT the PR worktrees. Override with IRON_DIR=... to build an
+# arm against a different tree -- and the stamp will say so, which is the point.
 #
 # Usage:  scripts/build_encoder_mha.sh [--heads 20] [--pipelines 8] [--out DIR]
 set -euo pipefail

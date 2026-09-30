@@ -7,7 +7,7 @@
 #
 # For adopting a tree whose blobs were packed per arm; buffer_blob pools them as it writes,
 # so this is a one-off per tree, not a job that keeps up with builds. Measured 2026-09-22:
-# 84.5 GB across /mnt/data/xdna/artifacts.
+# 84.5 GB across the artifact store.
 
 # SCOPE IS `buffers/` ONLY, and that is load-bearing. A link is safe exactly when every writer
 # replaces the file rather than truncating it -- buffer_blob.write_blob does, and
@@ -16,8 +16,10 @@
 # instead and needs no such invariant.
 
 set -euo pipefail
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$REPO/scripts/lib/data_root.sh"   # -> XDNA_ARTIFACT_STORE
 
-STORE="${XDNA_ARTIFACT_STORE:-/mnt/data/xdna/artifacts}"
+STORE="$XDNA_ARTIFACT_STORE"
 MIN_SIZE="${DEDUP_MIN_SIZE:-1M}"
 
 apply=0

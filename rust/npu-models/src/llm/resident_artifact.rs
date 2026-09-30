@@ -502,15 +502,24 @@ mod tests {
     /// Real store manifest packed on this box. Override with `RESIDENT_STORE_DIR` on a box that
     /// keeps it elsewhere; the repo's own convention for a device-box fixture is a defaulted,
     /// overridable path (`detokenize.rs::qwen3_tokenizer_path`).
-    fn store_dir() -> PathBuf {
-        let dir = std::env::var("RESIDENT_STORE_DIR")
-            .unwrap_or_else(|_| "/mnt/data/xdna/artifacts/gemma4-12b/store".to_string());
-        PathBuf::from(dir)
+    fn store_dir() -> Option<PathBuf> {
+        let dir = std::env::var_os("RESIDENT_STORE_DIR").map(PathBuf::from).unwrap_or_else(|| {
+            std::env::var_os("XDNA_DATA").map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data"))
+                .join("artifacts/gemma4-12b/store")
+        });
+        if dir.join("manifest.json").is_file() {
+            Some(dir)
+        } else {
+            eprintln!("skip: no gemma4-12b store at {} (set RESIDENT_STORE_DIR or XDNA_DATA)", dir.display());
+            None
+        }
     }
 
     #[test]
     fn loads_the_real_gemma4_12b_store_manifest() {
-        let m = StoreManifest::load(&store_dir()).expect("load the real packed manifest");
+        let Some(dir) = store_dir() else { return };
+        let m = StoreManifest::load(&dir).expect("load the real packed manifest");
         assert_eq!(m.model, "gemma4-12b");
         assert_eq!(m.num_layers, 48);
         assert!(!m.is_empty());

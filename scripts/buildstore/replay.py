@@ -90,13 +90,9 @@ def build_plan(manifest_path, scratch):
     # check rec_preload.c's open-based hooks never see, so no manifest records it either way.
     repo = m["env"].get("REPO")
     if repo:
-        # build_llm_decode.sh's own fallback ("$REPO/.venv-iron" -> "$WS/xdna-engine/.venv-iron",
-        # WS = dirname(REPO)) is the same kind of probe: bind whichever one exists, as furniture.
-        for venv_python in (os.path.join(repo, ".venv-iron", "bin", "python"),
-                            os.path.join(os.path.dirname(repo), "xdna-engine", ".venv-iron",
-                                        "bin", "python")):
-            if os.path.exists(venv_python):
-                furniture.append([venv_python, False])
+        venv_python = os.path.join(repo, ".venv-iron", "bin", "python")
+        if os.path.exists(venv_python):
+            furniture.append([venv_python, False])
     # toolchain_up.sh's `[ -e "$MLIR_DISTRO_ABS/bin/mlir-tblgen" ]` probe is unhooked-on-success
     # like the others, AND the instance's own python/aie/dialects/*.py are themselves symlinks
     # INTO this tree (vendored generated MLIR Python sources) -- a furnitured instance dir alone

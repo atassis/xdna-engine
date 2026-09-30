@@ -16,11 +16,11 @@
 # 5-sliding-1-global layer pattern the configure count depends on.
 set -u
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WS="$(cd "$REPO/.." && pwd)"
+. "$REPO/scripts/lib/data_root.sh"   # -> XDNA_ARTIFACTS, XDNA_SCRATCH, XDNA_BUILD
 SPEC=gemma4-12b
-WEIGHTS="${WEIGHTS:-/mnt/data/xdna/artifacts/$SPEC/weights_int8g64}"
-OUT="${CONFIGURE_RATE_OUT:-/mnt/data/xdna/scratch/gemma4/configure-rate}"
-WORK="${CONFIGURE_RATE_WORK:-/mnt/data/xdna/build/gemma4-configure-rate}"
+WEIGHTS="${WEIGHTS:-$XDNA_ARTIFACTS/$SPEC/weights_int8g64}"
+OUT="${CONFIGURE_RATE_OUT:-$XDNA_SCRATCH/gemma4/configure-rate}"
+WORK="${CONFIGURE_RATE_WORK:-$XDNA_BUILD/gemma4-configure-rate}"
 ARMS=(${CONFIGURE_RATE_ARMS:-g0 g4 g2 g1})
 # --warm takes LAYERS as its only positional. Sharing one positional list with the timing form
 # silently built L=6 for `--warm 12`, and a census of the wrong depth looks exactly like a census
@@ -55,7 +55,6 @@ fi
 mkdir -p "$OUT" "$WORK"
 cd "$REPO"
 VENV_IRON="${VENV_IRON:-$REPO/.venv-iron}"
-[ -x "$VENV_IRON/bin/python" ] || VENV_IRON="$WS/xdna-engine/.venv-iron"
 . "$REPO/scripts/amd_paths.sh"
 IRON="${IRON:-$IRON_DIR}"
 INST="$("$REPO/scripts/toolchain_up.sh")" || exit 1

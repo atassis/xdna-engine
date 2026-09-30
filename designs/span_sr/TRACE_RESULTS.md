@@ -11,7 +11,7 @@ Method: `aie_kernels/_test/trace_span_net.py`, built on `net_design.py`'s new `t
 MEMORY_STALL + STREAM_STALL). Clock assumed 1.8 GHz (canonical measured), power mode NOT pinned
 for these runs (device shared under heavy contention -- see caveat below).
 
-Raw summaries: `/mnt/data/xdna/traces/span/trace_span_net_<stage>_summary.json` (mirrored off
+Raw summaries: `$XDNA_DATA/traces/span/trace_span_net_<stage>_summary.json` (mirrored off
 tmpfs; `/tmp` does not survive and is not shared across sessions).
 
 ## Results so far
@@ -722,7 +722,7 @@ No other zero-slack link exists to check.
 
 **Chain-length bisection re-run at the new baseline** (`probe_span_upto_bisect.py`, unchanged
 script, W=32, same alternated-per-height fitted-slope method). Log:
-`/mnt/data/xdna/traces/span/phase1c_bisect.log`.
+`$XDNA_DATA/traces/span/phase1c_bisect.log`.
 
 | upto | cores | fitted cyc/px (W=32) |
 |---|---|---|

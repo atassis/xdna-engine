@@ -8,12 +8,19 @@ and digests of `quant.py` (IRON is ancestry-pinned, so the packer can move witho
 the generator.
 """
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
 import tempfile
 
 CACHE_FORMAT_VERSION = 1
+
+_dr_spec = importlib.util.spec_from_file_location(
+    "data_root", os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, os.pardir,
+                               "scripts", "lib", "data_root.py"))
+_data_root = importlib.util.module_from_spec(_dr_spec)
+_dr_spec.loader.exec_module(_data_root)
 
 
 def sha256_file(path, chunk_size=1 << 20):
@@ -93,7 +100,7 @@ class ContentStore:
 
 
 def default_cache_dir():
-    return os.environ.get("PREFILL_PACK_CACHE_DIR", "/mnt/data/xdna/cache/prefill_pack")
+    return os.environ.get("PREFILL_PACK_CACHE_DIR", str(_data_root.XDNA_CACHE / "prefill_pack"))
 
 
 def cache_enabled():

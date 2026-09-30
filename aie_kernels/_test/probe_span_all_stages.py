@@ -35,7 +35,9 @@ from trace_span_net import summarize  # noqa: E402
 WIDTH, TRACE_H, CLOCK = 32, 128, 1.8e9
 EVENTS = [CoreEvent.INSTR_EVENT_0, CoreEvent.INSTR_EVENT_1, CoreEvent.LOCK_STALL,
          CoreEvent.MEMORY_STALL, CoreEvent.STREAM_STALL]
-OUT_DIR = Path("/mnt/data/xdna/traces/span")
+sys.path.insert(0, str(HERE.parents[1] / "scripts" / "lib"))
+from data_root import XDNA_DATA  # noqa: E402
+OUT_DIR = XDNA_DATA / "traces" / "span"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 ALREADY_TRACED = {"conv_1", "b1c1", "b1c2", "b3c3", "b6c1", "conv_2", "conv_cat", "up"}
