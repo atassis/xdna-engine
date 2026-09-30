@@ -28,12 +28,12 @@ fn sr_engine_through_servable_matches_the_direct_call() {
     let rgb: Vec<u8> = (0..w * h * 3).map(|i| (i % 256) as u8).collect();
 
     // The direct call -- today's real ABI, what npu-sr-capi actually invokes.
-    let mut direct = SrEngine::load("artifacts/espcn/espcn.json", false).unwrap();
+    let mut direct = SrEngine::load("scenarios/schedules/espcn.json", false).unwrap();
     let (direct_rgb, direct_w, direct_h) = direct.upscale_rgb8(&rgb, w, h).unwrap();
 
     // The SAME model, driven only through the trait object -- proves `Box<dyn Servable>` is a real
     // substitute for the direct ABI, not just a type that happens to compile.
-    let mut boxed: Box<dyn Servable> = Box::new(SrEngine::load("artifacts/espcn/espcn.json", false).unwrap());
+    let mut boxed: Box<dyn Servable> = Box::new(SrEngine::load("scenarios/schedules/espcn.json", false).unwrap());
     assert_eq!(boxed.capabilities().0, "image-sr");
     let resp = boxed.run(Request::Image { rgb: rgb.clone(), w, h }).unwrap();
     let (via_rgb, via_w, via_h) = match resp {

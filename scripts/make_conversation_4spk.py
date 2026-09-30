@@ -63,7 +63,7 @@ SPEAKERS = {
 }
 
 def read(stem):
-    p = f"artifacts/wer_clips/{stem}.wav"
+    p = f"tests/data/wer_clips/{stem}.wav"
     with wave.open(p) as w:
         assert (w.getframerate(), w.getnchannels(), w.getsampwidth()) == (SR, 1, 2), p
         return np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32)

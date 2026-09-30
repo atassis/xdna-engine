@@ -103,7 +103,7 @@ mod tests {
             .unwrap()
             .parent()
             .unwrap();
-        let p = root.join("artifacts/espcn/espcn.json");
+        let p = root.join("scenarios/schedules/espcn.json");
         if !p.exists() {
             eprintln!("SKIP: espcn.json missing");
             return;

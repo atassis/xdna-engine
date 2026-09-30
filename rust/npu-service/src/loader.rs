@@ -510,7 +510,7 @@ mod tests {
     #[test]
     fn declared_capability_reports_image_sr_for_the_image_sr_kind() {
         let dir = tempfile::tempdir().unwrap();
-        write_image_sr_scenario(dir.path(), "artifacts/espcn/espcn.json");
+        write_image_sr_scenario(dir.path(), "scenarios/schedules/espcn.json");
         let l = EngineLoader { root: dir.path().to_path_buf() };
         assert_eq!(l.declared_capability(&cfg()), Some(Capability::IMAGE_SR));
     }
@@ -538,9 +538,9 @@ mod tests {
     #[test]
     fn image_sr_checkpoint_override_is_resolved_against_root_and_checked_first() {
         let dir = tempfile::tempdir().unwrap();
-        write_espcn_schedule(dir.path(), "artifacts/espcn/espcn.json", "unused.safetensors");
+        write_espcn_schedule(dir.path(), "scenarios/schedules/espcn.json", "unused.safetensors");
         write_image_sr_scenario_with_checkpoint(
-            dir.path(), "artifacts/espcn/espcn.json", Some("artifacts/espcn/espcn.safetensors"));
+            dir.path(), "scenarios/schedules/espcn.json", Some("artifacts/espcn/espcn.safetensors"));
         let l = EngineLoader { root: dir.path().to_path_buf() };
         let err = l.load(&cfg()).err().expect("a missing checkpoint must fail to load");
         let msg = err.to_string();
@@ -558,9 +558,9 @@ mod tests {
     #[test]
     fn image_sr_checkpoint_override_is_the_one_actually_read() {
         let dir = tempfile::tempdir().unwrap();
-        write_espcn_schedule(dir.path(), "artifacts/espcn/espcn.json", "should-not-be-read.safetensors");
+        write_espcn_schedule(dir.path(), "scenarios/schedules/espcn.json", "should-not-be-read.safetensors");
         write_image_sr_scenario_with_checkpoint(
-            dir.path(), "artifacts/espcn/espcn.json", Some("artifacts/espcn/espcn.safetensors"));
+            dir.path(), "scenarios/schedules/espcn.json", Some("artifacts/espcn/espcn.safetensors"));
         let ckpt_dir = dir.path().join("artifacts/espcn");
         std::fs::create_dir_all(&ckpt_dir).unwrap();
         std::fs::write(ckpt_dir.join("espcn.safetensors"), b"not a real checkpoint").unwrap();
@@ -576,8 +576,8 @@ mod tests {
     #[test]
     fn image_sr_scenario_without_a_checkpoint_field_keeps_the_schedules_own_path() {
         let dir = tempfile::tempdir().unwrap();
-        write_espcn_schedule(dir.path(), "artifacts/espcn/espcn.json", "schedule-owns-this.safetensors");
-        write_image_sr_scenario(dir.path(), "artifacts/espcn/espcn.json");
+        write_espcn_schedule(dir.path(), "scenarios/schedules/espcn.json", "schedule-owns-this.safetensors");
+        write_image_sr_scenario(dir.path(), "scenarios/schedules/espcn.json");
         let l = EngineLoader { root: dir.path().to_path_buf() };
         let err = l.load(&cfg()).err().expect("a missing checkpoint must fail to load");
         assert!(err.to_string().contains("schedule-owns-this.safetensors"), "{err}");

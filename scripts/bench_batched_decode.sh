@@ -17,7 +17,7 @@ WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$WT"
 LDLIB=~/.local/lib/npu-asr
 M1_DIR="$WT/artifacts/fused_decode12"                       # shipped M=1 deep-C ELF
 E2E="$WT/rust/target/release/npu-dev"
-CLIPDIR="$WT/artifacts/wer_clips"
+CLIPDIR="$WT/tests/data/wer_clips"
 TS="$(date +%Y%m%d_%H%M%S)"; LOG="$WT/artifacts/bench_batched_${TS}.log"
 mkdir -p "$WT/artifacts"; : > "$LOG"
 log(){ echo -e "$*" | tee -a "$LOG"; }

@@ -70,14 +70,14 @@ configured as an `[[model]]`; see `docs/configuration.md`):
     npu upscale input.mp4 output.mp4 --model espcn2   # a differently-named [[model]] entry
 
 EDSR has no shipped scenario yet, so it is reachable only through the FFmpeg filter below
-(point `schedule=` at `artifacts/edsr/edsr.json`), or by adding your own `image-sr` scenario +
+(point `schedule=` at `scenarios/schedules/edsr.json`), or by adding your own `image-sr` scenario +
 `[[model]]` entry for it.
 
 FFmpeg filter (compiles the filter into a local FFmpeg build; see `integrations/ffmpeg/README-xdna-sr-filter.md`):
 
     bash integrations/ffmpeg/apply.sh
     LD_LIBRARY_PATH=rust/target/release target/ffmpeg-xdna/ffmpeg \
-      -i input.mp4 -vf "xdna_sr=schedule=artifacts/edsr/edsr.json:npu=1" output.mp4
+      -i input.mp4 -vf "xdna_sr=schedule=scenarios/schedules/edsr.json:npu=1" output.mp4
 
 ## How it works
 

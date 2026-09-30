@@ -115,7 +115,7 @@ done:
 #define FLAGS AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_FILTERING_PARAM
 static const AVOption xdna_sr_options[] = {
     { "schedule", "path to the net schedule <net>.json", OFFSET(schedule),
-      AV_OPT_TYPE_STRING, { .str = "artifacts/espcn/espcn.json" }, 0, 0, FLAGS },
+      AV_OPT_TYPE_STRING, { .str = "scenarios/schedules/espcn.json" }, 0, 0, FLAGS },
     { "npu", "use the NPU frontier (0 forces CPU)", OFFSET(npu),
       AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, FLAGS },
     { NULL }

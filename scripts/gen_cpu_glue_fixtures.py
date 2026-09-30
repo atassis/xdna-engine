@@ -52,7 +52,7 @@ def gen_mel_fixtures():
     sess = rt.InferenceSession(str(PREPROC_ONNX), providers=["CPUExecutionProvider"])
     cases = {
         "synthetic_sweep": synth_signal(),
-        "real_clip_1s": read_wav_f32(ROOT / "artifacts/wer_clips/en_01.wav")[:16000],
+        "real_clip_1s": read_wav_f32(ROOT / "tests/data/wer_clips/en_01.wav")[:16000],
     }
     d = OUT / "mel"
     d.mkdir(parents=True, exist_ok=True)

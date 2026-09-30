@@ -7,7 +7,7 @@ the checkpoint). Saved to artifacts/<model>/mels_<clipset>/<name>.npy. The NPU e
 bin then consumes these (squeezed to [n_mels,3000]).
 
 Usage: python scripts/whisper_dump_mels.py [--model whisper-small|whisper-turbo]
-                                            [--clips artifacts/wer_clips]
+                                            [--clips tests/data/wer_clips]
 """
 import argparse
 import numpy as np
@@ -24,7 +24,7 @@ MODEL_HF = {
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="whisper-small", choices=sorted(MODEL_HF))
-    ap.add_argument("--clips", default="artifacts/wer_clips")
+    ap.add_argument("--clips", default="tests/data/wer_clips")
     args = ap.parse_args()
 
     clips = Path(args.clips)

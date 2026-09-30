@@ -28,7 +28,7 @@ arm(){
   grep -q 'CREATE_HWCTX' "$raw" && echo "HWCTX" || echo "ok"
 }
 
-for clip in "$WT"/artifacts/wer_clips/*.wav; do
+for clip in "$WT"/tests/data/wer_clips/*.wav; do
   stem="$(basename "$clip" .wav)"
   # Only clips still missing a complete NPU set.
   complete=1

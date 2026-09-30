@@ -20,7 +20,7 @@ WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$WT"
 LDLIB=~/.local/lib/npu-asr
 SERVE="$WT/rust/target/release/engine_serve"
 SCEN="$WT/scenarios/asr-whisper-small.toml"
-CLIP="$WT/artifacts/wer_clips/en_01.wav"
+CLIP="$WT/tests/data/wer_clips/en_01.wav"
 TS="$(date +%Y%m%d_%H%M%S)"; LOG="$WT/artifacts/lever3_isolate_${TS}.log"; WERDIR="$WT/artifacts/lever3_iso_${TS}"
 PORT=11434; URL="http://127.0.0.1:${PORT}/v1/audio/transcriptions"
 mkdir -p "$WT/artifacts" "$WERDIR"; : > "$LOG"

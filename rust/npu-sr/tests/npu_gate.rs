@@ -40,10 +40,10 @@ fn npu_frontier_matches_cpu_and_oracle() {
     let (lr_h, lr_w) = (ls[ls.len() - 2], ls[ls.len() - 1]);
     let plane = Plane { w: lr_w, h: lr_h, data: lr.iter().cloned().collect() };
 
-    let mut cpu = SrEngine::load("artifacts/espcn/espcn.json", false).unwrap();
+    let mut cpu = SrEngine::load("scenarios/schedules/espcn.json", false).unwrap();
     let out_cpu = cpu.upscale_plane(&plane).unwrap();
 
-    let mut npu = SrEngine::load("artifacts/espcn/espcn.json", true).unwrap();
+    let mut npu = SrEngine::load("scenarios/schedules/espcn.json", true).unwrap();
     let out_npu = npu.upscale_plane(&plane).unwrap();
 
     assert_eq!((out_npu.h, out_npu.w), (out_cpu.h, out_cpu.w));

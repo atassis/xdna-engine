@@ -13,13 +13,13 @@ Text is normalized (lowercase + punctuation stripped + whitespace collapsed) bef
 scoring. WER uses jiwer if installed, else an inline word-level Levenshtein (no hard dep).
 
 Run (full eval — needs the service up on :11434 AND the NPU free):
-    ~/npuvox-asr-bench/.venv/bin/python scripts/wer_eval.py --clips artifacts/wer_clips
+    ~/npuvox-asr-bench/.venv/bin/python scripts/wer_eval.py --clips tests/data/wer_clips
 
 Smoke-test the oracle path only (NO service POST — safe to run anytime):
-    ~/npuvox-asr-bench/.venv/bin/python scripts/wer_eval.py --clips artifacts/wer_clips --no-service
+    ~/npuvox-asr-bench/.venv/bin/python scripts/wer_eval.py --clips tests/data/wer_clips --no-service
 
 Flags:
-    --clips DIR     clip dir containing *.wav + refs.json   (default artifacts/wer_clips)
+    --clips DIR     clip dir containing *.wav + refs.json   (default tests/data/wer_clips)
     --no-service    skip the :11434 POST; only run the oracle (for smoke-testing)
     --url URL       override service endpoint
     --timeout SEC   per-request HTTP timeout (default 120)
@@ -156,7 +156,7 @@ def write_placeholder(clips_dir, names):
         "Run to populate (needs service on :11434 + NPU free):",
         "",
         "```",
-        "~/npuvox-asr-bench/.venv/bin/python scripts/wer_eval.py --clips artifacts/wer_clips",
+        "~/npuvox-asr-bench/.venv/bin/python scripts/wer_eval.py --clips tests/data/wer_clips",
         "```",
         "",
         "WER = word error rate (lower is better). Text normalized (lowercase, no punctuation).",

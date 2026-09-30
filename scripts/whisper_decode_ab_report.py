@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Score scripts/whisper_decode_ab.sh logs: per arm, token-id determinism across every transcription
-of each clip, pooled WER against artifacts/wer_clips/refs.json, and decode ms per emitted token by
+of each clip, pooled WER against tests/data/wer_clips/refs.json, and decode ms per emitted token by
 round (decode_ms / tokens from the [WHISPER_TIMING] line, timed passes only).
 
   .venv-export/bin/python scripts/whisper_decode_ab_report.py <OUT_DIR> [--json out.json]
@@ -41,7 +41,7 @@ def main():
     a = ap.parse_args()
     from transformers import WhisperProcessor
     tok = WhisperProcessor.from_pretrained("artifacts/whisper-small/onnx").tokenizer
-    refs = json.load(open("artifacts/wer_clips/refs.json", encoding="utf-8"))
+    refs = json.load(open("tests/data/wer_clips/refs.json", encoding="utf-8"))
     ids_by = defaultdict(lambda: defaultdict(set))
     ms_by = defaultdict(lambda: defaultdict(list))
     backend = {}

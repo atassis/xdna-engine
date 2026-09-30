@@ -14,7 +14,7 @@ import numpy as np
 import onnxruntime as ort
 from transformers import WhisperProcessor
 
-CLIPS = Path("artifacts/wer_clips")
+CLIPS = Path("tests/data/wer_clips")
 ONNX = Path("artifacts/whisper-small/onnx")
 MELS = Path("artifacts/whisper-small/mels")
 

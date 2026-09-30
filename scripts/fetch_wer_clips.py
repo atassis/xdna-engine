@@ -15,7 +15,7 @@ import zlib
 
 import requests
 
-# Repo-relative output: artifacts/wer_clips next to this script's repo root (overridable).
+# Repo-relative output: tests/data/wer_clips next to this script's repo root (overridable).
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.environ.get("WER_CLIPS_DIR", os.path.join(_REPO, "artifacts", "wer_clips"))
 RAW = os.path.join(OUT, "_raw")

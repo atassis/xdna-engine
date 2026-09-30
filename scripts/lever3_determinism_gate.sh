@@ -64,7 +64,7 @@ arm(){
   sed -n 's/.*tokens=\([0-9]*\).*/\1/p' "$raw" | head -1 > "$OUT/$label.r$rep.$stem.ntok"
 }
 
-CLIPS=( $(ls "$WT"/artifacts/wer_clips/*.wav | sort) )
+CLIPS=( $(ls "$WT"/tests/data/wer_clips/*.wav | sort) )
 log "[gate] ${#CLIPS[@]} clips x (onnx 1 rep + base 2 + cross 2)"
 for clip in "${CLIPS[@]}"; do
   stem="$(basename "$clip" .wav)"

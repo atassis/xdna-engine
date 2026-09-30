@@ -37,4 +37,4 @@ JOBS=$(( $(nproc) / 2 )); [ "$JOBS" -lt 1 ] && JOBS=1
 make -j"$JOBS" ffmpeg >/tmp/xdna-ffmake.log 2>&1 || { echo "make FAILED (see /tmp/xdna-ffmake.log)"; tail -30 /tmp/xdna-ffmake.log; exit 1; }
 
 echo "built: $FFDIR/ffmpeg"
-echo "run with: LD_LIBRARY_PATH=$LIBDIR $FFDIR/ffmpeg -i in.mp4 -vf xdna_sr=schedule=artifacts/espcn/espcn.json out.mp4"
+echo "run with: LD_LIBRARY_PATH=$LIBDIR $FFDIR/ffmpeg -i in.mp4 -vf xdna_sr=schedule=scenarios/schedules/espcn.json out.mp4"

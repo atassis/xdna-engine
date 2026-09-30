@@ -2,5 +2,5 @@
 # Ground truth lives in <dir>/refs.json (filename -> lowercased reference transcript).
 [corpus]
 name = "wer_clips"
-dir = "artifacts/wer_clips"
-refs = "artifacts/wer_clips/refs.json"
+dir = "tests/data/wer_clips"
+refs = "tests/data/wer_clips/refs.json"

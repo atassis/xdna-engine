@@ -64,7 +64,7 @@ save("refs/ln_post.bias.npy", enc.layer_norm.bias)
 # golden activations on a fixed clip
 proc = WhisperProcessor.from_pretrained(MODEL)
 import soundfile as sf
-wav, sr = sf.read("artifacts/wer_clips/en_01.wav")
+wav, sr = sf.read("tests/data/wer_clips/en_01.wav")
 feats = proc(wav, sampling_rate=16000, return_tensors="pt").input_features
 np.save(OUT / "refs/input_features.npy", feats.numpy().astype(np.float32))
 

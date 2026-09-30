@@ -6,7 +6,7 @@ tokens from decoder_model/decoder_with_past, the shipped host decode). The devic
 (designs/decode_fused/verify_whisper_rail.py) runs in the IRON venv, which has no onnxruntime.
 
   .venv-export/bin/python scripts/whisper_host_decode_ref.py --model whisper-small \
-      --clips artifacts/wer_clips --out $XDNA_CACHE/whisper-rail/ref
+      --clips tests/data/wer_clips --out $XDNA_CACHE/whisper-rail/ref
 """
 import argparse
 import json
@@ -25,7 +25,7 @@ from whisper_wer_from_hidden import greedy_decode_kv  # noqa: E402
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="whisper-small")
-    ap.add_argument("--clips", default="artifacts/wer_clips")
+    ap.add_argument("--clips", default="tests/data/wer_clips")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     onnx_dir = Path("artifacts") / a.model / "onnx"

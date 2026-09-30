@@ -39,7 +39,7 @@ fn cpu_frontier_matches_onnx_oracle() {
     let (lr_h, lr_w) = (ls[ls.len() - 2], ls[ls.len() - 1]);
     let (sr_h, sr_w) = (ss[ss.len() - 2], ss[ss.len() - 1]);
 
-    let mut eng = SrEngine::load("artifacts/espcn/espcn.json", false).unwrap();
+    let mut eng = SrEngine::load("scenarios/schedules/espcn.json", false).unwrap();
     let out = eng
         .upscale_plane(&Plane {
             w: lr_w,
