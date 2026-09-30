@@ -147,11 +147,26 @@ fn reuse_kv() -> bool {
     std::env::var("NPU_RESIDENT_REUSE_KV").ok().as_deref() != Some("0")
 }
 
-/// Whether a resume at `r` finds every sliding position its window reads, `[first(r), r)`, still in
-/// its ring slot: no row at or past `first(r) + c` has been written over one of them. `high_water`
-/// is one past the furthest row written, padding included.
-pub fn resume_keeps_the_window(r: usize, high_water: usize, window: usize, c: usize) -> bool {
-    r == 0 || high_water <= ring_read_first(r, window) + c
+/// The positions `[lo, hi)` whose sliding-ring slots hold their own K/V, as dispatches write them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RingValid {
+    pub lo: usize,
+    pub hi: usize,
+}
+
+impl RingValid {
+    /// A dispatch at `s` writes `p_len` real rows and pads to `rows`, in a ring of `c` slots. Its
+    /// rows land on the slots of `[s + rows - c, s)` too, and its padding rows are not positions.
+    /// Old valid positions stay contiguous with the new ones only if the write starts inside them.
+    pub fn write(self, s: usize, p_len: usize, rows: usize, c: usize) -> RingValid {
+        let lo = if self.lo <= s && s <= self.hi { self.lo } else { s };
+        RingValid { lo: lo.max((s + rows).saturating_sub(c)), hi: s + p_len }
+    }
+
+    /// Whether a resume at `r` finds every sliding position its window reads, `[first(r), r)`.
+    pub fn keeps_the_window(self, r: usize, window: usize) -> bool {
+        r == 0 || (ring_read_first(r, window) >= self.lo && r <= self.hi)
+    }
 }
 
 /// What `npu stats` names this build by: the ELF's content hash, the toolchain instance it was built
@@ -444,9 +459,8 @@ pub struct LadderResidentForward {
     kb: Bo,
     boot: ElfResident,
     rungs: HashMap<String, ElfResident>,
-    /// One past the furthest sliding-ring row any dispatch wrote since the caches were zeroed,
-    /// padding rows included: what [`resume_keeps_the_window`] measures a resume against.
-    high_water: usize,
+    /// What a resume is measured against ([`RingValid::keeps_the_window`]).
+    ring_valid: RingValid,
     /// A dispatch failed or stayed non-finite, so the caches may hold NaN rows (K034: a masked NaN
     /// V row still poisons the output). The next `reset` zeroes them.
     poisoned: bool,
@@ -499,7 +513,7 @@ impl LadderResidentForward {
         }
 
         let provenance = build_provenance(&meta.dir, &elf, meta.largest_keys(1));
-        Ok(LadderResidentForward { meta, embed, xb, ob, sb, kb, boot, rungs, high_water: 0, poisoned: false, provenance, media: MediaEmbeds::default() })
+        Ok(LadderResidentForward { meta, embed, xb, ob, sb, kb, boot, rungs, ring_valid: RingValid::default(), poisoned: false, provenance, media: MediaEmbeds::default() })
     }
 
     /// Build `%x` for a piece of `p_len` rows at position `s` and dispatch the rung named
@@ -578,7 +592,8 @@ impl LadderResidentForward {
         kern.dispatch().map_err(EngineError::Device)?;
         self.ob.sync_from_device().map_err(|e| EngineError::Device(format!("sync ob: {e}")))?;
 
-        self.high_water = self.high_water.max(s + rung_nt * self.meta.row_block);
+        let c = self.meta.s_ring_layout.blocks * self.meta.s_ring_layout.block_rows;
+        self.ring_valid = self.ring_valid.write(s, p_len, rung_nt * self.meta.row_block, c);
         Ok(first)
     }
 
@@ -652,7 +667,7 @@ impl LadderResidentForward {
                 layers.insert(layer.to_string(), serde_json::json!({"bytes": total, "ranges": ranges}));
             }
         }
-        let line = serde_json::json!({"rung": rung_name, "s": s, "p_len": p_len, "high_water": self.high_water, "layers": layers});
+        let line = serde_json::json!({"rung": rung_name, "s": s, "p_len": p_len, "ring_valid": [self.ring_valid.lo, self.ring_valid.hi], "layers": layers});
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
             use std::io::Write;
             let _ = writeln!(f, "{line}");
@@ -662,7 +677,7 @@ impl LadderResidentForward {
     fn zero_caches(&mut self) -> Result<(), EngineError> {
         self.kb.write_bytes(&vec![0u8; self.meta.cache_bytes]).map_err(|e| EngineError::Device(format!("zero caches: {e}")))?;
         self.kb.sync_to_device().map_err(|e| EngineError::Device(format!("sync caches: {e}")))?;
-        self.high_water = 0;
+        self.ring_valid = RingValid::default();
         self.poisoned = false;
         Ok(())
     }
@@ -737,8 +752,7 @@ impl DecodeStep for LadderResidentForward {
     }
 
     fn resume_limit(&self, reused: usize) -> usize {
-        let c = self.meta.s_ring_layout.blocks * self.meta.s_ring_layout.block_rows;
-        match resume_keeps_the_window(reused, self.high_water, self.meta.sliding_window, c) {
+        match self.ring_valid.keeps_the_window(reused, self.meta.sliding_window) {
             true => reused,
             false => 0,
         }
@@ -810,18 +824,36 @@ mod tests {
     #[test]
     fn a_resume_is_kept_only_while_the_ring_still_holds_its_window() {
         let (w, c) = (1024, 1280);
-        // Never wrapped: every slot holds its own position.
-        assert!(resume_keeps_the_window(900, 1200, w, c));
-        // r = 2000: first = 960, so rows up to 2240 leave [960, 2000) intact.
-        assert!(resume_keeps_the_window(2000, 2240, w, c));
-        // One row further lands on position 960's slot.
-        assert!(!resume_keeps_the_window(2000, 2241, w, c));
-        // A long divergent tail wraps the whole window.
-        assert!(!resume_keeps_the_window(2000, 4000, w, c));
-        // Nothing to keep at 0.
-        assert!(resume_keeps_the_window(0, 100_000, w, c));
+        // A fresh prime of 2240 rows then no wrap onto [960, 2000): kept; one more row lands on 960.
+        let v = RingValid::default().write(0, 2240, 2240, c);
+        assert!(v.keeps_the_window(2000, w));
+        assert!(!RingValid::default().write(0, 2241, 2241, c).keeps_the_window(2000, w));
+        // Padding rows destroy slots too, and are not positions themselves.
+        let v = RingValid::default().write(0, 2224, 2241, c);
+        assert!(!v.keeps_the_window(2000, w));
+        assert!(!v.keeps_the_window(2230, w), "a padding row is not a written position");
+        assert!(RingValid::default().keeps_the_window(0, w));
     }
 
+    /// The 2026-09-30 service gate's sequence: a long request, then one re-primed from 0 that shares
+    /// only a few tokens, then its follow-up. The re-prime rewrote every slot the follow-up needs.
+    #[test]
+    fn a_re_prime_from_zero_makes_its_own_follow_up_resumable() {
+        let (w, c) = (1024, 1280);
+        let steps = |mut v: RingValid, from: usize, to: usize| {
+            for s in from..to { v = v.write(s, 1, 16, c); }
+            v
+        };
+        let prime = |v: RingValid, n: usize| {
+            let mut v = v;
+            for a in (0..n).step_by(32) { let p = (n - a).min(32); v = v.write(a, p, 32, c); }
+            v
+        };
+        let long = steps(prime(RingValid::default(), 2797), 2797, 2842);
+        assert!(!long.keeps_the_window(2475, w), "the long reply overwrote the follow-up's window");
+        let qa1 = steps(prime(long, 2484), 2484, 2508);
+        assert!(qa1.keeps_the_window(2481, w), "qa1 re-primed [0, 2508): its follow-up must resume");
+    }
     #[test]
     fn rung_selection_picks_the_smallest_window_that_holds_the_keys() {
         let rungs = rf48l_rungs();
