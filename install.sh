@@ -390,6 +390,10 @@ ok "Kernels published (pin $(cat "$ENGINE_KERNELS/.toolchain-stamp" 2>/dev/null 
 # artifacts stale" -- naming the artifacts, which were the correct half. Copy them together.
 install -m 0644 "$REPO/toolchain.lock" "$ENGINE_ROOT/toolchain.lock"
 ok "Staged toolchain.lock (pin $(sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' "$ENGINE_ROOT/toolchain.lock" | sha256sum | cut -c1-12))"
+# xrt.ini raises XRT's device-BO heap (num_heap_pages) so ELFs over 64 MiB load; `npu serve` points
+# XRT_INI_PATH at this copy when the environment does not.
+install -m 0644 "$REPO/xrt.ini" "$ENGINE_ROOT/xrt.ini"
+ok "Staged xrt.ini"
 
 # ---- Parakeet artifacts (MODEL=parakeet) ----
 if [ "$MODEL" = parakeet ]; then

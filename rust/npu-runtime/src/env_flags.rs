@@ -229,7 +229,7 @@ pub const FLAGS: &[Flag] = &[
               then sets NPU_QUIET=1 for one-shot commands. It does not itself gate the banners; \
               npu-xrt's NPU_QUIET (this table, owner npu-xrt) is the actual consumer." },
     Flag { name: "XDNA_ENGINE_ROOT", owner: "npu-cli", site: "npu-cli/src/main.rs",
-        semantics: Value, default: "derived (XDG_DATA_HOME, or cwd, checked for scenarios/)",
+        semantics: Value, default: "derived (XDG_DATA_HOME, or cwd, checked for scenarios/; `npu serve` takes the install root first)",
         doc: "explicit override for the repo root that scenario/artifact paths resolve against." },
     Flag { name: "XDG_DATA_HOME", owner: "npu-cli", site: "npu-cli/src/main.rs",
         semantics: Value, default: "$HOME/.local/share",
