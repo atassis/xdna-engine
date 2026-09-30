@@ -142,11 +142,17 @@ if [ "$ENGINE_ROOT" = "$_XDG_DATA/npu" ] && [ -d "$_XDG_DATA/xdna-engine" ]; the
   fi
 fi
 
-# Where the staged root's artifacts/ and mlir-aie/ point. Default to this checkout, but they are
-# overridable BECAUSE this script may legitimately be run from a git worktree: a worktree supplies
-# the sources, and linking a service's weights into one would tie production to a directory that
-# gets pruned. Point these at the permanent checkout (or a shared model store) in that case.
-ENGINE_ARTIFACTS="${ENGINE_ARTIFACTS:-$REPO/artifacts}"
+# Where generated data (models, artifacts, caches) lives on this machine -- XDNA_ARTIFACTS etc.
+# Never a git checkout: builds write here directly (scripts/build_llm_decode.sh and friends), so
+# it is the one place an artifact's bytes are the ones a build produced, not a copy of them.
+. "$REPO/scripts/lib/data_root.sh"
+
+# Where the staged root's artifacts/ and mlir-aie/ point. artifacts default to XDNA_ARTIFACTS (the
+# generated-data store, not this checkout) since section 4b below stages only the artifacts served
+# scenarios reference, as symlinks into it. mlir-aie stays checkout-relative: it supplies compiler
+# sources, not served data, and is overridable for the same reason ENGINE_ARTIFACTS is -- this
+# script may run from a worktree whose lifetime should not gate a running service.
+ENGINE_ARTIFACTS="${ENGINE_ARTIFACTS:-$XDNA_ARTIFACTS}"
 ENGINE_MLIR_AIE="${ENGINE_MLIR_AIE:-$REPO/mlir-aie}"
 
 # Stable runtime dir for libonnxruntime, decoupled from the volatile cargo target/ build tree
@@ -502,13 +508,30 @@ fi
 # the walk-up no longer resolves symlinks (llm/artifact.rs::resolve_current_pin_hash) and there is
 # no longer a link for it to resolve.
 #
-# ENGINE_ARTIFACTS still says where the SOURCE lives (another partition is fine). ENGINE_ARTIFACTS_LINK=1
-# restores the old symlink behaviour for an operator who genuinely cannot spare the copy -- on a
-# non-CoW filesystem this is a real duplication and the warning below says so.
+# ENGINE_ARTIFACTS still says where the SOURCE lives (another partition is fine).
 info "Staging production root -> $ENGINE_ROOT"
 mkdir -p "$ENGINE_ROOT"
 rm -rf "$ENGINE_ROOT/scenarios"
 cp -r "$REPO/scenarios" "$ENGINE_ROOT/scenarios"
+# Tuning profile config/profiles/<hw-class>.toml (rust/npu-models/src/tuning_profile.rs), staged
+# the same way scenarios are: without this the service silently runs its baked-in default profile
+# instead of the checked-in one.
+rm -rf "$ENGINE_ROOT/config"
+mkdir -p "$ENGINE_ROOT/config"
+cp -r "$REPO/config/profiles" "$ENGINE_ROOT/config/profiles"
+ok "  config/profiles -> $ENGINE_ROOT/config/profiles"
+
+# Retire a name.prev-* / name.staging-* helper shared by both stage functions below: prune to the
+# newest ONE by the TIMESTAMP IN THE NAME, not mtime -- `cp -a`/reflink preserves the SOURCE's
+# mtime, so sorting by mtime kept whichever source copy happened to be newest upstream, not
+# whichever install actually ran most recently. Names sort lexically the same as chronologically
+# (`%Y%m%dT%H%M%S`), so a plain `sort -r` is exact.
+prune_prev() {  # name
+  ls -1d "$ENGINE_ROOT/$1.prev-"* 2>/dev/null | sort -r | tail -n +2 | while IFS= read -r old; do
+    rm -rf -- "$old" && echo "  pruned superseded $(basename "$old")"
+  done || true
+}
+
 stage_link() {  # name, source
   if [ -e "$2" ]; then
     ln -sfn "$(readlink -f "$2")" "$ENGINE_ROOT/$1"
@@ -543,23 +566,67 @@ stage_copy() {  # name, source
     mv "$dst" "$ENGINE_ROOT/$name.prev-$(date +%Y%m%dT%H%M%S)"
   fi
   mv "$new" "$dst"
-  # Keep exactly ONE previous copy. Retiring on every run is right -- the whole point of copying is
-  # that production survives the source tree changing, so the rollback must not live in the source
-  # either -- but without a prune it grows by a full tree per install, and three runs in one evening
-  # left two dead artifacts.prev-* here. Newest survives; the rest go.
-  ls -1dt "$ENGINE_ROOT/$name.prev-"* 2>/dev/null | tail -n +2 | while IFS= read -r old; do
-    rm -rf -- "$old" && echo "  pruned superseded $(basename "$old")"
-  done || true
+  prune_prev "$name"
   local sz; sz="$(du -sh "$dst" 2>/dev/null | cut -f1)"
   ok "  $name copied ($sz, extents shared where the filesystem allows) <- $(readlink -f "$src")"
 }
 
+# Stage ONLY the artifacts the served scenarios reference, as symlinks into $ENGINE_ARTIFACTS
+# (the generated-data store, e.g. /mnt/data/xdna/artifacts) -- never a whole-tree copy/link of it.
+# A build is immutable (writes a new dir, never rewrites one in place), so a served artifact
+# resolves to exactly one build's bytes for as long as that build exists, and a rebuild-in-place
+# is refused later by artifacts.manifest.json's identity check (scripts/verify_installed_artifacts.sh)
+# rather than silently served.
+#
+# Replaces the old whole-`artifacts/`-directory copy, which only worked because the big model
+# dirs under it happened to be symlinks into /mnt/data already -- so every unreferenced build ever
+# made (every `.prepin-*`, every abandoned rung) was copied into the production root too.
+stage_served_artifacts() {
+  local out="$ENGINE_ROOT/artifacts" new="$ENGINE_ROOT/artifacts.staging-$$"
+  rm -rf "$new"; mkdir -p "$new"
+  local rels; rels="$("$ONNX_ASR_PY" "$REPO/scripts/lib/collect_served_artifacts.py" "$ENGINE_CONFIG" "$ENGINE_ROOT")"
+  local linked=0 missing=0
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    local sub="${rel#artifacts/}" src="$ENGINE_ARTIFACTS/$sub" link="$new/$sub"
+    if [ ! -e "$src" ]; then
+      warn "  served artifact missing under \$ENGINE_ARTIFACTS: $sub (from $src) -- not linked, the engine-config preflight below will refuse any scenario that needs it"
+      missing=$((missing + 1))
+      continue
+    fi
+    mkdir -p "$(dirname "$link")"
+    ln -sfn "$(readlink -f "$src")" "$link"
+    ok "  $sub -> $(readlink -f "$src")"
+    linked=$((linked + 1))
+  done <<< "$rels"
+  if [ -L "$out" ]; then
+    rm -f "$out"
+  elif [ -d "$out" ]; then
+    mv "$out" "$ENGINE_ROOT/artifacts.prev-$(date +%Y%m%dT%H%M%S)"
+  fi
+  mv "$new" "$out"
+  prune_prev artifacts
+  ok "Staged $linked served artifact(s) as links into \$ENGINE_ARTIFACTS ($missing missing)."
+
+  # artifacts.manifest.json: one identity per staged artifact, so a rebuild-in-place or a
+  # truncated copy under $ENGINE_ARTIFACTS is DETECTED (scripts/verify_installed_artifacts.sh)
+  # instead of silently served the next time the process restarts and re-resolves the symlink.
+  "$ONNX_ASR_PY" "$REPO/scripts/lib/artifact_manifest.py" build "$ENGINE_ROOT" "$ENGINE_ARTIFACTS" $rels \
+    > "$ENGINE_ROOT/artifacts.manifest.json.new"
+  mv "$ENGINE_ROOT/artifacts.manifest.json.new" "$ENGINE_ROOT/artifacts.manifest.json"
+  ok "Wrote artifacts.manifest.json ($linked entries)."
+  bash "$REPO/scripts/verify_installed_artifacts.sh" "$ENGINE_ROOT" \
+    || die "the artifacts manifest this install just wrote does not verify against what it just staged -- see above."
+  ok "Verified staged artifacts against the manifest just written."
+}
+
 if [ "${ENGINE_ARTIFACTS_LINK:-0}" = "1" ]; then
-  warn "ENGINE_ARTIFACTS_LINK=1: artifacts/ staged as a SYMLINK into $ENGINE_ARTIFACTS."
-  warn "  A rebuild or branch switch in that tree then changes what the running service loads."
+  warn "ENGINE_ARTIFACTS_LINK=1: artifacts/ staged as a SYMLINK to the WHOLE \$ENGINE_ARTIFACTS tree,"
+  warn "  not just what's served. A rebuild or branch switch in that tree changes what the running"
+  warn "  service loads, and no manifest is written (there is no fixed served-only set to record)."
   stage_link artifacts "$ENGINE_ARTIFACTS"
 else
-  stage_copy artifacts "$ENGINE_ARTIFACTS"
+  stage_served_artifacts
 fi
 # NO `stage_link mlir-aie`. A compiler tree does not belong in a production install; section 4
 # published the artifacts a running engine actually resolves.
