@@ -6,7 +6,7 @@ build <recipe>... [--recipes TSV] [--out-root DIR] [--no-hit]: take the recipe's
 stored actions newest-first for a hit, else run the recipe under the recorder and store the
 result. TSV format matches run_s0.sh: tab-separated, `#` comments, NORECIPE skipped.
 """
-import argparse, hashlib, json, os, pathlib, shutil, sys, time
+import argparse, hashlib, json, os, pathlib, shutil, subprocess, sys, time
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "buildstore"))
@@ -31,6 +31,22 @@ def _elapsed_seconds(s):
         parts.insert(0, 0.0)
     h, m, sec = parts
     return h * 3600 + m * 60 + sec
+
+
+def iron_pin_verified(repo, env):
+    """Run amd_paths.sh's iron_require_pin ONCE, outside any replay sandbox (which never has
+    .git -- see the function's own comment), and return the sha it verified. None for a repo
+    with no amd_paths.sh (the test fixtures) or no IRON pin to check."""
+    amd_paths = pathlib.Path(repo) / "scripts" / "amd_paths.sh"
+    if not amd_paths.is_file():
+        return None
+    script = (f'. "{amd_paths}"; iron_require_pin || exit 1; '
+              r"""sed -n 's/^IRON_FORK_COMMIT=\([0-9a-f]\{7,\}\).*/\1/p' toolchain.lock | head -1""")
+    r = subprocess.run(["bash", "-c", script], cwd=repo, env=env, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"iron pin check failed for {repo}: {r.stderr.strip()}")
+    lines = r.stdout.strip().splitlines()
+    return lines[-1] if lines else None
 
 
 def parse_time_v(path):
@@ -65,6 +81,9 @@ def cmd_build(args):
             argv = ["bash", "-c", f"cd {repo} && {cmd}"]
             env = record.hermetic_env(os.environ, record.allowlist())
             env["REPO"] = str(repo)
+            want = iron_pin_verified(repo, env)
+            if want:
+                env["IRON_PIN_VERIFIED"] = want
 
             staging = cas / "staging" / name
             out = staging / "out"
