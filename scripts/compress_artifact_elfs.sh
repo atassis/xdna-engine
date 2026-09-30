@@ -28,6 +28,12 @@ for root in "$@"; do
   while IFS= read -r -d '' elf; do
     zst="$elf.zst"
     if [ -e "$zst" ]; then
+      if ! cmp -s <(zstd -dc "$zst") "$elf"; then
+        echo "FAIL existing .zst does not match: $elf (both kept)" >&2
+        fail=$((fail + 1))
+        continue
+      fi
+      [ -n "${KEEP_PLAIN:-}" ] || rm -f "$elf"
       skip=$((skip + 1))
       continue
     fi
