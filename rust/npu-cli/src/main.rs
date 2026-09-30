@@ -232,21 +232,26 @@ fn serve_root(cfg: &Config, config_path: &Path) -> Result<PathBuf> {
 }
 
 /// XRT reads `num_heap_pages` from `XRT_INI_PATH`; without the staged one any ELF over 64 MiB fails
-/// CREATE_BO with EAGAIN. Set before the first device open, and only when the caller did not.
-fn default_xrt_ini(root: &Path) {
+/// CREATE_BO with EAGAIN. XRT has read its config before `main` runs, so setting the variable here
+/// is too late (measured 2026-09-30: qwen3.5-4b's prefill failed exactly so). When the caller did
+/// not set it, re-exec this process with it set; the re-exec'd one sees it and returns.
+fn exec_with_xrt_ini(root: &Path) {
+    use std::os::unix::process::CommandExt;
     if std::env::var_os("XRT_INI_PATH").is_some() {
         return;
     }
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let found = [Some(root.join("xrt.ini")), home.map(|h| h.join(".config/xrt/xrt.ini"))]
         .into_iter().flatten().find(|p| p.is_file());
-    match found {
-        Some(p) => {
-            eprintln!("[npu-serve] XRT_INI_PATH unset, using {}", p.display());
-            std::env::set_var("XRT_INI_PATH", p);
-        }
-        None => eprintln!("[npu-serve] WARNING: no xrt.ini found; ELFs over 64 MiB will fail to load"),
-    }
+    let Some(ini) = found else {
+        eprintln!("[npu-serve] WARNING: no xrt.ini found; ELFs over 64 MiB will fail to load");
+        return;
+    };
+    let Ok(exe) = std::env::current_exe() else { return };
+    eprintln!("[npu-serve] XRT_INI_PATH unset, re-executing with {}", ini.display());
+    let err = std::process::Command::new(exe).args(std::env::args_os().skip(1))
+        .env("XRT_INI_PATH", &ini).env("XDNA_ENGINE_ROOT", root).exec();
+    eprintln!("[npu-serve] WARNING: re-exec failed ({err}); ELFs over 64 MiB will fail to load");
 }
 
 /// The candidate roots, most explicit first. Separate from `root` so the ordering is testable
@@ -379,8 +384,8 @@ fn serve(path: &Path, allow_degraded: bool) -> Result<()> {
     warn_on_lopsided_endpoint_override(&cfg);
     preflight_serve(&addr)?;
     let root = serve_root(&cfg, path)?;
+    exec_with_xrt_ini(&root);
     eprintln!("[npu-serve] engine root {}", root.display());
-    default_xrt_ini(&root);
     default_run_log(&root);
     preflight_artifacts(&cfg, &root)?;
     let (handle, _join) = start(cfg, Box::new(EngineLoader { root }))
