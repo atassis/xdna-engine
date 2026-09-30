@@ -42,11 +42,14 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))), "scripts", "lib"))
 import precision as P                                            # noqa: E402
 import wq_formats as F                                           # noqa: E402
 from wq_eval import TARGETS, load_model, baseline_bf16, paired, run, tokenize   # noqa: E402
+from data_root import XDNA_QLAB                                  # noqa: E402
 
-QLAB = os.environ.get("QLAB_WORK", "/mnt/data/xdna/qlab")
+QLAB = os.environ.get("QLAB_WORK", str(XDNA_QLAB))
 
 # The plane's scale_kind vocabulary against wq_formats' spec fields. Symmetric `clip` is a
 # host-side scale SEARCH the lab does not implement, so it is reported as uncovered rather than

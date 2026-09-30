@@ -16,7 +16,12 @@ So measure three things per scheme, on real tensors and real activations:
 import os as _os
 # Work root: corpora/ and runs/ live here, NOT in the repo -- a 6000-position logprob
 # memmap is 3.6 GB and belongs on nvme. Override with QLAB_WORK.
-QLAB = _os.environ.get("QLAB_WORK", "/mnt/data/xdna/qlab")
+import importlib.util as _ilu
+_dr_spec = _ilu.spec_from_file_location(
+    "data_root", _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), _os.pardir, _os.pardir, _os.pardir,
+                                "scripts", "lib", "data_root.py"))
+_dr = _ilu.module_from_spec(_dr_spec); _dr_spec.loader.exec_module(_dr)
+QLAB = _os.environ.get("QLAB_WORK", str(_dr.XDNA_QLAB))
 import sys, glob, numpy as np, torch
 sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 import wq_formats as F

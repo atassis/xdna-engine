@@ -42,7 +42,10 @@ import ml_dtypes
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, os.pardir,
                                 "scripts"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, os.pardir,
+                                "scripts", "lib"))
 from buffer_blob import write_blob  # noqa: E402
+from data_root import XDNA_SCRATCH  # noqa: E402
 from elf_zst import write_elf  # noqa: E402
 from llm_decode_spec import (SPECS, C_TILE_GRANULE, L1_BYTES, L1_RESERVE,  # noqa: E402,F401
                              gemv_fits, gemv_tile_output, k_chunks_for, operator_rejects)
@@ -1168,13 +1171,13 @@ def isolate_build_dir(tag):
             raise SystemExit(
                 f"[{tag}] DECODE_WORK={explicit} is on {fs}, which is RAM. A decode artifact is "
                 f"~1.4 GB and competes with the weight buffers the model holds resident. Use a "
-                f"disk-backed path (e.g. ${{XDNA_SCRATCH:-/mnt/data/xdna/scratch}}/{tag}), or set "
+                f"disk-backed path (e.g. ${{XDNA_SCRATCH:-{XDNA_SCRATCH}}}/{tag}), or set "
                 f"ALLOW_TMPFS_BUILD=1 for a small probe build.")
         os.chdir(explicit)
         print(f"[{tag}] build dir {explicit} (DECODE_WORK, kept)", flush=True)
         return explicit
 
-    root = os.environ.get("XDNA_SCRATCH", "/mnt/data/xdna/scratch")
+    root = os.environ.get("XDNA_SCRATCH", str(XDNA_SCRATCH))
     base, why = None, ""
     try:
         os.makedirs(root, exist_ok=True)
