@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the S0 build-profiling shim and summarizer. No toolchain, no device."""
 import os
+import re
 import stat
 import subprocess
 from pathlib import Path
@@ -113,6 +114,55 @@ def test_stage_of_classifies_edges():
     assert s("something_new") == "other"
 
 
+def test_stage_of_known_real_edges():
+    # Explicit cases from the 2026-09-30 review of aiecc.cpp @ xdna-engine (bad classifications
+    # the earlier guessed rules produced).
+    s = _summ().stage_of
+    assert s("elfs_{0}.elf") == "per-core"
+    assert s("preBakedElfs_{0}.elf") == "per-core"
+    assert s("probeElfs_{0}.elf") == "per-core"
+    assert s("chesslinked_{0}.ll") == "per-core"
+    assert s("placedCoreCompile") == "per-core"
+    assert s("perDeviceNPULowered_{0}.mlir") == "control-code"
+    assert s("input_aie_partition_{0}.json") == "package"
+    assert s("input_aie_partition_parsed_{0}.json") == "package"
+    assert s("memTopology_{0}.json") == "package"
+    # A generic "partition" substring must not catch the NPU control-code partition edge.
+    assert s("npu_partition_{0}.mlir") == "control-code"
+
+
+AIECC_CPP = (HERE / ".." / ".." / "xdna-engine" / "mlir-aie" / "tools" / "aiecc" / "aiecc.cpp")
+# One level of template nesting (e.g. .map<std::vector<std::string>>() or
+# .split<OpInModule<CoreOp>>()) is enough to cover every builder call in aiecc.cpp.
+_EDGE_LITERAL = re.compile(
+    r'\.(?:map|split|join)<(?:[^<>]|<[^<>]*>)*>\(\s*"([^"]+)"'
+    r'|\.filter\(\s*"([^"]+)"'
+    r'|\.fileInput\([^,]+,\s*"([^"]+)"'
+    r'|splitPerDevice\(\s*\S+\s*,\s*"([^"]+)"\s*,\s*"([^"]+)"'
+    r'|buildNpuProgramSubgraph\(\s*\S+\s*,\s*"([^"]+)"'
+)
+
+
+def test_stage_of_covers_every_real_edge_name():
+    if not AIECC_CPP.exists():
+        import pytest
+        pytest.skip(f"{AIECC_CPP} not present")
+    text = AIECC_CPP.read_text()
+    names = {g for m in _EDGE_LITERAL.finditer(text) for g in m.groups() if g}
+    assert len(names) > 50  # sanity: the extractor is actually matching something
+    s = _summ().stage_of
+    misclassified = sorted(n for n in names if s(n) == "other")
+    assert misclassified == []
+
+
+def test_parse_profile_rows(tmp_path):
+    _run(tmp_path, ["aie.mlir"])
+    log = next((tmp_path / "logs").glob("aiecc-*.log"))
+    rows = _summ().parse_profile(log.read_text())
+    assert rows == [("placed.mlir", 120, 110.0), ("lowered_main_core_0_2.mlir", 3000, 400.0),
+                    ("npu_dma_lowered.mlir", 9000, 900.0), ("full.elf", 40, 900.0)]
+
+
 def test_parse_profile_stops_at_total_row():
     # The real `total` row has an empty dRSS column (3 tokens), so ROW never matches it; a
     # digit-led line after it must not be swept in as if it were still inside the block.
@@ -125,14 +175,6 @@ def test_parse_profile_stops_at_total_row():
     )
     rows = _summ().parse_profile(text)
     assert rows == [("placed.mlir", 120, 110.0)]
-
-
-def test_parse_profile_rows(tmp_path):
-    _run(tmp_path, ["aie.mlir"])
-    log = next((tmp_path / "logs").glob("aiecc-*.log"))
-    rows = _summ().parse_profile(log.read_text())
-    assert rows == [("placed.mlir", 120, 110.0), ("lowered_main_core_0_2.mlir", 3000, 400.0),
-                    ("npu_dma_lowered.mlir", 9000, 900.0), ("full.elf", 40, 900.0)]
 
 
 def test_summarize_artifact_dir(tmp_path):

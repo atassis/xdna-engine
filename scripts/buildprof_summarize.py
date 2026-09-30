@@ -11,23 +11,52 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-# First match wins; "package" precedes "per-core" so full.elf is not read as a core ELF.
+# Built 2026-09-30 by reading every edge-name literal aiecc.cpp actually passes to
+# .map/.split/.join/.filter, splitPerDevice and buildNpuProgramSubgraph (see
+# test_stage_of_covers_every_real_edge_name) -- the earlier version guessed keys and
+# misclassified real names (e.g. "mem_topology" never matched "memTopology_{0}.json").
+# Matched by exact lowercase name or lowercase prefix/suffix, never by substring: a
+# substring "partition" would also catch npu_partition_{0}.mlir, which is control-code.
 STAGE_RULES = [
-    ("control-code", ("npu_", "materialized", "dma_lowered", "insts")),
-    ("package", ("cdo", "pdi", "bif", "partition", "xclbin", "full_elf", "full.elf",
-                 "kernels", "mem_topology")),
-    ("per-core", ("percore", "lowered_", "llvmir_", "peano-", "opted_", "core_",
-                  "ld.script", "probescripts")),
-    ("front", ("input", "placed", "physical", "traced", "stack", "params", "symbols",
-               "ctrlpkt")),
+    ("front", {
+        "input.mlir", "input_with_symbols.mlir", "input_physical.mlir",
+        "input_with_addresses.mlir", "placed.mlir", "traced.mlir",
+        "default_stack_size.mlir", "params.txt", "physical_with_elfs.mlir",
+        "measured_stack_sizes.mlir", "measured_data_sizes.mlir",
+        "checked_bank_placement.mlir", "checked_lut_banks.mlir",
+        "devicecachelookup", "sequenceplacement", "perdevicematching",
+    }, ("perdevice_",), ()),
+    ("per-core", {
+        "percoreindevice", "percorecompile", "prebakedcores", "placedcorecompile",
+        "perdevicecompilematching",
+    }, (
+        "llvmir_", "chess-compat_", "chesslinked_", "peano-compat_", "peano-linked_",
+        "opted_", "percore_", "prebakedelfs_", "percorestackspace_", "percorearches_",
+        "percoreirlinkfiles_", "probescripts_", "probeelfs_", "elfs_", "placedcore_",
+        "ldscripts_", "linkwith_", "perdevicecompile_", "perdevicearches_", "lowered_",
+    ), (".bcf",)),
+    ("control-code", {
+        "perseqmatching", "ctrlpktseqs", "fullelfctrlpktnonempty",
+        "perdevicenpuloweredmatching",
+    }, ("npu_", "ctrlpkt_", "perdevicenpulowered_"), ()),
+    ("package", {
+        "full.elf", "aie.xclbin", "full_elf_config.json",
+        "sim/reports/graph.xpe", "sim/arch/aieshim_solution.aiesol",
+        "sim/config/scsim_config.json", "sim/.target", "aiesim.sh", "sim/ps/ps.so",
+        "aiesim.stamp", "aie_inc.cpp",
+    }, (
+        "kernels_", "memtopology_", "partition_", "merged_partition_",
+        "input_aie_partition_", "cdo_", "bif_", "full_elf_",
+    ), ()),
 ]
 ROW = re.compile(r"^\s*(\d+)\s+(\S+)\s+(\S+)\s+(\S.*)$")
 
 
 def stage_of(edge):
     e = edge.lower()
-    for stage, keys in STAGE_RULES:
-        if any(k in e for k in keys):
+    for stage, exact, prefixes, suffixes in STAGE_RULES:
+        if e in exact or any(e.startswith(p) for p in prefixes) or \
+           any(e.endswith(s) for s in suffixes):
             return stage
     return "other"
 
