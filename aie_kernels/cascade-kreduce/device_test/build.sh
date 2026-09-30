@@ -14,7 +14,7 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../../.." && pwd)"
-: "${FORK_AIE_API:?set FORK_AIE_API to the aie_api fork's include/ dir (cascade.hpp)}"
+: "${FORK_AIE_API:?set FORK_AIE_API to the aie_api forks include/ dir (cascade.hpp)}"
 MLIR_AIE="${MLIR_AIE:-$REPO/mlir-aie}"          # the in-repo submodule
 TEST_LIB="$MLIR_AIE/runtime_lib/test_lib"
 
