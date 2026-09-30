@@ -118,6 +118,10 @@ def test_stage_of_known_real_edges():
     # Explicit cases from the 2026-09-30 review of aiecc.cpp @ xdna-engine (bad classifications
     # the earlier guessed rules produced).
     s = _summ().stage_of
+    # Names built from option defaults, invisible to the literal extraction below.
+    assert s("{0}.pdi") == "package"
+    assert s("objects_{0}.o") == "per-core"
+    assert s("noCtrlPktSeqs") == "control-code"
     assert s("elfs_{0}.elf") == "per-core"
     assert s("preBakedElfs_{0}.elf") == "per-core"
     assert s("probeElfs_{0}.elf") == "per-core"

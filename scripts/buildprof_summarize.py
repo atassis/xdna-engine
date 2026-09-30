@@ -34,9 +34,10 @@ STAGE_RULES = [
         "opted_", "percore_", "prebakedelfs_", "percorestackspace_", "percorearches_",
         "percoreirlinkfiles_", "probescripts_", "probeelfs_", "elfs_", "placedcore_",
         "ldscripts_", "linkwith_", "perdevicecompile_", "perdevicearches_", "lowered_",
+        "objects_",
     ), (".bcf",)),
     ("control-code", {
-        "perseqmatching", "ctrlpktseqs", "fullelfctrlpktnonempty",
+        "perseqmatching", "ctrlpktseqs", "noctrlpktseqs", "fullelfctrlpktnonempty",
         "perdevicenpuloweredmatching",
     }, ("npu_", "ctrlpkt_", "perdevicenpulowered_"), ()),
     ("package", {
@@ -47,7 +48,7 @@ STAGE_RULES = [
     }, (
         "kernels_", "memtopology_", "partition_", "merged_partition_",
         "input_aie_partition_", "cdo_", "bif_", "full_elf_",
-    ), ()),
+    ), (".pdi",)),
 ]
 ROW = re.compile(r"^\s*(\d+)\s+(\S+)\s+(\S+)\s+(\S.*)$")
 
