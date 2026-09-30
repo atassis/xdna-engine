@@ -115,7 +115,7 @@ static inline float exp2_scalar(float x) {
 }
 
 // SOFTWARE f32 2^x (x <= 0). The hw aie::exp2 is a bf16-OUTPUT LUT. MEASURED on aie2p against a
-// float64 reference (experiments/exp2_ab/, 2026-07-29), max rel-err by input domain:
+// float64 reference (tools/experiments/exp2_ab/, 2026-07-29), max rel-err by input domain:
 //   [-1,0] 6.1%   [0,10] 6.1%   [-10,0] 10.1%   [-100,0] 49.1%
 // versus 8.5e-5 flat for this poly -- a 720x-5771x gap. Do NOT quote the older "~2-4%" figure that
 // stood here: that is roughly the MEAN on the two moderate domains (3.2-3.8%), not a bound, and the

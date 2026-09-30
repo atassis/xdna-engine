@@ -13,10 +13,10 @@ GELU chains against the float64 tanh-approx GELU they both target. gelu_hw is th
 control -- it must reproduce the shipped epilogue's own error, or the comparison is
 measuring this probe rather than the kernel.
 
-Pattern (pyxrt buffer wiring) copied from experiments/exp2_ab/run_exp2_ab.py.
+Pattern (pyxrt buffer wiring) copied from tools/experiments/exp2_ab/run_exp2_ab.py.
 
 Usage (the NPU is single-tenant -- serialize against any other on-device work):
-  scripts/npu_lock.sh run -- .venv-iron/bin/python experiments/tanh_ab/run_tanh_ab.py
+  scripts/npu_lock.sh run -- .venv-iron/bin/python tools/experiments/tanh_ab/run_tanh_ab.py
 """
 import argparse, os, sys
 import numpy as np

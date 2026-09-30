@@ -3,7 +3,7 @@
 # Self-contained build for the minimal non-Parakeet RA/spill-around-call repro.
 # Does NOT depend on sync_kernels.sh / the mlir-aie programming_examples tree --
 # it resolves the aie_api include by path and drives aiecc directly, so it builds
-# in-place from experiments/probes/.
+# in-place from tools/experiments/probes/.
 #
 # Prereq: source the fork toolchain env first (PEANO_INSTALL_DIR + aiecc on PATH):
 #   source ../../../xdna-engine/scripts/iron_env.sh

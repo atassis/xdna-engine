@@ -1,6 +1,6 @@
 # tanh_ab_iron.py -- A/B device probe. Single core, in[N] f32 -> out[5*N] f32
 # ([raw|hwtanh|swtanh|gelu_hw|gelu_sw]). Pattern copied from
-# experiments/exp2_ab/exp2_ab_iron.py, which is itself the migrated single-core
+# tools/experiments/exp2_ab/exp2_ab_iron.py, which is itself the migrated single-core
 # shape from relpos_mha/probe_floor_iron.py -- see toolchain.lock for the IRON API
 # break this depends on (Runtime(seq_fn, fn_args), fill/drain on the ObjectFifo
 # handle, Worker's core_body, Program(..., workers=).resolve_program()).

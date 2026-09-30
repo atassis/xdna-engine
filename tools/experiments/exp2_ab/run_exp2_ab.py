@@ -3,7 +3,7 @@
 
 Re-measures the claim in designs/relpos_mha/relpos_mha.cc:117-122 ("hw LUT
 ~2-4% inaccurate, sw poly ~1e-4 accurate") for an upstream mlir-aie PR. Drives the
-exp2_ab xclbin (experiments/exp2_ab/exp2_ab.cc) once per input domain via
+exp2_ab xclbin (tools/experiments/exp2_ab/exp2_ab.cc) once per input domain via
 pyxrt, and scores hw2x/sw2x against a float64 numpy 2**x reference (+ the bonus
 hwex column, bf16_exp.cc's literal e^x pipeline, against float64 np.exp(x)).
 
@@ -12,7 +12,7 @@ to the exp2_ab probe's 1-in/1-out ABI (group_id(3)=in, group_id(4)=out; group_id
 =cacheable instr bo, same as every other probe runner in this repo).
 
 Usage (the NPU is single-tenant -- serialize against any other on-device work):
-  .venv-iron/bin/python experiments/exp2_ab/run_exp2_ab.py \\
+  .venv-iron/bin/python tools/experiments/exp2_ab/run_exp2_ab.py \\
       --xclbin mlir-aie/programming_examples/ml/exp2_ab/build/final.xclbin \\
       --insts  mlir-aie/programming_examples/ml/exp2_ab/build/insts.bin
 """

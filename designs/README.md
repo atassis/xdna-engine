@@ -4,9 +4,9 @@ A design is a multi-core AIE dataflow graph compiled from one or more `aie_kerne
 sources into one artifact (xclbin+insts, or an ELF for the fused-decode path). "design" is
 AMD's own noun for this (1399 uses in mlir-aie, their `aie_design.py` convention).
 
-This directory, `aie_kernels/`, `experiments/` and `patches/` are what `route_b_kernels/`
-split into in `81e513d` ("designs: retire route_b_kernels..."), 2026-09-05 -- 16 shipping
-designs here, 7 one-off studies to `experiments/`, the mlir-air PR drafts to `patches/`. That
+This directory, `aie_kernels/`, `tools/experiments/` (then `experiments/`) and `patches/` are what
+`route_b_kernels/` split into in `81e513d` ("designs: retire route_b_kernels..."), 2026-09-05 -- 16
+shipping designs here, 7 one-off studies to `experiments/`, the mlir-air PR drafts to `patches/`. That
 commit deleted `route_b_kernels/README.md` (40 lines) with no replacement; this file is it.
 
 ## Build models -- three, not two, and checked by counting `Makefile*` per dir
@@ -70,7 +70,7 @@ found, not a runtime guarantee for every code path or feature flag.
   [`aie_kernels/INDEX.md`](../aie_kernels/INDEX.md).
 - **`aie_kernels/_test/`** -- device-verify harness for kernels in isolation (40 `verify_*.py`
   gates plus bisect probes), not per-design; see its own `README.md`.
-- **`experiments/`** (7 dirs: `exp2_ab`, `ffn_bfp16`, `lpddr_bw`, `occupancy`, `phase_probe`,
+- **`tools/experiments/`** (7 dirs: `exp2_ab`, `ffn_bfp16`, `lpddr_bw`, `occupancy`, `phase_probe`,
   `probes`, `tanh_ab`) -- one-off studies and A/B probes, not dispatched by the engine. Build
   model varies per dir (4 of 7 have their own `Makefile`).
 - **`patches/`** -- carried upstream toolchain patches (mlir-aie, IRON, a draft mlir-air PR),
