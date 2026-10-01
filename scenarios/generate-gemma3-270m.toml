@@ -25,14 +25,14 @@ name = "gemma3-270m"
 #   as a RELATIVE 3rd arg to build_llm_decode.sh silently miscompiles the artifact into a phantom
 #   nested dir under the shared $WORK cache (the script cd's into $WORK before invoking the
 #   generator, so a relative --out resolves against the wrong cwd) -- always pass an ABSOLUTE OUT.
-# ADOPTED 2026-10-01 (`decode_qat_int4_p8e3958`): weights from
+# ADOPTED 2026-10-01 (`decode_qat_int4_pe8e957d`, built at pin e8e957da947, instance 559594e85444): weights from
 #   google/gemma-3-270m-it-qat-q4_0-unquantized, mlp/attn_o/head packed int4 g32 full_range; q/k/v
 #   and norms stay bf16 (the generator cannot read them packed):
 #     weights  scripts/dump_llm_weights.py --spec gemma3-270m --checkpoint-dir <qat snapshot> \
 #                --out artifacts/gemma3-270m/weights_qat_int4g32 --quant int4 --quant-group 32 \
 #                --quant-full-range --quant-leaves gate_proj,up_proj,down_proj,o_proj,embed_tokens
 #     decode   WEIGHTS=artifacts/gemma3-270m/weights_qat_int4g32 \
-#                scripts/build_llm_decode.sh gemma3-270m "" artifacts/gemma3-270m/decode_qat_int4_p8e3958
+#                scripts/build_llm_decode.sh gemma3-270m "" artifacts/gemma3-270m/decode_qat_int4_pe8e957d
 #   tokenizer_qat is the checkpoint's own tokenizer: encodings and chat template identical to the
 #   unsloth one, eos_token <eos> vs <end_of_turn>, generation_config eos_token_id [1, 106] in both.
 #   Unlike gemma4-12b's, this QAT checkpoint is not snapped to the Q4_0 grid (31-32 distinct values
@@ -41,6 +41,6 @@ name = "gemma3-270m"
 #   the bf16 decode_p8e3958: 50.38/50.20 vs 50.57/50.66 ms/token, alternated; no fused arm applies to
 #   this shape. The unsloth bf16 weights and decode_p8e3958 were removed once this was installed.
 [artifacts]
-decode = "artifacts/gemma3-270m/decode_qat_int4_p8e3958"
+decode = "artifacts/gemma3-270m/decode_qat_int4_pe8e957d"
 weights = "artifacts/gemma3-270m/weights_qat_int4g32"
 tokenizer_dir = "artifacts/gemma3-270m/tokenizer_qat"
