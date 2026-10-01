@@ -221,9 +221,20 @@ _build_aie_translate() {
 # Build the vendored aiebu-asm (third_party/aiebu submodule) instead of requiring AIEBU_ASM_DIR to
 # point at a hand-built binary. No-op on a pin that predates the submodule, so this stays safe across
 # a repin boundary in either direction.
+# aiebu's spec step runs spec_tool.py under cmake's Python3_EXECUTABLE and redirects its stdout into
+# the SOURCE tree's isa.h, so a missing `markdown` module leaves an empty isa.h instead of a failure.
+_require_aiebu_spec_python() {
+  "$REPO/.venv-iron/bin/python" -c "import markdown" 2>/dev/null && return 0
+  echo "[toolchain_up] ERROR: .venv-iron lacks the python 'markdown' module, which aiebu's spec" \
+       "step needs (without it, it writes an empty isa.h into the source tree);" \
+       "fix: $REPO/.venv-iron/bin/python -m pip install markdown" >&2
+  exit 1
+}
+
 _build_vendored_aiebu_asm() {
   [ -e "$INST/build/bin/aiebu-asm" ] && return 0
   ninja -C "$INST/build" -t targets 2>/dev/null | grep -q '^aiebu-asm:' || return 0
+  _require_aiebu_spec_python
   ninja -C "$INST/build" aiebu-asm >&2
 }
 
@@ -243,6 +254,7 @@ echo "[toolchain_up] building instance $LOCKHASH ..." >&2
 # nanobind builds the MLIR bindings; pybind11 builds _parameter_scratchpad (below). Both are
 # configure-time hard requirements -- cmake FATAL_ERRORs without them.
 "$REPO/.venv-iron/bin/python" -m pip install -q "nanobind==$NANOBIND" pybind11
+_require_aiebu_spec_python
 mkdir -p "$INST"
 # Source = a CLEAN checkout of the fork integration-branch commit (NO dirty working tree). Our
 # kernels are NOT overlaid here; designs reach them through lib_kernels_dir -> aie_kernels/. The prebuilt MLIR distro + cmake helpers come from the submodule.
