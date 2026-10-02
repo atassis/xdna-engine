@@ -36,6 +36,13 @@ CONFIG = Path.home() / ".config/npu/engine.toml"
 
 
 class ModelArtifactDispatchPlanTests(unittest.TestCase):
+    def test_community_sdk_pins_checkpoint_loader_fix(self) -> None:
+        requirements = (REPO / "scripts/requirements-pyannote-community.txt").read_text().splitlines()
+        self.assertIn("pyannote.audio==4.0.3", requirements)
+        self.assertIn("torchcodec==0.7.0", requirements)
+        self.assertIn("torch==2.8.0+cpu", requirements)
+        self.assertIn("torchaudio==2.8.0+cpu", requirements)
+
     def test_install_provisions_only_the_pyannote_sdks_selected_by_config(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config = Path(directory) / "engine.toml"
