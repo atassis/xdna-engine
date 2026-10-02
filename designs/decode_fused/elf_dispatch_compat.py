@@ -29,7 +29,6 @@ import ctypes
 
 import numpy as np
 import ml_dtypes
-import pyxrt
 
 from iron.common import compilation as comp
 # XRTSubBuffer is the pre-subview() fallback below and upstream DELETED it (IRON 1838f82, "drop
@@ -41,7 +40,6 @@ try:
 except ImportError:  # current IRON: subview() is the only path
     XRTSubBuffer = None
 import aie.utils as aie_utils
-from aie.utils.hostruntime.xrtruntime.tensor import XRTTensor
 
 # The build half, upstream's own (amd/IRON #117). No fallback to the pre-rename
 # FusedMLIROperator: the carried fusion.py is deleted, so a missing sequence.py means the build
@@ -86,6 +84,8 @@ class FullELFCallable:
         self.reload_elf(elf_data)
 
     def __call__(self, *args):
+        import pyxrt
+
         run = pyxrt.run(self.xrt_kernel)
         for i, arg in enumerate(args):
             assert isinstance(arg, pyxrt.bo), f"Argument {i} is not a pyxrt.bo"
@@ -96,6 +96,8 @@ class FullELFCallable:
             raise RuntimeError(f"Kernel execution failed with return code {ret_code}")
 
     def reload_elf(self, elf_data):
+        import pyxrt
+
         # Create a PyCapsule from the numpy array pointer for pybind11
         elf_data_u8 = elf_data.view(dtype=np.uint8)
         ctypes.pythonapi.PyCapsule_New.restype = ctypes.py_object
@@ -114,6 +116,8 @@ class FullELFCallable:
 
 class FusedFullELFCallable(FullELFCallable):
     def __init__(self, op, elf_data=None):
+        from aie.utils.hostruntime.xrtruntime.tensor import XRTTensor
+
         if elf_data is None:
             elf_data = load_elf(op)
         super().__init__(elf_data)
