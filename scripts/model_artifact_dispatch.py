@@ -349,6 +349,8 @@ def copy_tokenizer(source: Path, target: Path) -> None:
 
 
 def link_or_copy(source: str, destination: str) -> str:
+    if Path(source).name.endswith(".onnx.data"):
+        return shutil.copy2(source, destination)
     try:
         os.link(source, destination)
     except OSError:

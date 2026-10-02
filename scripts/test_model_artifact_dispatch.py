@@ -11,6 +11,7 @@ from model_artifact_dispatch import (
     Command,
     Recipe,
     authority_digest,
+    copy_tree,
     materialize_input,
     build_recipe,
     ensure_outputs_ready,
@@ -32,6 +33,20 @@ CONFIG = Path.home() / ".config/npu/engine.toml"
 
 
 class ModelArtifactDispatchPlanTests(unittest.TestCase):
+    def test_onnx_external_data_gets_a_private_inode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            payload = source / "encoder-model.onnx.data"
+            payload.write_bytes(b"external tensor fixture")
+            target = root / "input"
+            copy_tree(source, target)
+            copied = target / payload.name
+            self.assertEqual(copied.read_bytes(), payload.read_bytes())
+            self.assertEqual(copied.stat().st_nlink, 1)
+            self.assertNotEqual(copied.stat().st_ino, payload.stat().st_ino)
+
     def test_dotted_model_directory_is_not_treated_as_a_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
