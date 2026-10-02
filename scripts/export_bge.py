@@ -67,7 +67,7 @@ def main():
         output_names=["last_hidden_state"],
         dynamic_axes={"input_ids": {0: "b", 1: "s"}, "attention_mask": {0: "b", 1: "s"},
                       "token_type_ids": {0: "b", 1: "s"}, "last_hidden_state": {0: "b", 1: "s"}},
-        opset_version=17,
+        opset_version=17, dynamo=False,
     )
     print(f"exported {n_layers} layers + onnx + tokenizer to {OUT}")
 
