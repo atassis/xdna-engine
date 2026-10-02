@@ -134,7 +134,11 @@ pub fn npu_wake(idle_ms: Option<u64>) -> Option<npu_models::NpuWake> {
 /// Count one cold wake for `/v1/models`'s aggregate line. Never decremented -- it counts requests
 /// that paid the wake, not devices currently suspended.
 pub fn note_cold_wake() {
-    COLD_WAKES.fetch_add(1, Ordering::Relaxed);
+    note_cold_wake_to(&COLD_WAKES);
+}
+
+fn note_cold_wake_to(counter: &AtomicU64) {
+    counter.fetch_add(1, Ordering::Relaxed);
 }
 
 pub fn cold_wake_count() -> u64 {
@@ -147,7 +151,11 @@ pub fn cold_wake_count() -> u64 {
 /// (a phase inside a `GenerationReport` vs. the whole request's wall time in the actor) and neither
 /// should be silently relabelled as the other.
 pub fn log_cold_wake(kind: &str, model: &str, w: &npu_models::NpuWake, cost_label: &str, cost_ms: f64) {
-    note_cold_wake();
+    log_cold_wake_to(&COLD_WAKES, kind, model, w, cost_label, cost_ms);
+}
+
+fn log_cold_wake_to(counter: &AtomicU64, kind: &str, model: &str, w: &npu_models::NpuWake, cost_label: &str, cost_ms: f64) {
+    note_cold_wake_to(counter);
     eprintln!(
         "[npu-service] cold NPU wake for {model} ({kind}): device was runtime-{} ({} since the \
          previous NPU job), {cost_label} took {cost_ms:.1} ms",
@@ -214,20 +222,20 @@ mod wake_tests {
 
     #[test]
     fn note_cold_wake_is_cumulative_and_never_decrements() {
-        let before = cold_wake_count();
-        note_cold_wake();
-        note_cold_wake();
-        assert_eq!(cold_wake_count(), before + 2);
+        let counter = AtomicU64::new(0);
+        note_cold_wake_to(&counter);
+        note_cold_wake_to(&counter);
+        assert_eq!(counter.load(Ordering::Relaxed), 2);
     }
 
     #[test]
     fn log_cold_wake_counts_the_wake_it_logs() {
-        let before = cold_wake_count();
+        let counter = AtomicU64::new(0);
         let w = npu_models::NpuWake {
             cold: true, status: "suspended".into(), idle_ms: Some(500), first_dispatch_us: None,
         };
-        log_cold_wake("asr", "parakeet", &w, "request", 142.3);
-        assert_eq!(cold_wake_count(), before + 1);
+        log_cold_wake_to(&counter, "asr", "parakeet", &w, "request", 142.3);
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
     }
 }
 
