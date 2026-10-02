@@ -12,8 +12,8 @@ Linear weights are TRANSPOSED to [in, out] (the x@W B-operand form the Rust engi
 import os, numpy as np, torch
 from transformers import AutoModel, AutoTokenizer
 
-MODEL = "BAAI/bge-base-en-v1.5"
-OUT = os.path.join("artifacts", "bge-base")
+MODEL = os.environ.get("BGE_SOURCE", "BAAI/bge-base-en-v1.5")
+OUT = os.environ.get("BGE_OUT", os.path.join("artifacts", "bge-base"))
 ENC = os.path.join(OUT, "encoder")
 
 def save(path, arr):
@@ -21,8 +21,9 @@ def save(path, arr):
     np.save(path, np.ascontiguousarray(arr.astype(np.float32)))
 
 def main():
-    tok = AutoTokenizer.from_pretrained(MODEL)
-    model = AutoModel.from_pretrained(MODEL).eval()
+    local_only = os.environ.get("HF_HUB_OFFLINE") == "1"
+    tok = AutoTokenizer.from_pretrained(MODEL, local_files_only=local_only)
+    model = AutoModel.from_pretrained(MODEL, local_files_only=local_only).eval()
     sd = model.state_dict()
     g = lambda k: sd[k].cpu().numpy()
 

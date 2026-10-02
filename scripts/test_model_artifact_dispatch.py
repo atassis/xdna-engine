@@ -1,0 +1,343 @@
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from model_artifact_dispatch import (
+    Command,
+    Recipe,
+    authority_digest,
+    materialize_input,
+    build_recipe,
+    ensure_outputs_ready,
+    plan as build_plan,
+    publish_recipe,
+    provision_inputs,
+    recipe_key,
+    source_manifest_path,
+    run_commands,
+    validate_recipe_inputs,
+    validate_recipe_outputs,
+    verified_existing_gemma4,
+    validate_command_executables,
+)
+
+REPO = Path(__file__).resolve().parents[1]
+DISPATCH = REPO / "scripts/model_artifact_dispatch.py"
+CONFIG = Path.home() / ".config/npu/engine.toml"
+
+
+class ModelArtifactDispatchPlanTests(unittest.TestCase):
+    def test_dotted_model_directory_is_not_treated_as_a_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "snapshot"
+            source.mkdir()
+            (source / "config.yaml").write_text("pipeline: fixture\n")
+            target = root / "inputs/speaker-diarization-3.1"
+            recipe = Recipe("pyannote-3.1", "fixture", (str(target),), (), ())
+            self.assertEqual(source_manifest_path(recipe), target / ".model-input-source.json")
+            materialize_input(recipe, source, "fixture", "fixture")
+            self.assertTrue((target / "config.yaml").is_file())
+
+    def test_recipe_count_follows_the_configured_subset(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "engine.toml"
+            config.write_text('[[model]]\nname = "bge-base"\nscenario = "scenarios/bge-base.toml"\n')
+            recipes = build_plan(config, REPO, root / "artifacts", root / "inputs", root / "build")
+            self.assertEqual(len(recipes), 1)
+
+    def plan(self) -> list[dict]:
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(DISPATCH),
+                "--plan",
+                "--config",
+                str(CONFIG),
+                "--repo",
+                str(REPO),
+                "--artifacts-root",
+                "/model-artifacts",
+                "--model-input-root",
+                "/model-inputs",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return json.loads(result.stdout)
+
+    def test_selected_config_has_one_recipe_for_each_configured_model(self) -> None:
+        plan = self.plan()
+        self.assertEqual(len(plan), 10)
+        self.assertEqual(
+            [entry["model"] for entry in plan],
+            [
+                "parakeet",
+                "bge-base",
+                "pyannote-community-1",
+                "pyannote-3.1",
+                "whisper-turbo",
+                "gemma3-270m",
+                "qwen3-0.6b",
+                "gemma4-12b",
+                "qwen3.5-4b",
+                "espcn",
+            ],
+        )
+        self.assertTrue(all(entry["scenario"].startswith("scenarios/") for entry in plan))
+        self.assertTrue(all(entry["commands"] for entry in plan))
+
+    def test_generate_pairs_build_decode_before_prefill_with_absolute_metadata(self) -> None:
+        plan = {entry["model"]: entry for entry in self.plan()}
+        for model in ("qwen3-0.6b", "qwen3.5-4b"):
+            commands = plan[model]["commands"]
+            steps = [command["step"] for command in commands]
+            self.assertLess(steps.index("decode"), steps.index("prefill"))
+            prefill = commands[steps.index("prefill")]
+            self.assertTrue(prefill["env"]["DECODE_META"].startswith("/model-artifacts/"))
+            self.assertNotIn("$PWD", prefill["env"]["DECODE_META"])
+
+    def test_resident_recipe_packages_the_declared_artifact(self) -> None:
+        gemma4 = next(entry for entry in self.plan() if entry["model"] == "gemma4-12b")
+        self.assertEqual([command["step"] for command in gemma4["commands"]], ["data", "build", "package"])
+        outputs = set(gemma4["outputs"])
+        self.assertTrue({
+            "/model-artifacts/gemma4-12b/resident_rf48C_p7148a7",
+            "/model-artifacts/gemma4-12b/tokenizer",
+            "/model-artifacts/gemma4-12b-qat/checkpoint",
+            "/model-artifacts/gemma4-12b/rf_stack",
+            "/model-artifacts/gemma4-12b/store",
+            "/model-artifacts/gemma4-12b/weights_int4g32sbf16_planar_qat_rg",
+        }.issubset(outputs))
+
+    def test_mocked_command_failure_propagates_without_running_a_model(self) -> None:
+        recipe = Recipe(
+            model="dispatch-fixture",
+            scenario="scenarios/asr.toml",
+            inputs=(),
+            outputs=(),
+            commands=(Command("fixture", (sys.executable, "-c", "raise SystemExit(17)"), {}),),
+        )
+        with self.assertRaises(subprocess.CalledProcessError) as caught:
+            run_commands(recipe, REPO)
+        self.assertEqual(caught.exception.returncode, 17)
+
+    def test_unmanaged_artifact_output_is_left_for_transactional_rebuild(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "artifact"
+            output.mkdir()
+            (output / "legacy.bin").write_bytes(b"old")
+            recipe = Recipe("fixture", "scenarios/asr.toml", (), (str(output),), ())
+            ensure_outputs_ready(recipe, "different-key")
+            self.assertEqual((output / "legacy.bin").read_bytes(), b"old")
+
+    def test_missing_absolute_builder_is_reported_before_any_recipe_runs(self) -> None:
+        recipe = Recipe(
+            "fixture", "scenarios/asr.toml", (), (),
+            (Command("export", ("/no/such/python", "export.py"), {}),),
+        )
+        with self.assertRaisesRegex(FileNotFoundError, "missing executable"):
+            validate_command_executables([recipe])
+
+    def test_recipe_key_tracks_the_declared_builder_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "scenarios").mkdir()
+            (root / "scenarios/asr.toml").write_text("[scenario]\nkind = 'asr'\n")
+            (root / "toolchain.lock").write_text("PIN=one\n")
+            builder = root / "builder.py"
+            builder.write_text("print('one')\n")
+            config = root / "engine.toml"
+            config.write_text("[[model]]\nname = 'fixture'\nscenario = 'scenarios/asr.toml'\n")
+            input_file = root / "input.bin"
+            input_file.write_bytes(b"input")
+            output = root / "output"
+            recipe = Recipe("fixture", "scenarios/asr.toml", (str(input_file),), (str(output),),
+                            (Command("build", (sys.executable, str(builder)), {}),))
+            first = recipe_key(recipe, root, config)
+            builder.write_text("print('two')\n")
+            self.assertNotEqual(first, recipe_key(recipe, root, config))
+
+    def test_transitive_decode_and_prefill_generators_invalidate_a_recipe_key(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "scenarios").mkdir()
+            (root / "designs/decode_fused").mkdir(parents=True)
+            (root / "designs/resident_forward").mkdir(parents=True)
+            (root / "scripts").mkdir()
+            (root / "aie_kernels").mkdir()
+            (root / "third_party/iron").mkdir(parents=True)
+            (root / "scenarios/asr.toml").write_text("[scenario]\nkind = 'asr'\n")
+            (root / "toolchain.lock").write_text("PIN=one\n")
+            (root / "designs/decode_fused/gen_llm_decode.py").write_text("decode = 1\n")
+            prefill = root / "designs/decode_fused/gen_llm_prefill.py"
+            prefill.write_text("prefill = 1\n")
+            config = root / "engine.toml"
+            config.write_text("[[model]]\nname = 'fixture'\nscenario = 'scenarios/asr.toml'\n")
+            source = root / "input.bin"
+            source.write_bytes(b"input")
+            recipe = Recipe("fixture", "scenarios/asr.toml", (str(source),), (str(root / "output"),), ())
+            first = recipe_key(recipe, root, config)
+            prefill.write_text("prefill = 2\n")
+            self.assertNotEqual(first, recipe_key(recipe, root, config))
+
+    def test_input_validation_fails_for_a_later_recipe_before_commands_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            present = root / "present"
+            present.mkdir()
+            later = root / "missing"
+            first = Recipe("fixture-one", "scenarios/asr.toml", (str(present),), (), ())
+            second = Recipe("fixture-two", "scenarios/asr.toml", (str(later),), (), ())
+            with self.assertRaisesRegex(FileNotFoundError, "fixture-two"):
+                validate_recipe_inputs([first, second])
+
+    def test_cache_snapshot_provisions_an_explicit_input_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache = root / "hub/models--BAAI--bge-base-en-v1.5/snapshots/revision"
+            cache.mkdir(parents=True)
+            for name in ("config.json", "tokenizer.json", "model.safetensors"):
+                (cache / name).write_text(name)
+            target = root / "inputs/bge-base"
+            recipe = Recipe("bge-base", "scenarios/bge-base.toml", (str(target),), (str(root / "out"),), ())
+            prior = os.environ.get("HF_HUB_CACHE")
+            os.environ["HF_HUB_CACHE"] = str(root / "hub")
+            try:
+                provision_inputs([recipe], allow_download=False)
+            finally:
+                if prior is None:
+                    os.environ.pop("HF_HUB_CACHE", None)
+                else:
+                    os.environ["HF_HUB_CACHE"] = prior
+            self.assertTrue((target / ".model-input-source.json").is_file())
+            validate_recipe_inputs([recipe])
+
+    def test_explicit_local_espcn_source_is_manifested_without_a_download_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source/espcn_x3_dyn.onnx"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"onnx")
+            target = root / "inputs/espcn/espcn_x3_dyn.onnx"
+            recipe = Recipe("espcn", "scenarios/upscale-espcn.toml", (str(target),), (str(root / "out"),), ())
+            os.environ["MODEL_INPUT_SOURCE_ESPCN"] = str(source)
+            try:
+                provision_inputs([recipe], allow_download=False)
+            finally:
+                os.environ.pop("MODEL_INPUT_SOURCE_ESPCN", None)
+            self.assertEqual(target.read_bytes(), b"onnx")
+            self.assertTrue((target.parent / ".model-input-source.json").is_file())
+
+    def test_parakeet_requires_all_served_source_and_artifact_members(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "parakeet"
+            source.mkdir()
+            (source / "encoder-model.onnx").write_bytes(b"onnx")
+            recipe = Recipe("parakeet", "scenarios/asr.toml", (str(source),), (str(root / "artifact"),), ())
+            with self.assertRaisesRegex(FileNotFoundError, "encoder-model.onnx.data"):
+                validate_recipe_inputs([recipe])
+            artifact = root / "artifact"
+            (artifact / "encoder").mkdir(parents=True)
+            (artifact / "encoder/manifest.json").write_text("{}")
+            with self.assertRaisesRegex(FileNotFoundError, "preprocessor.onnx"):
+                validate_recipe_outputs(recipe)
+
+    def test_publish_keeps_the_old_tree_as_rollback_and_writes_verified_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            live = root / "artifacts/model"
+            staged = root / "staging/model"
+            live.mkdir(parents=True)
+            staged.mkdir(parents=True)
+            (live / "value").write_text("old")
+            (staged / "value").write_text("new")
+            recipe = Recipe("fixture", "scenarios/asr.toml", (), (str(live),), ())
+            staged_recipe = Recipe("fixture", "scenarios/asr.toml", (), (str(staged),), ())
+            publish_recipe(recipe, staged_recipe, "key", root / "rollback")
+            self.assertEqual((live / "value").read_text(), "new")
+            backups = list((root / "rollback").rglob("value"))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(backups[0].read_text(), "old")
+            self.assertTrue((live / ".model-recipe.json").is_file())
+
+    def test_fresh_gemma4_provenance_is_verified_without_rebuilding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            outputs = tuple(str(root / name) for name in (
+                "resident", "tokenizer", "checkpoint", "rf_stack", "store", "weights", "hf_config", "towers"))
+            for output in outputs:
+                Path(output).mkdir(parents=True)
+            (Path(outputs[0]) / "meta.json").write_text(json.dumps({"iron": {"commit": "a", "dirty": False, "identity": "pinned:a"}}))
+            (Path(outputs[1]) / "tokenizer.json").write_text("{}")
+            (Path(outputs[2]) / "config.json").write_text("{}")
+            (Path(outputs[3]) / "w_head.npy").write_bytes(b"w")
+            (Path(outputs[4]) / "manifest.json").write_text("{}")
+            (Path(outputs[5]) / "quant.json").write_text("{}")
+            (Path(outputs[6]) / "config.json").write_text("{}")
+            (Path(outputs[7]) / "tower.npy").write_bytes(b"w")
+            for output in outputs[3:]:
+                (Path(output) / ".recipe-manifest.json").write_text("{}")
+            recipe = Recipe("gemma4-12b", "scenarios/generate-gemma4-12b-resident-256k.toml", (), outputs, ())
+            self.assertTrue(verified_existing_gemma4(recipe, "key"))
+            self.assertTrue((Path(outputs[0]) / ".model-recipe.json").is_file())
+
+    def test_failed_staged_command_never_replaces_an_unmanaged_live_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "scenarios").mkdir()
+            (root / "scripts").mkdir()
+            (root / "designs/decode_fused").mkdir(parents=True)
+            (root / "designs/resident_forward").mkdir(parents=True)
+            (root / "aie_kernels").mkdir()
+            (root / "third_party/iron").mkdir(parents=True)
+            (root / "scenarios/asr.toml").write_text("[scenario]\nkind = 'asr'\n")
+            (root / "toolchain.lock").write_text("PIN=one\n")
+            config = root / "engine.toml"
+            config.write_text("[[model]]\nname = 'fixture'\nscenario = 'scenarios/asr.toml'\n")
+            source = root / "source"
+            source.mkdir()
+            live = root / "artifacts/fixture"
+            live.mkdir(parents=True)
+            (live / "value").write_text("old")
+            builder = root / "scripts/builder.py"
+            builder.write_text(
+                "import os\nfrom pathlib import Path\nout = Path(os.environ['OUT'])\nout.mkdir(parents=True, exist_ok=True)\n(out / 'value').write_text('partial')\nraise SystemExit(17)\n")
+            recipe = Recipe("fixture", "scenarios/asr.toml", (str(source),), (str(live),),
+                            (Command("fixture", (sys.executable, str(builder)), {"OUT": str(live)}),))
+            with self.assertRaises(subprocess.CalledProcessError):
+                build_recipe(recipe, root, config, root / "artifacts", root / "build")
+            self.assertEqual((live / "value").read_text(), "old")
+            self.assertFalse((live / ".model-recipe.json").exists())
+
+    def test_espcn_recipe_bakes_the_served_checkpoint_from_its_explicit_input(self) -> None:
+        espcn = next(entry for entry in self.plan() if entry["model"] == "espcn")
+        bake = next(command for command in espcn["commands"] if command["step"] == "bake")
+        self.assertIn("checkpoint", bake["argv"])
+        self.assertIn("--source", bake["argv"])
+        self.assertTrue(any(value.startswith("path:/model-inputs/espcn/") for value in bake["argv"]))
+        self.assertIn("/model-artifacts/espcn/espcn.safetensors", bake["argv"])
+
+    def test_whisper_recipe_passes_the_venv_root_to_its_existing_builder(self) -> None:
+        whisper = next(entry for entry in self.plan() if entry["model"] == "whisper-turbo")
+        decode = next(command for command in whisper["commands"] if command["step"] == "decode")
+        self.assertTrue(decode["env"]["VENV_IRON"].endswith("/.venv-iron"))
+
+    def test_install_uses_the_same_configured_model_dispatch(self) -> None:
+        install = (REPO / "install.sh").read_text()
+        self.assertIn("model_artifact_dispatch.py", install)
+        self.assertIn("--model-input-root", install)
+        self.assertIn("--report", install)
+        self.assertIn("$XDNA_LOGS/model-install-report.json", install)
+
+
+if __name__ == "__main__":
+    unittest.main()

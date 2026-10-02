@@ -324,6 +324,19 @@ fi
 # ---------------------------------------------------------------------------
 # 4. Artifacts
 # ---------------------------------------------------------------------------
+MODEL_INPUT_ROOT="${MODEL_INPUT_ROOT:-$XDNA_DATA/model-inputs}"
+MODEL_INSTALL_REPORT="${MODEL_INSTALL_REPORT:-$XDNA_LOGS/model-install-report.json}"
+MODEL_IRON_PY="${MODEL_IRON_PY:-${VENV_IRON:-$REPO/.venv-iron}/bin/python}"
+MODEL_PYANNOTE_PY="${MODEL_PYANNOTE_PY:-${PYANNOTE_VENV:-$REPO/.venv-pyannote}/bin/python}"
+info "Building configured model artifacts from $MODEL_INPUT_ROOT"
+MODEL_EXPORT_PY="$ONNX_ASR_PY" MODEL_IRON_PY="$MODEL_IRON_PY" \
+MODEL_PYANNOTE_PY="$MODEL_PYANNOTE_PY" NPU_BIN="$BUILT_BIN" \
+  "$ONNX_ASR_PY" "$REPO/scripts/model_artifact_dispatch.py" --build \
+  --config "$ENGINE_CONFIG" --repo "$REPO" --artifacts-root "$ENGINE_ARTIFACTS" \
+  --model-input-root "$MODEL_INPUT_ROOT" --report "$MODEL_INSTALL_REPORT" \
+  || die "configured model artifact build failed; see the command above and $MODEL_INSTALL_REPORT"
+ok "Configured model artifact recipes completed: $MODEL_INSTALL_REPORT"
+
 # A directory "exists with content" check (non-empty).
 dir_has_content() { [ -d "$1" ] && [ -n "$(ls -A "$1" 2>/dev/null)" ]; }
 

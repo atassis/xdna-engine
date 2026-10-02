@@ -8,11 +8,12 @@ its CPU ESPCN SR output (gate_lr.npy / gate_sr.npy) for the npu-sr frontier pari
 Mirrors scripts/export_resnet.py. Run with any venv that has onnx + onnxruntime + numpy, cwd = repo root:
     <venv>/bin/python scripts/export_espcn.py
 Requires artifacts/espcn/espcn_x3_dyn.onnx (the pretrained ESPCN, copied from the M1 asset)."""
+import os
 import numpy as np, onnxruntime as ort, onnx
 from pathlib import Path
 
-OUT = Path("artifacts/espcn"); OUT.mkdir(parents=True, exist_ok=True)
-MODEL = OUT / "espcn_x3_dyn.onnx"
+OUT = Path(os.environ.get("ESPCN_OUT", "artifacts/espcn")); OUT.mkdir(parents=True, exist_ok=True)
+MODEL = Path(os.environ.get("ESPCN_MODEL", str(OUT / "espcn_x3_dyn.onnx")))
 assert MODEL.exists(), f"missing {MODEL} -- copy espcn_x3_dyn.onnx (M1 asset) into artifacts/espcn/ first"
 
 # --- weights: pull conv initializers (4-D weight + 1-D bias), map conv1..conv4 in graph order ---

@@ -21,6 +21,7 @@ Run: .venv-export/bin/python scripts/export_pyannote.py
 Needs HF_TOKEN (pyannote/segmentation-3.0 is gated).
 """
 import json, os, sys, urllib.request
+from pathlib import Path
 import torch, torch.nn as nn, torchaudio
 import pyannote.audio
 import torchaudio.compliance.kaldi as kaldi
@@ -29,7 +30,7 @@ from pyannote.audio import Model
 
 PIPELINE = os.environ.get("PYANNOTE_PIPELINE", "pyannote/speaker-diarization-3.1")
 SLUG = PIPELINE.split("/")[-1]
-OUT = f"artifacts/pyannote/{SLUG}"
+OUT = os.environ.get("PYANNOTE_OUT", f"artifacts/pyannote/{SLUG}")
 os.makedirs(OUT, exist_ok=True)
 SR = 16000
 # Read from the installed package, never hardcoded: the manifest claims this as the
@@ -40,15 +41,16 @@ PYANNOTE_REV = pyannote.audio.__version__
 PIPELINE_CFG = "https://raw.githubusercontent.com/pyannote/hf-speaker-diarization-3.1/main/config.yaml"
 EMBED_CFG = "https://huggingface.co/pyannote/wespeaker-voxceleb-resnet34-LM/resolve/main/config.yaml"
 
+local_pipeline = Path(PIPELINE).is_dir()
 token = os.environ.get("HF_TOKEN")
-if not token:
+if not token and not local_pipeline:
     sys.exit("HF_TOKEN is required: pyannote/segmentation-3.0 is a gated repo. Accept its "
              "conditions on huggingface.co, then export HF_TOKEN=hf_...")
 
 # `use_auth_token` was removed from huggingface_hub; pyannote 4.x takes `token`.
 import inspect as _inspect
-TOKEN_KW = ({"token": token} if "token" in _inspect.signature(Model.from_pretrained).parameters
-            else {"use_auth_token": token})
+TOKEN_KW = ({"token": token} if token and "token" in _inspect.signature(Model.from_pretrained).parameters
+            else ({"use_auth_token": token} if token else {}))
 
 def fetch_yaml(url):
     with urllib.request.urlopen(url, timeout=30) as r:
@@ -57,6 +59,9 @@ def fetch_yaml(url):
 def pipeline_config():
     """The pipeline's own config.yaml. For 3.1 an ungated GitHub mirror serves it without a token;
     for anything else read the repo directly."""
+    local_config = Path(PIPELINE) / "config.yaml"
+    if local_config.is_file():
+        return yaml.safe_load(local_config.read_text())
     if SLUG == "speaker-diarization-3.1":
         return fetch_yaml(PIPELINE_CFG)
     import urllib.request
@@ -66,7 +71,6 @@ def pipeline_config():
         return yaml.safe_load(r.read())
 
 pipe_cfg = pipeline_config()
-emb_cfg = fetch_yaml(EMBED_CFG)   # fetched for provenance/diffing only; hparams win
 clus = pipe_cfg["params"]["clustering"]
 seg_params = pipe_cfg["params"]["segmentation"]
 pipe_params = pipe_cfg["pipeline"]["params"]
@@ -78,7 +82,11 @@ pipe_params = pipe_cfg["pipeline"]["params"]
 BUNDLED = "community" in SLUG or "precision" in SLUG
 def _load(sub, repo):
     if BUNDLED:
+        if local_pipeline:
+            return Model.from_pretrained(str(Path(PIPELINE) / sub), **TOKEN_KW).eval()
         return Model.from_pretrained(PIPELINE, subfolder=sub, **TOKEN_KW).eval()
+    if local_pipeline:
+        return Model.from_pretrained(str(Path(PIPELINE) / sub), **TOKEN_KW).eval()
     return Model.from_pretrained(repo, **TOKEN_KW).eval()
 
 seg = _load("segmentation", "pyannote/segmentation-3.0")
@@ -238,9 +246,15 @@ def clustering_block():
 
     import numpy as np
     from scipy.linalg import eigh
-    from huggingface_hub import hf_hub_download
-    tf_p = hf_hub_download(PIPELINE, "xvec_transform.npz", subfolder="plda", token=token)
-    pl_p = hf_hub_download(PIPELINE, "plda.npz", subfolder="plda", token=token)
+    if local_pipeline:
+        tf_p = Path(PIPELINE) / "plda/xvec_transform.npz"
+        pl_p = Path(PIPELINE) / "plda/plda.npz"
+        if not tf_p.is_file() or not pl_p.is_file():
+            raise FileNotFoundError(f"local pyannote input lacks {tf_p} or {pl_p}")
+    else:
+        from huggingface_hub import hf_hub_download
+        tf_p = hf_hub_download(PIPELINE, "xvec_transform.npz", subfolder="plda", token=token)
+        pl_p = hf_hub_download(PIPELINE, "plda.npz", subfolder="plda", token=token)
     x, pl = np.load(tf_p), np.load(pl_p)
     mean1, mean2, lda = x["mean1"], x["mean2"], x["lda"]
     mu, tr, psi = pl["mu"], pl["tr"], pl["psi"]

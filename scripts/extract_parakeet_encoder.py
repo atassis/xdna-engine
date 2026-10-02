@@ -20,7 +20,7 @@ all tensors fp32 on disk (bf16 happens at runtime). Run in ~/npuvox-asr-bench/.v
 
 Usage: ~/npuvox-asr-bench/.venv/bin/python scripts/extract_parakeet_encoder.py
 """
-import os, json, re
+import os, json, re, shutil
 import numpy as np
 import onnx
 from onnx import numpy_helper, helper
@@ -28,14 +28,24 @@ import onnxruntime as ort
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # real-copy of the cached fp32 encoder (external-data symlink deref'd into models/parakeet/)
-ONNX = os.path.join(REPO, "models", "parakeet", "encoder-model.onnx")
-OUT = os.path.join(REPO, "artifacts", "parakeet", "encoder")
+SOURCE = os.environ.get("PARAKEET_SOURCE", os.path.join(REPO, "models", "parakeet"))
+ONNX = os.environ.get("PARAKEET_ONNX", os.path.join(SOURCE, "encoder-model.onnx"))
+OUT = os.path.join(os.environ.get("PARAKEET_OUT", os.path.join(REPO, "artifacts", "parakeet")), "encoder")
 NB = 24
 T_MEL = 256           # seeded-random mel frames for the ref forward pass (->32 after ÷8)
 SEED = 0
 
 
 def main():
+    artifact_root = os.path.dirname(OUT)
+    for source_name, output_name in (("preprocessor.onnx", "preprocessor.onnx"),
+                                     ("decoder_joint.onnx", "decoder_joint.onnx"),
+                                     ("decoder_joint-model.onnx", "decoder_joint.onnx"),
+                                     ("vocab.txt", "vocab.txt")):
+        source = os.path.join(SOURCE, source_name)
+        if os.path.isfile(source):
+            os.makedirs(artifact_root, exist_ok=True)
+            shutil.copy2(source, os.path.join(artifact_root, output_name))
     os.makedirs(f"{OUT}/refs", exist_ok=True)
     os.makedirs(f"{OUT}/pre_encode", exist_ok=True)
     for b in range(NB):
