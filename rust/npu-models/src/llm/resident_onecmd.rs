@@ -28,7 +28,7 @@ use npu_xrt::{Bo, Device, ElfResident, FLAG_HOST_ONLY};
 use crate::api::EngineError;
 use crate::llm::generator::{CacheState, DecodeStep};
 use crate::llm::npu_decode::unpack_bf16_bytes;
-use crate::llm::resident_raw::{global_widths_record, piece_nt, rope_row_global, rope_row_sliding, sliding_widths_record, EmbedHeadPack};
+use crate::llm::resident_raw::{artifact_relative_path, global_widths_record, piece_nt, rope_row_global, rope_row_sliding, sliding_widths_record, EmbedHeadPack};
 
 /// `rf48s/meta.json`'s own schema (`kind: "resident_forward_onecmd"`) -- the byte layout of the
 /// three arena buffers plus the scratchpad param indices, all computed once by
@@ -97,7 +97,7 @@ impl OneCmdMeta {
         let u = |k: &str| -> Result<usize, EngineError> {
             v.get(k).and_then(|x| x.as_u64()).map(|x| x as usize).ok_or_else(|| ctx(format!("missing/non-numeric `{k}`")))
         };
-        let path = |k: &str| -> Result<PathBuf, EngineError> { Ok(PathBuf::from(s(k)?)) };
+        let path = |k: &str| -> Result<PathBuf, EngineError> { Ok(artifact_relative_path(dir, &s(k)?)) };
         let usize_map = |k: &str| -> Result<HashMap<usize, usize>, EngineError> {
             let obj = v.get(k).and_then(|x| x.as_object()).ok_or_else(|| ctx(format!("missing `{k}`")))?;
             obj.iter()

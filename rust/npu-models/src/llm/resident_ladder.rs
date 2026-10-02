@@ -46,7 +46,7 @@ use crate::llm::npu_decode::unpack_bf16_bytes;
 use crate::llm::resident::ring_read_first;
 use crate::telemetry::ArmProvenance;
 use crate::llm::multimodal::MediaEmbeds;
-use crate::llm::resident_raw::{global_widths_record, piece_nt, rope_row_global, rope_row_sliding, sliding_widths_record, EmbedHeadPack};
+use crate::llm::resident_raw::{artifact_relative_path, global_widths_record, piece_nt, rope_row_global, rope_row_sliding, sliding_widths_record, EmbedHeadPack};
 
 /// Pause before each re-run of a non-finite dispatch. A policy, measured 2026-09-30 on rf48C under
 /// desktop load: failures come in bursts, 63% clear on an immediate re-run, and 7 of 8 that failed
@@ -349,7 +349,7 @@ impl LadderMeta {
         let u = |k: &str| -> Result<usize, EngineError> {
             v.get(k).and_then(|x| x.as_u64()).map(|x| x as usize).ok_or_else(|| ctx(format!("missing/non-numeric `{k}`")))
         };
-        let path = |k: &str| -> Result<PathBuf, EngineError> { Ok(PathBuf::from(s(k)?)) };
+        let path = |k: &str| -> Result<PathBuf, EngineError> { Ok(artifact_relative_path(dir, &s(k)?)) };
         let usize_map = |k: &str| -> Result<HashMap<usize, usize>, EngineError> {
             let obj = v.get(k).and_then(|x| x.as_object()).ok_or_else(|| ctx(format!("missing `{k}`")))?;
             obj.iter()
