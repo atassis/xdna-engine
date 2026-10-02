@@ -3,7 +3,7 @@
 # Activate with:  git config core.hooksPath hooks
 set -euo pipefail
 Z=0000000000000000000000000000000000000000
-forbidden_paths='^(journal/|strategy/|internal/|docs/(handoffs|tasks|log|kb|reference|superpowers|archive|research)/|\.claude/|STARTER_PROMPT)'
+forbidden_paths='^(designs/fsr1/|designs/warp/|rust/npu-sr/src/fsr1_|rust/npu-sr/tests/data/(fsr1_|tiled_rt_)|journal/|strategy/|internal/|docs/(handoffs|tasks|log|kb|reference|superpowers|archive|research)/|\.claude/|STARTER_PROMPT)'
 forbidden_text='/home/[a-z]|autonomous session|two-Sonnet|atassis\.ru|100\.64\.|-----BEGIN [A-Z ]*PRIVATE KEY-----'
 fail=0
 pushed_tips=()
@@ -16,7 +16,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     revs=$(git rev-list "$remote_sha..$local_sha")
   fi
   for c in $revs; do
-    changed=$(git diff-tree --no-commit-id --name-only -r "$c" \
+    changed=$(git diff-tree --root --no-commit-id --name-only -r "$c" \
               | grep -vE '^hooks/pre-push(-fork)?$|^hooks/README\.md$' || true)
     if printf '%s\n' "$changed" | grep -Eq "$forbidden_paths"; then
       echo "BLOCKED: $c touches a forbidden private path"; fail=1
