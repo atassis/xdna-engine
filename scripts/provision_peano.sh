@@ -43,7 +43,7 @@ stage_seed_from_release() {
   wheel="$stage/$ASSET"
   gh release download nightly --repo Xilinx/llvm-aie --pattern "$ASSET" --output "$wheel" --clobber
   printf '%s  %s\n' "$PEANO_DIST_SHA256" "$wheel" | sha256sum -c -
-  python3 -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' "$wheel" "$stage"
+  python3 "$REPO/scripts/extract_peano_wheel.py" "$wheel" "$stage"
   rm -f "$wheel"
   [ -x "$stage/llvm-aie/bin/clang" ] || {
     echo "[provision_peano] ERROR: $ASSET did not contain llvm-aie/bin/clang" >&2
