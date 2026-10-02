@@ -225,6 +225,9 @@ pub const FLAGS: &[Flag] = &[
     Flag { name: "XDG_DATA_HOME", owner: "npu-cli", site: "npu-cli/src/main.rs",
         semantics: Value, default: "$HOME/.local/share",
         doc: "XDG data-home candidate for the install root when XDNA_ENGINE_ROOT is unset." },
+    Flag { name: "XDG_CONFIG_HOME", owner: "npu-asr", site: "npu-asr/src/kernel_registry.rs",
+        semantics: Value, default: "$HOME/.config",
+        doc: "base directory for the installed engine config path." },
     Flag { name: "NPU_ASR_MAX_SPAN_S", owner: "npu-cli", site: "npu-cli/src/main.rs",
         semantics: Value, default: "18.0",
         doc: "max transcription window span in seconds; span-granularity only now that both ASR \

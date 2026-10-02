@@ -3398,10 +3398,7 @@ mod tests {
         assert_eq!(parse_speaker_index("garbage"), 0, "an unparseable label defaults rather than panics");
     }
 
-    /// Builds a fake `root` with a real `toolchain.lock`, a `scenarios/asr.toml` naming the
-    /// Parakeet scenario, and (optionally) a resident build dir stamped for a DIFFERENT pin --
-    /// the re-pin-wipe shape `artifact-preflight-and-fail-loud` exists to catch. Returns the root
-    /// and the `Config` a real `serve()` call would have loaded.
+    /// Builds a filesystem-only fixture with the artifact pairs consumed by Parakeet preflight.
     fn fake_parakeet_root(stamp_matches_current_pin: bool) -> (tempfile::TempDir, Config) {
         let td = tempfile::tempdir().unwrap();
         std::fs::write(td.path().join("toolchain.lock"), b"pin-current").unwrap();
@@ -3412,15 +3409,36 @@ mod tests {
              [model]\nhidden=1024\nff=4096\nn_heads=8\nhead_dim=128\nn_layers=24\nmax_seq=2040\n\
              [artifacts]\nweights = \"artifacts/parakeet\"\n",
         ).unwrap();
-        let wa_dir = td.path().join(npu_parakeet::npu::WA_SUBDIR);
-        std::fs::create_dir_all(&wa_dir).unwrap();
-        std::fs::write(wa_dir.join("final_512x1024x4096_64x32x128_8c.xclbin"), b"fake").unwrap();
-        let stamp = if stamp_matches_current_pin {
-            npu_asr::kernel_registry::current_toolchain_hash(td.path()).unwrap()
-        } else {
-            "stale00000pin".to_string()
-        };
-        std::fs::write(wa_dir.join(".toolchain-stamp"), stamp).unwrap();
+        let kernel_root = |subdir: &str| npu_asr::kernel_registry::resolve_kernel_dir(td.path(), subdir);
+        let wa_dir = kernel_root(npu_asr::engines::WA_SUBDIR);
+        let ln_dir = kernel_root("mlir-aie/programming_examples/ml/layernorm/build");
+        let dw_dir = kernel_root(npu_asr::engines::DW_SUBDIR);
+        let mut pairs = vec![
+            (wa_dir.clone(), format!("{}x1024x4096_64x32x128_8c_modalsilukrtp", npu_asr::engines::PAD_M)),
+            (ln_dir.clone(), format!("ctxln_{}x1024", npu_asr::engines::PAD_M)),
+            (ln_dir.clone(), format!("affcast_{}x1024", npu_asr::engines::PAD_M)),
+            (dw_dir.clone(), "dwconv_silu_t_1024x400".to_string()),
+        ];
+        let suffix = std::env::var("PARAKEET_MODAL_EPI_SUFFIX").unwrap_or_default();
+        let mut panel = format!("{}x1024x4096_32x32x128_8c_modalsilubf16outpanel1024{suffix}", npu_asr::engines::PAD_M);
+        if std::env::var("PARAKEET_LN_MODE").is_ok_and(|v| v != "0") {
+            panel.push_str("lnaff1024scat21x");
+        }
+        pairs.push((wa_dir.clone(), panel));
+        for (dir, stem) in &pairs {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join(format!("final_{stem}.xclbin")), b"fixture").unwrap();
+            std::fs::write(dir.join(format!("insts_{stem}.txt")), b"fixture").unwrap();
+        }
+        let current_stamp = npu_asr::kernel_registry::current_toolchain_hash(td.path()).unwrap();
+        for dir in [&wa_dir, &ln_dir, &dw_dir] {
+            let stamp = if stamp_matches_current_pin || dir != &wa_dir {
+                current_stamp.as_str()
+            } else {
+                "stale00000pin"
+            };
+            std::fs::write(dir.join(".toolchain-stamp"), stamp).unwrap();
+        }
         let cfg = Config {
             server: ServerCfg::default(),
             defaults: Defaults::default(),
@@ -3450,6 +3468,17 @@ mod tests {
         assert!(msg.contains("parakeet-tdt-0.6b-v3"), "{msg}");
         assert!(msg.contains("re-pinned"), "{msg}");
         assert!(msg.contains("build_parakeet_kernels.sh"), "{msg}");
+        assert!(msg.contains("it was re-pinned and this dir was never rebuilt"), "{msg}");
+    }
+
+    #[test]
+    fn preflight_artifacts_rejects_a_missing_companion_pair() {
+        let (td, cfg) = fake_parakeet_root(true);
+        let missing = npu_asr::kernel_registry::resolve_kernel_dir(td.path(), npu_asr::engines::DW_SUBDIR)
+            .join("insts_dwconv_silu_t_1024x400.txt");
+        std::fs::remove_file(missing).unwrap();
+        let err = preflight_artifacts(&cfg, td.path()).expect_err("incomplete companion pair must fail");
+        assert!(err.to_string().contains("resident Parakeet companion kernels missing"), "{err}");
     }
 
     /// A config with no Parakeet scenario at all must not pay (or fail) this check -- proves the
