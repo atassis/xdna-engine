@@ -186,7 +186,7 @@ impl CtxAShape {
 impl Default for CtxAShape {
     fn default() -> Self { CtxAShape::whisper_small() }
 }
-/// K-augmented contraction for the Step-A modal on-chip epilogue (`NPU_MODAL_EPI=1`): bias rides an
+/// K-augmented contraction for the Step-A modal on-chip epilogue: bias rides an
 /// extra 32-wide k-block (`A_aug=[A|ones]`, `B_aug=[B;bias]` → `A@B+bias`), so the on-chip epilogue
 
 /// On-chip-epilogue replacement, applied on the HOST to ctxA's f32 output (first N columns only).
@@ -195,9 +195,6 @@ pub enum Epi {
     /// SiLU(x + bias[col]) (replaces the `_silu` xclbin for the FFN mm1; bias rode the K-aug block
     /// there, applied BEFORE SiLU, so it's added here before the sigmoid). bias length = n.
     SiluBias,
-    /// GELU(x + bias[col]) (tanh approx) — modal-only, folds the Whisper encoder FFN fc1 activation into
-    /// the GEMM epilogue (rtp[0]=2 mode). bias rides the K-aug block (applied before gelu). bias length = n.
-    GeluBias,
     /// x + bias[col] (replaces the `_bias` xclbin for qk/v/o/pw1/pw2). bias length = n.
     Bias,
     /// raw matmul output, no bias (bias slice is empty). Used by the mm2 K-split partials, which
@@ -240,14 +237,14 @@ pub struct SharedCtxA {
     /// while the host preps the next / post-processes the previous). See [`FfnMm2::forward`].
     pipeline: bool,
     pipe: Vec<PipeSlot>,
-    /// Step-A modal on-chip epilogue (`NPU_MODAL_EPI=1`, bf16/native only). The resident xclbin is the
+    /// Step-A modal on-chip epilogue (bf16/native only). The resident xclbin is the
     /// K-augmented (K=800) f32-out modal design; bias is folded via K-aug and SiLU runs on-chip,
     /// selected per dispatch by the instruction-stream's baked RTP mode. Output stays f32 (no
     /// re-expand), so the host epilogue becomes a no-op. `ka_dev` = device-side K (768 normal, 800
     /// modal). `modal_streams` = (N, is_silu, instr BO, n_instr) — 6 streams (3 N × {silu,identity}).
     modal: bool,
     ka_dev: usize,
-    modal_streams: Vec<(usize, u8, Bo, usize)>, // (N, mode 0=id/1=silu/2=gelu, instr, n_instr)
+    modal_streams: Vec<(usize, u8, Bo, usize)>, // (N, mode 0=id/1=silu, instr, n_instr)
     /// int8 host fast-path (`NPU_INT8_FASTEPI`, default ON; `=0` reverts to the legacy path for A/B).
     /// Two byte-identical cuts to the int8 marshaling pools: (1) parallel exact `amax` reduction
     /// (replaces the serial `iter().fold` quant scan); (2) division-free row-chunked dequant epilogue
@@ -278,8 +275,6 @@ struct PipeSlot {
 /// only sees what ran, which is how `bge-base`'s `512x800x3072_64x32x96_8c_modalsilu` survived an
 /// install preflight and killed the service at first request instead.
 ///
-/// `NPU_ENC_GELU_FUSED` is an input here, not a detail: it changes which artifact must exist, so an
-/// enumeration that ignores it answers for a different configuration than the one that will run.
 /// Every ctxA xclbin stem this tuning can ask for, over every encoder shape the runtime can select.
 ///
 /// The point of enumerating rather than discovering: `for_whisper` already refuses an unbuilt
@@ -291,30 +286,17 @@ struct PipeSlot {
 /// this install never selects, and a preflight that fails on those is a preflight people learn to
 /// ignore.
 pub fn required_stems(cfg: &crate::tuning::TuningConfig) -> Vec<String> {
-    let gelu_fused = std::env::var("NPU_ENC_GELU_FUSED").is_ok();
     [CtxAShape::whisper_small(), CtxAShape::whisper_turbo()]
         .iter()
-        .map(|sh| xclbin_stem_with(sh, cfg, gelu_fused))
+        .map(|sh| xclbin_stem(sh, cfg))
         .collect()
 }
 
 pub fn xclbin_stem(shape: &CtxAShape, cfg: &crate::tuning::TuningConfig) -> String {
-    xclbin_stem_with(shape, cfg, std::env::var("NPU_ENC_GELU_FUSED").is_ok())
-}
-
-/// [`xclbin_stem`] with the environment made an argument. The env read is a real input -- it decides
-/// which artifact must exist -- so it belongs in the signature, not read from ambient state inside a
-/// function whose whole value is being pure and enumerable.
-pub fn xclbin_stem_with(
-    shape: &CtxAShape,
-    cfg: &crate::tuning::TuningConfig,
-    gelu_fused: bool,
-) -> String {
     let prec = cfg.precision;
     let (mt, kt, nt) = shape.tile.unwrap_or_else(|| prec.tile());
-    if !prec.is_int8() && cfg.modal_epilogue {
-        let tag = if gelu_fused { "modalgelu" } else { "modalsilu" };
-        format!("{PAD_M}x{}x{}_{mt}x{kt}x{nt}_8c_{tag}{}", shape.kaug(), shape.na, prec.nat_tag())
+    if !prec.is_int8() {
+        format!("{PAD_M}x{}x{}_{mt}x{kt}x{nt}_8c_modalsilu{}", shape.kaug(), shape.na, prec.nat_tag())
     } else {
         format!("{PAD_M}x{}x{}_{mt}x{kt}x{nt}_8c", shape.ka, shape.na)
     }
@@ -347,11 +329,9 @@ impl SharedCtxA {
         let (mt, kt, nt) = shape.tile.unwrap_or_else(|| prec.tile());
         // Step-A modal on-chip epilogue: K-aug bias + on-chip SiLU, f32 out, one resident xclbin with
         // RTP-selected mode per inst-stream. bf16/native only (the modal xclbin is the native 32³ tile).
-        // modal on-chip epilogue (K-aug bias + on-chip SiLU, f32 out) — built for both bf16 tiles
-        // (native 32³, fast 64×32×96). DEFAULT-ON for bf16 (measured: fast −40ms → sub-300ms idle,
-        // WER 9.6% unchanged). int8 would need an i32-dequant epilogue (not built). Opt out:
-        // `NPU_MODAL_EPI=0`.
-        let modal = !prec.is_int8() && cfg.modal_epilogue;
+        // Built for both bf16 tiles (native 32³, fast 64×32×96); measured fast −40ms → sub-300ms
+        // idle, WER 9.6% unchanged. int8 would need an i32-dequant epilogue (not built).
+        let modal = !prec.is_int8();
         let ka_dev = if modal { shape.kaug() } else { shape.ka };
         if !npu_xrt::quiet() {
             eprintln!(
@@ -385,17 +365,12 @@ impl SharedCtxA {
         let mut streams = Vec::with_capacity(shape.streams.len());
         let mut modal_streams: Vec<(usize, u8, Bo, usize)> = Vec::new();
         if modal {
-            let gelu_enabled = std::env::var("NPU_ENC_GELU_FUSED").is_ok();
             for &n in shape.streams.iter() {
-                // mode: 1=silu, 0=identity (every N); 2=gelu only when NPU_ENC_GELU_FUSED + a stream exists
-                // (built for N=NA, the FFN fc1 width — the only gelu user). All modes run on the loaded xclbin.
-                for (mode, tag) in [(1u8, "modalsilu"), (0u8, "modalid"), (2u8, "modalgelu")] {
+                // mode: 1=silu, 0=identity (every N). All modes run on the loaded xclbin.
+                for (mode, tag) in [(1u8, "modalsilu"), (0u8, "modalid")] {
                     let nat = prec.nat_tag();
                     let kaug = shape.kaug();
                     let insts = crate::kernel_registry::insts_path(&wa, &format!("{PAD_M}x{kaug}x{n}_{mt}x{kt}x{nt}_8c_{tag}{nat}"));
-                    if mode == 2 && !gelu_enabled {
-                        continue; // gelu is opt-in
-                    }
                     // A mode with no built stream is skipped, not fatal: a model uses a subset of
                     // {identity, silu, gelu} and the set that exists differs per shape (whisper's
                     // encoder never asks for silu; only its fc1 asks for gelu, at N=ffn). Asking for
@@ -632,7 +607,7 @@ pub struct CtxAOp {
     bias: Vec<f32>, // length n
     bo_b: Bo,       // weight [KA, n] row-major (modal: [KAUG, n] with bias K-aug'd into row KA)
     w_scale: Vec<f32>, // int8: per-output-channel symmetric scale (len n); empty for bf16
-    mode: u8,  // modal epilogue mode: 0=identity, 1=silu (Epi::SiluBias), 2=gelu (Epi::GeluBias)
+    mode: u8,  // modal epilogue mode: 0=identity, 1=silu (Epi::SiluBias)
 }
 
 impl CtxAOp {
@@ -696,7 +671,7 @@ impl CtxAOp {
         };
 
         CtxAOp {
-            mode: if shared.modal { match epi { Epi::SiluBias => 1, Epi::GeluBias => 2, _ => 0 } } else { 0 },
+            mode: if shared.modal { match epi { Epi::SiluBias => 1, _ => 0 } } else { 0 },
             shared,
             n,
             epi,
@@ -834,7 +809,6 @@ impl CtxAOp {
             match epi {
                 Epi::None => vals.to_vec(),
                 Epi::Bias => vals.par_iter().enumerate().map(|(i, &raw)| raw + bias[i % n]).collect(),
-                Epi::GeluBias => unreachable!("GeluBias is modal-only (gelu runs on-chip)"),
                 Epi::SiluBias => vals
                     .par_iter()
                     .enumerate()
@@ -1002,7 +976,6 @@ impl CtxAOp {
                                 let z = raw + bias[c];
                                 z * fast_sigmoid(z)
                             }
-                            Epi::GeluBias => unreachable!("GeluBias is modal-only (gelu runs on-chip)"),
                         }
                     };
                     orow[c] = f32_to_bf16_bits(act);
@@ -1123,7 +1096,6 @@ impl CtxAOp {
                     row[c] += bias[c];
                 }
             }),
-            Epi::GeluBias => unreachable!("GeluBias is modal-only (gelu runs on-chip)"),
             Epi::SiluBias => out.iter_mut().enumerate().for_each(|(i, v)| {
                 let z = *v + bias[i % n];
                 *v = z * fast_sigmoid(z);
@@ -1183,11 +1155,9 @@ impl FfnMm2 {
     /// is byte-identical to the non-resident path (same activated-f32 -> bf16 truncation), so the
     /// output matches `forward(&mm1.forward(x))` exactly.
     ///
-    /// REQUIRES the on-chip activation (modal GELU-fused fc1 = `Epi::GeluBias`, mode 2): with the
-    /// activation fused into fc1's epilogue there is no host op between fc1 and fc2, which is what lets
-    /// the intermediate stay bf16-resident. The caller gates on `NPU_ENC_FFN_RESIDENT` +
-    /// `NPU_ENC_GELU_FUSED`. int8 is not covered by this draft -> it falls back to the host-mediated
-    /// `forward(&mm1.forward(x))`.
+    /// REQUIRES the on-chip activation fused into fc1's epilogue: with no host op between fc1 and
+    /// fc2, the intermediate stays bf16-resident. int8 is not covered by this draft -> it falls back
+    /// to the host-mediated `forward(&mm1.forward(x))`.
     ///
     /// NOTE (the remaining, kernel-gated step): the f32 device->host READBACK of fc1's output still
     /// happens (the resident kernel outputs f32, and an fc2 K-split column-slice of a `[mp, NA]`
@@ -1429,7 +1399,6 @@ fn dequant_epi(
                 match epi {
                     Epi::None => v,
                     Epi::Bias => v + bias[c],
-                    Epi::GeluBias => unreachable!("GeluBias is modal-only (gelu runs on-chip)"),
                     Epi::SiluBias => {
                         let z = v + bias[c];
                         z * fast_sigmoid(z)
@@ -1450,7 +1419,6 @@ fn dequant_epi(
                 orow[c] = arow[c] as f32 * scale_a * ws[c] + bias[c];
             }
         }
-        Epi::GeluBias => unreachable!("GeluBias is modal-only (gelu runs on-chip)"),
         Epi::SiluBias => {
             for c in 0..n {
                 let z = arow[c] as f32 * scale_a * ws[c] + bias[c];
@@ -1475,7 +1443,7 @@ impl SharedCtxA {
 
 #[cfg(test)]
 mod tests {
-    use super::{xclbin_stem_with, CtxAShape, Precision, PAD_M};
+    use super::{xclbin_stem, CtxAShape, Precision, PAD_M};
     use crate::tuning::TuningConfig;
 
     /// The stem is what decides which artifact must exist, so pin every branch of it. This is a
@@ -1487,25 +1455,16 @@ mod tests {
         let shape = CtxAShape { ka: 768, na: 3072, mm2_out: 768, streams: vec![768, 1536, 3072],
                                 tile: Some((64, 32, 96)), ..CtxAShape::default() };
         let mut cfg = TuningConfig::baked_default(Precision::FastBf16);
-        cfg.modal_epilogue = true;
 
         // the artifact bge-base actually loads
-        assert_eq!(xclbin_stem_with(&shape, &cfg, false), "512x800x3072_64x32x96_8c_modalsilu");
-        // NPU_ENC_GELU_FUSED is an INPUT: it selects a different artifact, so an enumeration that
-        // ignores it answers for a configuration that will not run.
-        assert_eq!(xclbin_stem_with(&shape, &cfg, true), "512x800x3072_64x32x96_8c_modalgelu");
-
-        // non-modal: no K-aug, so ka not kaug
-        cfg.modal_epilogue = false;
-        assert_eq!(xclbin_stem_with(&shape, &cfg, false), "512x768x3072_64x32x96_8c");
+        assert_eq!(xclbin_stem(&shape, &cfg), "512x800x3072_64x32x96_8c_modalsilu");
 
         // native carries the nat tag
-        cfg.modal_epilogue = true;
         cfg.precision = Precision::NativeBf16;
-        assert_eq!(xclbin_stem_with(&shape, &cfg, false), "512x800x3072_64x32x96_8c_modalsilunat");
-        // int8 never takes the modal branch, regardless of modal_epilogue
+        assert_eq!(xclbin_stem(&shape, &cfg), "512x800x3072_64x32x96_8c_modalsilunat");
+        // int8 never takes the modal branch
         cfg.precision = Precision::Int8;
-        assert_eq!(xclbin_stem_with(&shape, &cfg, false), "512x768x3072_64x32x96_8c");
+        assert_eq!(xclbin_stem(&shape, &cfg), "512x768x3072_64x32x96_8c");
     }
 
     /// The set is closed: two shapes, and `for_whisper` refuses anything else. If a third encoder
@@ -1525,8 +1484,8 @@ mod tests {
     /// second `format!` that agrees today.
     #[test]
     fn stem_is_pure_and_needs_no_device() {
-        let a = xclbin_stem_with(&CtxAShape::default(), &TuningConfig::baked_default(Precision::FastBf16), false);
-        let b = xclbin_stem_with(&CtxAShape::default(), &TuningConfig::baked_default(Precision::FastBf16), false);
+        let a = xclbin_stem(&CtxAShape::default(), &TuningConfig::baked_default(Precision::FastBf16));
+        let b = xclbin_stem(&CtxAShape::default(), &TuningConfig::baked_default(Precision::FastBf16));
         assert_eq!(a, b);
         assert!(a.starts_with(&format!("{PAD_M}x")), "{a}");
     }

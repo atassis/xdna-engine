@@ -14,7 +14,6 @@ pub fn detect_hw_class() -> String {
 /// The committed profile file. Every field is optional → omitted keys keep the baked default.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct TuningProfile {
-    pub modal_epilogue: Option<bool>,
     pub subsample_on_npu: Option<bool>,
     pub layernorm_on_npu: Option<bool>,
     pub glu_fused: Option<bool>,
@@ -32,7 +31,6 @@ impl TuningProfile {
     /// Apply this profile over the baked default for `precision`, then env overrides on top.
     pub fn resolve(&self, precision: Precision) -> TuningConfig {
         let mut c = TuningConfig::baked_default(precision);
-        if let Some(v) = self.modal_epilogue { c.modal_epilogue = v; }
         if let Some(v) = self.subsample_on_npu { c.subsample_on_npu = v; }
         if let Some(v) = self.layernorm_on_npu { c.layernorm_on_npu = v; }
         if let Some(v) = self.glu_fused { c.glu_fused = v; }

@@ -26,7 +26,6 @@ pub fn ffn_resident_requested() -> bool {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TuningConfig {
     pub precision: Precision,
-    pub modal_epilogue: bool,      // NPU_MODAL_EPI (gated to non-int8 at construction)
     pub subsample_on_npu: bool,    // NPU_SS_NPU
     pub layernorm_on_npu: bool,    // NPU_LN_NPU
     pub glu_fused: bool,           // NPU_GLU_FUSED
@@ -43,7 +42,6 @@ impl TuningConfig {
     pub fn baked_default(precision: Precision) -> Self {
         TuningConfig {
             precision,
-            modal_epilogue: true,
             subsample_on_npu: true,
             layernorm_on_npu: false,
             glu_fused: true,
@@ -63,7 +61,6 @@ impl TuningConfig {
             Some(_) => true,
             None => dflt,
         };
-        self.modal_epilogue = not_zero("NPU_MODAL_EPI", self.modal_epilogue);
         self.subsample_on_npu = not_zero("NPU_SS_NPU", self.subsample_on_npu);
         self.glu_fused = not_zero("NPU_GLU_FUSED", self.glu_fused);
         self.mm2_pipeline = not_zero("NPU_MM2_PIPELINE", self.mm2_pipeline);
@@ -84,7 +81,6 @@ mod tests {
     #[test]
     fn baked_default_matches_legacy_defaults() {
         let bf16 = TuningConfig::baked_default(Precision::FastBf16);
-        assert!(bf16.modal_epilogue);
         assert!(bf16.subsample_on_npu);
         assert!(!bf16.layernorm_on_npu);
         assert!(bf16.glu_fused);
@@ -123,9 +119,8 @@ mod tests {
         std::env::remove_var("NPU_ENC_FFN_RESIDENT");
     }
 
-    /// npu-whisper's encoder calls `ffn_resident_requested()` (no more independent `env::var`
-    /// read); this proves it agrees with npu-asr's own `TuningConfig` resolution for unset/=0/=1
-    /// -- the defect the single accessor closes.
+    /// `TuningConfig::ffn_resident` and the standalone `ffn_resident_requested()` accessor must
+    /// resolve identically for unset/=0/=1 -- the defect the single accessor closes.
     #[test]
     fn ffn_resident_agrees_across_both_encoders_env_states() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());

@@ -181,15 +181,14 @@ build_family_concurrent "$MMW" "${KERNEL_BUILD_MAX_JOBS:-4}" \
   "Makefile.silu|M=512 K=800  N=1536 n_aie_cols=8 no_silu=1|build/final_512x800x1536_32x32x32_8c_bias.xclbin" \
   "Makefile.silu|M=512 K=800  N=768  n_aie_cols=8 no_silu=1|build/final_512x800x768_32x32x32_8c_bias.xclbin" \
   || BUILD_FAILURES+=("kernel family: FUSION whole_array Makefile.silu (K=800/3104 quad)")
-# Step-A MODAL on-chip epilogue (NPU_MODAL_EPI=1, native): ONE resident K=800 f32-out xclbin with an
+# Step-A MODAL on-chip epilogue: ONE resident K=800 f32-out xclbin with an
 # RTP-selected epilogue; 6 streams = 3 N x {silu(no_silu=0), identity(no_silu=1)}. The silu/identity
 # xclbins are identical modulo the per-build UUID, so the silu one is the resident; both insts are used.
 # Clean BOTH the epilogue AND the matmul objects: `make` mtime-tracking can reuse a stale mm_*.o across
 # kernel-source changes, producing a silently-wrong xclbin (bit us 2026-06-20).
 rm -f $MMW/build/mm_silu_epilogue_*.o $MMW/build/mm_64x32x96.o $MMW/build/mm_32x32x32.o
-# FAST (64x32x96 BFP16_IREE) modal -- the shipped default precision. All 3 N's + the GELU
-# line below share mm_64x32x96.o/mm_silu_epilogue_64x32x96.o (gelu=1 only changes a python
-# generator arg, not MM_DEFINES/EPI_DEFINES), so one build_family_concurrent call covers all 7.
+# FAST (64x32x96 BFP16_IREE) modal -- the shipped default precision. All 3 N's share
+# mm_64x32x96.o/mm_silu_epilogue_64x32x96.o, so one build_family_concurrent call covers all 6.
 build_family_concurrent "$MMW" "${KERNEL_BUILD_MAX_JOBS:-4}" \
   "Makefile.modal|WA_C_DEPTH=1 M=512 K=800 N=3072 m=64 k=32 n=96 n_aie_cols=8 emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1|build/final_512x800x3072_64x32x96_8c_modalsilu.xclbin" \
   "Makefile.modal|WA_C_DEPTH=1 M=512 K=800 N=3072 m=64 k=32 n=96 n_aie_cols=8 emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1 no_silu=1|build/final_512x800x3072_64x32x96_8c_modalid.xclbin" \
@@ -197,8 +196,7 @@ build_family_concurrent "$MMW" "${KERNEL_BUILD_MAX_JOBS:-4}" \
   "Makefile.modal|WA_C_DEPTH=1 M=512 K=800 N=1536 m=64 k=32 n=96 n_aie_cols=8 emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1 no_silu=1|build/final_512x800x1536_64x32x96_8c_modalid.xclbin" \
   "Makefile.modal|WA_C_DEPTH=1 M=512 K=800 N=768  m=64 k=32 n=96 n_aie_cols=8 emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1|build/final_512x800x768_64x32x96_8c_modalsilu.xclbin" \
   "Makefile.modal|WA_C_DEPTH=1 M=512 K=800 N=768  m=64 k=32 n=96 n_aie_cols=8 emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1 no_silu=1|build/final_512x800x768_64x32x96_8c_modalid.xclbin" \
-  "Makefile.modal|WA_C_DEPTH=1 M=512 K=800 N=3072 m=64 k=32 n=96 n_aie_cols=8 emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1 gelu=1|build/final_512x800x3072_64x32x96_8c_modalgelu.xclbin" \
-  || BUILD_FAILURES+=("kernel family: modal K=800 FAST tile (64x32x96, incl. GELU)")
+  || BUILD_FAILURES+=("kernel family: modal K=800 FAST tile (64x32x96)")
 # NATIVE (32x32x32) modal -- for NPU_PRECISION=native. The `nat` suffix is Makefile.modal's own
 # nat_tag: a build without emulate_bfloat16_mmul_with_bfp16=1 is tagged so a fast-flagged build can
 # never be mistaken for the native kernel. These four target names omitted it and so named targets
@@ -224,9 +222,8 @@ for N in 1280 5120; do
   WA_C_DEPTH=1 make -C $MMW -f Makefile.modal NPU2=1 M=512 K=1312 N=$N m=32 k=32 n=32 n_aie_cols=8 emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1           build/final_512x1312x${N}_32x32x32_8c_modalsilu.xclbin
   WA_C_DEPTH=1 make -C $MMW -f Makefile.modal NPU2=1 M=512 K=1312 N=$N m=32 k=32 n=32 n_aie_cols=8 emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1 no_silu=1 build/final_512x1312x${N}_32x32x32_8c_modalid.xclbin
 done
-# The two turbo shapes that are not a plain {silu,id} pair: the 64x32x32 proj tile, and the FFN GELU.
+# The turbo shape that is not a plain {silu,id} pair from the loop above: the 64x32x32 proj tile.
 WA_C_DEPTH=1 make -C $MMW -f Makefile.modal NPU2=1 M=512 K=1312 N=1280 m=64 k=32 n=32 n_aie_cols=8 emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1 no_silu=1 build/final_512x1312x1280_64x32x32_8c_modalid.xclbin
-WA_C_DEPTH=1 make -C $MMW -f Makefile.modal NPU2=1 M=512 K=1312 N=5120 m=32 k=32 n=32 n_aie_cols=8 emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1 gelu=1    build/final_512x1312x5120_32x32x32_8c_modalgelu.xclbin
 make -C $MMW -f Makefile.silu NPU2=1 M=512 K=1312 N=1280 n_aie_cols=8 no_silu=1 build/final_512x1312x1280_32x32x32_8c_bias.xclbin
 
 make -C $PE/ml/softmax400 NPU2=1 build/final.xclbin   # softmax-400 (pad->416)

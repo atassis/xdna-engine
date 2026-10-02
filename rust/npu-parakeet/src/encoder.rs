@@ -160,12 +160,11 @@ impl FastConformerEncoder {
 
     fn feed_forward(&self, x: &Array2<f32>, b: &BlockWeights, blk: usize, tag: &str, norm_w: &str, norm_b: &str, l1: &str, l2: &str) -> Array2<f32> {
         let stage: &'static str = if tag == "ff1" { "ff1" } else { "ff2" };
-        // RESIDENT FFN (DEFAULT on the modal resident; opt out with PARAKEET_RESIDENT_FF=0):
-        // LN + fc1 + SiLU run FULLY on-NPU (ctxLN -> affine_cast(gamma,beta) -> modal fc1 on-chip silu),
-        // the activation stream never touching host across LN->fc1. Falls back to the host LN path when
-        // the resident xclbins aren't built (resident_ff_available).
+        // RESIDENT FFN: LN + fc1 + SiLU run FULLY on-NPU (ctxLN -> affine_cast(gamma,beta) -> modal
+        // fc1 on-chip silu), the activation stream never touching host across LN->fc1. Falls back to
+        // the host LN path when the resident xclbins aren't built (resident_ff_available).
         #[cfg(feature = "npu")]
-        if std::env::var("PARAKEET_RESIDENT_FF").map(|v| v != "0").unwrap_or(true) {
+        {
             if let Some(npu) = &self.npu {
                 if npu.resident_ff_available() {
                     // These lookups MATERIALIZE the norm vectors and sat outside every scope, so they
@@ -177,42 +176,33 @@ impl FastConformerEncoder {
                     };
                     prof::phase::set_stage(stage);
                     let _h = PhaseScope::new("ff_resident", Bucket::Npu);
-                    // FULL FFN device-side (LN->fc1->fc2, Variant B, DEFAULT; opt out PARAKEET_RESIDENT_FFN=0):
-                    // fc2's K-split partials stay on-device (deinterleave -> sub-BO chunks + host-sum),
-                    // bit-identical to the host 4xK-split -> WER-NEUTRAL. resident_ff_available() requires the
-                    // deint xclbin, so this falls back to the host-fed fc2 (below) when that xclbin is absent.
-                    if std::env::var("PARAKEET_RESIDENT_FFN").map(|v| v != "0").unwrap_or(true) {
-                        // GATE (PARAKEET_FFN_DEVACC): accumulate fc2 ON-DEVICE (acc_add brick) then read
-                        // back at the FFN boundary -- ONLY the accumulation moved on-device (block
-                        // dataflow unchanged). A WER-neutral result proves the device-accumulate is
-                        // bit-identical to the host K-split. Falls through to resident_ffn if acc_add absent.
-                        let id1 = format!("{blk}.{tag}.l1");
-                        let id2 = format!("{blk}.{tag}.l2");
-                        if Self::resident_on("PARAKEET_FFN_DEVACC") {
-                            if let Some(out) = npu.resident_ffn_devacc_readback(x, gamma.as_slice().unwrap(), beta.as_slice().unwrap(),
-                                || b.m(l1), &id1,
-                                || b.m(l2), &id2) {
-                                return out;
-                            }
-                        }
-                        // bf16-checkpoint fast path (NPU_WEIGHTS_CHECKPOINT): fc1/fc2 are both baked bf16
-                        // verbatim [K,N], so when both are available skip the host f32->bf16 pack
-                        // entirely on a cache miss. Falls back to the f32 path below (byte-identical
-                        // to before) when the checkpoint isn't loaded (bf16_m always None on npy).
-                        if let (Some((k1, n1, bits1)), Some((k2, n2, bits2))) =
-                            (b.bf16_m(l1), b.bf16_m(l2))
-                        {
-                            return npu.resident_ffn_bf16(x, gamma.as_slice().unwrap(), beta.as_slice().unwrap(),
-                                &id1, k1, n1, bits1, &id2, k2, n2, bits2);
-                        }
-                        return npu.resident_ffn(x, gamma.as_slice().unwrap(), beta.as_slice().unwrap(),
+                    // FULL FFN device-side (LN->fc1->fc2): fc1 drains chunk-major bf16, and fc2's
+                    // K-split reads its sub-BO chunks before the host sum.
+                    let id1 = format!("{blk}.{tag}.l1");
+                    let id2 = format!("{blk}.{tag}.l2");
+                    // Accumulate fc2 ON-DEVICE (acc_add brick) then read back at the FFN boundary --
+                    // ONLY the accumulation moved on-device (block dataflow unchanged). Falls through
+                    // to resident_ffn if acc_add absent.
+                    if !Self::hybrid() {
+                        if let Some(out) = npu.resident_ffn_devacc_readback(x, gamma.as_slice().unwrap(), beta.as_slice().unwrap(),
                             || b.m(l1), &id1,
-                            || b.m(l2), &id2);
+                            || b.m(l2), &id2) {
+                            return out;
+                        }
                     }
-                    let h = npu.resident_ff1_fc1(x, gamma.as_slice().unwrap(), beta.as_slice().unwrap(),
-                        || b.m(l1), &format!("{blk}.{tag}.l1"), self.cfg.ff, true);
-                    prof::phase::set_stage(stage);
-                    return self.mm_lazy(&h, || { let _wp = PhaseScope::new("ff_wprep", Bucket::Marshal); b.m(l2) }, &format!("{blk}.{tag}.l2"));
+                    // bf16-checkpoint fast path (NPU_WEIGHTS_CHECKPOINT): fc1/fc2 are both baked bf16
+                    // verbatim [K,N], so when both are available skip the host f32->bf16 pack
+                    // entirely on a cache miss. Falls back to the f32 path below (byte-identical
+                    // to before) when the checkpoint isn't loaded (bf16_m always None on npy).
+                    if let (Some((k1, n1, bits1)), Some((k2, n2, bits2))) =
+                        (b.bf16_m(l1), b.bf16_m(l2))
+                    {
+                        return npu.resident_ffn_bf16(x, gamma.as_slice().unwrap(), beta.as_slice().unwrap(),
+                            &id1, k1, n1, bits1, &id2, k2, n2, bits2);
+                    }
+                    return npu.resident_ffn(x, gamma.as_slice().unwrap(), beta.as_slice().unwrap(),
+                        || b.m(l1), &id1,
+                        || b.m(l2), &id2);
                 }
             }
         }
@@ -387,18 +377,18 @@ impl FastConformerEncoder {
         // None on the npy path, so the `unwrap_or_else` fallback is the pre-existing f32 mm_lazy
         // call, byte-identical to before.
         prof::phase::set_stage("mhsa_qkv");
-        // x is pre-LN. RESIDENT LN->QKV seam (default-on; PARAKEET_RESIDENT_MHA=0 opts out): norm_self_att LN runs
-        // on-NPU (ctxLN -> affine_cast) and feeds the q/k/v modal GEMMs device-side off one resident
-        // bf16 A -- the host LN is off the MHSA frontier. Falls back to host layernorm + mm_lazy when
-        // the seam is off or the resident xclbins are absent (WER-identical to the old block()-level LN).
+        // x is pre-LN. RESIDENT LN->QKV seam: norm_self_att LN runs on-NPU (ctxLN -> affine_cast) and
+        // feeds the q/k/v modal GEMMs device-side off one resident bf16 A -- the host LN is off the
+        // MHSA frontier. Falls back to host layernorm + mm_lazy when PARAKEET_HYBRID is set or the
+        // resident xclbins are absent (WER-identical to the old block()-level LN).
         #[cfg(feature = "npu")]
-        let resident_mha = Self::resident_on("PARAKEET_RESIDENT_MHA");
+        let resident_mha = !Self::hybrid();
         // Consumed only on the NPU path, so the fallback binding is unread without the feature.
         #[cfg(not(feature = "npu"))]
         let _resident_mha = false;
         // DIAGNOSTIC (PARAKEET_MHA_HOSTQKV=1): keep the resident attention block but feed it
         // HOST f32-LN + mm_lazy q/k/v (the DEFAULT path's qkv), decoupling the LN->QKV seam from
-        // the resident attention to isolate which owns any WER gap. No effect unless RESIDENT_MHA.
+        // the resident attention to isolate which owns any WER gap. No effect under PARAKEET_HYBRID.
         #[cfg(feature = "npu")]
         let resident_mha_qkv = resident_mha && std::env::var("PARAKEET_MHA_HOSTQKV").is_err();
         #[cfg(feature = "npu")]
@@ -539,14 +529,14 @@ impl FastConformerEncoder {
         };
         let scale = (dk as f32).sqrt();
 
-        // RESIDENT MHA (default-on; PARAKEET_RESIDENT_MHA=0 opts out): replace the host per-head
-        // scores/rel_shift/softmax/context with the on-chip STEP=8 block, one dispatch per head.
+        // RESIDENT MHA: replace the host per-head scores/rel_shift/softmax/context with the
+        // on-chip STEP=8 block, one dispatch per head (PARAKEET_HYBRID forces the host path).
         // The kernel bakes inv_scale=1/sqrt(128), so pass qu=qh+u / qv=qh+v / k / p / v directly.
         // The resident relpos block is baked at its bucket's BUILT_T (max = relpos_max_t() = 172); it cannot serve longer clips.
         // Gate on t <= relpos_max_t() PER-CLIP: a T>BUILT_T clip skips the resident per-head loop and
         // falls through to the host attention path below (whole-block golden), so no crash/corruption.
         #[cfg(feature = "npu")]
-        if Self::resident_on("PARAKEET_RESIDENT_MHA")
+        if !Self::hybrid()
             && self.npu.as_ref().map(|n| t <= n.relpos_max_t()).unwrap_or(false) {
             if let Some(npu) = &self.npu {
                 let _h = PhaseScope::new("mhsa_resident", Bucket::Npu);
@@ -775,17 +765,13 @@ impl FastConformerEncoder {
         let b = self.w.block(blk);
         let d = self.cfg.hidden;
         let t = x.nrows();
-        // RESIDENT conv module: the whole module can run resident -- LN -> pw1 (modal GEMM) -> GLU ->
+        // RESIDENT conv module: the whole module runs resident -- LN -> pw1 (modal GEMM) -> GLU ->
         // dwconv -> silu (time-major [T,D], transposes dissolved) -> pw2 (modal GEMM), the activation
-        // stream never touching host across the frontier. On-NPU SiLU is part of it.
-        //
-        // DEFAULT-ON; opt out with PARAKEET_RESIDENT_CONV=0 / PARAKEET_RESIDENT_SILU=0. Gate any
-        // change to these on rel-L2 vs the shipped path: the 17-clip greedy WER is chaotic at ~1e-5
-        // and cannot validate a device change of this kind.
+        // stream never touching host across the frontier. On-NPU SiLU is part of it (PARAKEET_HYBRID
+        // forces the host path; gate any change on rel-L2 vs the shipped path -- the 17-clip greedy
+        // WER is chaotic at ~1e-5 and cannot validate a device change of this kind).
         #[cfg(feature = "npu")]
-        let resident_conv = Self::resident_on("PARAKEET_RESIDENT_CONV");
-        #[cfg(feature = "npu")]
-        let resident_silu = Self::resident_on("PARAKEET_RESIDENT_SILU");
+        let resident_silu = !Self::hybrid();
         // conv_wprep: materialize + reshape the (T'-independent) conv weights for mm(). The pointwise
         // conv1/conv2 weights (pw1/pw2) feed a cached NPU weight BO, so they are now materialized
         // LAZILY inside mm_lazy's closure (whole `b.m3(..).index_axis(..).to_owned().t().to_owned()`
@@ -800,13 +786,12 @@ impl FastConformerEncoder {
         };
 
         prof::phase::set_stage("conv_pw");
-        // RESIDENT conv front (DEFAULT-ON, opt out PARAKEET_RESIDENT_CONV=0). norm_conv LN + pw1 + GLU run
-        // FULLY on-NPU (ctxLN -> affine_cast -> modal pw1 N=2D identity -> GLU brick a*sigmoid(g)),
-        // producing the gated [T, D] directly -- the activation never touches host across LN->pw1->GLU.
-        // If the glu xclbin is absent, fall back to resident LN->pw1 [T,2D] + host GLU; if the resident seam
-        // is off entirely (=0), full host LN + pw1 + host GLU.
+        // RESIDENT conv front. norm_conv LN + pw1 + GLU run FULLY on-NPU (ctxLN -> affine_cast ->
+        // modal pw1 N=2D identity -> GLU brick a*sigmoid(g)), producing the gated [T, D] directly --
+        // the activation never touches host across LN->pw1->GLU. If the glu xclbin is absent, fall
+        // back to resident LN->pw1 [T,2D] + host GLU.
         #[cfg(feature = "npu")]
-        let resident_glu = if resident_conv && precomputed_glu.is_none() {
+        let resident_glu = if precomputed_glu.is_none() {
             self.npu.as_ref().filter(|n| n.resident_ff_available()).and_then(|npu| {
                 let gamma = b.v("norm_conv.weight");
                 let beta = b.v("norm_conv.bias");
@@ -829,16 +814,14 @@ impl FastConformerEncoder {
         } else {
             // step-1 resident LN->pw1 if available, else host LN + pw1 GEMM -> h [T, 2D]
             #[cfg(feature = "npu")]
-            let resident_h = if resident_conv {
-                self.npu.as_ref().filter(|n| n.resident_ff_available()).map(|npu| {
-                    let gamma = b.v("norm_conv.weight");
-                    let beta = b.v("norm_conv.bias");
-                    let _hh = PhaseScope::new("conv_resident_pw1", Bucket::Npu);
-                    npu.resident_ff1_fc1(x, gamma.as_slice().unwrap(), beta.as_slice().unwrap(),
-                        || b.m3("conv.pointwise_conv1.weight").index_axis(Axis(2), 0).to_owned().t().to_owned(),
-                        &format!("{blk}.pw1"), 2 * d, false)
-                })
-            } else { None };
+            let resident_h = self.npu.as_ref().filter(|n| n.resident_ff_available()).map(|npu| {
+                let gamma = b.v("norm_conv.weight");
+                let beta = b.v("norm_conv.bias");
+                let _hh = PhaseScope::new("conv_resident_pw1", Bucket::Npu);
+                npu.resident_ff1_fc1(x, gamma.as_slice().unwrap(), beta.as_slice().unwrap(),
+                    || b.m3("conv.pointwise_conv1.weight").index_axis(Axis(2), 0).to_owned().t().to_owned(),
+                    &format!("{blk}.pw1"), 2 * d, false)
+            });
             #[cfg(not(feature = "npu"))]
             let resident_h: Option<Array2<f32>> = None;
             let h = resident_h.unwrap_or_else(|| {
@@ -869,18 +852,12 @@ impl FastConformerEncoder {
         // with no mm() inside, so they fold into the conv_dwconv Host leaf scope.
         let back = prof::time("dwconv", || {
             // TIME-MAJOR fused dwconv+silu (step 3b): consumes GLU [T,D] DIRECTLY and emits [T,D]
-            // DIRECTLY -- BOTH host transposes DISSOLVED (no glu.t() in, no dwc.t() out). Gated like the
-            // channel-major fused path (CONV+SILU). Falls back to the channel-major path below (which
-            // keeps the two transposes) when the time-major xclbin is absent or t > DW_T.
-            //
-            // BUCKET: this is the LIVE path and it is ONE NPU DISPATCH, so it is Npu. It was tagged
-            // Host -- the comment describing "bracketing transposes + trailing SiLU are host math"
-            // belongs to the FALLBACK below, which does not run. That mis-tag put 50 ms/clip of NPU
-            // work in the host column and made the encoder look less resident than it is.
+            // DIRECTLY -- BOTH host transposes DISSOLVED. The only on-NPU conv wiring; PARAKEET_HYBRID
+            // forces the host path (host FIR + host SiLU, with the transposes back).
             #[cfg(feature = "npu")]
             let tmajor = {
                 let _h = PhaseScope::new("conv_dwconv", Bucket::Npu);
-                if resident_conv && resident_silu {
+                if resident_silu {
                     self.npu.as_ref().and_then(|npu| npu.npu_dwconv_silu_tmajor(&glu, &taps, &dwb))
                 } else { None }
             };
@@ -889,49 +866,12 @@ impl FastConformerEncoder {
             if let Some(f) = tmajor {
                 return f; // [T,D] -- dwconv+silu applied on-NPU, transposes dissolved (step 3b)
             }
-            // ---- fallback: channel-major fused / separate bricks / host (transposes stay host) ----
-            // Genuinely host-heavy (two transposes + possibly a host FIR/SiLU), hence its own Host
-            // scope. Distinct name so a report tells you WHICH path ran instead of averaging them.
+            // ---- host fallback (PARAKEET_HYBRID, no npu feature, or t > DW_T) ----
             let _h = PhaseScope::new("conv_dwconv_hostfallback", Bucket::Host);
-            let glu_t = glu.t().to_owned(); // [T,D] -> [D,T]  (transpose 1, killed on the time-major path)
-            // FUSED dwconv->SiLU (steps 3+4 in ONE xclbin) when CONV+SILU are on + the fused
-            // brick is present: one hw-context, the post-dwconv SiLU runs device-to-device (no second
-            // switch, no host bridge). Returns silu(dwconv(glu_t)) [D,T] directly. Falls back to the
-            // separate dwconv + silu path below (then host) if the fused xclbin is absent.
-            #[cfg(feature = "npu")]
-            let fused = if resident_conv && resident_silu {
-                self.npu.as_ref().and_then(|npu| npu.npu_dwconv_silu(&glu_t, &taps, &dwb))
-            } else { None };
-            #[cfg(not(feature = "npu"))]
-            let fused: Option<Array2<f32>> = None;
-            let dwc = if let Some(f) = fused {
-                f // [D,T] -- dwconv+silu already applied on-NPU, one hw-context
-            } else {
-                // dwconv on NPU (step 3a, host-fed [D,T]) when the resident conv path is on + the brick is
-                // present + T<=400; else the host FIR. Transposes stay host here (cut in 3b).
-                #[cfg(feature = "npu")]
-                let dw_npu = if resident_conv {
-                    self.npu.as_ref().and_then(|npu| npu.npu_dwconv1d(&glu_t, &taps, &dwb))
-                } else { None };
-                #[cfg(not(feature = "npu"))]
-                let dw_npu: Option<Array2<f32>> = None;
-                let mut dwc = dw_npu.unwrap_or_else(|| dwconv1d(&glu_t, &taps, &dwb, 9)); // [D, T]
-                // SiLU on NPU (step 4) as a SEPARATE brick, DEFAULT-ON with the resident conv path (opt out
-                // PARAKEET_RESIDENT_SILU=0 -> host silu). dwc is [D=C, T] channel-major == the silu brick's
-                // [C,T] shape. (Separate brick, NOT a dwconv epilogue -- the fused epilogue miscompiles
-                // alternate channels on this toolchain; see dwconv-fused-epilogue-alt-channel-miscompile.)
-                // The on-NPU silu is bf16-tanh precision; that precision is WER-IRRELEVANT (~8.5 accepted as
-                // the resident baseline, the 8.2 host-silu delta is a 17-clip decoder-chaos artifact). The
-                // separate opt-out preserves the clean host-silu path for the future WER-refinement pass.
-                #[cfg(feature = "npu")]
-                let silu_npu = if resident_conv && resident_silu {
-                    self.npu.as_ref().and_then(|npu| npu.npu_silu(&dwc))
-                } else { None };
-                #[cfg(not(feature = "npu"))]
-                let silu_npu: Option<Array2<f32>> = None;
-                silu_npu.unwrap_or_else(|| { silu_inplace(&mut dwc); dwc })
-            };
-            dwc.t().to_owned() // [D,T] -> [T,D]  (transpose 2, killed on the time-major path)
+            let glu_t = glu.t().to_owned(); // [T,D] -> [D,T]
+            let mut dwc = dwconv1d(&glu_t, &taps, &dwb, 9); // [D, T]
+            silu_inplace(&mut dwc);
+            dwc.t().to_owned() // [D,T] -> [T,D]
         });
         prof::phase::set_stage("conv_pw");
         // pw2 chain -> [D, D]: materialized lazily; skipped on warm passes.

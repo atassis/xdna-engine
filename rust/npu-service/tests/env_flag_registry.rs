@@ -547,8 +547,8 @@ fn every_flag_shaped_env_read_is_registered() {
     }
 
     // Pass 2: every call `wrapper_name("LITERAL")` anywhere in scope, for every wrapper resolved
-    // above -- this is what turns `resident_on("PARAKEET_FFN_DEVACC")` into a read of
-    // `PARAKEET_FFN_DEVACC` without ever grepping for that literal directly.
+    // above -- this is what turns `resident_on("PARAKEET_FUSED_BLOCK")` into a read of
+    // `PARAKEET_FUSED_BLOCK` without ever grepping for that literal directly.
     let mut indirect: Vec<Found> = Vec::new();
     for wrapper in &wrapper_names {
         for fv in &files {

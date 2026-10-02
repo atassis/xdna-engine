@@ -245,17 +245,15 @@ git ls-files tests/data/wer_clips/   # 24 tracked files, verify present in your 
 ## Step 9 -- Build the resident Parakeet encoder xclbins  [CPU]
 
 ```bash
-scripts/build_parakeet_kernels.sh       # AIECC_JOBS=<n> to parallelize; NPU_NATIVE path built too
+scripts/build_parakeet_kernels.sh       # AIECC_JOBS=<n> to parallelize
 ```
 - **Produces, under
   `mlir-aie/programming_examples/basic/matrix_multiplication/whole_array/build/`:**
-  `final_512x1024x{1024,2048,4096}_64x32x128_8c.xclbin` (FAST BFP16, the default resident
-  kernel) + matching `insts_*.txt`, and the same for the NATIVE `32x32x32` tile
-  (`NPU_NATIVE=1` path). The engine (`rust/npu-parakeet/src/npu.rs`) loads these from this
-  exact relative dir with `WorkingDirectory=$REPO`.
-- **Success signal:** prints `Built Parakeet resident xclbins ...`; the six `final_*.xclbin`
+  `final_512x1024x{1024,2048,4096}_64x32x128_8c.xclbin` (FAST BFP16, the served resident
+  kernel) + matching `insts_*.txt`. The engine (`rust/npu-parakeet/src/npu.rs`) loads these
+  from this exact relative dir with `WorkingDirectory=$REPO`.
+- **Success signal:** prints `Built Parakeet resident xclbins ...`; the three `final_*.xclbin`
   + `insts_*.txt` exist.
-- **Time:** 10-40 min (six aiecc builds; warm ccache much faster).
 - **Depends on:** Step 4 green (sources `iron_env.sh`, re-syncs kernels).
 
 ### 9.opt  Decode GEMV kernels (OPTIONAL -- not on the Parakeet serve path)

@@ -2,7 +2,6 @@
 # (Class 0/1). Omitted keys keep the baked default in npu_asr::tuning::TuningConfig::baked_default.
 # Finalized by `probe_tuning` (see internal notes).
 # Provisional values below mirror the measured Class-0 winners.
-modal_epilogue   = true
 subsample_on_npu = true
 glu_fused        = true
 mm2_pipeline     = true

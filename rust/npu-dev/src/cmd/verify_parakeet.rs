@@ -28,19 +28,15 @@ pub fn run(argv: Vec<String>) {
     // (GigaAM's bf16 encoder lands ~1.8e-2 vs ONNX; 0.08 is the verify_encoder bar).
     let npu_mode = argv.iter().any(|a| a == "--npu");
     let tol = 0.08f32;
-    // gate4 (full 24-block stack) needs its own, looser bar for the production-default
-    // resident kernel: BFP16_IREE (npu.rs tile 64x32x128) accumulates materially more drift
-    // over 24 blocks than native bf16 (32x32x32, NPU_NATIVE=1) -- 0.08 was calibrated against
-    // native bf16 only (Phase-3 bring-up) and was never re-validated when BFP16_IREE became
-    // the default. 2026-07-05 finding (internal notes):
-    // measured worst-per-block 4.85e-1, final 4.48e-1 at the default kernel; WER unaffected
-    // (8.6%, matches history). 0.65 gives ~35% margin over that single measured point (tighten
-    // once more clip-to-clip variance data exists) while staying well under the ~1.0 rel-L2 a
-    // genuinely broken config lands at historically (e.g. the falsified COALESCE_TR=1 case).
-    // gate2/gate3 (subsample, block-0) are unaffected by kernel choice at this depth and keep
-    // the original 0.08 -- no observed need to loosen them, and doing so would lose sensitivity.
-    let native_kernel = std::env::var("NPU_NATIVE").is_ok();
-    let tol_full = if npu_mode && !native_kernel { 0.65f32 } else { tol };
+    // gate4 (full 24-block stack) needs its own, looser bar: the served resident kernel
+    // (npu.rs tile 64x32x128, BFP16_IREE) accumulates materially more drift over 24 blocks
+    // than the 0.08 bar calibrated for. 2026-07-05 finding (internal notes): measured
+    // worst-per-block 4.85e-1, final 4.48e-1; WER unaffected (8.6%, matches history). 0.65
+    // gives ~35% margin over that single measured point while staying well under the ~1.0
+    // rel-L2 a genuinely broken config lands at historically (e.g. the falsified
+    // COALESCE_TR=1 case). gate2/gate3 (subsample, block-0) are unaffected at this depth and
+    // keep the original 0.08.
+    let tol_full = if npu_mode { 0.65f32 } else { tol };
     let artifacts = Path::new("artifacts/parakeet/encoder");
 
     #[cfg(feature = "npu")]

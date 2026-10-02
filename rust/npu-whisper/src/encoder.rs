@@ -50,14 +50,10 @@ pub struct WhisperEncoder {
     npu: Option<crate::npu::WhisperNpu>,
     #[cfg(feature = "npu")]
     block_ops: Vec<crate::npu::BlockOps>,
-    // NPU_ENC_MHA_NPU=1: full attention on the NPU (static-shape MHA xclbin) instead of host `mha`.
-    // Default None -> host path (production untouched). Gated + WER-validated separately.
+    // Full attention on the NPU (static-shape MHA xclbin) instead of host `mha`; None when the
+    // xclbin isn't built (falls back to host, see `new_npu`).
     #[cfg(feature = "npu")]
     mha_npu: Option<crate::mha_npu::MhaNpu>,
-    // NPU_ENC_CONV_NPU=1: conv stem (conv1/conv2) as M-stationary GEMM on the NPU (reuses the prebuilt
-    // 512x768x768 band) instead of host im2col_conv1d. GELU/transpose stay host. Gated; default None.
-    #[cfg(feature = "npu")]
-    conv_npu: Option<npu_asr::conv_npu::ConvNpu>,
 }
 
 impl WhisperEncoder {
@@ -73,8 +69,6 @@ impl WhisperEncoder {
             block_ops: Vec::new(),
             #[cfg(feature = "npu")]
             mha_npu: None,
-            #[cfg(feature = "npu")]
-            conv_npu: None,
         }
     }
 
@@ -111,82 +105,50 @@ impl WhisperEncoder {
                     k: mk("k.weight", "k.bias", cfg.d_model),
                     v: mk("v.weight", "v.bias", cfg.d_model),
                     out: mk("out.weight", "out.bias", cfg.d_model),
-                    // FFN mm1: K=d_model -> ffn + bias. NPU_ENC_GELU_FUSED=1 folds GELU into the GEMM
-                    // epilogue (Epi::GeluBias, modal rtp[0]=2) — drops the ~260 ms/utt host GELU.
-                    fc1: if std::env::var("NPU_ENC_GELU_FUSED").is_ok() {
-                        CtxAOp::new(shared.clone(), &bw.m("fc1.weight"), cfg.ffn, Epi::GeluBias,
-                                    bw.v("fc1.bias").as_slice().unwrap())
-                    } else {
-                        mk("fc1.weight", "fc1.bias", cfg.ffn)
-                    },
+                    // FFN mm1: K=d_model -> ffn + bias. GELU runs on host after this (see `fc1`'s caller).
+                    fc1: mk("fc1.weight", "fc1.bias", cfg.ffn),
                     // FFN mm2: K=ffn -> d_model + bias2 (host-accumulated K-split, bias2 added once).
                     fc2: FfnMm2::new(shared.clone(), &bw.m("fc2.weight"), bw.v("fc2.bias").as_slice().unwrap()),
                 }
             })
             .collect();
 
-        // Encoder MHA runs on the NPU by DEFAULT. `NPU_ENC_MHA_NPU=0` opts out to the host f32
-        // path -- the "!= 0" convention the rest of the engine's default-on knobs use
-        // (npu-asr/src/tuning.rs `not_zero`: any value but "0" enables).
-        //
-        // Flipped 2026-09-03 on the single-hardware rule, NOT on latency: it is a measured +72 ms
-        // /clip (+2.6%) REGRESSION, because the host MHA it replaces overlapped NPU dispatch and
-        // was never on the critical path. It is gated on EXACT token parity -- 17/17 clips
-        // byte-identical vs the host path -- and the point is to stop reasoning about a
-        // two-hardware graph. Re-rank latency once MHA folds into ctx2 as a mode rather than a
-        // second hw_context.
-        let mha_requested = std::env::var("NPU_ENC_MHA_NPU").ok();
-        let mha_explicit = mha_requested.is_some();
-        let mha_on = !matches!(mha_requested.as_deref(), Some("0"));
-        let mha_npu = if mha_on {
-            let base = root.join("artifacts/encoder_mha");
-            let h = cfg.n_heads;
-            // Two names, because the op's own naming changed: IRON's MHA dropped `causal` as a
-            // field, so builds before that carry `_causal0_` and builds after do not. The name says
-            // NOTHING about whether the kernel is non-causal -- mha.cc masks unconditionally unless
-            // it is compiled with -DMHA_NONCAUSAL (StaticMHA.get_kernel_artifacts). A `_causal0_`
-            // artifact predating that flag is CAUSAL despite its name; rebuild rather than trust it.
-            let found = [format!("StaticMHA_h{h}_s1500_d64_kv0_npu2"),
-                         format!("StaticMHA_h{h}_s1500_d64_kv0_causal0_npu2")]
-                .into_iter()
-                .find(|s| base.join(format!("{s}.xclbin")).exists());
-            // A missing artifact is FATAL when the flag was asked for explicitly, and a loud
-            // fallback when this is merely the default -- a default path that panics on an absent
-            // build artifact is worse than one that runs correctly on the host and says so.
-            let build_hint = format!(
-                "no encoder-MHA xclbin for h={h} in {} -- build it with \
-                 `python designs/decode_fused/gen_encoder_mha.py --heads {h} --out {}`",
-                base.display(), base.display());
-            match found {
-                None if mha_explicit => panic!("NPU_ENC_MHA_NPU: {build_hint}"),
-                None => {
-                    eprintln!("[encoder] WARNING: {build_hint}; falling back to HOST attention");
-                    None
-                }
-                Some(stem) => {
-                    let xclbin = base.join(format!("{stem}.xclbin"));
-                    let insts = base.join(format!("{stem}.bin"));
-                    match crate::mha_npu::MhaNpu::open(&npu.device(), h, &xclbin, &insts) {
-                        Ok(op) => Some(op),
-                        Err(e) if mha_explicit => panic!("NPU_ENC_MHA_NPU: load {}: {e}", xclbin.display()),
-                        Err(e) => {
-                            eprintln!("[encoder] WARNING: load {}: {e}; falling back to HOST attention",
-                                      xclbin.display());
-                            None
-                        }
+        // Encoder MHA runs on the NPU: a measured +72 ms/clip (+2.6%) REGRESSION vs host, kept on
+        // the single-hardware rule (the host MHA it replaces overlapped NPU dispatch and was never
+        // on the critical path). Gated on EXACT token parity -- 17/17 clips byte-identical vs the
+        // host path. Falls back to host attention, loudly, when the xclbin isn't built.
+        let base = root.join("artifacts/encoder_mha");
+        let h = cfg.n_heads;
+        // Two names, because the op's own naming changed: IRON's MHA dropped `causal` as a
+        // field, so builds before that carry `_causal0_` and builds after do not. The name says
+        // NOTHING about whether the kernel is non-causal -- mha.cc masks unconditionally unless
+        // it is compiled with -DMHA_NONCAUSAL (StaticMHA.get_kernel_artifacts). A `_causal0_`
+        // artifact predating that flag is CAUSAL despite its name; rebuild rather than trust it.
+        let found = [format!("StaticMHA_h{h}_s1500_d64_kv0_npu2"),
+                     format!("StaticMHA_h{h}_s1500_d64_kv0_causal0_npu2")]
+            .into_iter()
+            .find(|s| base.join(format!("{s}.xclbin")).exists());
+        let build_hint = format!(
+            "no encoder-MHA xclbin for h={h} in {} -- build it with \
+             `python designs/decode_fused/gen_encoder_mha.py --heads {h} --out {}`",
+            base.display(), base.display());
+        let mha_npu = match found {
+            None => {
+                eprintln!("[encoder] WARNING: {build_hint}; falling back to HOST attention");
+                None
+            }
+            Some(stem) => {
+                let xclbin = base.join(format!("{stem}.xclbin"));
+                let insts = base.join(format!("{stem}.bin"));
+                match crate::mha_npu::MhaNpu::open(&npu.device(), h, &xclbin, &insts) {
+                    Ok(op) => Some(op),
+                    Err(e) => {
+                        eprintln!("[encoder] WARNING: load {}: {e}; falling back to HOST attention",
+                                  xclbin.display());
+                        None
                     }
                 }
             }
-        } else {
-            None
-        };
-
-        // NPU_ENC_CONV_NPU=1: route the conv stem through the M-stationary GEMM conv (prebuilt 768 band).
-        let conv_npu = if std::env::var("NPU_ENC_CONV_NPU").is_ok() {
-            let wa = root.join(npu_asr::engines::WA_SUBDIR);
-            Some(npu_asr::conv_npu::ConvNpu::new(npu.device(), wa))
-        } else {
-            None
         };
 
         WhisperEncoder {
@@ -195,7 +157,6 @@ impl WhisperEncoder {
             npu: Some(npu),
             block_ops,
             mha_npu,
-            conv_npu,
         }
     }
 
@@ -231,43 +192,11 @@ impl WhisperEncoder {
         let c = self.w.conv();
         // conv1: k3 s1 p1, Cin=n_mels -> Cout=d_model ; [d_model, 3000]
         // conv2: k3 s2 p1, Cin=d_model -> Cout=d_model ; [d_model, 1500]
-        #[cfg(feature = "npu")]
-        if let Some(cv) = &self.conv_npu {
-            let h = self.conv1d_npu(cv, mel, &c.m3("conv1.weight"), &c.v("conv1.bias"), 1, 1);
-            let h = gelu(&h);
-            let h = self.conv1d_npu(cv, &h, &c.m3("conv2.weight"), &c.v("conv2.bias"), 2, 1);
-            let h = gelu(&h);
-            return h.t().to_owned(); // [1500, d_model]
-        }
         let h = im2col_conv1d(mel, &c.m3("conv1.weight"), c.v("conv1.bias").as_slice().unwrap(), 1, 1);
         let h = gelu(&h);
         let h = im2col_conv1d(&h, &c.m3("conv2.weight"), c.v("conv2.bias").as_slice().unwrap(), 2, 1);
         let h = gelu(&h);
         h.t().to_owned() // [1500, d_model]
-    }
-
-    /// conv1d-as-GEMM on the NPU: `x[Cin,W]` * `w[Cout,Cin,k]` (+bias) -> `[Cout,Wout]`. Wraps the 2D
-    /// ConvNpu (treats the 1D conv as kh=1). bf16 on-chip — gated + WER-validated (NPU_ENC_CONV_NPU).
-    #[cfg(feature = "npu")]
-    fn conv1d_npu(
-        &self,
-        cv: &npu_asr::conv_npu::ConvNpu,
-        x: &Array2<f32>,
-        w3: &Array3<f32>,
-        b: &Array1<f32>,
-        stride: usize,
-        pad: usize,
-    ) -> Array2<f32> {
-        let (cin, wd) = x.dim();
-        let (cout, _cin, k) = w3.dim();
-        let x3 = x.view().insert_axis(Axis(1)).to_owned(); // [Cin, 1, W]
-        let w4 = w3.view().insert_axis(Axis(2)).to_owned(); // [Cout, Cin, 1, k]
-        // 1D conv: H=1 with kh=1, NO H-padding (ph=0, sh=1); W carries the sequence (kw=k, pad=pw).
-        let y3 = cv.conv_asym(&x3, &w4, b, 1, k, 1, stride, 0, pad); // [Cout, 1, Wout]
-        let wout = y3.dim().2;
-        debug_assert_eq!((y3.dim().0, y3.dim().1), (cout, 1));
-        let _ = (cin, wd);
-        y3.into_shape_with_order((cout, wout)).unwrap()
     }
 
     /// Add the learned positional embedding `embed_positions[:T]` in place.
@@ -313,7 +242,7 @@ impl WhisperEncoder {
             k = timed!("qkv_proj", self.linear(&ln1, &b.m("k.weight"), &b.v("k.bias"), &format!("{i}.k")));
             v = timed!("qkv_proj", self.linear(&ln1, &b.m("v.weight"), &b.v("v.bias"), &format!("{i}.v")));
         }
-        // full attention: NPU static-MHA op when gated (NPU_ENC_MHA_NPU), else host f32 mha.
+        // full attention: NPU static-MHA op when the xclbin loaded, else host f32 mha.
         // NPU_ENC_MHA_MAXLAYER=N: run NPU MHA only for the first N blocks (i<N). The bf16 attention
         // error compounds over layers, so the first few may stay WER-acceptable — a PARTIAL offload.
         #[cfg(feature = "npu")]
@@ -348,47 +277,14 @@ impl WhisperEncoder {
         if use_npu {
             #[cfg(feature = "npu")]
             {
-                use crate::npu::{apply_tiled, apply_tiled_ffn_resident, apply_tiled_mm2};
+                use crate::npu::{apply_tiled, apply_tiled_mm2};
                 use npu_asr::engines::marsh;
                 let ops = &self.block_ops[i];
-                // RESIDENT-INTERMEDIATE FFN (NPU_ENC_FFN_RESIDENT, requires NPU_ENC_GELU_FUSED so the
-                // GELU is fused into fc1's on-chip epilogue): keep the [mp,ffn] fc1->fc2 intermediate
-                // in one bf16 buffer across the seam -> no host materialize / re-conversion of the
-                // largest data object. See internal notes (the FFN
-                // sub-block is ~67% of the encoder's host marshaling).
-                //
-                // NPU_ENC_FFN_RESIDENT goes through npu_asr::tuning's single accessor instead
-                // of an independent env::var read here: this crate used
-                // to read it with is_ok() (ANY set value, including "0", true), while npu-asr read the
-                // same name with is_one() (only "1" true) -- one export could enable residency for one
-                // encoder and disable it for the other. Both now resolve identically.
-                let ffn_resident_requested = npu_asr::tuning::ffn_resident_requested();
-                let gelu_fused = std::env::var("NPU_ENC_GELU_FUSED").is_ok();
-                if ffn_resident_requested && !gelu_fused {
-                    // Requesting residency without its prerequisite used to silently no-op (byte-
-                    // identical to the default path, no diagnostic). Say so once instead.
-                    static MISSING_PREREQ_WARNED: std::sync::Once = std::sync::Once::new();
-                    MISSING_PREREQ_WARNED.call_once(|| {
-                        eprintln!(
-                            "[encoder] WARNING: NPU_ENC_FFN_RESIDENT requested but NPU_ENC_GELU_FUSED \
-                             is unset -- residency requires GELU fused into fc1's on-chip epilogue; \
-                             falling back to the non-resident FFN path"
-                        );
-                    });
-                }
-                let resident = ffn_resident_requested && gelu_fused;
-                if resident {
-                    marsh::set_op(marsh::FC1);
-                    f_out = timed!("ffn_resident", apply_tiled_ffn_resident(&ops.fc1, &ops.fc2, &ln2));
-                } else {
-                    marsh::set_op(marsh::FC1);
-                    // NPU_ENC_GELU_FUSED: fc1 is built with Epi::GeluBias → its output is already
-                    // gelu(W·x+b), so the host GELU is skipped. Else GELU on host (default).
-                    let h1 = timed!("fc1", apply_tiled(&ops.fc1, &ln2, self.cfg.ffn));
-                    let f = if std::env::var("NPU_ENC_GELU_FUSED").is_ok() { h1 } else { timed!("gelu", gelu(&h1)) };
-                    marsh::set_op(marsh::FC2);
-                    f_out = timed!("fc2", apply_tiled_mm2(&ops.fc2, &f));
-                }
+                marsh::set_op(marsh::FC1);
+                let h1 = timed!("fc1", apply_tiled(&ops.fc1, &ln2, self.cfg.ffn));
+                let f = timed!("gelu", gelu(&h1));
+                marsh::set_op(marsh::FC2);
+                f_out = timed!("fc2", apply_tiled_mm2(&ops.fc2, &f));
             }
             #[cfg(not(feature = "npu"))]
             unreachable!();

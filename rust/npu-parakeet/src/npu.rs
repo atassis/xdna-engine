@@ -116,6 +116,14 @@ fn conveyor_artifact_present(dir: &Path) -> bool {
     dir.join("final.xclbin").exists() && dir.join("insts.bin").exists()
 }
 
+fn resident_ln_artifacts_present(dir: &Path) -> bool {
+    ["ctxln", "affcast"].iter().all(|name| {
+        let stem = format!("{name}_{PAD_M}x{KRES}");
+        kernel_registry::xclbin_path(dir, &stem).exists()
+            && kernel_registry::insts_path(dir, &stem).exists()
+    })
+}
+
 /// BD-carriage precision for the conveyor query belt (open-item C / SPLITP). Default PLAIN per the
 /// Deliverable-1 gate (scripts/conveyor_bd_precision_check.py). Env PARAKEET_CONVEYOR_BD=split flips
 /// to two-bf16 (hi+lo, ~14 mantissa bits) if the device 17-clip WER ever regresses vs 8.5.
@@ -132,9 +140,9 @@ impl BdCarry {
     fn name(self) -> &'static str { match self { BdCarry::Plain => "plain-bf16", BdCarry::Split => "split-bf16" } }
 }
 
-// --- Phase-2 spatial-parallel relpos (opt-in PARAKEET_RESIDENT_MHA) -----------------------------
+// --- Phase-2 spatial-parallel relpos (the served resident MHA path) -----------------------------
 // Independent of the CONVEYOR above: that path loads via `conveyor_block` behind
-// PARAKEET_CONVEYOR_MHA, this one via `relpos_block` behind PARAKEET_RESIDENT_MHA. Both are kept.
+// PARAKEET_CONVEYOR_MHA, this one via `relpos_block`, served by default. Both are kept.
 // This path carries the positional operand as SPLIT bf16 (p_hi + p_lo), preserving the WER-critical
 // precision the shipped relpos block uses; the conveyor's BD-in-belt defaults to plain bf16.
 //
@@ -284,8 +292,8 @@ pub struct NpuStats {
     pub ffn_readback_s: f64,
     /// The `dispatch_with_a` return path, split. Every GEMM that hands its result back as an
     /// `Array2` pays these three after the dispatch, and none of them were timed: `ffn_readback_s`
-    /// above sits on the fc2_k4096 branch, which the default path does not take, so it reads 0.00
-    /// and reads as "readback is free". These are HOST time inside the `ff_resident` phase scope,
+    /// above sits on a branch the default path does not take, so it reads 0.00 and reads as
+    /// "readback is free". These are HOST time inside the `ff_resident` phase scope,
     /// charged to `Bucket::Npu` like the other two host leaves.
     ///
     /// `rb_decode_elems` is carried so the decode cost can be quoted per element -- the loop is
@@ -309,7 +317,7 @@ struct PipeSlot {
 pub struct NpuMatmul {
     dev: Device,
     base: PathBuf,
-    tile: String, // "64x32x128" (fast BFP16, default) or "32x32x32" (native bf16, accurate)
+    tile: String, // always "64x32x128" (fast BFP16)
     kern: Rc<Kernel>,
     bo_a: Bo, // [PAD_M, KRES] bf16 (resident, single-dispatch path)
     bo_tmp: Bo,
@@ -329,8 +337,7 @@ pub struct NpuMatmul {
     glu_epi: RefCell<Option<bool>>,
     // Bytes per element of whatever this resident drains into a C buffer -- 4 (f32) or 2 (bf16).
     // `split_acc` bakes the C objectFIFO's element type into the array program, so it is a property
-    // of the loaded resident, not of a stream: `fold_fc1` swaps the resident for fc1's bf16-out
-    // build and EVERY modal GEMM's C halves with it. `None` until `c_elem_bytes()` settles it.
+    // of the loaded resident, not of a stream. `None` until `c_elem_bytes()` settles it.
     c_elem: RefCell<Option<usize>>,
     // (K, N, activation, a_panel) -> stream. `a_panel` is part of the KEY, not just the filename:
     // at k!=KRES the same (k,n,act) has both a panel-major and a row-major stream, and letting them
@@ -389,14 +396,6 @@ struct ResidentLn {
     bo_ln: Bo,   // [PAD_M, KRES] f32   (ctxLN output = affine_cast input, ln g4 / ac g3)
     bo_gb: Bo,   // [2*KRES] f32        (gamma|beta params, ac g4)
     bo_bf16: Rc<Bo>, // [PAD_M, KRES] bf16  (affine_cast output = modal fc1 A / device-in satt, ac g5)
-    // fc1->fc2 device-side (full FFN, Variant B): deinterleave+cast the [PAD_M,DFF] fc1 output into a
-    // CHUNK-MAJOR [n_chunks,PAD_M,KRES] bf16 buffer (one dispatch, 3D drain TAP), then the fc2 K-split
-    // reads each K=KRES chunk as a device SUB-BUFFER (Bo::sub) into the K=KRES modal -- bit-identical
-    // to the host 4xK=1024 K-split (WER-neutral), A fed device-side.
-    deint_kern: Rc<Kernel>,
-    deint_instr: Bo,
-    deint_n: usize,
-    bo_deint: Bo, // [n_chunks*PAD_M*KRES] bf16 chunk-major (deint output, deint g4)
     // conv-module GLU (step 2): a*sigmoid(g) over pw1's on-chip [PAD_M,2*KRES] f32 -> [PAD_M,KRES] f32,
     // device-side (the pw1 GEMM output stays resident; GLU reads it as its A/g3 input, no host). OPTIONAL:
     // absent when the glu xclbin isn't built, so the FFN LN->fc1 seam + step-1 resident pw1 still load.
@@ -408,23 +407,14 @@ struct ResidentLn {
     resadd_s050: Option<ResidualAdd>,
     // scaled residual-add (out = a + 1.0*b, f32), OPTIONAL. The full MHSA/conv residual x+sublayer.
     resadd_s100: Option<ResidualAdd>,
-    // one-dispatch K=4096 fc2 (cast@4096 -> K=4096 modal), OPTIONAL. Collapses the 4x K=1024 + acc_add.
-    fc2_k4096: Option<Fc2K4096>,
-    // fc1 that drains chunk-major bf16 itself, deleting the deint dispatch. OPTIONAL + opt-in.
+    // fc1 that drains chunk-major bf16 itself, the served fc1->fc2 seam. `open()` requires its
+    // artifact; there is no deinterleave-dispatch fallback.
     fc1_panel_bf16: Option<Fc1PanelBf16>,
     // lnaffcast as a MODE of the panel above rather than its own xclbin. Takes priority over
     // `lnaffcast` when present; both absent -> the two-dispatch chain.
     ln_mode: Option<LnMode>,
-    // conv-module depthwise conv1d (step 3), OPTIONAL like glu.
-    dwconv: Option<ConvDw>,
-    // conv-module post-dwconv SiLU (step 4), OPTIONAL like glu/dwconv. SEPARATE single-op-loop
-    // brick (NOT a dwconv epilogue) -- immune to the fused-epilogue per-channel-loop miscompile.
-    silu: Option<ConvSilu>,
-    // FUSED dwconv->SiLU (step 3+4 in one xclbin), OPTIONAL. When present it replaces the
-    // separate dwconv + silu dispatches (one hw-context, no host bridge); absent -> the two-brick path.
-    dwconv_silu: Option<ConvDwSilu>,
-    // TIME-MAJOR fused dwconv->SiLU (step 3b), OPTIONAL. When present the conv path prefers it: [T,D]
-    // in/out DISSOLVES both host transposes (vs the channel-major dwconv_silu which keeps them).
+    // TIME-MAJOR fused dwconv->SiLU (step 3b), the served conv brick: [T,D] in/out dissolves both
+    // host transposes. `open()` requires its artifact; there is no other conv wiring.
     dwconv_silu_t: Option<ConvDwSiluT>,
     // per-kernel dummy placeholders (0-size segfaults)
     ln_c: Bo,
@@ -432,9 +422,6 @@ struct ResidentLn {
     ln_tr: Bo,
     ac_tmp: Bo,
     ac_tr: Bo,
-    deint_c: Bo,
-    deint_tmp: Bo,
-    deint_tr: Bo,
 }
 
 /// Device-side conv-module GLU kernel + its output/dummy BOs. Input (pw1's [PAD_M,2*KRES] f32) is fed
@@ -501,31 +488,11 @@ struct AccAdd {
     dummy_tr: Bo,
 }
 
-/// One-dispatch fc2 (K=DFF=4096) brick: replaces the 4x K=1024 chunk GEMMs + acc_add (which cost
-/// separate hw-context dispatches) with `cast@4096 (f32->bf16 row-major) -> K=4096 modal GEMM (internal
-/// L1 K-accumulation over 4096) -> f32 [PAD_M,KRES] device BO`. NOT bit-identical to the 4-way split
-/// (different L1 accumulation order + bfp16), so gated by the sound rel-L2 gate, not per-op bit-parity.
-struct Fc2K4096 {
-    cast_kern: Rc<Kernel>,
-    cast_instr: Bo,
-    cast_n: usize,
-    cast_out: Bo, // bf16 [PAD_M, DFF] row-major (cast output = K=4096 modal A input)
-    cast_dc: Bo,
-    cast_dt: Bo,
-    cast_dr: Bo,
-    mm_kern: Rc<Kernel>, // K=4096 modal (identity epilogue)
-    mm_instr: Bo,
-    mm_n: usize,
-    mm_c: Rc<Bo>, // f32 [PAD_M, KRES] fc2 output (device-resident)
-}
 
-/// fc1 with the K-PANEL PACKING FOLDED INTO ITS OWN C DRAIN. DEFAULT ON; `PARAKEET_FC1_PACK_IN_DRAIN=0` opts out.
-///
-/// The shipped seam is two dispatches on two xclbins: the modal fc1 writes C row-major f32
-/// [PAD_M,DFF], then `deint` casts it to bf16 and reorders it chunk-major so the fc2 K-split can
-/// take each chunk as a sub-buffer. This variant makes the GEMM write that layout directly, so the
-/// deint dispatch -- and one hw-context transition per FFN -- disappear. `bo_out` is bit-compatible
-/// with `bo_deint`: same [n_chunks,PAD_M,KRES] bf16 chunk-major buffer, so nothing downstream moves.
+/// fc1 with the K-PANEL PACKING FOLDED INTO ITS OWN C DRAIN -- the served fc1->fc2 seam. The GEMM
+/// writes its output chunk-major bf16 directly (instead of row-major f32 needing a separate
+/// deinterleave dispatch), so the fc2 K-split reads each chunk as a sub-buffer with no extra
+/// hw-context transition per FFN.
 ///
 /// TWO things make this a different xclbin rather than a different instruction stream:
 ///   * chunk-major drain alone IS insts-only (a pure re-stride of the same 4-D drain TAP; the PDI is
@@ -551,10 +518,6 @@ struct Fc2K4096 {
 /// A modal<->modal transition does cost more than the modal<->deint pair it replaces (deint is
 /// cheap precisely because it is a small design), which is why the win is much smaller than the
 /// -48/-48 suggests. Model the whole per-FFN sequence, not the command count.
-///
-/// Revert with `PARAKEET_FC1_PACK_IN_DRAIN=0`. First thing to reconsider if the resident set turns
-/// out to be design-constrained by the LN-into-GEMM-epilogue work, which is worth ~20% against this
-/// 3.4%. See the deint-fold-into-gemm-drain task.
 struct Fc1PanelBf16 {
     kern: Rc<Kernel>,
     instr: Bo,
@@ -581,64 +544,20 @@ struct ResidualAdd {
 // T=400 is Parakeet's ~30s frame cap (>subsample); the brick bakes it. C=1024 = d_model.
 const DW_C: usize = 1024; // channels (d_model)
 const DW_T: usize = 400; // baked time steps (Parakeet frame cap)
-const DW_KW: usize = 16; // weight tile: taps[0..8] + BN-folded bias[9]
 // TIME-MAJOR fused dwconv+silu (conv step 3b): [T,D] layout. Input host-padded to [T+2P, D] (P=4 halo
 // rows top+bottom); weights repacked TAP-MAJOR [K+1, D] (rows 0..8 per-channel taps, row 9 BN bias).
 const DW_K: usize = 9; // depthwise kernel width
 const DW_P: usize = 4; // 'same' pad = (K-1)/2
 const DW_TPAD: usize = DW_T + 2 * DW_P; // padded input rows (=408)
 
-/// Device-side depthwise conv1d brick (dwconv1d_k9_bf16). 3-buffer ABI: in[C,T] bf16 (g3), w[C,16]
-/// bf16 (g4), out[C,T] bf16 (g5). Host-fed in step 3a (transposes still host); device-fed in 3b.
-struct ConvDw {
-    kern: Rc<Kernel>,
-    instr: Bo,
-    n: usize,
-    bo_in: Bo,  // [C, T] bf16 (g3)
-    bo_w: Bo,   // [C, 16] bf16 (g4)
-    bo_out: Bo, // [C, T] bf16 (g5)
-    dummy_tmp: Bo,
-    dummy_tr: Bo,
-}
-
-// Conv-module post-dwconv SiLU brick (step 4): out[c,t] = silu(in[c,t]), [C,T] f32 -> f32, per-row
-// (one channel's T-row per core loop). A SEPARATE single-op-loop kernel (silu_row), fed the dwconv
-// output host-side (device-to-device in a later step). Same [C=1024,T=400] shape as the dwconv brick.
-// 2-buffer ABI: in[C,T] f32 (g3), out[C,T] f32 (g4); tmp/ctrl/trace dummies (g5/g6/g7) -- like ctx_ln/glu.
-struct ConvSilu {
-    kern: Rc<Kernel>,
-    instr: Bo,
-    n: usize,
-    bo_in: Bo,      // [C, T] f32 (g3)
-    bo_out: Bo,     // [C, T] f32 (g4)
-    dummy_tmp: Bo,  // g5
-    dummy_ctrl: Bo, // g6
-    dummy_tr: Bo,   // g7
-}
-
-// FUSED conv-module dwconv->SiLU brick (step 3+4 in ONE xclbin). A two-stage on-chip
-// pipeline (dwconv core -> f32 ObjectFifo -> silu core, per column): the post-dwconv SiLU runs
-// device-to-device with NO second hw-context switch and NO host round-trip -- collapsing the two
-// separate ConvDw + ConvSilu xclbins (which each cost a ~1.9 ms switch) into one resident dispatch.
-// Same 3-buffer ABI as ConvDw (in[C,T] bf16 g3, w[C,16] bf16 g4) but out[C,T] is f32 (g5). Both cores
-// stay simple single-op loops, so it is immune to the alt-channel per-tile-loop miscompile. OPTIONAL.
-struct ConvDwSilu {
-    kern: Rc<Kernel>,
-    instr: Bo,
-    n: usize,
-    bo_in: Bo,  // [C, T] bf16 (g3)
-    bo_w: Bo,   // [C, 16] bf16 (g4)
-    bo_out: Bo, // [C, T] f32 (g5)
-    dummy_tmp: Bo,
-    dummy_tr: Bo,
-}
-
-// TIME-MAJOR fused dwconv->SiLU brick (conv step 3b -- the transpose-DISSOLVING layout). Same two-stage
-// on-chip pipeline as ConvDwSilu but in [T,D] instead of [C,T]: it consumes GLU's [T,D] directly and
-// emits pw2's [T,D] directly, so BOTH host transposes (GLU[T,D]->[D,T] and [D,T]->[T,D]) are gone. The
-// FIR vectorizes along D with the k=9 halo along TIME (consecutive row loads, NO shuffle / cross-column
-// DMA -> immune to the n-D-DMA co-residency hang). 3-buffer ABI: in [T+2P, D] bf16 (g3, host-padded),
-// w [K+1, D] bf16 TAP-MAJOR (g4), out [T, D] f32 (g5). OPTIONAL; present -> the Rust conv path prefers it.
+// TIME-MAJOR fused dwconv->SiLU brick (conv step 3b -- the transpose-DISSOLVING layout): a two-stage
+// on-chip pipeline (dwconv core -> f32 ObjectFifo -> silu core, per column) in [T,D] instead of [C,T],
+// consuming GLU's [T,D] directly and emitting pw2's [T,D] directly, so BOTH host transposes
+// (GLU[T,D]->[D,T] and [D,T]->[T,D]) are gone. The FIR vectorizes along D with the k=9 halo along
+// TIME (consecutive row loads, NO shuffle / cross-column DMA -> immune to the n-D-DMA co-residency
+// hang). Both cores are simple single-op loops, immune to the alt-channel per-tile-loop miscompile.
+// 3-buffer ABI: in [T+2P, D] bf16 (g3, host-padded), w [K+1, D] bf16 TAP-MAJOR (g4), out [T, D] f32
+// (g5). The served conv path; a missing artifact is a build error, not a fallback.
 struct ConvDwSiluT {
     kern: Rc<Kernel>,
     instr: Bo,
@@ -696,20 +615,10 @@ const LN_MODE_GROUP_ROUNDS: usize = 4; // lnaffcast_group_rounds=4
 /// charges fc1 nothing (fc1's instruction stream is byte-identical on both xclbins, the L1 allocation
 /// unmoved to the address).
 ///
-/// WHAT IT IS WORTH DEPENDS ON WHAT fc1'S NEIGHBOURS ARE, and each row is bracketed rather than
-/// projected (blocking dispatch ledger, paired, one quiesced window each):
-///
-/// | composition                                     | transitions/clip | ms/clip                  |
-/// |-------------------------------------------------|------------------|--------------------------|
-/// | shipped default (hybrid)                        | 743 -> 695 (-48) | RISES (single pass)      |
-/// | `PARAKEET_FOLD_FC1`                             | 695 -> 575 (-120)| -128.9 [-133.6, -124.3]  |
-/// | + `FOLD_GLU` + `MODAL_EPI_SUFFIX=krtpkrl`       | 335 -> 192 (-143)| -183.1 [-205.8, -160.4]  |
-///
-/// The last row is the one the 96-in/47-out ledger always described; its COUNT reproduces exactly
-/// and its earlier -240.0 ms/clip projection does not -- that priced each boundary at 1.678 ms and
-/// the composition charges 1.085. On the shipped default the flag is still a small LOSS, because
-/// there is no `panel-fc1 -> lnaffcast` edge to delete and the surviving arrivals move into a
-/// costlier program to enter.
+/// WHAT IT IS WORTH DEPENDS ON WHAT fc1'S NEIGHBOURS ARE. On the shipped default composition the
+/// mode is still a small LOSS (transitions 743 -> 695, ms/clip RISES) because there is no
+/// `panel-fc1 -> lnaffcast` edge to delete and the surviving arrivals move into a costlier program
+/// to enter.
 ///
 /// OPT-IN, and the default flip is a separate decision -- it moves the encoder onto a different
 /// xclbin, which is exactly the class of change the shipped path gets gated on rather than inherits.
@@ -758,42 +667,6 @@ fn fc1_panel_bf16_dir<'a>(base: &'a Path, ln_dir: &'a Path, stem: &str) -> &'a P
         kernel_registry::xclbin_path(d, stem).exists() && kernel_registry::insts_path(d, stem).exists()
     };
     if has(ln_dir) || !has(base) { ln_dir } else { base }
-}
-
-/// `PARAKEET_FOLD_FC1=1`: make fc1's bf16-out xclbin the RESIDENT one, so fc1 and every other modal
-/// GEMM share a single hardware context.
-///
-/// The lever: fc1 is the only op in the 3-xclbin rotation that could move, and moving it takes the
-/// rotation from 3 visits per FFN to 2 -- 47-48 transitions/clip at the controlled 1.78 ms each. It
-/// works without any dispatch-site change because `Device::load_kernel` caches by PATH: point the
-/// resident at fc1's own xclbin and both handles resolve to the same `Kernel`, so no switch can occur
-/// between them.
-///
-/// The cost, and why this is opt-in rather than default. `split_acc` bakes `dtype_out` into the array
-/// program, so one xclbin cannot serve an f32-out and a bf16-out GEMM; folding therefore moves EVERY
-/// modal GEMM to bf16 out, and the only bf16-out build that fits L1 is m=32 (at m=64 it overflows by
-/// exactly 11596 B, verified by build). Measured tile penalty: 1.13x at N=1024, 1.27x at N=4096.
-/// Projected net ~-67 ms/clip.
-///
-/// **CORRECTED 2026-09-08: this comment said "encoder OUTPUT IS WRONG under this flag" and listed
-/// the bf16 resadd/acc_add arms as missing. Commit 73b5ed1 added them TWELVE MINUTES after 8c46d00
-/// wrote this text (2026-08-22 23:13 -> 23:25), and all three `*_bf16b` artifacts are on disk; the
-/// log `2026-08-22-the-full-fold-is-correct.md` records the pair encoding correctly end to end.**
-/// Still opt-in, and the standalone case is the open question: correctness was demonstrated for
-/// `PARAKEET_FOLD_FC1=1` TOGETHER WITH `PARAKEET_FOLD_GLU=1`, never for this flag alone.
-/// The device-side dtype reasoning below is why the pair is needed: the bf16 C is handed straight to bricks compiled against
-/// f32, and no host reader is on those paths. `matmul_id_to_bo`'s linear_out feeds
-/// `residual_add_dev` on the MHSA seam (measured at rel-L2 1.223 under the fold against 6.652e-3
-/// without), the fc2 K-split partials feed `acc_add`, which has no bf16 arm at all, and pw1 feeds
-/// the GLU brick through `glu.cc`'s `const float *`. The last one already has its escape --
-/// `PARAKEET_FOLD_GLU=1` gates inside pw1's own epilogue (`rtp[0]==3`) and deletes the consumer --
-/// so shipping needs a resident carrying BOTH that epilogue and this branch's bf16-out panel drain,
-/// plus bf16-input builds of resadd and acc_add. The host half is done: `c_elem_bytes` settles the
-/// drain width and the modal readbacks decode at it. The accuracy side is priced separately: zero
-/// WER cost on 200 clips.
-fn fold_fc1() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("PARAKEET_FOLD_FC1").map(|v| v != "0").unwrap_or(false))
 }
 
 /// `PARAKEET_FOLD_GLU=1`: apply the conv-module gate in pw1's OWN epilogue (`rtp[0]==3`), taking the
@@ -880,15 +753,8 @@ impl NpuMatmul {
         let dev = Device::open(0).map_err(LoadError::Device)?;
         let base = kernel_registry::resolve_kernel_dir(root, WA_SUBDIR);
         let ln_dir = root.join("artifacts/parakeet/ln");
-        // resident kernel tile: fast BFP16 64x32x128 (default) or native bf16 32x32x32 (NPU_NATIVE=1),
-        // or the FOLD's 32x32x128 (see `fold_fc1`).
-        let tile = if fold_fc1() {
-            FC1_PANEL_BF16_TILE.to_string()
-        } else if std::env::var("NPU_NATIVE").is_ok() {
-            "32x32x32".to_string()
-        } else {
-            "64x32x128".to_string()
-        };
+        // resident kernel tile: fast BFP16 64x32x128, the only served tile.
+        let tile = "64x32x128".to_string();
         // resident xclbin = a K=1024 whole_array kernel for this tile. What is N-independent is the
         // BD-CHAIN SHAPE, not the array program: all three modal insts are 1436 words and N lives in
         // the BDs' size/stride fields (see `stream()`), while the device region does differ across N
@@ -899,13 +765,7 @@ impl NpuMatmul {
         // whole_array_modal_iron.py's core_fn. Prefer the largest N present;
         // fall back to a smaller surviving build (the N=4096/2048 twins were deleted by the
         // an earlier occupancy run; N=1024 survives). Env NPU_RESIDENT_XCLBIN overrides.
-        let (xclbin, modal) = if fold_fc1() {
-            // The resident IS fc1's bf16-out xclbin, so the fc1<->fc2 transition disappears with no
-            // dispatch site touched -- but only while this load and `Fc1PanelBf16`'s name one path.
-            // `fc1_panel_bf16_dir` is what makes them agree.
-            let stem = fc1_panel_bf16_stem();
-            (resolve_verified(fc1_panel_bf16_dir(&base, &ln_dir, &stem), &stem).xclbin, true)
-        } else if let Ok(p) = std::env::var("NPU_RESIDENT_XCLBIN") {
+        let (xclbin, modal) = if let Ok(p) = std::env::var("NPU_RESIDENT_XCLBIN") {
             let path = PathBuf::from(p);
             // Arbitrary override path (a manual/debug knob): no guaranteed `final_{stem}.xclbin`
             // convention to recover a stem from, so this branch keeps the raw filename check it
@@ -913,10 +773,11 @@ impl NpuMatmul {
             let modal = path.file_name().and_then(|s| s.to_str()).is_some_and(|s| s.contains("modal"));
             (path, modal)
         } else {
-            // A1 (ff_act on-chip): prefer the MODAL resident xclbin (fused f32-out epilogue; the
-            // per-inst-stream RTP selects silu@N=4096 / identity elsewhere -> the FFN SiLU runs on
-            // chip with zero extra hw-context switches). Fall back to the plain matmul xclbin if the
-            // modal build is absent (then `modal=false` and the host keeps applying silu).
+            // The MODAL resident xclbin (fused f32-out epilogue; the per-inst-stream RTP selects
+            // silu@N=4096 / identity elsewhere -> the FFN SiLU runs on chip with zero extra
+            // hw-context switches) is the served resident -- every other loader below (fc1_panel_bf16,
+            // glu, acc_add, dwconv_silu_t, ...) already assumes it, so there is no plain-matmul
+            // fallback to degrade to.
             // PREFER the krtp resident: its cores read the k-loop bound from rtp[1], which is what
             // lets ONE resident serve K=KRES and the K=DFF one-dispatch fc2. Without it the fc2
             // K-split (4 partials + 4 acc_add) is the only correct path, and that is 336 extra
@@ -929,15 +790,8 @@ impl NpuMatmul {
             } else if kernel_registry::xclbin_path(&base, &modal_stem).exists() {
                 modal_stem
             } else {
-                let mut chosen = None;
-                for n in ["4096", "2048", "1024"] {
-                    let cand_stem = format!("512x1024x{n}_{tile}_8c");
-                    if kernel_registry::xclbin_path(&base, &cand_stem).exists() {
-                        chosen = Some(cand_stem);
-                        break;
-                    }
-                }
-                chosen.unwrap_or_else(|| format!("512x1024x4096_{tile}_8c"))
+                panic!("[npu] modal resident xclbin absent in {} (final_{modal_stem}.xclbin) -- \
+                        build it with scripts/build_parakeet_modal_kernels.sh", base.display());
             };
             // Opt-in manifest verification (engine-op-manifest-and-dynamic-xclbin): this xclbin is
             // REQUIRED (no host fallback exists for a missing resident matmul kernel -- a missing
@@ -1522,18 +1376,7 @@ impl NpuMatmul {
         // Graceful: if the ctxln+affcast xclbins aren't present, the FFN LN->fc1 stays on the host
         // path (no panic) -- so the resident seam can be the DEFAULT without breaking builds/branches
         // that haven't built these kernels.
-        let seam = ["ctxln", "affcast"].iter().all(|n| {
-            let stem = format!("{n}_{PAD_M}x{KRES}");
-            kernel_registry::xclbin_path(&self.ln_dir, &stem).exists()
-                && kernel_registry::insts_path(&self.ln_dir, &stem).exists()
-        });
-        // full FFN (Variant B) also needs the deinterleave xclbin. Pre-existing asymmetry,
-        // preserved as-is: this checks only the xclbin, not its insts counterpart (unlike every
-        // other presence gate in this function) -- a behavior-preserving routing pass is not the
-        // place to also change what "present" means here.
-        let fc2ok =
-            kernel_registry::xclbin_path(&self.ln_dir, &format!("deint_{PAD_M}x{DFF}")).exists();
-        let present = seam && fc2ok;
+        let present = resident_ln_artifacts_present(&self.ln_dir);
         let result = if present {
             Some(self.load_resident_ln())
         } else {
@@ -1571,8 +1414,6 @@ impl NpuMatmul {
             bo.sync_to_device().unwrap();
             (kern, bo, n)
         };
-        let (deint_kern, deint_instr, deint_n) =
-            load_path(&self.ln_dir, &format!("deint_{PAD_M}x{DFF}"));
         // FUSED ctxLN->affine_cast, OPTIONAL like glu. Default ON when built; PARAKEET_LN_FUSED=0
         // forces the two-dispatch chain back (two-way, not a one-way flip).
         let lnaffcast = {
@@ -1701,71 +1542,27 @@ impl NpuMatmul {
                 None
             }
         };
-        // one-dispatch K=DFF fc2 (cast@DFF row-major bf16 -> K=DFF modal), OPTIONAL: collapses the
-        // deint + 4x K=1024 chunk GEMMs + 4x acc_add into cast + 1 K=4096 modal. Both xclbins are
-        // built+staged by build_parakeet_modal_kernels.sh (cast_512x4096, 512x4096x1024 modalid).
-        let fc2_k4096 = {
-            let cast_stem = format!("cast_{PAD_M}x{DFF}");
-            let mm_stem = format!("{PAD_M}x{DFF}x{KRES}_{}_8c_modalid", self.tile);
-            // TWO hw_context slots (the cast and the K=DFF GEMM) for an OPT-IN path. Loading them
-            // when the flag is off spent 2 of the driver's 16 on programs that can never dispatch;
-            // that budget is what blocked attention-on-NPU. Gate on the flag, not on the artifacts
-            // existing.
-            let present = self.fc2_k4096_on()
-                && kernel_registry::xclbin_path(&self.ln_dir, &cast_stem).exists()
-                && kernel_registry::insts_path(&self.ln_dir, &cast_stem).exists()
-                && kernel_registry::xclbin_path(&self.ln_dir, &mm_stem).exists()
-                && kernel_registry::insts_path(&self.ln_dir, &mm_stem).exists();
-            if present {
-                let (cast_kern, cast_instr, cast_n) = load_path(&self.ln_dir, &cast_stem);
-                let (mm_kern, mm_instr, mm_n) = load_path(&self.ln_dir, &mm_stem);
-                let gc = |i| cast_kern.group_id(i).unwrap();
-                let gm = |i| mm_kern.group_id(i).unwrap();
-                Some(Fc2K4096 {
-                    cast_out: self.dev.alloc_bo(&cast_kern, PAD_M * DFF * 2, FLAG_HOST_ONLY, gc(4)).unwrap(),
-                    cast_dc: self.dev.alloc_bo(&cast_kern, 1, FLAG_HOST_ONLY, gc(5)).unwrap(),
-                    cast_dt: self.dev.alloc_bo(&cast_kern, 8, FLAG_HOST_ONLY, gc(6)).unwrap(),
-                    cast_dr: self.dev.alloc_bo(&cast_kern, 1, FLAG_HOST_ONLY, gc(7)).unwrap(),
-                    mm_c: Rc::new(self.dev.alloc_bo(&mm_kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gm(5)).unwrap()),
-                    cast_kern, cast_instr, cast_n, mm_kern, mm_instr, mm_n,
-                })
-            } else {
-                eprintln!("[npu] fc2_k4096 xclbins absent in {} -- one-dispatch fc2 unavailable (build cast_{PAD_M}x{DFF} + {PAD_M}x{DFF}x{KRES} modal)", self.ln_dir.display());
-                None
-            }
-        };
-        // fc1 with the K-panel packing folded into its C drain. DEFAULT ON (PARAKEET_FC1_PACK_IN_DRAIN=0
-        // opts out). Loaded whenever the artifact is present so the flag alone selects it; the m=32 tile
-        // is baked into the name because bf16-out does not FIT at the m=64 fast tile (L1 overflow, see
-        // Fc1PanelBf16). Absent artifact still falls back cleanly, which is what makes default-on safe
-        // for a tree that has not rebuilt the modal kernels.
+        // fc1 with the K-panel packing folded into its C drain -- the served fc1->fc2 seam. The m=32
+        // tile is baked into the name because bf16-out does not fit at the m=64 fast tile (L1
+        // overflow, see Fc1PanelBf16). Required: there is no fc1+deint fallback, so a missing
+        // artifact is a build error.
         let fc1_panel_bf16 = {
             let tag = fc1_panel_bf16_stem();
             let dir = fc1_panel_bf16_dir(&self.base, &self.ln_dir, &tag);
             let present = kernel_registry::xclbin_path(dir, &tag).exists()
                 && kernel_registry::insts_path(dir, &tag).exists();
-            if present {
-                let (kern, instr, n) = load_path(dir, &tag);
-                let gg = |i| kern.group_id(i).unwrap();
-                Some(Fc1PanelBf16 {
-                    bo_out: self.dev.alloc_bo(&kern, (DFF / KRES) * PAD_M * KRES * 2, FLAG_HOST_ONLY, gg(5)).unwrap(),
-                    dummy_tmp: self.dev.alloc_bo(&kern, 1, FLAG_HOST_ONLY, gg(6)).unwrap(),
-                    dummy_tr: self.dev.alloc_bo(&kern, 4, FLAG_HOST_ONLY, gg(7)).unwrap(),
-                    kern, instr, n,
-                })
-            } else {
-                // Say why the DEFAULT path is not running. The old wording blamed the env var, which
-                // is now wrong in the common case: the flag defaults on, so an operator who set
-                // nothing would be told they had set something.
-                // NOT quiet-gated, same reason as the lnaffcast warning above: a missing artifact
-                // that silently costs ~3.4%/clip is a degradation, not a banner.
-                if self.fc1_pack_in_drain_on() {
-                    eprintln!("[npu] final_{tag}.xclbin absent in {} -- falling back to fc1+deint (slower by ~3.4%/clip). \
-                               Build it with scripts/build_parakeet_modal_kernels.sh, or set PARAKEET_FC1_PACK_IN_DRAIN=0 to silence this.",
-                              dir.display());
-                }
-                None
+            if !present {
+                panic!("[npu] final_{tag}.xclbin absent in {} -- build it with \
+                        scripts/build_parakeet_modal_kernels.sh", dir.display());
             }
+            let (kern, instr, n) = load_path(dir, &tag);
+            let gg = |i| kern.group_id(i).unwrap();
+            Some(Fc1PanelBf16 {
+                bo_out: self.dev.alloc_bo(&kern, (DFF / KRES) * PAD_M * KRES * 2, FLAG_HOST_ONLY, gg(5)).unwrap(),
+                dummy_tmp: self.dev.alloc_bo(&kern, 1, FLAG_HOST_ONLY, gg(6)).unwrap(),
+                dummy_tr: self.dev.alloc_bo(&kern, 4, FLAG_HOST_ONLY, gg(7)).unwrap(),
+                kern, instr, n,
+            })
         };
         // lnaffcast as a mode of that panel (PARAKEET_LN_MODE=1). Insts-only: the stream is bound to
         // the panel's ALREADY-LOADED kernel, never to a second `load_kernel`, because a second handle
@@ -1804,143 +1601,44 @@ impl NpuMatmul {
                 (false, _) => None,
             }
         };
-        // conv-module depthwise conv1d (step 3), OPTIONAL. 3-buffer ABI in[C,T]/w[C,16]/out[C,T] bf16.
-        // The dwconv/SiLU bricks are FOUR builds of ONE op, and the conv path has a strict
-        // preference order (time-major fused > channel-major fused > separate dwconv+silu). Loading
-        // all four spends four of the driver's 16 hw_context slots to dispatch at most two of them,
-        // which is what left no slot for attention-on-NPU (EINVAL at CREATE_HWCTX). Decide the
-        // variant ONCE here and load only that one.
+        // TIME-MAJOR fused dwconv->SiLU (step 3b), the served conv brick. 3-buffer ABI: in [T+2P,D]
+        // bf16 (g3, host-padded), w [K+1,D] bf16 tap-major (g4), out [T,D] f32 (g5). Required: there
+        // is no other conv wiring to fall back to, so a missing artifact is a build error.
         let have = |stem: &str| {
             kernel_registry::xclbin_path(&self.ln_dir, stem).exists()
                 && kernel_registry::insts_path(&self.ln_dir, stem).exists()
         };
-        let want_dws_t = have(&format!("dwconv_silu_t_{DW_C}x{DW_T}"));
-        let want_dws = !want_dws_t && have(&format!("dwconv_silu_{DW_C}x{DW_T}"));
-        // separate dwconv + silu only when neither fused variant exists
-        let want_split = !want_dws_t && !want_dws;
-        // Which variant won, said once. The three branches below then warn only when the variant
-        // was actually wanted and is genuinely missing -- they used to print "absent" for a file
-        // that was present but lost the order, and send the reader to rebuild it. In each of those
-        // branches `want_split` is exactly that genuine-absence case: a fused variant winning is
-        // the only other way to reach them.
-        let selected = if want_dws_t {
-            "dwconv_silu_t (time-major fused)"
-        } else if want_dws {
-            "dwconv_silu (channel-major fused)"
-        } else {
-            "separate dwconv + silu"
-        };
-        if !npu_xrt::quiet() {
-            eprintln!("[npu] conv dwconv/SiLU: {selected} selected in {}", self.ln_dir.display());
-        }
-
-        let dwconv = {
-            let stem = format!("dwconv_{DW_C}x{DW_T}");
-            let present = want_split && have(&stem);
-            if present {
-                let (kern, instr, n) = load_path(&self.ln_dir, &stem);
-                let gw = |i| kern.group_id(i).unwrap();
-                Some(ConvDw {
-                    bo_in: self.dev.alloc_bo(&kern, DW_C * DW_T * 2, FLAG_HOST_ONLY, gw(3)).unwrap(),
-                    bo_w: self.dev.alloc_bo(&kern, DW_C * DW_KW * 2, FLAG_HOST_ONLY, gw(4)).unwrap(),
-                    bo_out: self.dev.alloc_bo(&kern, DW_C * DW_T * 2, FLAG_HOST_ONLY, gw(5)).unwrap(),
-                    dummy_tmp: self.dev.alloc_bo(&kern, 8, FLAG_HOST_ONLY, gw(6)).unwrap(),
-                    dummy_tr: self.dev.alloc_bo(&kern, 1, FLAG_HOST_ONLY, gw(7)).unwrap(),
-                    kern, instr, n,
-                })
-            } else {
-                if want_split {
-                    eprintln!("[npu] dwconv xclbin absent in {} -- conv dwconv stays host (build final_dwconv_{DW_C}x{DW_T})", self.ln_dir.display());
-                }
-                None
-            }
-        };
-        // conv-module post-dwconv SiLU (step 4), OPTIONAL. 2-buffer ABI in[C,T]/out[C,T] f32.
-        let silu = {
-            let stem = format!("silu_{DW_C}x{DW_T}");
-            let present = want_split && have(&stem);
-            if present {
-                let (kern, instr, n) = load_path(&self.ln_dir, &stem);
-                let gs = |i| kern.group_id(i).unwrap();
-                Some(ConvSilu {
-                    bo_in: self.dev.alloc_bo(&kern, DW_C * DW_T * 4, FLAG_HOST_ONLY, gs(3)).unwrap(),
-                    bo_out: self.dev.alloc_bo(&kern, DW_C * DW_T * 4, FLAG_HOST_ONLY, gs(4)).unwrap(),
-                    dummy_tmp: self.dev.alloc_bo(&kern, 8, FLAG_HOST_ONLY, gs(5)).unwrap(),
-                    dummy_ctrl: self.dev.alloc_bo(&kern, 8, FLAG_HOST_ONLY, gs(6)).unwrap(),
-                    dummy_tr: self.dev.alloc_bo(&kern, 1, FLAG_HOST_ONLY, gs(7)).unwrap(),
-                    kern, instr, n,
-                })
-            } else {
-                if want_split {
-                    eprintln!("[npu] silu xclbin absent in {} -- conv SiLU stays host (build final_silu_{DW_C}x{DW_T})", self.ln_dir.display());
-                }
-                None
-            }
-        };
-        // FUSED dwconv->SiLU (step 3+4, one xclbin), OPTIONAL. 3-buffer ABI in[C,T] bf16 / w[C,16] bf16 /
-        // out[C,T] f32 (== ConvDw ABI, f32 out). Present -> replaces the separate dwconv+silu dispatches.
-        let dwconv_silu = {
-            let stem = format!("dwconv_silu_{DW_C}x{DW_T}");
-            let present = want_dws && have(&stem);
-            if present {
-                let (kern, instr, n) = load_path(&self.ln_dir, &stem);
-                let gw = |i| kern.group_id(i).unwrap();
-                Some(ConvDwSilu {
-                    bo_in: self.dev.alloc_bo(&kern, DW_C * DW_T * 2, FLAG_HOST_ONLY, gw(3)).unwrap(),
-                    bo_w: self.dev.alloc_bo(&kern, DW_C * DW_KW * 2, FLAG_HOST_ONLY, gw(4)).unwrap(),
-                    bo_out: self.dev.alloc_bo(&kern, DW_C * DW_T * 4, FLAG_HOST_ONLY, gw(5)).unwrap(),
-                    dummy_tmp: self.dev.alloc_bo(&kern, 8, FLAG_HOST_ONLY, gw(6)).unwrap(),
-                    dummy_tr: self.dev.alloc_bo(&kern, 1, FLAG_HOST_ONLY, gw(7)).unwrap(),
-                    kern, instr, n,
-                })
-            } else {
-                if want_split {
-                    eprintln!("[npu] fused dwconv+silu xclbin absent in {} -- separate dwconv+silu path (build final_dwconv_silu_{DW_C}x{DW_T})", self.ln_dir.display());
-                }
-                None
-            }
-        };
-        // TIME-MAJOR fused dwconv->SiLU (step 3b), OPTIONAL. 3-buffer ABI: in [T+2P,D] bf16 (g3,
-        // host-padded), w [K+1,D] bf16 tap-major (g4), out [T,D] f32 (g5). Present -> conv path prefers
-        // it (dissolves both host transposes); absent -> channel-major dwconv_silu / separate bricks.
         let dwconv_silu_t = {
             let stem = format!("dwconv_silu_t_{DW_C}x{DW_T}");
-            let present = want_dws_t && have(&stem);
-            if present {
-                let (kern, instr, n) = load_path(&self.ln_dir, &stem);
-                let gw = |i| kern.group_id(i).unwrap();
-                Some(ConvDwSiluT {
-                    bo_in: self.dev.alloc_bo(&kern, DW_TPAD * DW_C * 2, FLAG_HOST_ONLY, gw(3)).unwrap(),
-                    bo_w: self.dev.alloc_bo(&kern, (DW_K + 1) * DW_C * 2, FLAG_HOST_ONLY, gw(4)).unwrap(),
-                    bo_out: self.dev.alloc_bo(&kern, DW_T * DW_C * 4, FLAG_HOST_ONLY, gw(5)).unwrap(),
-                    dummy_tmp: self.dev.alloc_bo(&kern, 8, FLAG_HOST_ONLY, gw(6)).unwrap(),
-                    dummy_tr: self.dev.alloc_bo(&kern, 1, FLAG_HOST_ONLY, gw(7)).unwrap(),
-                    kern, instr, n,
-                })
-            } else {
-                eprintln!("[npu] time-major fused dwconv+silu xclbin absent in {} -- channel-major path w/ host transposes (build final_dwconv_silu_t_{DW_C}x{DW_T})", self.ln_dir.display());
-                None
+            if !have(&stem) {
+                panic!("[npu] time-major fused dwconv+silu xclbin absent in {} -- build it with \
+                        scripts/build_parakeet_modal_kernels.sh (final_{stem})", self.ln_dir.display());
             }
+            let (kern, instr, n) = load_path(&self.ln_dir, &stem);
+            let gw = |i| kern.group_id(i).unwrap();
+            Some(ConvDwSiluT {
+                bo_in: self.dev.alloc_bo(&kern, DW_TPAD * DW_C * 2, FLAG_HOST_ONLY, gw(3)).unwrap(),
+                bo_w: self.dev.alloc_bo(&kern, (DW_K + 1) * DW_C * 2, FLAG_HOST_ONLY, gw(4)).unwrap(),
+                bo_out: self.dev.alloc_bo(&kern, DW_T * DW_C * 4, FLAG_HOST_ONLY, gw(5)).unwrap(),
+                dummy_tmp: self.dev.alloc_bo(&kern, 8, FLAG_HOST_ONLY, gw(6)).unwrap(),
+                dummy_tr: self.dev.alloc_bo(&kern, 1, FLAG_HOST_ONLY, gw(7)).unwrap(),
+                kern, instr, n,
+            })
         };
         let gl = |i| ln_kern.group_id(i).unwrap();
         let ga = |i| ac_kern.group_id(i).unwrap();
-        let gd = |i| deint_kern.group_id(i).unwrap();
         let rl = Rc::new(ResidentLn {
             bo_x: self.dev.alloc_bo(&ln_kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gl(3)).unwrap(),
             bo_ln: self.dev.alloc_bo(&ln_kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gl(4)).unwrap(),
             bo_gb: self.dev.alloc_bo(&ac_kern, 2 * KRES * 4, FLAG_HOST_ONLY, ga(4)).unwrap(),
             bo_bf16: Rc::new(self.dev.alloc_bo(&ac_kern, PAD_M * KRES * 2, FLAG_HOST_ONLY, ga(5)).unwrap()),
-            bo_deint: self.dev.alloc_bo(&deint_kern, (DFF / KRES) * PAD_M * KRES * 2, FLAG_HOST_ONLY, gd(4)).unwrap(),
             ln_c: self.dev.alloc_bo(&ln_kern, 1, FLAG_HOST_ONLY, gl(5)).unwrap(),
             ln_tmp: self.dev.alloc_bo(&ln_kern, 8, FLAG_HOST_ONLY, gl(6)).unwrap(),
             ln_tr: self.dev.alloc_bo(&ln_kern, 1, FLAG_HOST_ONLY, gl(7)).unwrap(),
             ac_tmp: self.dev.alloc_bo(&ac_kern, 8, FLAG_HOST_ONLY, ga(6)).unwrap(),
             ac_tr: self.dev.alloc_bo(&ac_kern, 1, FLAG_HOST_ONLY, ga(7)).unwrap(),
-            deint_c: self.dev.alloc_bo(&deint_kern, 1, FLAG_HOST_ONLY, gd(5)).unwrap(),
-            deint_tmp: self.dev.alloc_bo(&deint_kern, 8, FLAG_HOST_ONLY, gd(6)).unwrap(),
-            deint_tr: self.dev.alloc_bo(&deint_kern, 1, FLAG_HOST_ONLY, gd(7)).unwrap(),
             ln_kern, ln_instr, ln_n, ac_kern, ac_instr, ac_n, lnaffcast, ln_mode,
-            deint_kern, deint_instr, deint_n, glu, acc_add, resadd_s050, resadd_s100, fc2_k4096, fc1_panel_bf16, dwconv, silu, dwconv_silu, dwconv_silu_t,
+            glu, acc_add, resadd_s050, resadd_s100, fc1_panel_bf16, dwconv_silu_t,
         });
         rl
     }
@@ -2158,21 +1856,18 @@ impl NpuMatmul {
     /// Bytes per element of whatever the resident drains into a C buffer: 4 (f32) or 2 (bf16).
     ///
     /// Every host readback and every device consumer of a modal C is written against f32, so a
-    /// resident that drains bf16 is silently wrong output rather than a failure. `PARAKEET_FOLD_FC1`
-    /// makes fc1's bf16-out build the resident, which halves the drain of every modal GEMM on it --
-    /// not just fc1's.
+    /// resident that drains bf16 is silently wrong output rather than a failure.
     ///
     /// The shipped default picks an f32-out resident in `open()`, so the branch that chose the
-    /// xclbin is the authority and no probe is spent. The two branches that can land a bf16-out
-    /// program here -- the fold and an arbitrary `NPU_RESIDENT_XCLBIN` -- are both opt-in, and there
-    /// the answer is MEASURED. Not read off a `bf16out` substring, for the reason `glu_epi` is not:
-    /// the last time a filename stood in for a property of the compiled program it was a stream's
-    /// mode tag, and it disagreed.
+    /// xclbin is the authority and no probe is spent. An arbitrary `NPU_RESIDENT_XCLBIN` can land a
+    /// bf16-out program here, and there the answer is MEASURED. Not read off a `bf16out` substring,
+    /// for the reason `glu_epi` is not: the last time a filename stood in for a property of the
+    /// compiled program it was a stream's mode tag, and it disagreed.
     pub fn c_elem_bytes(&self) -> usize {
         if let Some(v) = *self.c_elem.borrow() {
             return v;
         }
-        let v = if fold_fc1() || std::env::var_os("NPU_RESIDENT_XCLBIN").is_some() {
+        let v = if std::env::var_os("NPU_RESIDENT_XCLBIN").is_some() {
             self.probe_c_elem_bytes()
         } else {
             4
@@ -2698,159 +2393,12 @@ impl NpuMatmul {
         Rc::new(out)
     }
 
-    /// Host-fed on-NPU depthwise conv1d (conv step 3a): the sliding_mul FIR brick. `x_ct` = [C=1024, T]
-    /// channel-major f32 (T <= 400), `taps` [C,9], `bias` [C]. Packs to bf16, runs the brick (in->w->out
-    /// 3-buffer ABI), returns [C, T] f32. Transposes stay on host (killed in 3b, when x_ct is fed
-    /// device-to-device from the GLU output). None if the dwconv xclbin is absent or T exceeds the baked
-    /// DW_T (caller keeps the host dwconv1d).
-    pub fn npu_dwconv1d(&self, x_ct: &Array2<f32>, taps: &Array2<f32>, bias: &Array1<f32>) -> Option<Array2<f32>> {
-        let rl = self.resident_ln()?;
-        let dw = rl.dwconv.as_ref()?;
-        let (c, t) = x_ct.dim();
-        if c != DW_C || t > DW_T {
-            return None; // shape outside the baked brick -> host fallback
-        }
-        self.stats.borrow_mut().calls += 1;
-        // pack input [C, t] f32 -> bf16 [C, DW_T] channel-major, zero-padding the time tail (t..DW_T).
-        // 'same' conv sees zeros past the sequence end == correct end-padding; the pad outputs are sliced off.
-        let x_std = x_ct.as_standard_layout();
-        let xs = x_std.as_slice().unwrap();
-        let mut in_bits = vec![0u16; DW_C * DW_T];
-        for ch in 0..c {
-            npu_xrt::pack_f32_to_bf16(&xs[ch * t..ch * t + t], &mut in_bits[ch * DW_T..ch * DW_T + t]);
-        }
-        dw.bo_in.write_bytes(u16_bytes(&in_bits)).unwrap();
-        dw.bo_in.sync_to_device().unwrap();
-        // pack weights [C,9] + bias[C] -> [C,16] bf16 (taps in [0..8], BN-folded bias in [9]).
-        let taps_std = taps.as_standard_layout();
-        let tp = taps_std.as_slice().unwrap();
-        let mut w_bits = vec![0u16; DW_C * DW_KW];
-        for ch in 0..c {
-            let mut row = [0f32; DW_KW];
-            row[..9].copy_from_slice(&tp[ch * 9..ch * 9 + 9]);
-            row[9] = bias[ch];
-            npu_xrt::pack_f32_to_bf16(&row, &mut w_bits[ch * DW_KW..ch * DW_KW + DW_KW]);
-        }
-        dw.bo_w.write_bytes(u16_bytes(&w_bits)).unwrap();
-        dw.bo_w.sync_to_device().unwrap();
-        // dispatch + read [C, DW_T] bf16 -> f32, slice to [C, t].
-        modal_site("dw.kern#1");
-        { let _dt = self.dtimer(); dw.kern.run_matmul8(3, &dw.instr, dw.n, &dw.bo_in, &dw.bo_w, &dw.bo_out, &dw.dummy_tmp, &dw.dummy_tr).unwrap(); }
-        self.stats.borrow_mut().dispatches += 1;
-        dw.bo_out.sync_from_device().unwrap();
-        let mut ob = vec![0u8; DW_C * DW_T * 2];
-        dw.bo_out.read_bytes(&mut ob).unwrap();
-        let mut out = Array2::<f32>::zeros((c, t));
-        for ch in 0..c {
-            for ti in 0..t {
-                let off = (ch * DW_T + ti) * 2;
-                let u = u16::from_le_bytes([ob[off], ob[off + 1]]);
-                out[[ch, ti]] = f32::from_bits((u as u32) << 16);
-            }
-        }
-        Some(out)
-    }
-
-    /// Host-fed on-NPU SiLU (conv step 4): the post-dwconv activation as a SEPARATE brick (silu_row).
-    /// `x_ct` = [C=1024, T] channel-major f32 (T <= 400). Packs f32 -> device (zero-padding the time
-    /// tail; silu(0)=0 so pad rows are 0 and sliced off), runs the 2-buffer brick, returns [C, T] f32.
-    /// This replaces the host `silu_inplace` on the dwconv output -- advancing the single-hardware graph
-    /// WITHOUT fusing silu into dwconv (which miscompiles alternate channels; see the KB log). None if
-    /// the silu xclbin is absent or T exceeds the baked DW_T (caller keeps the host silu).
-    pub fn npu_silu(&self, x_ct: &Array2<f32>) -> Option<Array2<f32>> {
-        let rl = self.resident_ln()?;
-        let s = rl.silu.as_ref()?;
-        let (c, t) = x_ct.dim();
-        if c != DW_C || t > DW_T {
-            return None; // shape outside the baked brick -> host fallback
-        }
-        self.stats.borrow_mut().calls += 1;
-        let x_std = x_ct.as_standard_layout();
-        let xs = x_std.as_slice().unwrap();
-        let mut in_f = vec![0f32; DW_C * DW_T];
-        for ch in 0..c {
-            in_f[ch * DW_T..ch * DW_T + t].copy_from_slice(&xs[ch * t..ch * t + t]);
-        }
-        s.bo_in.write_bytes(f32_bytes(&in_f)).unwrap();
-        s.bo_in.sync_to_device().unwrap();
-        // 2-buffer ABI: in(g3) -> out(g4); tmp/ctrl/trace dummies (g5/g6/g7).
-        modal_site("s.kern#1");
-        { let _dt = self.dtimer(); s.kern.run_matmul8(3, &s.instr, s.n, &s.bo_in, &s.bo_out, &s.dummy_tmp, &s.dummy_ctrl, &s.dummy_tr).unwrap(); }
-        self.stats.borrow_mut().dispatches += 1;
-        s.bo_out.sync_from_device().unwrap();
-        let mut ob = vec![0u8; DW_C * DW_T * 4];
-        s.bo_out.read_bytes(&mut ob).unwrap();
-        let mut out = Array2::<f32>::zeros((c, t));
-        for ch in 0..c {
-            for ti in 0..t {
-                let off = (ch * DW_T + ti) * 4;
-                out[[ch, ti]] = f32::from_le_bytes([ob[off], ob[off + 1], ob[off + 2], ob[off + 3]]);
-            }
-        }
-        Some(out)
-    }
-
-    /// FUSED on-NPU dwconv->SiLU (conv steps 3+4 in ONE xclbin). Replaces the two
-    /// separate npu_dwconv1d + npu_silu dispatches: one hw-context, the post-dwconv SiLU runs
-    /// device-to-device (dwconv core -> on-chip f32 fifo -> silu core), so the on-NPU SiLU costs NO
-    /// extra hw-context switch and no host round-trip (the ~1 ms/block the separate silu xclbin added).
-    /// `x_ct` = [C=1024, T] channel-major f32 (T <= 400, the transposed GLU output), taps [C,9], bias
-    /// [C]. Returns silu(dwconv(x)) as [C, T] f32. None if the fused xclbin is absent or T > DW_T
-    /// (caller falls back to the separate dwconv+silu path, or host).
-    pub fn npu_dwconv_silu(&self, x_ct: &Array2<f32>, taps: &Array2<f32>, bias: &Array1<f32>) -> Option<Array2<f32>> {
-        let rl = self.resident_ln()?;
-        let ds = rl.dwconv_silu.as_ref()?;
-        let (c, t) = x_ct.dim();
-        if c != DW_C || t > DW_T {
-            return None; // shape outside the baked brick -> fallback
-        }
-        self.stats.borrow_mut().calls += 1;
-        // pack input [C,t] f32 -> bf16 [C,DW_T] channel-major, zero-padding the time tail (== 'same' end pad).
-        let x_std = x_ct.as_standard_layout();
-        let xs = x_std.as_slice().unwrap();
-        let mut in_bits = vec![0u16; DW_C * DW_T];
-        for ch in 0..c {
-            npu_xrt::pack_f32_to_bf16(&xs[ch * t..ch * t + t], &mut in_bits[ch * DW_T..ch * DW_T + t]);
-        }
-        ds.bo_in.write_bytes(u16_bytes(&in_bits)).unwrap();
-        ds.bo_in.sync_to_device().unwrap();
-        // pack weights [C,9] + bias[C] -> [C,16] bf16 (taps [0..8], BN-folded bias [9]).
-        let taps_std = taps.as_standard_layout();
-        let tp = taps_std.as_slice().unwrap();
-        let mut w_bits = vec![0u16; DW_C * DW_KW];
-        for ch in 0..c {
-            let mut row = [0f32; DW_KW];
-            row[..9].copy_from_slice(&tp[ch * 9..ch * 9 + 9]);
-            row[9] = bias[ch];
-            npu_xrt::pack_f32_to_bf16(&row, &mut w_bits[ch * DW_KW..ch * DW_KW + DW_KW]);
-        }
-        ds.bo_w.write_bytes(u16_bytes(&w_bits)).unwrap();
-        ds.bo_w.sync_to_device().unwrap();
-        // 3-buffer ABI (== dwconv): in(g3), w(g4), out(g5) f32; tmp/trace dummies (g6/g7).
-        modal_site("ds.kern#1");
-        { let _dt = self.dtimer(); ds.kern.run_matmul8(3, &ds.instr, ds.n, &ds.bo_in, &ds.bo_w, &ds.bo_out, &ds.dummy_tmp, &ds.dummy_tr).unwrap(); }
-        self.stats.borrow_mut().dispatches += 1;
-        ds.bo_out.sync_from_device().unwrap();
-        let mut ob = vec![0u8; DW_C * DW_T * 4];
-        ds.bo_out.read_bytes(&mut ob).unwrap();
-        let mut out = Array2::<f32>::zeros((c, t));
-        for ch in 0..c {
-            for ti in 0..t {
-                let off = (ch * DW_T + ti) * 4;
-                out[[ch, ti]] = f32::from_le_bytes([ob[off], ob[off + 1], ob[off + 2], ob[off + 3]]);
-            }
-        }
-        Some(out)
-    }
-
-    /// TIME-MAJOR fused on-NPU dwconv->SiLU (conv step 3b -- the transpose-DISSOLVING path). Unlike
-    /// `npu_dwconv_silu` ([C,T], bracketed by two host transposes), this takes the GLU output `x_td`
-    /// [T,D] DIRECTLY and returns silu(dwconv(x)) as [T,D] DIRECTLY -- so `conv_module` feeds pw2 the
-    /// result with NO transpose on either side. The FIR vectorizes along D with the k=9 halo along time
-    /// (consecutive row loads, no shuffle / cross-column DMA), so it dodges the n-D-DMA co-residency
-    /// hang. Precision recipe IDENTICAL to the channel-major fused brick (bf16 in, f32 on-chip mid to
-    /// silu, bf16-tanh silu). `taps` [D,9], `bias` [D]. None if the time-major xclbin is absent or
-    /// t > DW_T (caller falls back to the channel-major path, then host).
+    /// TIME-MAJOR fused on-NPU dwconv->SiLU (conv step 3b -- the transpose-DISSOLVING path). Takes
+    /// the GLU output `x_td` [T,D] DIRECTLY and returns silu(dwconv(x)) as [T,D] DIRECTLY -- so
+    /// `conv_module` feeds pw2 the result with NO transpose on either side. The FIR vectorizes along D
+    /// with the k=9 halo along time (consecutive row loads, no shuffle / cross-column DMA), so it
+    /// dodges the n-D-DMA co-residency hang. `taps` [D,9], `bias` [D]. None if t > DW_T (caller keeps
+    /// host dwconv1d + host silu).
     pub fn npu_dwconv_silu_tmajor(&self, x_td: &Array2<f32>, taps: &Array2<f32>, bias: &Array1<f32>) -> Option<Array2<f32>> {
         let rl = self.resident_ln()?;
         let ds = rl.dwconv_silu_t.as_ref()?;
@@ -2908,22 +2456,15 @@ impl NpuMatmul {
     ///   ctxLN -> affine_cast -> modal fc1 (on-chip silu, [t,DFF]) -> cast@DFF (bf16) -> K=DFF fc2
     ///   (identity, on-chip K-reduce, [t,KRES]) -> read [t,KRES] f32.
     /// No host K-split / accumulate. `make_w1` = [KRES,DFF] fc1 weight; `make_w2` = [DFF,KRES] fc2.
-    /// True when the one-dispatch K=DFF fc2 collapse is enabled (opt-in `PARAKEET_FC2_ONEDISPATCH`).
-    /// Unlike `fc2_k4096_on` this is tested on the DEFAULT path, not inside a `None` arm the default
-    /// never takes -- see the warning in `ffn_dev_accum`.
     /// One-dispatch fc2: contract all DFF of K in ONE modal dispatch instead of 4 K=KRES partials +
-    /// 4 acc_add. DEFAULT ON; `PARAKEET_FC2_ONEDISPATCH=0` is a kill switch, matching the house
-    /// pattern for the other resident seams.
+    /// 4 acc_add.
     ///
     /// It REQUIRES the krtp resident -- at `k != KRES` the k-loop bound comes from rtp[1], and a BAKED
     /// resident would contract over its own K instead. Today a mispairing happens to panic on a
     /// missing `...apanel1024` insts file, but that is safety by an artifact's ABSENCE: build that
     /// artifact and the protection disappears. So the requirement is checked here explicitly, and the
-    /// path declines rather than dispatching a wrong contraction.
+    /// path declines (to the K-split fc2 below) rather than dispatching a wrong contraction.
     fn fc2_onedispatch_on(&self) -> bool {
-        if !std::env::var("PARAKEET_FC2_ONEDISPATCH").map(|v| v != "0").unwrap_or(true) {
-            return false;
-        }
         if !self.krtp {
             // Not an error: the K-split path below is correct and is what a non-krtp resident wants.
             if !npu_xrt::quiet() {
@@ -2968,30 +2509,10 @@ impl NpuMatmul {
         bo
     }
 
-    /// True when the one-dispatch K=DFF fc2 collapse is enabled (opt-in `PARAKEET_FC2_K4096`).
-    fn fc2_k4096_on(&self) -> bool {
-        std::env::var("PARAKEET_FC2_K4096").map(|v| v != "0").unwrap_or(false)
-    }
-
-    /// DEFAULT ON since 2026-07-28. `PARAKEET_FC1_PACK_IN_DRAIN=0` returns to the fc1+deint pair.
-    fn fc1_pack_in_drain_on(&self) -> bool {
-        std::env::var("PARAKEET_FC1_PACK_IN_DRAIN").map(|v| v != "0").unwrap_or(true)
-    }
-
-    /// fc1 -> the chunk-major bf16 buffer the fc2 K-split reads, as ONE dispatch instead of two.
-    ///
-    /// `Some(bo)` means the fold ran: the GEMM drained chunk-major bf16 itself and no deint was
-    /// dispatched. `None` means the caller must run the shipped fc1 + deint pair -- either the flag
-    /// is off or the xclbin was not built. The returned BO holds exactly what `bo_deint` would have,
-    /// so callers only need to swap which buffer they sub-slice.
-    fn fc1_pack_in_drain<'a>(&self, rl: &'a ResidentLn, w1: &Bo) -> Option<&'a Bo> {
-        if !self.fc1_pack_in_drain_on() {
-            return None;
-        }
-        let o = rl.fc1_panel_bf16.as_ref()?;
-        // This is the DEFAULT fc1 path, so the leaf breakdown has to charge it here -- the
-        // fc1/deint timers on the fallback branch never run while the fold is on, and reported 0.
-        // Timed outside the dtimer scope: that guard borrows self.stats at drop.
+    /// fc1 -> the chunk-major bf16 buffer the fc2 K-split reads, as ONE dispatch instead of two. The
+    /// served fc1 path: `open()` already requires `fc1_panel_bf16`, so this always runs the fold.
+    fn fc1_pack_in_drain<'a>(&self, rl: &'a ResidentLn, w1: &Bo) -> &'a Bo {
+        let o = rl.fc1_panel_bf16.as_ref().expect("fc1_panel_bf16 required by open()");
         let t_fc1 = Instant::now();
         {
             let _p = crate::prof::phase::PhaseScope::new("ffn_fc1", crate::prof::phase::Bucket::Npu);
@@ -3006,29 +2527,7 @@ impl NpuMatmul {
             s.dispatches += 1; // fc1 only -- the deint is folded into its drain
             s.ffn_fc1_s += fc1_s; // includes the folded deint, which no longer has its own dispatch
         }
-        Some(&o.bo_out)
-    }
-
-    /// Shared one-dispatch K=DFF fc2: cast the fc1 output (`fc1_out` f32 [PAD_M,DFF]) to bf16 row-major,
-    /// then ONE K=DFF modal GEMM (internal L1 K-accum over DFF) with the full fc2 weight -> f32
-    /// [PAD_M,KRES] device BO. Counts 2 dispatches (cast + modal); the caller counts fc1. Full fc2
-    /// weight cached under "{id2}.full". Collapses the deint + 4x K=1024 GEMM + 4x acc_add.
-    fn fc2_k4096_dev<F2: FnOnce() -> Array2<f32>>(&self, k4: &Fc2K4096, fc1_out: &Bo, make_w2: F2, id2: &str) -> Rc<Bo> {
-        modal_site("k4.cast_kern#1");
-        { let _dt = self.dtimer(); k4.cast_kern.run_matmul8(3, &k4.cast_instr, k4.cast_n, fc1_out, &k4.cast_out, &k4.cast_dc, &k4.cast_dt, &k4.cast_dr).unwrap(); }
-        let wid = format!("{id2}.full");
-        let cached = self.wcache.borrow().get(&wid).cloned();
-        let w2f = if let Some(bo) = cached {
-            bo
-        } else {
-            let w = make_w2();
-            assert_eq!(w.dim(), (DFF, KRES), "fc2 W2 dim");
-            self.weight_bo(&wid, w.view())
-        };
-        modal_site("k4.mm_kern#1");
-        { let _dt = self.dtimer(); k4.mm_kern.run_matmul8(3, &k4.mm_instr, k4.mm_n, &k4.cast_out, &w2f, &k4.mm_c, &self.bo_tmp, &self.bo_tr).unwrap(); }
-        self.stats.borrow_mut().dispatches += 2; // cast + K=DFF modal
-        k4.mm_c.clone()
+        &o.bo_out
     }
 
     pub fn resident_ffn<F1: FnOnce() -> Array2<f32>, F2: FnOnce() -> Array2<f32>>(
@@ -3052,61 +2551,10 @@ impl NpuMatmul {
             })
         };
         self.stats.borrow_mut().ffn_weight_prep_s += t_wp.elapsed().as_secs_f64();
-        // fc1 -> chunk-major bf16. The fold (opt-in) does it in ONE dispatch; otherwise the shipped
-        // fc1 + deint pair. `a_chunks` is the buffer the fc2 K-split sub-slices either way.
-        let a_chunks: &Bo = match self.fc1_pack_in_drain(&rl, &w1) {
-            Some(bo) => bo,
-            None => {
-                let st1 = self.stream(DFF, Act::Silu); // fc1 on-chip SiLU iff modal (plain resident ignores it)
-                let t_fc1 = Instant::now();
-                modal_site("kern#5");
-                self.kern.run_matmul8(3, &st1.instr, st1.n_instr, &rl.bo_bf16, &w1, &st1.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
-                let fc1_s = t_fc1.elapsed().as_secs_f64();
-                {
-                    let mut s = self.stats.borrow_mut();
-                    s.dispatch_s += fc1_s;
-                    s.ffn_fc1_s += fc1_s;
-                }
-                // ONE-DISPATCH K=DFF fc2 (opt-in): cast@DFF -> K=DFF modal -> readback to host [m,KRES].
-                if self.fc2_k4096_on() {
-                    if let Some(k4) = rl.fc2_k4096.as_ref() {
-                        self.stats.borrow_mut().dispatches += 1; // fc1
-                        let bo = self.fc2_k4096_dev(k4, &st1.bo_c, make_w2, id2);
-                        // HOST from here: sync, copy out, decode f32. Inside the ff_resident phase
-                        // scope this was charged to Bucket::Npu.
-                        let t_rb = Instant::now();
-                        bo.sync_from_device().unwrap();
-                        let mut cb = vec![0u8; m * KRES * 4];
-                        bo.read_bytes(&mut cb).unwrap();
-                        let mut out = Array2::<f32>::zeros((m, KRES));
-                        for r in 0..m {
-                            for c in 0..KRES {
-                                let off = (r * KRES + c) * 4;
-                                out[[r, c]] = f32::from_le_bytes([cb[off], cb[off + 1], cb[off + 2], cb[off + 3]]);
-                            }
-                        }
-                        self.stats.borrow_mut().ffn_readback_s += t_rb.elapsed().as_secs_f64();
-                        return out;
-                    }
-                }
-                // deinterleave+cast: st1.bo_c (f32 [PAD_M,DFF]) -> rl.bo_deint (bf16 [parts,PAD_M,KRES]
-                // chunk-major), device-side. One dispatch (chunk-major drain TAP). NOTE: this n-D output DMA
-                // HANGS ("run did not complete") when the deint is a co-resident hw-context alongside the
-                // modal (it works standalone) -- a multi-context n-D-DMA toolchain issue; see the debug note.
-                let t_deint = Instant::now();
-                modal_site("rl.deint_kern#1");
-                rl.deint_kern.run_matmul8(3, &rl.deint_instr, rl.deint_n, &st1.bo_c, &rl.bo_deint, &rl.deint_c, &rl.deint_tmp, &rl.deint_tr).unwrap();
-                let deint_s = t_deint.elapsed().as_secs_f64();
-                {
-                    let mut s = self.stats.borrow_mut();
-                    s.dispatch_s += deint_s;
-                    s.ffn_deint_s += deint_s;
-                }
-                self.stats.borrow_mut().dispatches += 2; // fc1 + deint
-                &rl.bo_deint
-            }
-        };
-        // fc2 K-split: each K=KRES chunk is a device SUB-BUFFER of bo_deint; K=KRES modal (identity),
+        // fc1 -> chunk-major bf16 in ONE dispatch (the served fc1 path). `a_chunks` is the buffer
+        // the fc2 K-split sub-slices.
+        let a_chunks: &Bo = self.fc1_pack_in_drain(&rl, &w1);
+        // fc2 K-split: each K=KRES chunk is a device SUB-BUFFER of a_chunks; K=KRES modal (identity),
         // host-accumulate the `parts` partials in f32 -- bit-identical to the host K-split (WER-neutral).
         let parts = DFF / KRES;
         let chunk_bytes = PAD_M * KRES * 2;
@@ -3139,8 +2587,8 @@ impl NpuMatmul {
     /// bf16-checkpoint sibling of [`Self::resident_ffn`]: `bits1`/`bits2` are pre-packed bf16 straight
     /// from a bf16-baked `NPU_WEIGHTS_CHECKPOINT` (fc1 `[KRES,DFF]`, fc2 `[DFF,KRES]`, both verbatim
     /// layout), so every weight-BO build on a cache miss skips the host f32->bf16 pack entirely.
-    /// Same device-side LN->fc1->deint->fc2(K-split) dataflow as `resident_ffn`; only the weight
-    /// source differs.
+    /// Same device-side LN->fc1(panel-drain)->fc2(K-split) dataflow as `resident_ffn`; only the
+    /// weight source differs.
     pub fn resident_ffn_bf16(
         &self, x: &Array2<f32>, gamma: &[f32], beta: &[f32],
         id1: &str, k1: usize, n1: usize, bits1: &[u16],
@@ -3155,34 +2603,7 @@ impl NpuMatmul {
             let c = self.wcache.borrow().get(id1).cloned();
             c.unwrap_or_else(|| self.weight_bo_bf16(id1, k1, n1, bits1))
         };
-        // Ported to the Act enum that `stream()` took on in the k768 rail merge; matches the f32
-        // sibling `resident_ffn` exactly (was `self.modal` under the old bool API).
-        let a_chunks: &Bo = match self.fc1_pack_in_drain(&rl, &w1) {
-            Some(bo) => bo,
-            None => {
-                let st1 = self.stream(DFF, Act::Silu); // fc1 on-chip SiLU iff modal (plain resident ignores it)
-                let t_fc1 = Instant::now();
-                modal_site("kern#6");
-                self.kern.run_matmul8(3, &st1.instr, st1.n_instr, &rl.bo_bf16, &w1, &st1.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
-                let fc1_s = t_fc1.elapsed().as_secs_f64();
-                {
-                    let mut s = self.stats.borrow_mut();
-                    s.dispatch_s += fc1_s;
-                    s.ffn_fc1_s += fc1_s;
-                }
-                let t_deint = Instant::now();
-                modal_site("rl.deint_kern#2");
-                rl.deint_kern.run_matmul8(3, &rl.deint_instr, rl.deint_n, &st1.bo_c, &rl.bo_deint, &rl.deint_c, &rl.deint_tmp, &rl.deint_tr).unwrap();
-                let deint_s = t_deint.elapsed().as_secs_f64();
-                {
-                    let mut s = self.stats.borrow_mut();
-                    s.dispatch_s += deint_s;
-                    s.ffn_deint_s += deint_s;
-                }
-                self.stats.borrow_mut().dispatches += 2; // fc1 + deint
-                &rl.bo_deint
-            }
-        };
+        let a_chunks: &Bo = self.fc1_pack_in_drain(&rl, &w1);
         let parts = DFF / KRES;
         let chunk_bytes = PAD_M * KRES * 2;
         let mut acc = Array2::<f32>::zeros((m, KRES));
@@ -3219,44 +2640,8 @@ impl NpuMatmul {
                 self.weight_bo(id1, w.view())
             })
         };
-        let a_chunks: &Bo = match self.fc1_pack_in_drain(rl, &w1) {
-            Some(bo) => bo,
-            None => {
-                let st1 = self.stream(DFF, Act::Silu); // fc1 on-chip SiLU iff modal (plain resident ignores it)
-                let t_fc1 = Instant::now();
-                modal_site("kern#7");
-                self.kern.run_matmul8(3, &st1.instr, st1.n_instr, &rl.bo_bf16, &w1, &st1.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
-                let fc1_s = t_fc1.elapsed().as_secs_f64();
-                {
-                    let mut s = self.stats.borrow_mut();
-                    s.dispatch_s += fc1_s;
-                    s.ffn_fc1_s += fc1_s;
-                }
-                // ONE-DISPATCH fc2 (K=DFF): cast fc1's f32 [PAD_M,DFF] -> bf16 row-major, then a SINGLE K=DFF
-                // modal GEMM that accumulates all DFF K internally in L1 -> f32 [PAD_M,KRES] device. Collapses
-                // deint + 4x K=1024 GEMM + 4x acc_add (8 dispatches) into cast + 1 modal (2). NOT bit-identical
-                // to the 4-way split (different L1 accum + bfp16) -> validated by the sound rel-L2 gate.
-                if self.fc2_k4096_on() {
-                    if let Some(k4) = rl.fc2_k4096.as_ref() {
-                        self.stats.borrow_mut().dispatches += 1; // fc1
-                        return self.fc2_k4096_dev(k4, &st1.bo_c, make_w2, id2);
-                    }
-                }
-                // deinterleave+cast: st1.bo_c (f32 [PAD_M,DFF]) -> rl.bo_deint (bf16 chunk-major), device-side.
-                let t_deint = Instant::now();
-                modal_site("rl.deint_kern#3");
-                rl.deint_kern.run_matmul8(3, &rl.deint_instr, rl.deint_n, &st1.bo_c, &rl.bo_deint, &rl.deint_c, &rl.deint_tmp, &rl.deint_tr).unwrap();
-                let deint_s = t_deint.elapsed().as_secs_f64();
-                {
-                    let mut s = self.stats.borrow_mut();
-                    s.dispatch_s += deint_s;
-                    s.ffn_deint_s += deint_s;
-                }
-                self.stats.borrow_mut().dispatches += 2; // fc1 + deint
-                &rl.bo_deint
-            }
-        };
-        // ONE-DISPATCH fc2 (opt-in `PARAKEET_FC2_ONEDISPATCH`): contract all DFF of K in a SINGLE
+        let a_chunks: &Bo = self.fc1_pack_in_drain(rl, &w1);
+        // ONE-DISPATCH fc2 (on the krtp resident): contract all DFF of K in a SINGLE
         // modal dispatch instead of 4 K=KRES partials + 4 acc_add. The accumulator already lives
         // on-core across the k-loop; the K-split is what threw it away and made acc_add necessary.
         // Worth -336 of 816 dispatches/clip and deletes the accadd program (one hw_context back).
@@ -3269,14 +2654,6 @@ impl NpuMatmul {
         // NOT bit-identical to the 4-partial path, and that is expected: on-core accumulation rounds
         // the same products in a different order than four separately-rounded host-order partials
         // (`acc_add.cc` -- f32 add is deterministic, not exact). Gate on the transcript, not bits.
-        //
-        // Tested HERE, on the path the default actually takes -- unlike `fc2_k4096_on` below, which
-        // sits inside the `None` arm of the `fc1_pack_in_drain` match and is therefore inert under
-        // the default fold. Warn rather than let that stay silent:
-        if self.fc2_k4096_on() && self.fc1_pack_in_drain_on() {
-            eprintln!("[npu] PARAKEET_FC2_K4096 is set but has NO EFFECT: it is only reachable with \
-                       PARAKEET_FC1_PACK_IN_DRAIN=0. Did you mean PARAKEET_FC2_ONEDISPATCH=1?");
-        }
         if self.fc2_onedispatch_on() {
             let wid = format!("{id2}.full");
             let cached = self.wcache.borrow().get(&wid).cloned();
@@ -3426,9 +2803,9 @@ impl NpuMatmul {
         None
     }
 
-    /// Host-readback wrapper over [`Self::resident_ffn_dev`] for the FFN-boundary gate
-    /// (`PARAKEET_FFN_DEVACC`): device-accumulate the FFN, then `sync_from`+read the first `m` rows.
-    /// So ONLY the accumulation moved on-device vs resident_ffn; the block dataflow is unchanged.
+    /// Host-readback wrapper over [`Self::resident_ffn_dev`]: device-accumulate the FFN, then
+    /// `sync_from`+read the first `m` rows. So ONLY the accumulation moved on-device vs
+    /// resident_ffn; the block dataflow is unchanged.
     pub fn resident_ffn_devacc_readback<F1: FnOnce() -> Array2<f32>, F2: FnOnce() -> Array2<f32>>(
         &self, x: &Array2<f32>, gamma: &[f32], beta: &[f32],
         make_w1: F1, id1: &str, make_w2: F2, id2: &str,
@@ -3635,8 +3012,9 @@ impl NpuMatmul {
     /// A missing stream file panics in the read below rather than falling back, which is what makes
     /// that pairing fail loud instead of quietly wrong.
     fn stream_k(&self, k: usize, n: usize, act: Act) -> Rc<NStream> {
-        // Derived, because for a DEVICE-fed A the layout is a property of the producer (fc1's drain).
-        let a_panel = k != KRES && self.fc1_pack_in_drain_on();
+        // Derived, because for a DEVICE-fed A the layout is a property of the producer (fc1's
+        // panel-drain, the served fc1 path).
+        let a_panel = k != KRES;
         self.stream_k_ex(k, n, act, a_panel)
     }
 
@@ -3659,14 +3037,7 @@ impl NpuMatmul {
             // xclbin: the variant is a different EPI_DEFINES build, so both the array program and
             // every per-N stream carry the suffix and the two must not be mixed.
             let mode = act.mode_tag();
-            // Under the fold every stream is a bf16-out build, so it carries `bf16out`. NOT via
-            // PARAKEET_MODAL_EPI_SUFFIX: that suffix is also appended to fc1's own panel stem, which
-            // would name a stream that does not exist (`...panel1024bf16out`).
-            let sfx = if fold_fc1() {
-                "bf16out".to_string()
-            } else {
-                std::env::var("PARAKEET_MODAL_EPI_SUFFIX").unwrap_or_default()
-            };
+            let sfx = std::env::var("PARAKEET_MODAL_EPI_SUFFIX").unwrap_or_default();
             // insts-only stem (engine-op-manifest-and-dynamic-xclbin): most (n, mode) combos here
             // have NO co-resident `final_*.xclbin` at this same stem -- they all dispatch on the
             // ONE resident kernel loaded in `open()`, only the instruction stream differs per call
@@ -4131,5 +3502,34 @@ mod conveyor_presence_tests {
         std::fs::write(dir.path().join("final.xclbin"), b"stub").unwrap();
         std::fs::write(dir.path().join("insts.bin"), b"stub").unwrap();
         assert!(conveyor_artifact_present(dir.path()));
+    }
+}
+
+#[cfg(test)]
+mod resident_ln_presence_tests {
+    use super::*;
+
+    fn write_seam(dir: &Path) {
+        for name in ["ctxln", "affcast"] {
+            let stem = format!("{name}_{PAD_M}x{KRES}");
+            std::fs::write(kernel_registry::xclbin_path(dir, &stem), b"stub").unwrap();
+            std::fs::write(kernel_registry::insts_path(dir, &stem), b"stub").unwrap();
+        }
+    }
+
+    #[test]
+    fn accepts_the_complete_current_seam_without_deinterleave() {
+        let dir = tempfile::tempdir().unwrap();
+        write_seam(dir.path());
+        assert!(resident_ln_artifacts_present(dir.path()));
+    }
+
+    #[test]
+    fn rejects_a_seam_artifact_without_its_instruction_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        write_seam(dir.path());
+        let stem = format!("affcast_{PAD_M}x{KRES}");
+        std::fs::remove_file(kernel_registry::insts_path(dir.path(), &stem)).unwrap();
+        assert!(!resident_ln_artifacts_present(dir.path()));
     }
 }

@@ -60,8 +60,8 @@ import aie.utils as aie_utils
 
 DTYPE = {"bf16": bfloat16, "f32": np.float32}
 
-# The fold's resident: fc1's own bf16-out panel build, and the program every modal stream
-# borrows under PARAKEET_FOLD_FC1=1.
+# fc1's own bf16-out panel build, and the program every modal stream borrows when it is the
+# resident (reachable via NPU_RESIDENT_XCLBIN).
 RESIDENT = "512x1024x4096_32x32x128_8c_modalsilubf16outpanel1024krtp"
 
 ARMS = [

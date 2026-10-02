@@ -160,9 +160,6 @@ pub const FLAGS: &[Flag] = &[
     // via `not_zero`/`is_one` closures parameterized by these literal keys, not by a direct
     // `env::var("LITERAL")` call -- which is why a plain grep for the literal undercounts this
     // crate.
-    Flag { name: "NPU_MODAL_EPI", owner: "npu-asr", site: "npu-asr/src/tuning.rs",
-        semantics: NotZero, default: "true",
-        doc: "modal (fused) epilogue on the encoder GEMMs; gated to non-int8 at construction." },
     Flag { name: "NPU_SS_NPU", owner: "npu-asr", site: "npu-asr/src/tuning.rs",
         semantics: NotZero, default: "true",
         doc: "subsampling stage dispatches on the NPU instead of host." },
@@ -211,12 +208,6 @@ pub const FLAGS: &[Flag] = &[
     Flag { name: "NPU_PRECISION", owner: "npu-asr", site: "npu-asr/src/ctx2.rs",
         semantics: Value, default: "bf16 (Precision::FastBf16)",
         doc: "runtime precision selector for the encoder GEMMs: native|bf16|int8." },
-    Flag { name: "NPU_ENC_GELU_FUSED", owner: "npu-asr", site: "npu-asr/src/ctx2.rs",
-        semantics: IsOk, default: "false",
-        doc: "picks the GELU-fused xclbin stem/required artifact set for the encoder. COUPLING: \
-              npu-whisper reads the SAME name (encoder.rs) with the same is_ok() rule to decide \
-              whether to skip the host GELU at runtime -- nothing ties the two reads together, so \
-              setting it for one crate's artifacts without the other is a silent mismatch." },
 
     // -- npu-cli --------------------------------------------------------------------------------
     Flag { name: "NPU_CONFIG", owner: "npu-cli", site: "npu-cli/src/main.rs",
@@ -259,6 +250,9 @@ pub const FLAGS: &[Flag] = &[
     Flag { name: "NPU_DISPATCH_SEQ", owner: "npu-dev", site: "npu-dev/src/cmd/parakeet_encode.rs",
         semantics: Value, default: "unset (not written)",
         doc: "path to write the NPU_DISPATCH_LOG xclbin-transition sequence to." },
+    Flag { name: "PASSES", owner: "npu-dev", site: "npu-dev/src/cmd/parakeet_e2e.rs",
+        semantics: Value, default: "10",
+        doc: "number of timed passes for the Parakeet end-to-end latency bench." },
     Flag { name: "PROBE_POS", owner: "npu-dev", site: "npu-dev/src/cmd/fused_elf.rs",
         semantics: Value, default: "unset (single-shot mode)",
         doc: "decode position to drive a resident-scratchpad fused-elf dispatch at (current token \
@@ -382,35 +376,11 @@ pub const FLAGS: &[Flag] = &[
     Flag { name: "PARAKEET_DUMP_CONVIN", owner: "npu-parakeet", site: "npu-parakeet/src/encoder.rs",
         semantics: Value, default: "unset (off)",
         doc: "dumps the conv-front input tensor to {dir}/{tag}_b{blk}.npy, for parity bisection." },
-    Flag { name: "PARAKEET_RESIDENT_FF", owner: "npu-parakeet", site: "npu-parakeet/src/encoder.rs",
-        semantics: NotZero, default: "true",
-        doc: "resident on-chip LN->fc1->SiLU FFN stage 1 on the modal resident path. NOT a \
-              duplicate of PARAKEET_RESIDENT_FFN: this one gates the outer stage; FFN (below) \
-              gates whether fc2's K-split ALSO stays on-device, nested inside this one." },
-    Flag { name: "PARAKEET_RESIDENT_FFN", owner: "npu-parakeet", site: "npu-parakeet/src/encoder.rs",
-        semantics: NotZero, default: "true",
-        doc: "nested inside PARAKEET_RESIDENT_FF: keeps fc2's K-split accumulation on-device too \
-              (deinterleave + sub-BO chunks + host-sum, bit-identical to the host 4x K-split)." },
-    Flag { name: "PARAKEET_FFN_DEVACC", owner: "npu-parakeet", site: "npu-parakeet/src/encoder.rs",
-        semantics: NotZero, default: "true (also requires !hybrid())",
-        doc: "accumulates fc2 ON-DEVICE via the acc_add brick instead of host K-split-sum; falls \
-              through to resident_ffn if the acc_add xclbin is absent. Read via resident_on(), a \
-              dynamic-name closure (encoder.rs:285) -- invisible to a grep for the literal string." },
     Flag { name: "PARAKEET_HYBRID", owner: "npu-parakeet", site: "npu-parakeet/src/encoder.rs",
         semantics: NotZero, default: "false",
         doc: "hybrid encoder mode (measured 8.425% WER at ~1.89 s/clip vs the default's 8.791%/ \
               0.98s); forces every PARAKEET_RESIDENT_*/FUSED_BLOCK off via resident_on(), and uses \
               all 16 of the driver's hw_contexts." },
-    Flag { name: "PARAKEET_RESIDENT_MHA", owner: "npu-parakeet", site: "npu-parakeet/src/encoder.rs",
-        semantics: NotZero, default: "true (also requires !hybrid())",
-        doc: "resident on-chip multi-head attention. Read via resident_on() (dynamic name); also \
-              checked at line 549." },
-    Flag { name: "PARAKEET_RESIDENT_CONV", owner: "npu-parakeet", site: "npu-parakeet/src/encoder.rs",
-        semantics: NotZero, default: "true (also requires !hybrid())",
-        doc: "resident on-chip conv module. Read via resident_on() (dynamic name)." },
-    Flag { name: "PARAKEET_RESIDENT_SILU", owner: "npu-parakeet", site: "npu-parakeet/src/encoder.rs",
-        semantics: NotZero, default: "true (also requires !hybrid())",
-        doc: "resident on-chip SiLU activation. Read via resident_on() (dynamic name)." },
     Flag { name: "PARAKEET_FUSED_BLOCK", owner: "npu-parakeet", site: "npu-parakeet/src/encoder.rs",
         semantics: NotZero, default: "true (also requires !hybrid())",
         doc: "fully fused encoder block dispatch. Read via resident_on() (dynamic name)." },
@@ -421,7 +391,7 @@ pub const FLAGS: &[Flag] = &[
         semantics: IsOk, default: "false (set = diagnostic ON)",
         doc: "DIAGNOSTIC, inverted polarity: when SET, keeps the resident attention block but \
               feeds it HOST f32-LN + mm_lazy q/k/v instead of the resident QKV, to isolate the \
-              LN->QKV seam. No effect unless PARAKEET_RESIDENT_MHA is active." },
+              LN->QKV seam. No effect under PARAKEET_HYBRID." },
     Flag { name: "PARAKEET_MHA_SPLITA", owner: "npu-parakeet", site: "npu-parakeet/src/encoder.rs",
         semantics: NotZero, default: "true",
         doc: "bf16x2 device-A split for resident MHA (WER-neutral 8.5); opt out =0 for the old \
@@ -456,17 +426,10 @@ pub const FLAGS: &[Flag] = &[
               flip is a separate, deliberately deferred decision)." },
     Flag { name: "PARAKEET_MODAL_EPI_SUFFIX", owner: "npu-parakeet", site: "npu-parakeet/src/npu.rs",
         semantics: Value, default: "\"\" (empty)",
-        doc: "suffix appended to the fc1 panel / insts-only stem names for artifact selection. \
-              Read again at line 3587 (skipped under fold_fc1())." },
-    Flag { name: "PARAKEET_FOLD_FC1", owner: "npu-parakeet", site: "npu-parakeet/src/npu.rs",
-        semantics: NotZero, default: "false",
-        doc: "folds fc1 into the resident modal xclbin (prices folding fc1 into the modal path)." },
+        doc: "suffix appended to the fc1 panel / insts-only stem names for artifact selection." },
     Flag { name: "PARAKEET_FOLD_GLU", owner: "npu-parakeet", site: "npu-parakeet/src/npu.rs",
         semantics: NotZero, default: "false",
         doc: "folds GLU into the pw1 resident dispatch." },
-    Flag { name: "NPU_NATIVE", owner: "npu-parakeet", site: "npu-parakeet/src/npu.rs",
-        semantics: IsOk, default: "false",
-        doc: "native bf16 32x32x32 resident tile instead of the default fast-bfp16 64x32x128." },
     Flag { name: "NPU_RESIDENT_XCLBIN", owner: "npu-parakeet", site: "npu-parakeet/src/npu.rs",
         semantics: Value, default: "unset",
         doc: "arbitrary override path for the resident xclbin (manual/debug knob, no guaranteed \
@@ -490,16 +453,6 @@ pub const FLAGS: &[Flag] = &[
     Flag { name: "PARAKEET_LN_FUSED", owner: "npu-parakeet", site: "npu-parakeet/src/npu.rs",
         semantics: NotZero, default: "true",
         doc: "fused ctxLN->affine_cast dispatch when built; =0 forces the two-dispatch chain back." },
-    Flag { name: "PARAKEET_FC2_ONEDISPATCH", owner: "npu-parakeet", site: "npu-parakeet/src/npu.rs",
-        semantics: NotZero, default: "true",
-        doc: "one-dispatch fc2 collapse path; declines outright (rather than mis-dispatching) when \
-              the required apanel1024 insts artifact is missing." },
-    Flag { name: "PARAKEET_FC2_K4096", owner: "npu-parakeet", site: "npu-parakeet/src/npu.rs",
-        semantics: NotZero, default: "false",
-        doc: "one-dispatch K=DFF (4096) fc2 collapse (opt-in)." },
-    Flag { name: "PARAKEET_FC1_PACK_IN_DRAIN", owner: "npu-parakeet", site: "npu-parakeet/src/npu.rs",
-        semantics: NotZero, default: "true",
-        doc: "packs fc1's output during the drain (default on since 2026-07-28); =0 reverts to the fc1+deint pair." },
     Flag { name: "PARAKEET_PHASE_TIMING", owner: "npu-parakeet", site: "npu-parakeet/src/prof.rs",
         semantics: Presence, default: "false",
         doc: "phase-timing profiler (Npu/Host/Marshal buckets) for the encode path." },
@@ -595,25 +548,20 @@ pub const FLAGS: &[Flag] = &[
               slice of a full-length run bit-identically -- which is what makes a short segment a \
               real end-to-end gate rather than a different computation." },
 
+    // -- npu-sr -----------------------------------------------------------------------------------
+    Flag { name: "NPU_SR_THREADS", owner: "npu-sr", site: "npu-sr/src/fsr1.rs",
+        semantics: Value, default: "4",
+        doc: "rayon thread count for FSR1 tile packing and unpacking." },
+    Flag { name: "NPU_SR_TIMING", owner: "npu-sr", site: "npu-sr/src/fsr1.rs",
+        semantics: Presence, default: "false",
+        doc: "prints FSR1 pack, transfer, dispatch, readback, and unpack timings." },
+
     // -- npu-weights ------------------------------------------------------------------------------
     Flag { name: "XDNA_CHECKPOINT_DIR", owner: "npu-weights", site: "npu-weights/src/spec.rs",
         semantics: Value, default: "<root>/artifacts/checkpoints",
         doc: "overrides where baked checkpoint .safetensors files are written/read." },
 
     // -- npu-whisper ------------------------------------------------------------------------------
-    Flag { name: "NPU_ENC_GELU_FUSED", owner: "npu-whisper", site: "npu-whisper/src/encoder.rs",
-        semantics: IsOk, default: "false",
-        doc: "folds GELU into fc1's on-chip epilogue at runtime (drops ~260 ms/utt host GELU). \
-              COUPLING: npu-asr reads the SAME name (ctx2.rs) with the same is_ok() rule to pick \
-              the matching xclbin artifact set -- see that entry; nothing ties the two together." },
-    Flag { name: "NPU_ENC_MHA_NPU", owner: "npu-whisper", site: "npu-whisper/src/encoder.rs",
-        semantics: NotZero, default: "true",
-        doc: "encoder MHA on NPU by default (the comment names this the tuning.rs not_zero \
-              convention explicitly); =0 opts out to host f32 -- a measured +2.6% latency \
-              regression kept anyway for the single-hardware rule." },
-    Flag { name: "NPU_ENC_CONV_NPU", owner: "npu-whisper", site: "npu-whisper/src/encoder.rs",
-        semantics: IsOk, default: "false",
-        doc: "routes the conv stem through the M-stationary GEMM conv (prebuilt 768 band)." },
     Flag { name: "NPU_ENC_MHA_MAXLAYER", owner: "npu-whisper", site: "npu-whisper/src/encoder.rs",
         semantics: Value, default: "usize::MAX (all layers)",
         doc: "caps NPU MHA to the first N encoder blocks; the bf16 attention error compounds over \

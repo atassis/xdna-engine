@@ -71,26 +71,6 @@ pub fn apply_tiled(op: &CtxAOp, x: &Array2<f32>, n: usize) -> Array2<f32> {
     out
 }
 
-/// RESIDENT-INTERMEDIATE FFN (flag-gated, `NPU_ENC_FFN_RESIDENT` + `NPU_ENC_GELU_FUSED`): fuse fc1 and
-/// fc2 per row-tile so the `[mp, 3072]` fc1->fc2 intermediate stays in ONE bf16 buffer on the device
-/// side (no host readback materialize / re-conversion of the largest data object -- the dominant
-/// encoder marshaling seam). `ln2` is `[M, d_model]` (M may exceed PAD_M=512); returns `[M, d_model]`.
-/// Numerically identical to `gelu(apply_tiled(fc1, ln2)) -> apply_tiled_mm2(fc2, .)` with the GELU
-/// fused on-chip (the intermediate fc2 consumes is the same activated-f32 -> bf16 value).
-pub fn apply_tiled_ffn_resident(fc1: &CtxAOp, fc2: &FfnMm2, ln2: &Array2<f32>) -> Array2<f32> {
-    let m = ln2.nrows();
-    let mut out = Array2::<f32>::zeros((m, fc2.out_width()));
-    let mut r = 0;
-    while r < m {
-        let end = (r + npu_asr::engines::PAD_M).min(m);
-        let chunk = ln2.slice(s![r..end, ..]).to_owned(); // [<=512, d_model]
-        let y = fc2.forward_resident(fc1, &chunk); // [end-r, d_model], intermediate held resident
-        out.slice_mut(s![r..end, ..]).assign(&y);
-        r = end;
-    }
-    out
-}
-
 /// As `apply_tiled` but for the FFN mm2 (`FfnMm2`): `h` `[M, ffn]` -> `[M, d_model]`, row-tiled.
 pub fn apply_tiled_mm2(op: &FfnMm2, h: &Array2<f32>) -> Array2<f32> {
     let m = h.nrows();

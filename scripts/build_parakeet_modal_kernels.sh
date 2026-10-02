@@ -51,9 +51,9 @@ ls -la $MMW/build/final_512x1024x4096_64x32x128_8c_modalsilu.xclbin \
        $MMW/build/insts_512x1024x1024_64x32x128_8c_modalid.txt \
        $MMW/build/insts_512x1024x2048_64x32x128_8c_modalid.txt
 
-# --- RESIDENT-LN SEAM (DEFAULT LN->fc1 on-NPU): ctxLN(normalize-only) + affine_cast(gamma,beta) at
-#     PAD_M x KRES = 512 x 1024. Loaded co-resident by npu.rs::resident_ln; the encoder defaults to
-#     the device-side LN->fc1 seam when these are present (opt out: PARAKEET_RESIDENT_FF=0). ---
+# --- RESIDENT-LN SEAM (LN->fc1 on-NPU): ctxLN(normalize-only) + affine_cast(gamma,beta) at
+#     PAD_M x KRES = 512 x 1024. Loaded co-resident by npu.rs::resident_ln; the encoder runs the
+#     device-side LN->fc1 seam when these are present. ---
 LNML=mlir-aie/programming_examples/ml/layernorm
 LNDIR=artifacts/parakeet/ln
 mkdir -p "$LNDIR"
@@ -67,8 +67,8 @@ make -C $LNML -f Makefile.cast       NPU2=1 rows=512 cols=1024 build/final_cast_
 # so nothing tracked could rebuild it and the aiecc flag migration skipped it.
 echo "== RESIDENT-LN: FUSED lnaffcast (ctxLN+affine+cast) 512x1024 =="
 make -C $LNML -f Makefile.lnaffcast  NPU2=1 rows=512 cols=1024 build/final_lnaffcast_512x1024.xclbin
-# De-interleave+cast at DFF: the engine loads final_deint_{PAD_M}x{DFF}.xclbin (npu.rs). Makefile was
-# tracked but no build step existed here, so the artifact was equally unreproducible.
+# De-interleave+cast at DFF: an alternate fc1->fc2 wiring, not the served one (npu.rs no longer has
+# a call site for it) -- kept staged for the declared-kernel-set follow-up to prune.
 echo "== RESIDENT-FFN: deint@4096 512x4096 =="
 make -C $LNML -f Makefile.deint      NPU2=1 rows=512 cols=4096 build/final_deint_512x4096.xclbin
 # RESIDENT-CONV: GLU gate (conv-module step 2). a*sigmoid(g) over pw1's [T,2D] -> [T,D], cols=D=1024.
@@ -80,10 +80,9 @@ make -C $LNML -f Makefile.glu        NPU2=1 rows=512 cols=1024 build/final_glu_5
 echo "== RESIDENT-FFN: acc_add 512x1024 =="
 make -C $LNML -f Makefile.accadd     NPU2=1 rows=512 cols=1024 build/final_accadd_512x1024.xclbin
 # bf16b siblings of the bricks whose ADDEND is a modal C drain: under a bf16-out resident
-# (PARAKEET_FOLD_FC1) the fc2 partial and the MHSA linear_out arrive bf16 while the accumulator /
-# residual stream stays f32. npu.rs picks these by measured drain width, so they are only reachable
-# on the opt-in bf16-out branches -- but an absent artifact silently drops the engine back to the
-# host-accum path there, so build them here rather than leave the fold's correctness to a manual step.
+# (reachable via NPU_RESIDENT_XCLBIN) the fc2 partial and the MHSA linear_out arrive bf16 while the
+# accumulator / residual stream stays f32. npu.rs picks these by measured drain width -- an absent
+# artifact silently drops the engine back to the host-accum path there, so build them here.
 # THREE bricks, not two: the one-dispatch fc2 returns the modal C itself where the K-split returned
 # acc_add's f32 output, which moves the Macaron residual's addend into this class as well.
 echo "== RESIDENT-FFN: acc_add 512x1024 bf16b (bf16 partial) =="
@@ -108,7 +107,7 @@ make -C $LNML -f Makefile.resadd     NPU2=1 rows=512 cols=1024 scale=1.0 stag=10
 # channels on this toolchain; see dwconv-fused-epilogue-alt-channel-miscompile). rows=C, cols=T.
 echo "== RESIDENT-CONV: SiLU brick 1024x400 =="
 make -C $LNML -f Makefile.silu2      NPU2=1 rows=1024 cols=400 build/final_silu_1024x400.xclbin
-# fc1 with the fc1->fc2 K-PANEL PACKING FOLDED INTO ITS OWN C DRAIN (PARAKEET_FC1_PACK_IN_DRAIN=1, opt-in).
+# fc1 with the fc1->fc2 K-PANEL PACKING FOLDED INTO ITS OWN C DRAIN -- the served fc1->fc2 seam.
 # bf16 C + panel-major drain, so the GEMM writes exactly the [DFF/KRES, PAD_M, KRES] buffer the fc2
 # K-split reads and the separate packing command disappears. m=32, NOT the m=64 fast tile: bf16 out needs
 # a per-core f32 accumulator back (the matmul can no longer reduce in-place into a bf16 C) and at m=64
@@ -119,7 +118,8 @@ make -C $MMW -f Makefile.modal NPU2=1 M=512 K=1024 N=4096 m=32 k=32 n=128 n_aie_
   build/final_512x1024x4096_32x32x128_8c_modalsilubf16outpanel1024.xclbin
 cp "$MMW/build/final_512x1024x4096_32x32x128_8c_modalsilubf16outpanel1024.xclbin" \
    "$MMW/build/insts_512x1024x4096_32x32x128_8c_modalsilubf16outpanel1024.txt" "$LNDIR/"
-# full FFN fc1->fc2 device-side: cast@DFF (fc1 f32 [T,4096] -> bf16) + the K=4096 fc2 resident (identity)
+# cast@DFF + K=4096 fc2 (identity): an alternate fc1->fc2 wiring, not the served one (npu.rs no
+# longer has a call site for it) -- kept staged for the declared-kernel-set follow-up to prune.
 echo "== RESIDENT-FFN: cast@4096 + K=4096 fc2 (identity) =="
 make -C $LNML -f Makefile.cast       NPU2=1 rows=512 cols=4096 build/final_cast_512x4096.xclbin
 WA_C_DEPTH=1 make -C $MMW -f Makefile.modal NPU2=1 M=512 K=4096 N=1024 m=64 k=32 n=128 n_aie_cols=8 \

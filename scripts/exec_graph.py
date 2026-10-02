@@ -56,13 +56,13 @@ WHISPER_FAMILY = ("whisper-small", "whisper-turbo")
 # ---------------------------------------------------------------------------------------------
 ENCODER_OPS = [
     # name,        unit,   ctx,     n_kind,     gate env,             default_on, cite
-    ("conv_stem",  "host", None,    None,       "NPU_ENC_CONV_NPU",   False, "encoder.rs conv stem"),
+    ("conv_stem",  "host", None,    None,       None,                 True,  "encoder.rs conv stem"),
     ("ln",         "host", None,    None,       "NPU_LN_NPU",         False, "encoder.rs layernorm"),
     ("qkv_proj",   "npu",  "ctx2",  "d_model",  None,                 True,  "ctx2.rs modal GEMM"),
-    ("mha",        "npu",  "mha",   None,       "NPU_ENC_MHA_NPU",    True,  "encoder.rs mha_npu (default flipped 2026-09-03)"),
+    ("mha",        "npu",  "mha",   None,       "NPU_ENC_MHA_MAXLAYER", True, "encoder.rs static MHA artifact at M=1500; first N layers"),
     ("out_proj",   "npu",  "ctx2",  "d_model",  None,                 True,  "ctx2.rs modal GEMM"),
     ("fc1",        "npu",  "ctx2",  "ffn",      None,                 True,  "ctx2.rs modal GEMM"),
-    ("gelu",       "host", None,    None,       "NPU_ENC_GELU_FUSED", False, "encoder.rs gelu / fused epilogue"),
+    ("gelu",       "host", None,    None,       None,                 True,  "encoder.rs gelu"),
     ("fc2",        "npu",  "ctx2",  "d_model",  None,                 True,  "ctx2.rs modal GEMM"),
     ("residual",   "host", None,    None,       None,                 True,  "encoder.rs residual add"),
 ]

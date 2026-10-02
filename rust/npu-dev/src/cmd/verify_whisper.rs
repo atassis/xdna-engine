@@ -13,9 +13,9 @@ const TOL_HOST: f32 = 5e-3;
 /// `cfg.tol_npu` (`WhisperCfg::{SMALL,TURBO}`) below, not a single binary-wide constant -- error
 /// accumulates over `n_layers`, so a bound for 12 layers does not transfer to 32. See each variant's
 /// own derivation comment in `npu_whisper::config`.
-/// Calibrated 2026-08-31 (device, k768-gelu-rail item (iv)): the two currently-shipped
-/// computation paths for `block_{n-1}` measure |alpha| = 2.069e-3 (NPU_ENC_GELU_FUSED on-chip
-/// GELU epilogue) and 3.426e-3 (host GELU, unfused) against the ONNX golden -- both believed
+/// Calibrated 2026-08-31 (device, k768-gelu-rail item (iv)): two computation paths for
+/// `block_{n-1}` measured |alpha| = 2.069e-3 (an on-chip GELU epilogue, since retired) and
+/// 3.426e-3 (host GELU, the served path) against the ONNX golden -- both believed
 /// correct, both pass `encoded`. Set at ~2x the larger of those two, so neither shipped path
 /// false-positives while still catching a regression an order of magnitude worse. A prior scale
 /// bug measured 8.564e-3 on the ISOLATED epilogue kernel alone -- a narrower, dirtier-signal
