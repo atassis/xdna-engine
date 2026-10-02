@@ -69,7 +69,7 @@ reap() {
     kill -0 "$pid" 2>/dev/null || dead+=("$pid")
   done
   for pid in "${dead[@]}"; do
-    wait "$pid"; rc=$?
+    if wait "$pid"; then rc=0; else rc=$?; fi
     local part=${PID_PART[$pid]} emit=${PID_EMIT[$pid]}
     local log=$RF_BUILD/$part/build.log
     local peak=$(grep "Maximum resident" "$log" | awk '{print $NF}')

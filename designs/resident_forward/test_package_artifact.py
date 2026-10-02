@@ -12,7 +12,7 @@ from package_artifact import package
 
 def write_build(build: Path) -> None:
     for name in ("design.elf.zst", "pack.json", "fwd_layout.json", "params.txt", "gen_args.txt"):
-        (build / name).write_text(name)
+        (build / name).write_text("{}" if name == "pack.json" else name)
 
 
 def write_meta(path: Path, *, elf: str = "design.elf", nlayer: int = 1) -> None:
@@ -96,7 +96,7 @@ class PackageArtifactTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "pack.json"):
                 package(tmp_path / "artifact", build, source_meta, weights, store)
 
-            (build / "pack.json").write_text("pack.json")
+            (build / "pack.json").write_text("{}")
             (store / "manifest.json").unlink()
             with self.assertRaisesRegex(ValueError, "manifest.json"):
                 package(tmp_path / "artifact", build, source_meta, weights, store)
@@ -167,7 +167,7 @@ class PackageArtifactTests(unittest.TestCase):
             for directory in (build / "nested", weights):
                 directory.mkdir(parents=True)
             for name in ("pack.json", "fwd_layout.json", "params.txt", "gen_args.txt"):
-                (build / name).write_text(name)
+                (build / name).write_text("{}" if name == "pack.json" else name)
             (build / "nested" / "design.elf").write_text("nested elf")
             write_meta(source_meta, elf="nested/design.elf")
             (weights / "w0.npy").write_bytes(b"weight-stream")

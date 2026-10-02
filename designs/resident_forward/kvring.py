@@ -15,6 +15,7 @@ for the values; `check` walks every value a host can pass and proves each BD sta
 in the region, from the same region size that sizes the region (rforward.s_rows)."""
 
 BLK = 64                         # rows per block: the attention's key block
+DEFAULT_WINDOW_ROWS = 1024
 HEADS, HD, SW = 8, 256, 64
 SLAB = 4 * BLK * SW              # elements of one (block, head, K|V), [slice][key][64]
 BLOCK_E = HEADS * 2 * SLAB       # elements of one block: BLK rows of [8][2][256]

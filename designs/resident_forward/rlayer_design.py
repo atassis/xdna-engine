@@ -20,6 +20,7 @@ import rf_paths
 import rattn2_design as A2
 import rattnh as AH
 import rmlp_design as R
+from kvring import DEFAULT_WINDOW_ROWS
 from rmlp_design import (M, core_name, NC, NR, ELEM, ABLK, PCAP_T, KERN, NORM, XROW, XB, UNITB, XRB,
                          WB, WGAIN, OUT_OFF, convert_loop, act_call, norm_pass, scale_core, gains)
 from o_ref import NDB as NDBO, NSPO, KCO
@@ -1583,8 +1584,8 @@ def configure(args):
     if SRING_FWD:        # K059 over every parameter value a host can pass, on the region rforward sizes
         import kvring
         import rforward
-        from rld_run import WIN
-        kvring.check(SRING_FWD, NBW_S, (1,) + tuple(nt for nt, _ in FNTS), WIN, rforward.s_rows(sys.modules[__name__]) * KVROW)
+        kvring.check(SRING_FWD, NBW_S, (1,) + tuple(nt for nt, _ in FNTS), DEFAULT_WINDOW_ROWS,
+                     rforward.s_rows(sys.modules[__name__]) * KVROW)
     return [int(a) for a in args]
 
 

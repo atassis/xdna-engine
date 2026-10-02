@@ -23,8 +23,8 @@ import attn_ref
 from bfp16_model import f32_to_bfp16
 from m1_design import PCAP_T, NC
 from m1_run_helpers import nt_of
+from kvring import DEFAULT_WINDOW_ROWS
 
-WIN = 1024
 CAP = 2048                    # cache positions
 
 
@@ -34,7 +34,7 @@ def widths(n_past, P, nt, first):
         for r in range(16):
             p = n_past + 16 * tb + r
             q = min(p, n_past + P - 1)       # padding rows take the last real row's window
-            hi, lo = q - first + 1, max(0, q - (WIN - 1) - first)
+            hi, lo = q - first + 1, max(0, q - (DEFAULT_WINDOW_ROWS - 1) - first)
             w[tb, 0, [r, 16 + r]] = hi
             w[tb, 1, [r, 16 + r]] = lo
     return w
@@ -48,7 +48,7 @@ def main():
     L.LAYER.oa = A2.FINISH_A = True
     attn_ref.PV_EDGE = A2.PV_EDGE
     nk = nbw * 64
-    first = max(0, n_past - (WIN - 1)) // 64 * 64
+    first = max(0, n_past - (DEFAULT_WINDOW_ROWS - 1)) // 64 * 64
     X = np.load(str(rf_paths.BUILD_ROOT / "scratch/rmlp/ref.npz"))["x"]
     R = np.load(str(rf_paths.BUILD_ROOT / f"scratch/qkv/ref_h_{n_past}.npz"))
     heads = R["out"]                                        # [8][112][1024] bits: q, q, k, v
