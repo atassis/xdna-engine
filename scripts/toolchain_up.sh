@@ -4,6 +4,7 @@
 # Self-consistent: fork IRON (place-tiles) + fork aiecc + the kernel aie_api headers, one version.
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$REPO/scripts/lib/init_source_aiebu.sh"
 set -a; . "$REPO/toolchain.lock"; set +a
 source "$REPO/scripts/fast_build_env.sh"   # ccache + lld (no-ops if absent)
 source "$REPO/scripts/toolchain_gc.sh"
@@ -233,6 +234,7 @@ _require_aiebu_spec_python() {
 
 _build_vendored_aiebu_asm() {
   [ -e "$INST/build/bin/aiebu-asm" ] && return 0
+  init_source_aiebu "$INST/src" || return 1
   ninja -C "$INST/build" -t targets 2>/dev/null | grep -q '^aiebu-asm:' || return 0
   _require_aiebu_spec_python
   ninja -C "$INST/build" aiebu-asm >&2
@@ -309,6 +311,7 @@ fi
 # buffer), and DISABLE_FIND_PACKAGE_XRT below does not suppress it -- XRT_COREUTIL/UUID come from
 # find_library, so the cmake_dependent_option guarding it holds. OFF emitted params.txt with
 # nothing able to read it, so every scratchpad test skipped rather than failed.
+init_source_aiebu "$SRC"
 cmake -G Ninja -B "$INST/build" -S "$SRC" \
   -DCMAKE_BUILD_TYPE=Release \
   -DPython3_EXECUTABLE="$REPO/.venv-iron/bin/python" \

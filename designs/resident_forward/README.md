@@ -29,6 +29,8 @@ CPU round trip between layers.
 - `recipes/gemma4_data.sh` -- recreates every data-side input (checkpoint, hf_config, quantized
   weights, towers, store, per-layer streams) from the upstream checkpoint, stage by stage, each
   skippable once its output's `.recipe-manifest.json` matches.
+- `package_artifact.py` -- packages an existing build, streams and store into one relocatable
+  resident artifact directory.
 
 ## Prerequisites
 
@@ -48,6 +50,17 @@ CPU round trip between layers.
 Writes `$RF_BUILD/rf48C/design.elf.zst` (the repo's `<name>.elf.zst`-only convention, see
 `designs/decode_fused/elf_zst.py`) plus `pack.json` (control-code sizes, the ELF's uncompressed
 `sha256`, and IRON/toolchain-instance provenance) and `gen_args.txt`.
+
+## Package
+
+    python3 designs/resident_forward/package_artifact.py \
+      --out /path/to/artifacts/gemma4-12b/resident_rf48C \
+      --build "$RF_BUILD/rf48C" --meta /path/to/meta.json \
+      --weights /path/to/rf_stack --store /path/to/store
+
+The package contains the control-code companions, `w_head.npy`, the per-layer streams and the
+weight store. Its metadata names `weights` and `store` relative to the artifact root; existing
+metadata with absolute paths remains readable for compatibility.
 
 ## Data prep
 

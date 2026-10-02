@@ -30,6 +30,11 @@ use crate::api::EngineError;
 use crate::llm::generator::{CacheState, DecodeStep};
 use crate::llm::npu_decode::unpack_bf16_bytes;
 
+pub(crate) fn artifact_relative_path(dir: &Path, value: &str) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() { path } else { dir.join(path) }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Embedding + head weights: int4 dequant, ported from head_ref.py (unplanar_chunk/dequant_f64/
 // row_group_for_k), read a single row at a time rather than materialising the 566 MB pack.
@@ -366,7 +371,7 @@ impl RawResidentMeta {
         let u = |k: &str| -> Result<usize, EngineError> {
             v.get(k).and_then(|x| x.as_u64()).map(|x| x as usize).ok_or_else(|| ctx(format!("missing/non-numeric `{k}`")))
         };
-        let path = |k: &str| -> Result<PathBuf, EngineError> { Ok(PathBuf::from(s(k)?)) };
+        let path = |k: &str| -> Result<PathBuf, EngineError> { Ok(artifact_relative_path(dir, &s(k)?)) };
 
         let full_attention_layers: Vec<usize> = v
             .get("full_attention_layers")
@@ -718,6 +723,29 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::process::{Command, Stdio};
+
+    #[test]
+    fn metadata_paths_anchor_to_the_artifact_and_keep_absolute_compatibility() {
+        let artifact = tempfile::tempdir().expect("temporary artifact root");
+        std::fs::write(
+            artifact.path().join("meta.json"),
+            r#"{
+                "kind": "resident_forward_raw", "elf": "design.elf", "boot": "boot",
+                "head_kernel": "head", "weight_dir": "weights", "embedding_store": "/legacy/store",
+                "d_model": 0, "nlayer": 0, "full_attention_layers": [], "row_block": 0,
+                "pcap_t": 0, "xbuf": 0, "obuf": 0, "kvb_s": 0, "kvb_g": 0, "wb_s": 0,
+                "wb_g": 0, "kvrow_s": 0, "kvrow_g": 0, "gcap": 0, "s_cap": 0, "nbw": 0,
+                "seg_nb": 0, "xr": 0, "widths_bytes": 0, "sliding_window": 0,
+                "classes": [], "global_classes": [], "vocab": 0, "head_ncol": 0,
+                "head_wcol": 0, "head_outb": 0
+            }"#,
+        )
+        .expect("write temporary metadata");
+
+        let meta = RawResidentMeta::load(artifact.path()).expect("load path metadata");
+        assert_eq!(meta.weight_dir, artifact.path().join("weights"));
+        assert_eq!(meta.embedding_store, PathBuf::from("/legacy/store"));
+    }
 
     #[test]
     fn row_group_for_k_matches_the_manifests_declared_value() {
