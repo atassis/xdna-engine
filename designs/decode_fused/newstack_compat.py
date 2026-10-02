@@ -36,15 +36,6 @@ Port deltas (keep this list as the canonical record):
      rule that shells out to aiecc rather than each rule's flag list. The BACKEND negations are not
      in that family: at this pin aiecc still defaults to Chess and needs them -- see Delta 5 below,
      and note the pin guard, since upstream #3501 deletes them 38 commits later.
-  6. IRON commit 8022a6f ("expose allocation_scheme, mechanism only") made RMSNorm/Softmax/RoPE/
-     ElementwiseAdd-Mul/GELU-SiLU pass `allocation_scheme=None` to every `Worker(...)` call
-     unconditionally, intending zero behavior change (no caller in this repo sets it). The pinned
-     instance's `Worker.__init__` has no such parameter at all, so the "default None" call still
-     raises TypeError -- caught cold on gemma4-12b's RMSNorm (d_model=3840, never cached from an
-     older IRON pin); qwen3-0.6b/gemma3-270m/qwen3.5-4b rebuilt clean earlier the same session only
-     because their RMSNorm shapes hit a pre-existing MLIR cache entry from before 8022a6f landed.
-     Dropped at the call site below, same as `placement` is renamed: this pinned instance never
-     lowers a per-op allocation scheme, so passing None through is a no-op by construction.
 """
 import contextlib
 import functools
@@ -86,7 +77,7 @@ def _assert_pinned_aie():
     # here: toolchain_up.sh is the authority for the name, this only has to agree with it.
     with open(lock, "r", encoding="utf-8") as f:
         text = f.read()
-    # IRON_FORK_COMMIT is excluded, mirroring toolchain_up.sh's _lock_semantic: IRON is resolved
+    # IRON_SOURCE_COMMIT is excluded, mirroring toolchain_up.sh's _lock_semantic: IRON is resolved
     # through PYTHONPATH at runtime and is never compiled into the instance, so pinning it must not
     # rename the instance. This exclusion has to be kept in step with the shell by hand -- that is
     # the standing cost of the second derivation this file's own comment warns against.
@@ -94,7 +85,7 @@ def _assert_pinned_aie():
         line.split("#", 1)[0].rstrip() + "\n"
         for line in text.splitlines()
         if line.split("#", 1)[0].strip()
-        and not line.split("#", 1)[0].lstrip().startswith("IRON_FORK_COMMIT=")
+        and not line.split("#", 1)[0].lstrip().startswith("IRON_SOURCE_COMMIT=")
     )
     want = hashlib.sha256(_semantic.encode()).hexdigest()[:12]
     # toolchain_up.sh ADOPTS an instance built under the old whole-file key by symlinking it to the
@@ -154,17 +145,6 @@ except ImportError:
 
         return _wrapped
 
-    # Delta 6. `allocation_scheme` is always None from every current caller (8022a6f's own commit
-    # message); drop it rather than rename it, since this instance has nothing to rename it TO.
-    def _drop_allocation_scheme(fn):
-        @functools.wraps(fn)
-        def _wrapped(*args, **kwargs):
-            kwargs.pop("allocation_scheme", None)
-            return fn(*args, **kwargs)
-
-        return _wrapped
-
-    Worker.__init__ = _drop_allocation_scheme(Worker.__init__)
 
     # Present-only: post-#3387 Runtime has neither fill nor drain (delta 4). An absent name here
     # means the API moved, which is this shim's subject -- not a silent failure to paper over.

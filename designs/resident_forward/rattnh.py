@@ -349,7 +349,7 @@ def kernels():
     here = os.path.dirname(os.path.abspath(__file__))
     iron_i = f"-I{rf_paths.iron_kernel_dir()}"
     iron_root_i = f"-I{rf_paths.iron_kernels_root()}"
-    fa_i = f"-I{rf_paths.fused_attn_dir()}"
+    fa_i = f"-I{rf_paths.iron_kernel_dir()}"
     fa = ["-D__AIECC__", "-Dbf16_f32_ONLY", "-DROUND_CONV_EVEN", "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16", f"-DFA_ROWS={R}"]
     pv_dims = [f"-DDIM_M={R}", f"-DDIM_K={SW}", f"-DDIM_N={SW}"]
     qk_dims = [f"-DDIM_M={KEYS}", f"-DDIM_K={SW}", f"-DDIM_N={R}"]

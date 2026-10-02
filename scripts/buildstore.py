@@ -46,8 +46,7 @@ def _elapsed_seconds(s):
 def resolve_xdna_cache(repo, env):
     """XDNA_CACHE, when not already in the hermetic env: cache_env.sh's own default resolves it
     via a worktree's .git (git-common-dir, to inherit the main checkout's cache), which a replay
-    sandbox never has. Resolve it here, once, outside any sandbox, and bake it into env -- same
-    reasoning as iron_pin_verified."""
+    sandbox never has. Resolve it here, once, outside any sandbox, and bake it into env."""
     if "XDNA_CACHE" in env:
         return
     cache_env = pathlib.Path(repo) / "scripts" / "cache_env.sh"
@@ -79,18 +78,18 @@ def resolve_mlir_aie_instance(repo, env):
         env["MLIR_AIE_INSTANCE"] = lines[-1]
 
 
-def iron_pin_verified(repo, env):
-    """Run amd_paths.sh's iron_require_pin ONCE, outside any replay sandbox (which never has
-    .git -- see the function's own comment), and return the sha it verified. None for a repo
-    with no amd_paths.sh (the test fixtures) or no IRON pin to check."""
+def iron_source_identity(repo, env):
+    """Resolve the exact IRON source input outside a replay sandbox."""
     amd_paths = pathlib.Path(repo) / "scripts" / "amd_paths.sh"
     if not amd_paths.is_file():
         return None
-    script = (f'. "{amd_paths}"; iron_require_pin || exit 1; '
-              r"""sed -n 's/^IRON_FORK_COMMIT=\([0-9a-f]\{7,\}\).*/\1/p' toolchain.lock | head -1""")
-    r = subprocess.run(["bash", "-c", script], cwd=repo, env=env, capture_output=True, text=True)
+    source_env = dict(env)
+    source_env.pop("IRON_SOURCE_IDENTITY", None)
+    source_env.pop("IRON_SOURCE_SNAPSHOT", None)
+    script = f'. "{amd_paths}"; iron_require_source || exit 1; printf "%s\\n" "$IRON_SOURCE_IDENTITY"'
+    r = subprocess.run(["bash", "-c", script], cwd=repo, env=source_env, capture_output=True, text=True)
     if r.returncode != 0:
-        raise RuntimeError(f"iron pin check failed for {repo}: {r.stderr.strip()}")
+        raise RuntimeError(f"IRON source check failed for {repo}: {r.stderr.strip()}")
     lines = r.stdout.strip().splitlines()
     return lines[-1] if lines else None
 
@@ -114,10 +113,11 @@ def _recipe_env(repo, s, cache_key):
     env = record.hermetic_env(os.environ, record.allowlist())
     env["REPO"] = str(repo)
     resolve_xdna_cache(repo, env)
+    env["IRON_DIR"] = env.get("IRON_DIR", str(pathlib.Path(repo) / "third_party" / "iron"))
+    source_identity = iron_source_identity(repo, env)
+    if source_identity:
+        env["IRON_SOURCE_IDENTITY"] = source_identity
     resolve_mlir_aie_instance(repo, env)
-    want = iron_pin_verified(repo, env)
-    if want:
-        env["IRON_PIN_VERIFIED"] = want
     npu_cache = pathlib.Path(s.root) / "caches" / cache_key / "npu_cache"
     ccache_dir = pathlib.Path(s.root) / "caches" / cache_key / "ccache"
     env["XDNA_BLOB_POOL"] = "0"

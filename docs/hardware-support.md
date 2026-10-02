@@ -87,7 +87,7 @@ since it moves. The fields it carries, and what each one is:
 | `MLIR_AIE_FORK_COMMIT` | The `atassis/mlir-aie` fork commit (tracking `Xilinx/mlir-aie` upstream) -- the place-tiles compiler and the IRON runtime. Its device model (`NPU1`/`NPU2`, tile counts, target-chip strings) is what encodes "which AMD NPU" at the compiler level. |
 | `PEANO_FORK_COMMIT` / `PEANO_DIST` | The `atassis/llvm-aie` (Peano) fork and its install seed -- the AIE-target LLVM backend. Its `aie2p` intrinsics are specific to this chip generation's ISA; a different generation needs a Peano build for that generation's backend, not a re-pin of this one. |
 | `MLIR_DISTRO_WHEEL` | The prebuilt core LLVM/MLIR framework `aiecc` itself is built on (separate from Peano, which only compiles the AIE kernel code). |
-| `IRON_FORK_COMMIT` | A floor commit for `amd/IRON`, resolved as a merge-base rather than an exact pin, since every IRON checkout in a working tree here carries local commits on top. |
+| `IRON_SOURCE_COMMIT` | The exact `third_party/iron` source commit used by generators. |
 | `NANOBIND` | The Python/C++ binding-layer version `aiecc`'s Python side needs. |
 
 Bring-up is `scripts/toolchain_up.sh` (build or locate the instance for the current

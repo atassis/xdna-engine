@@ -37,8 +37,11 @@ def commit(d):
 def provenance():
     """The source this pack ran from: this file's own repo, IRON (PYTHONPATH's first entry,
     per env.sh), and the toolchain instance (RF_INST) -- what recipes/rf48C.sh now pins."""
+    iron_identity = os.environ.get("IRON_SOURCE_IDENTITY")
     return {"private_commit": commit(os.path.dirname(os.path.abspath(__file__))),
             "iron_commit": commit((os.environ.get("PYTHONPATH", "") or "").split(":")[0]),
+            "iron_identity": iron_identity,
+            "iron_dirty": iron_identity.startswith("dirty:") if iron_identity else None,
             "instance": os.path.basename(os.environ.get("RF_INST", "")) or None}
 
 

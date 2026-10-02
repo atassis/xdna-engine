@@ -87,6 +87,18 @@ automatically in Step 1 (`setup_kernel_env.sh`). (Success signal, later: after S
 
 ---
 
+## Public bootstrap
+
+```bash
+scripts/bootstrap_public_env.sh
+```
+
+This initializes recursive source dependencies, verifies the exact `third_party/iron` source
+commit, creates the toolchain and export Python environments, fetches the pinned MLIR distro, and
+builds or resolves the fork toolchain instance. It runs the steps below in their listed order.
+
+---
+
 ## Step 1 -- Route B toolchain env: `.venv-iron` + AIE wheels + fork checkout  [CPU]
 
 ```bash

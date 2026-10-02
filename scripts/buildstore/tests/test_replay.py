@@ -15,6 +15,63 @@ def test_replay_passes_on_full_manifest_and_fails_on_a_dropped_read(tmp_path):
     assert r.returncode != 0
 
 
+def test_replay_binds_iron_to_the_recorded_source_snapshot(tmp_path):
+    iron = tmp_path / "iron"; iron.mkdir()
+    source = iron / "module.py"; source.write_text("x = 1\n")
+    out = tmp_path / "out"; out.mkdir()
+    m = record.run(
+        ["bash", "-c", f"cat {source} > {out}/o"], cwd=tmp_path,
+        env={"PATH": "/usr/bin:/bin", "IRON_DIR": str(iron),
+             "IRON_SOURCE_IDENTITY": "pinned:" + "a" * 40},
+        out_roots=[out], work_roots=[], cache_roots=[],
+    )
+    manifest = tmp_path / "m.json"; manifest.write_text(json.dumps(m))
+    plan = replay.build_plan(manifest, tmp_path / "scratch")
+    snapshot = pathlib.Path(plan["env"]["IRON_SOURCE_SNAPSHOT"])
+    text = snapshot.read_text()
+    assert "iron-source-snapshot-v1" in text
+    assert f"identity\tpinned:{'a' * 40}" in text
+    assert plan["env"]["IRON_SOURCE_MANIFEST"] == str(manifest)
+    assert f"file\t" in text and str(source) in text
+
+
+def test_replay_snapshot_rejects_a_strict_subset_of_recorded_iron_reads(tmp_path):
+    iron = tmp_path / "iron"; iron.mkdir()
+    first = iron / "first.py"; first.write_text("first = 1\n")
+    second = iron / "second.py"; second.write_text("second = 1\n")
+    out = tmp_path / "out"; out.mkdir()
+    want = "a" * 40
+    manifest_data = record.run(
+        ["bash", "-c", f"cat {first} {second} > {out}/o"], cwd=tmp_path,
+        env={"PATH": "/usr/bin:/bin", "IRON_DIR": str(iron),
+             "IRON_SOURCE_IDENTITY": f"pinned:{want}"},
+        out_roots=[out], work_roots=[], cache_roots=[],
+    )
+    manifest = tmp_path / "m.json"; manifest.write_text(json.dumps(manifest_data))
+    plan = replay.build_plan(manifest, tmp_path / "scratch")
+    snapshot = pathlib.Path(plan["env"]["IRON_SOURCE_SNAPSHOT"])
+    lock = tmp_path / "toolchain.lock"; lock.write_text(f"IRON_SOURCE_COMMIT={want}\n")
+
+    def source_gate(snapshot_path):
+        env = dict(plan["env"], PATH="/usr/bin:/bin", IRON_LOCK=str(lock),
+                   IRON_SOURCE_SNAPSHOT=str(snapshot_path))
+        return subprocess.run(
+            ["bash", "-c", f'. "{HERE.parent / "amd_paths.sh"}"; iron_require_source'],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+    complete = source_gate(snapshot)
+    assert complete.returncode == 0, complete.stderr
+    truncated = tmp_path / "truncated.snapshot"
+    truncated.write_text("\n".join(line for line in snapshot.read_text().splitlines()
+                                      if str(second) not in line) + "\n")
+    second.write_text("second = 2\n")
+    rejected = source_gate(truncated)
+    assert rejected.returncode != 0
+
+
 def test_replay_compares_by_identity_not_bytes(tmp_path):
     """meta.json's generator provenance is git state, not reproducible in the sandbox --
     identity.py already drops it. Replay must pass on a run whose meta.json differs ONLY in

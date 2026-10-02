@@ -36,8 +36,8 @@ def _iron_quant():
     """IRON's packer, loaded by path: the `iron` package imports the device toolchain, this file only
     numpy. IRON_DIR resolves as scripts/amd_paths.sh does."""
     import importlib.util
-    ws = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    path = os.path.join(os.environ.get("IRON_DIR") or os.path.join(ws, "wt-iron-integ"),
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(os.environ.get("IRON_DIR") or os.path.join(repo, "third_party", "iron"),
                         "iron", "common", "quant.py")
     spec = importlib.util.spec_from_file_location("iron_quant", path)
     m = importlib.util.module_from_spec(spec)

@@ -1256,7 +1256,11 @@ def iron_provenance():
         return {}
     if sha.returncode != 0 or not sha.stdout.strip():
         return {}
-    return {"tree": tree, "commit": sha.stdout.strip(), "dirty": bool(dirty.stdout.strip())}
+    provenance = {"tree": tree, "commit": sha.stdout.strip(), "dirty": bool(dirty.stdout.strip())}
+    identity = os.environ.get("IRON_SOURCE_IDENTITY")
+    if identity:
+        provenance["identity"] = identity
+    return provenance
 
 
 def toolchain_provenance():

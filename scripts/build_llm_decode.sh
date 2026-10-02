@@ -9,10 +9,7 @@
 # Writes decode.elf.zst only (zstd -3 --long=27, elf_zst.py) and records both sha256s in
 # meta.json.
 #
-# Env overrides: VENV_IRON, IRON (an IRON checkout carrying iron/common/fusion.py), WEIGHTS.
-# NOTE the shared workspace IRON checkout is NOT usable by default: its local integration-stack has
-# dropped the carried iron/common/fusion.py (upstream deleted it; we carry it). Point IRON at a
-# worktree of origin/integration-stack instead of editing the shared checkout.
+# Env overrides: VENV_IRON, IRON (explicit development source), WEIGHTS.
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$REPO/scripts/lib/data_root.sh"    # -> XDNA_CACHE

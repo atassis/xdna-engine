@@ -56,10 +56,8 @@ decode = "artifacts/qwen3-0.6b/decode_p8e3958"
 # REBUILT 2026-09-13 to pair with rungs4096-rowbatch (the 2026-09-12 pairing, against plain
 # rungs4096, went stale when decode picked up the rowbatch flip and was disabled here rather than
 # mis-bound). Two independent blockers, both fixed rather than routed around:
-#   1. gen_llm_prefill.py imports iron.common.kv_layout, which wt-iron-causal (build_prefill.sh's
-#      default IRON) does not have. wt-iron-integ (integration-stack) does, is a strict superset of
-#      causal-softmax's own required API surface, and satisfies toolchain.lock's IRON_FORK_COMMIT
-#      floor -- so the fix is IRON=wt-iron-integ, not a wt-iron-causal rebase.
+#   1. gen_llm_prefill.py imports iron.common.kv_layout. The build now uses the exact public
+#      IRON source declared by toolchain.lock and initialized at third_party/iron.
 #   2. The shared toolchain instance for the deployed pin (dc6ee51323ee, instance a7a75a7751d2 under
 #      $XDNA_CACHE/instances/) had 137 dangling symlinks into a since-deleted worktree
 #      (wt-toolchain-repin) -- the documented "linked worktree is ephemeral" failure mode

@@ -52,28 +52,61 @@ def test_replay_subcommand_dispatches_to_replay_py(tmp_path):
     assert r.returncode == 0
 
 
-def test_iron_pin_verified_is_a_key_input(tmp_path):
-    """A repo whose scripts/amd_paths.sh gates on IRON_PIN_VERIFIED: build injects the verified
-    sha, so a stale pin (lock changed under it) is a cache MISS, not a silent stale hit."""
+def test_iron_source_identity_is_a_key_input(tmp_path):
+    """A changed declared IRON source input cannot reuse a cached build."""
     (tmp_path / "scripts").mkdir()
     amd_paths = tmp_path / "scripts" / "amd_paths.sh"
     amd_paths.write_text(
-        'iron_require_pin() {\n'
-        '  want=$(sed -n \'s/^IRON_FORK_COMMIT=\\([0-9a-f]\\{7,\\}\\).*/\\1/p\' toolchain.lock | head -1)\n'
-        '  [ -n "${IRON_PIN_VERIFIED:-}" ] && { [ "$IRON_PIN_VERIFIED" = "$want" ] && return 0 || return 1; }\n'
-        '  return 0\n'
+        'iron_require_source() {\n'
+        '  want=$(sed -n \'s/^IRON_SOURCE_COMMIT=\\([0-9a-f]\\{7,\\}\\).*/\\1/p\' toolchain.lock | head -1)\n'
+        '  [ -n "${IRON_SOURCE_IDENTITY:-}" ] && { [ "$IRON_SOURCE_IDENTITY" = "pinned:$want" ] && return 0 || return 1; }\n'
+        '  export IRON_SOURCE_IDENTITY="pinned:$want"\n'
         '}\n'
     )
-    (tmp_path / "toolchain.lock").write_text("IRON_FORK_COMMIT=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n")
+    (tmp_path / "toolchain.lock").write_text("IRON_SOURCE_COMMIT=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n")
     tsv = tmp_path / "r.tsv"
-    tsv.write_text('fake\t. "$REPO/scripts/amd_paths.sh" && echo "$IRON_PIN_VERIFIED" > "$OUT/o"\n')
+    tsv.write_text('fake\t. "$REPO/scripts/amd_paths.sh" && echo "$IRON_SOURCE_IDENTITY" > "$OUT/o"\n')
     a = cli(tmp_path, "build", "fake", "--recipes", str(tsv), "--out-root", str(tmp_path / "o"))
     assert a.startswith("BUILT fake ")
-    assert (tmp_path / "o" / "fake" / "o").read_text().strip() == "a" * 40
-    (tmp_path / "toolchain.lock").write_text("IRON_FORK_COMMIT=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n")
+    assert (tmp_path / "o" / "fake" / "o").read_text().strip() == f"pinned:{'a' * 40}"
+    (tmp_path / "toolchain.lock").write_text("IRON_SOURCE_COMMIT=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n")
     b = cli(tmp_path, "build", "fake", "--recipes", str(tsv), "--out-root", str(tmp_path / "o"))
     assert b.startswith("BUILT fake ") and b.split()[2] != a.split()[2]
-    assert (tmp_path / "o" / "fake" / "o").read_text().strip() == "b" * 40
+    assert (tmp_path / "o" / "fake" / "o").read_text().strip() == f"pinned:{'b' * 40}"
+
+
+def test_buildstore_revalidates_source_instead_of_forwarding_ambient_identity(tmp_path, monkeypatch):
+    scripts = tmp_path / "scripts"; scripts.mkdir()
+    (scripts / "amd_paths.sh").write_text(
+        'iron_require_source() {\n'
+        '  [ -z "${IRON_SOURCE_IDENTITY:-}" ] || { echo "ambient identity" >&2; return 1; }\n'
+        '  export IRON_SOURCE_IDENTITY="pinned:' + "a" * 40 + '"\n'
+        '}\n'
+    )
+    tsv = tmp_path / "r.tsv"
+    tsv.write_text('fake\techo "$IRON_SOURCE_IDENTITY" > "$OUT/o"\n')
+    monkeypatch.setenv("IRON_SOURCE_IDENTITY", "pinned:" + "b" * 40)
+    result = cli(tmp_path, "build", "fake", "--recipes", str(tsv), "--out-root", str(tmp_path / "o"))
+    assert result.startswith("BUILT fake ")
+    assert (tmp_path / "o" / "fake" / "o").read_text().strip() == "pinned:" + "a" * 40
+
+
+def test_missing_iron_fails_before_toolchain_resolution(tmp_path):
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "amd_paths.sh").write_text('iron_require_source() { echo "missing IRON" >&2; return 1; }\n')
+    (scripts / "toolchain_up.sh").write_text('#!/usr/bin/env bash\ntouch "$REPO/toolchain-ran"\necho /never/reached\n')
+    tsv = tmp_path / "r.tsv"
+    tsv.write_text('fake\techo should-not-run > "$OUT/o"\n')
+    result = subprocess.run(
+        [sys.executable, str(CLI), "build", "fake", "--recipes", str(tsv), "--out-root", str(tmp_path / "o")],
+        env=dict(os.environ, BUILDSTORE_CAS=str(tmp_path / "cas"), BUILDSTORE_REPO=str(tmp_path)),
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "IRON source check failed" in result.stderr
+    assert not (tmp_path / "toolchain-ran").exists()
 
 def test_xdna_cache_resolved_and_baked_in(tmp_path):
     """cache_env.sh's own default resolves XDNA_CACHE via the worktree's .git, which a replay

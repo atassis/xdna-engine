@@ -31,10 +31,10 @@ fi
 # and nothing else. IRON is a separate python tree resolved through PYTHONPATH at runtime and is
 # never compiled in, so pinning it must not invalidate an already-built toolchain. Dropping it here
 # is a semantic statement, not a convenience: a key belongs in this hash only if changing it changes
-# the artifacts under $INST. Adding IRON_FORK_COMMIT without this moved the key to c4fb9caa28b9 and
+# the artifacts under $INST. Adding IRON_SOURCE_COMMIT without this moved the key to c4fb9caa28b9 and
 # would have forced a full rebuild for a value the build never reads.
 _lock_semantic() {
-  sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' -e '/^IRON_FORK_COMMIT=/d' "$REPO/toolchain.lock"
+  sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' -e '/^IRON_SOURCE_COMMIT=/d' "$REPO/toolchain.lock"
 }
 LOCKHASH="$(_lock_semantic | sha256sum | cut -c1-12)"
 INSTROOT="${TOOLCHAIN_HOME:-$XDNA_CACHE/instances}"

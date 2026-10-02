@@ -2,3 +2,6 @@
 	path = mlir-aie
 	url = https://github.com/atassis/mlir-aie
 	ignore = dirty
+[submodule "third_party/iron"]
+	path = third_party/iron
+	url = https://github.com/atassis/IRON.git

@@ -34,18 +34,14 @@ CPU round trip between layers.
 
 ## Prerequisites
 
-- An IRON checkout (`IRON_DIR`) whose HEAD is at or near `recipes/rf48C.sh`'s `IRON_PIN` --
-  required, no default (a different IRON tree changes the generated MLIR/ELF bytes).
+- The pinned `third_party/iron` submodule at `toolchain.lock:IRON_SOURCE_COMMIT`.
 - The toolchain instance `scripts/toolchain_up.sh` resolves for this repo's `toolchain.lock`
   (`RF_INST`, resolved automatically by `env.sh`; override only to pin a specific instance).
-- `RF_FUSED_ATTN_DIR` if `IRON_DIR` does not yet carry `aie_kernels/aie2p/fused_attn.cc` (the served
-  build used a second, slightly newer checkout of the same IRON fork for that one file --
-  `rf_paths.fused_attn_dir()`).
 - A disk-backed `RF_BUILD` dir (never `/tmp` -- see `scripts/require_disk_backed.sh`).
 
 ## Build
 
-    IRON_DIR=/path/to/iron RF_BUILD=/path/to/build/dir designs/resident_forward/recipes/rf48C.sh
+    RF_BUILD=/path/to/build/dir designs/resident_forward/recipes/rf48C.sh
 
 Writes `$RF_BUILD/rf48C/design.elf.zst` (the repo's `<name>.elf.zst`-only convention, see
 `designs/decode_fused/elf_zst.py`) plus `pack.json` (control-code sizes, the ELF's uncompressed

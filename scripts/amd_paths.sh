@@ -6,25 +6,13 @@
 #   source "$(dirname "${BASH_SOURCE[0]}")/amd_paths.sh"
 #   ... use "$IRON_DIR" / "$XRT_SRC_DIR" / "$MLIR_AIR_DIR" / "$AIEBU_ASM_DIR"
 #
-# No default location: these checkouts sit wherever the caller's box put them, and a
-# public clone of this repo names no such layout. IRON_DIR is REQUIRED by anything that
-# actually touches IRON (iron_require_pin/iron_require_api below fail loud, naming how
-# to set it) -- set it, or pass IRON=<dir> to a caller that reads that instead (planned:
-# IRON as a submodule). A caller that never touches IRON does not need it set.
+# IRON defaults to this repository's pinned third_party/iron submodule. IRON_DIR and IRON
+# are explicit development overrides. A caller that never touches IRON does not need it initialized.
 # Per-machine locations (XRT_SRC_DIR, AIEBU_ASM_DIR, ...) come from config/local.env.
-. "$(dirname "${BASH_SOURCE[0]:-$0}")/lib/data_root.sh"
-export IRON_DIR="${IRON_DIR:-${IRON:-}}"
+_AMD_PATHS_DIR="${_AMD_PATHS_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)}"
+. "$_AMD_PATHS_DIR/lib/data_root.sh"
+export IRON_DIR="${IRON_DIR:-${IRON:-$REPO/third_party/iron}}"
 
-# The shared IRON checkout sits on whatever branch it was last left on and carries neither
-# iron/operators/tmatvec/ nor iron/common/quant.py -- both imported at module scope by
-# designs/decode_fused/gen_llm_decode.py. So the documented build command for the LLM decode failed
-# at import with the default resolution, and every caller had to know to pass IRON=<worktree>.
-#
-# wt-iron-integ is the integration-stack model every other fork here already uses: latest upstream
-# as the base, our carries cherry-picked on top, dropped as they land upstream. Rebased 2026-09-07
-# onto upstream/devel deb6e1e with all carries applied and gated -- device-free tests, bf16-oracle
-# parity, DDR bytes, interleaved timing, and a byte-identical decode ELF against the pre-rebase
-# build. See the journal task iron-back-onto-the-integration-stack-model.
 
 # amd/IRON's two aiecc rules default AIECC_JOBS to '1', so every design's per-core
 # compiles run one at a time. On the 24-core encoder-MHA design that is 7.7 s against
@@ -65,8 +53,7 @@ if command -v ccache >/dev/null 2>&1; then
     *) export CCACHE_SLOPPINESS="${CCACHE_SLOPPINESS},time_macros" ;;
   esac
 fi
-# XRT_SRC_DIR/MLIR_AIR_DIR/LLVM_AIE_DIR are NOT defaulted here, same reason as
-# IRON_DIR above -- no assumed sibling layout. An empty MLIR_AIR_DIR/LLVM_AIE_DIR
+# XRT_SRC_DIR/MLIR_AIR_DIR/LLVM_AIE_DIR are not defaulted here. An empty MLIR_AIR_DIR/LLVM_AIE_DIR
 # also doubles as setup_amd_toolchains.sh's "do not patch this repo" gate.
 export XRT_SRC_DIR="${XRT_SRC_DIR:-}"
 export AIEBU_ASM_DIR="${AIEBU_ASM_DIR:-${XRT_SRC_DIR:+$XRT_SRC_DIR/src/runtime_src/core/common/aiebu/build/Release/src/cpp/utils/asm}}"
@@ -129,34 +116,90 @@ PYEOF
   echo "$on @ $(git -C "$dir" rev-parse --short HEAD 2>/dev/null)"
 }
 
-# iron_require_pin -- the IRON tree must CONTAIN toolchain.lock's IRON_FORK_COMMIT.
-#
-# Ancestry, not equality: every IRON worktree here carries local commits on top of the pinned
-# floor, so an exact-sha gate would fail all of them. The floor is the merge-base of every IRON
-# line in the workspace, so "contains it" means "descends from the state we all agreed on".
-#
-# An ABSENT pin is not a pass -- a lock that forgot the key must not read as unlocked.
-iron_require_pin() {
+iron_identity_is_allowed() {
+  local want="$1" identity="$2" got
+  case "$identity" in
+    "pinned:$want") return 0 ;;
+    override:*)
+      [[ "$identity" =~ ^override:[0-9a-f]{40}$ ]] && [ "${IRON_ALLOW_UNPINNED:-}" = 1 ] && return 0 ;;
+    dirty:*)
+      [[ "$identity" =~ ^dirty:([0-9a-f]{40}):([0-9a-f]{64})$ ]] || return 1
+      got="${BASH_REMATCH[1]}"
+      [ "${IRON_ALLOW_DIRTY:-}" = 1 ] && \
+        { [ "$got" = "$want" ] || [ "${IRON_ALLOW_UNPINNED:-}" = 1 ]; } && return 0 ;;
+  esac
+  return 1
+}
+
+iron_require_snapshot() {
+  local want="$1" dir="$2" snapshot="${IRON_SOURCE_SNAPSHOT:-}"
+  local manifest="${IRON_SOURCE_MANIFEST:-}" verifier="$_AMD_PATHS_DIR/buildstore/verify_iron_snapshot.py"
+  local identity
+  [ -r "$snapshot" ] && [ -r "$manifest" ] && [ -f "$verifier" ] || return 1
+  identity="$(python3 "$verifier" --snapshot "$snapshot" --manifest "$manifest" --dir "$dir")" || return 1
+  iron_identity_is_allowed "$want" "$identity" || return 1
+  export IRON_DIR="$dir" IRON_SOURCE_IDENTITY="$identity"
+}
+
+iron_dirty_hash() {
+  local dir="$1" untracked_hash
+  untracked_hash="$(
+    set -o pipefail
+    git -C "$dir" ls-files --others --exclude-standard -z |
+      while IFS= read -r -d '' path; do
+        blob="$(git -C "$dir" hash-object --no-filters -- "$path")" || exit 1
+        printf '%s\t%s\n' "$path" "$blob"
+      done | sha256sum | cut -d' ' -f1
+  )" || return 1
+  { git -C "$dir" diff --binary HEAD --; printf '%s\n%s\n' "--untracked--" "$untracked_hash"; } |
+    sha256sum | cut -d' ' -f1
+}
+
+iron_require_source() {
   local dir="${IRON:-$IRON_DIR}"
-  [ -n "$dir" ] || { echo "ERROR: IRON_DIR is not set. Point it at your IRON checkout: export IRON_DIR=/path/to/IRON" >&2; return 1; }
   local lock="${IRON_LOCK:-$(dirname "${BASH_SOURCE[0]:-$0}")/../toolchain.lock}"
-  local want
-  want="$(sed -n 's/^IRON_FORK_COMMIT=\([0-9a-f]\{7,\}\).*/\1/p' "$lock" 2>/dev/null | head -1)"
-  [ -n "$want" ] || { echo "ERROR: no IRON_FORK_COMMIT in $lock -- refusing to build unpinned" >&2; return 1; }
-  # A buildstore replay sandbox never has .git (deliberately not a recorded input), so the
-  # orchestrator runs the git check ONCE, outside the sandbox, and hands down the sha it got --
-  # mirrors AIECC_PIN_OVERRIDE's "must name the sha" idiom. Any other non-empty value is stale.
-  if [ -n "${IRON_PIN_VERIFIED:-}" ]; then
-    [ "$IRON_PIN_VERIFIED" = "$want" ] && return 0
-    echo "ERROR: IRON_PIN_VERIFIED=$IRON_PIN_VERIFIED is stale against pin $want." >&2
+  local want got dirty dirty_hash identity
+  want="$(sed -n 's/^IRON_SOURCE_COMMIT=\([0-9a-f]\{40\}\).*/\1/p' "$lock" 2>/dev/null | head -1)"
+  [ -n "$want" ] || { echo "ERROR: no IRON_SOURCE_COMMIT in $lock -- refusing to build." >&2; return 1; }
+  if ! { [ -d "$dir" ] && git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; }; then
+    iron_require_snapshot "$want" "$dir" && return 0
+    echo "ERROR: IRON dependency is missing or uninitialized at $dir. Run: git submodule update --init --recursive" >&2
     return 1
   fi
-  git -C "$dir" cat-file -e "$want^{commit}" 2>/dev/null || {
-    echo "ERROR: $dir does not have pinned IRON_FORK_COMMIT $want (fetch the fork?)" >&2; return 1; }
-  git -C "$dir" merge-base --is-ancestor "$want" HEAD 2>/dev/null || {
-    echo "ERROR: $dir HEAD ($(git -C "$dir" rev-parse --short HEAD)) does not contain pinned $want." >&2
-    echo "  Rebase onto the pin, or re-pin toolchain.lock to a new merge-base if the floor moved." >&2
-    return 1; }
+  got="$(git -C "$dir" rev-parse HEAD 2>/dev/null)" || return 1
+  if [ "$got" != "$want" ] && [ "${IRON_ALLOW_UNPINNED:-}" != 1 ]; then
+    echo "ERROR: IRON source is $got, expected $want. Set IRON_ALLOW_UNPINNED=1 only for a recorded development override." >&2
+    return 1
+  fi
+  dirty="$(git -C "$dir" status --porcelain --untracked-files=all 2>/dev/null)"
+  if [ -n "$dirty" ]; then
+    [ "${IRON_ALLOW_DIRTY:-}" = 1 ] || {
+      echo "ERROR: IRON source at $dir is dirty. Set IRON_ALLOW_DIRTY=1 only for a recorded development override." >&2
+      return 1
+    }
+    dirty_hash="$(iron_dirty_hash "$dir")" || {
+      echo "ERROR: failed to fingerprint dirty IRON source at $dir." >&2
+      return 1
+    }
+    identity="dirty:$got:$dirty_hash"
+  elif [ "$got" = "$want" ]; then
+    identity="pinned:$got"
+  else
+    identity="override:$got"
+  fi
+  export IRON_DIR="$dir" IRON_SOURCE_IDENTITY="$identity"
+}
+
+iron_require_pin() {
+  iron_require_source
+}
+
+iron_require_fused_attn() {
+  iron_require_source || return 1
+  [ -f "$IRON_DIR/aie_kernels/aie2p/fused_attn.cc" ] || {
+    echo "ERROR: pinned IRON source lacks aie_kernels/aie2p/fused_attn.cc: $IRON_DIR" >&2
+    return 1
+  }
 }
 
 # aiecc_require_pin [path] -- the aiecc that will RUN must be the one built from toolchain.lock's
@@ -174,8 +217,6 @@ iron_require_pin() {
 # Captured when this file is SOURCED: inside a function BASH_SOURCE resolves
 # against however the caller spelled the source path, so a relative `. scripts/amd_paths.sh` lost
 # the repo root and the check failed closed on a lock it simply could not find.
-_AMD_PATHS_DIR="${_AMD_PATHS_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)}"
-
 aiecc_require_pin() {
   local bin="${1:-${AIECC_PATH:-}}"
   local lock="${MLIR_AIE_LOCK:-$_AMD_PATHS_DIR/../toolchain.lock}"

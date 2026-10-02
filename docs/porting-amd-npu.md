@@ -85,9 +85,7 @@ and every field in it is generation-specific in some way:
   Peano build for that generation's backend, not a re-pin of this one.
 - `MLIR_DISTRO_WHEEL` -- the prebuilt core LLVM/MLIR framework aiecc itself is built on
   (separate from Peano, which only compiles the AIE kernel code).
-- `IRON_FORK_COMMIT` -- a floor commit for `amd/IRON`, resolved as a merge-base rather
-  than an exact pin (the file's own comment explains why: every local IRON checkout in
-  this workspace carries commits on top).
+- `IRON_SOURCE_COMMIT` -- the exact `third_party/iron` source commit used by generators.
 - `NANOBIND` -- the Python/C++ binding layer version aiecc's Python side needs.
 
 Bring-up is `scripts/toolchain_up.sh` (build or locate the instance for the current pin)

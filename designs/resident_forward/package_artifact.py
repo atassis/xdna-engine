@@ -122,6 +122,17 @@ def package(out: Path, build: Path, meta_path: Path, weights: Path, store: Path)
     for name in BUILD_FILES:
         require_file(build / name)
 
+    pack = json.loads((build / "pack.json").read_text())
+    provenance = pack.get("provenance") if isinstance(pack, dict) else None
+    if isinstance(provenance, dict):
+        iron = {
+            "commit": provenance.get("iron_commit"),
+            "dirty": provenance.get("iron_dirty"),
+            "identity": provenance.get("iron_identity"),
+        }
+        if all(value is not None for value in iron.values()):
+            meta["iron"] = iron
+
     staging = out.with_name(f"{out.name}.staging-{os.getpid()}")
     if staging.exists() or staging.is_symlink():
         raise ValueError(f"staging path already exists: {staging}")

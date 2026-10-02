@@ -32,10 +32,7 @@ QPASS = 2 * 16 * HD * 2
 XCOL = WB + NTMAX * QPASS
 NBW = 8                                          # window blocks (a build parameter)
 QK_O, PV_O = GQK, GPV = "attn_qk.o", "attn_pv.o"
-# Not on the served rf48C recipe's path (RF_ATTN_H=1 selects rattnh.kernels() instead, see
-# rlayer_design.kernels()); RF_FUSED_ATTN_DIR is a separate fused-attention-op checkout this
-# module's own kernels() needs only when ATTN_H is off.
-FA_SRC = os.path.join(os.environ.get("RF_FUSED_ATTN_DIR", ""), "aie_kernels/aie2p/fused_attn.cc")
+FA_SRC = rf_paths.iron_kernel("fused_attn.cc")
 GLUE_SRC = rf_paths.iron_kernel("rf_attn_glue.cc")
 FA_DEFS = ["-D__AIECC__", "-Dbf16_f32_ONLY", "-DROUND_CONV_EVEN", "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16", f"-DFA_ROWS={ROWS}"]
 ROLE = {2: "qk", 3: "pv0", 4: "pv1", 5: "sm"}

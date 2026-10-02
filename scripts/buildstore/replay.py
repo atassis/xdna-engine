@@ -13,7 +13,7 @@ usage: replay.py <manifest.json> <recorded-out-dir> <scratch>
 exit 0 = same identity.py identity (device bytes; drops meta.json provenance); anything else =
 the manifest is not sufficient. A byte diff excluding meta.json is printed as extra info.
 """
-import ctypes, ctypes.util, glob, json, os, pathlib, shutil, subprocess, sys
+import ctypes, ctypes.util, glob, hashlib, json, os, pathlib, shutil, subprocess, sys
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -74,6 +74,40 @@ def _recover_pyc_sources(reads):
     return extra
 
 
+def _sha256(path):
+    with pathlib.Path(path).open("rb") as source:
+        return hashlib.file_digest(source, "sha256").hexdigest()
+
+
+def _iron_snapshot(manifest_path, manifest, scratch):
+    env = manifest["env"]
+    identity, source_dir = env.get("IRON_SOURCE_IDENTITY"), env.get("IRON_DIR")
+    if not identity and not source_dir:
+        return None
+    if not isinstance(identity, str) or not isinstance(source_dir, str):
+        raise ValueError("replay: IRON source identity and directory must both be recorded")
+    prefix = source_dir.rstrip("/") + "/"
+    source_reads = {path: digest for path, digest in manifest["reads"].items()
+                    if path.startswith(prefix)}
+    if not source_reads:
+        raise ValueError("replay: IRON source snapshot has no recorded source files")
+    for name, expected_digest in source_reads.items():
+        source = pathlib.Path(name)
+        if not source.is_file() or _sha256(source) != expected_digest:
+            raise ValueError(f"replay: recorded IRON source changed before staging: {source}")
+    snapshot = pathlib.Path(scratch) / "iron-source.snapshot"
+    snapshot.parent.mkdir(parents=True, exist_ok=True)
+    with snapshot.open("w") as output:
+        output.write("iron-source-snapshot-v1\n")
+        output.write(f"identity\t{identity}\n")
+        output.write(f"dir\t{source_dir}\n")
+        output.write(f"manifest\t{_sha256(manifest_path)}\t{manifest_path}\n")
+        for name, expected_digest in sorted(source_reads.items()):
+            output.write(f"file\t{expected_digest}\t{name}\n")
+    snapshot.chmod(0o444)
+    return snapshot
+
+
 def build_plan(manifest_path, scratch):
     m = json.load(open(manifest_path))
     files = set(m["reads"]) | _recover_pyc_sources(m["reads"])
@@ -121,6 +155,15 @@ def build_plan(manifest_path, scratch):
     instance = m["env"].get("MLIR_AIE_INSTANCE")
     if instance and os.path.isdir(instance):
         furniture.append([instance, True])
+    snapshot = _iron_snapshot(manifest_path, m, scratch)
+    env = dict(m["env"])
+    if snapshot:
+        verifier = HERE / "verify_iron_snapshot.py"
+        if not verifier.is_file():
+            raise ValueError(f"replay: missing IRON snapshot verifier: {verifier}")
+        files.extend((str(snapshot), str(pathlib.Path(manifest_path)), str(verifier)))
+        env["IRON_SOURCE_SNAPSHOT"] = str(snapshot)
+        env["IRON_SOURCE_MANIFEST"] = str(manifest_path)
     symlinks = {"/lib64": "usr/lib", "/lib": "usr/lib", "/bin": "usr/bin", "/sbin": "usr/bin"}
     symlinks.update(m["links"])
     # ld.so resolves a DT_NEEDED soname through ld.so.cache to a *symlink* path (e.g.
@@ -153,7 +196,7 @@ def build_plan(manifest_path, scratch):
                         and os.path.realpath(full) in reads:
                     symlinks[full] = os.readlink(full)
     return {"files": files, "dirs": dirs, "furniture": furniture, "rw": list(m["writable"]),
-            "cwd": m["cwd"], "env": m["env"], "symlinks": symlinks, "argv": m["argv"],
+            "cwd": m["cwd"], "env": env, "symlinks": symlinks, "argv": m["argv"],
             "scratch": str(scratch)}
 
 

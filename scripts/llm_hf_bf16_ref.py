@@ -129,13 +129,13 @@ def main():
         # computes with -- not an approximation of them.
         import numpy as np
         sys.path.insert(0, os.environ.get("IRON_DIR", os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "..", "wt-iron-integ")))
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "third_party", "iron")))
         # Loaded as a FILE, not imported as `iron.common.quant`: that package's __init__ pulls in
         # `aie`, the on-device toolchain, which a host-only reference has no business needing and
         # this venv deliberately does not carry. quant.py itself is numpy + ml_dtypes.
         import importlib.util
         _iron = os.environ.get("IRON_DIR") or os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "..", "wt-iron-integ")
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "third_party", "iron")
         _qp = os.path.join(_iron, "iron", "common", "quant.py")
         if not os.path.isfile(_qp):  # pre-6a347dc tree, before the packer moved
             _qp = os.path.join(_iron, "iron", "operators", "gemv", "quant.py")
