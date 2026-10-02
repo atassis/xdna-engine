@@ -86,7 +86,7 @@ git -C "$SOURCE" checkout --detach "$PEANO_FORK_COMMIT"
 }
 
 LLVM_AIE_SRC="$SOURCE" BUILD_DIR="$BUILD" bash "$REPO/scripts/build_peano_fast.sh"
-bash "$REPO/scripts/install_peano_local.sh" --from "$SEED" --build "$BUILD" --tag "$PEANO_FORK_COMMIT"
+bash "$REPO/scripts/install_peano_local.sh" --from "$SEED/llvm-aie" --build "$BUILD" --tag "$PEANO_FORK_COMMIT"
 INSTALL="$(bash "$REPO/scripts/install_peano_local.sh" --resolve)"
 bash "$REPO/scripts/install_peano_local.sh" --activate "$INSTALL"
 "$VENV_LINK/bin/clang++" --version | grep -Fq "$PEANO_FORK_COMMIT" || {

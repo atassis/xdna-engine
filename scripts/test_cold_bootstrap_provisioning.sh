@@ -179,7 +179,7 @@ test_provision_uses_declared_seed_and_fork() {
   else
     fail "provision does not build the declared fork commit"
   fi
-  if contains "$MOCK_LOG" "--from $t/xdna-cache/peano-seed/llvm_aie-22.0.0.2026091901+0006955e --build $t/xdna-cache/peano-build/aa4acd25694884aadad7bdb1479b72ec0399744c"; then
+  if contains "$MOCK_LOG" "--from $t/xdna-cache/peano-seed/llvm_aie-22.0.0.2026091901+0006955e/llvm-aie --build $t/xdna-cache/peano-build/aa4acd25694884aadad7bdb1479b72ec0399744c"; then
     pass "provision installs fork codegen over the declared seed"
   else
     fail "provision does not install fork codegen over the declared seed"
