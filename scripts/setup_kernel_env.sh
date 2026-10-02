@@ -34,62 +34,50 @@ MLIR_AIE_SHA=8373e49165649644f1ec414c2e406c0abbbf51cf
 #        NOT the old literal 2026052701 which has rotated out of the nightly window.
 #      - mlir_aie: 0.0.1.2026033104+e4f35d6 (resolves the earlier provenance gap; NOT 1.3.2.dev126).
 #      - nanobind: pinned via toolchain.lock NANOBIND (2.13.0 silently breaks the bindings).
-#    PEANO_DIST looks like 'llvm_aie-21.0.0.2026062301+cb664e8c' -> pip spec 'llvm-aie==21.0.0...'.
-PEANO_PIN="llvm-aie==${PEANO_DIST#llvm_aie-}"
 MLIR_AIE_PIN='mlir_aie==0.0.1.2026033104+e4f35d6'
+MLIR_AIE_INDEX='https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-3'
 NANOBIND_PIN="nanobind==${NANOBIND:-2.12.0}"
 SITE=".venv-iron/lib/python3.14/site-packages"
+KERNEL_ENV_REQUIREMENTS="$REPO/scripts/requirements-kernel-env.txt"
 have_aie()   { .venv-iron/bin/python -c 'import aie' 2>/dev/null; }
 have_peano() { ls "$SITE"/llvm-aie/bin/clang >/dev/null 2>&1; }
-if ! { have_aie && have_peano; }; then
+have_pinned_peano() {
+  have_peano && "$SITE"/llvm-aie/bin/clang++ --version 2>/dev/null | grep -Fq "$PEANO_FORK_COMMIT"
+}
+if ! { have_aie && have_pinned_peano; }; then
   # Prefer an OFFLINE install from the uv cache (these exact versions are prefetched). On a cache
   # miss, use the LOCAL wheelhouse (vendor/wheelhouse) BEFORE the network -- vendor/ is gitignored, so
   # a fresh checkout rebuilds the wheel on demand from the uv archive cache via build_wheelhouse.sh
   # (works off the owner box too, not just where a wheel was hand-repacked).
-  # IMPORTANT: llvm-aie (Peano) ships only a cp310 wheel that is UNRESOLVABLE on this py3.14 venv, so
-  # it is EXCLUDED from every pip tier here -- bundling "$PEANO_PIN" would fail the whole resolve
-  # (installing nothing) and, as the last statement in this block, abort the script under `set -e`
-  # before Peano can be provided. Peano is handled EXCLUSIVELY by the tree-copy block below.
   WHEELHOUSE="$REPO/vendor/wheelhouse"
-  if ! uv pip install --python .venv-iron --offline "$MLIR_AIE_PIN" "$NANOBIND_PIN"; then
+  PIP_REQUIREMENTS=("$MLIR_AIE_PIN" "$NANOBIND_PIN" -r "$KERNEL_ENV_REQUIREMENTS")
+  if ! uv pip install --python .venv-iron --offline "${PIP_REQUIREMENTS[@]}"; then
     # Rebuild the wheelhouse if absent. A failure here (e.g. empty uv cache off the owner box) must
     # NOT abort under set -e: fall through so the network tier below can still fetch mlir_aie.
     ls "$WHEELHOUSE"/mlir_aie-*.whl >/dev/null 2>&1 || bash "$REPO/scripts/build_wheelhouse.sh" || true
-    uv pip install --python .venv-iron --find-links "$WHEELHOUSE" --offline \
-        "$MLIR_AIE_PIN" "$NANOBIND_PIN" \
-      || uv pip install --python .venv-iron \
-        --find-links "$WHEELHOUSE" \
-        --find-links https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-4 \
-        "$MLIR_AIE_PIN" "$NANOBIND_PIN"
-  fi
-
-  # llvm-aie (Peano) ships a cp310-tagged wheel; pip will not install it into this py3.14 venv. If
-  # it is still missing after the steps above, reconstruct it by copying the unpacked archive tree
-  # from the uv cache straight into site-packages (the wheel only vendors binaries; no python import
-  # is needed -- the blessed Peano is the fork instance, this just provides bootgen/clang/etc.).
-  if ! have_peano; then
-    LAR=$(find "$HOME/.cache/uv/archive-v0" -maxdepth 2 \
-            -name 'llvm_aie-'"${PEANO_PIN#llvm-aie==}"'.dist-info' 2>/dev/null | head -1 | xargs -r dirname)
-    if [ -n "${LAR:-}" ] && [ -d "$LAR/llvm-aie" ]; then
-      cp -a "$LAR"/llvm-aie "$LAR"/llvm_aie-*.dist-info "$SITE"/
-      echo "  llvm-aie (Peano) copied from uv archive cache -> $SITE/llvm-aie"
-    else
-      echo "  WARNING: llvm-aie tree not found in uv archive cache; Peano binaries unavailable" >&2
+    WHEELHOUSE_ARGS=()
+    if ls "$WHEELHOUSE"/mlir_aie-*.whl >/dev/null 2>&1; then
+      WHEELHOUSE_ARGS=(--find-links "$WHEELHOUSE")
+      uv pip install --python .venv-iron --offline "${WHEELHOUSE_ARGS[@]}" \
+          "${PIP_REQUIREMENTS[@]}" || true
     fi
+    uv pip install --python .venv-iron "${WHEELHOUSE_ARGS[@]}" \
+        --find-links "$MLIR_AIE_INDEX" \
+        "${PIP_REQUIREMENTS[@]}"
   fi
+fi
+
+if ! have_pinned_peano; then
+  bash "$REPO/scripts/provision_peano.sh"
 fi
 
 # Terminal guard (GAP #3): the tiers above WARN-and-continue on a cache/wheel miss, which under set -e
 # would otherwise surface as a confusing failure deep in the toolchain build (Step 3/4). Fail LOUD and
 # EARLY here instead. Idempotent: on the warm-cache path both checks pass and this is a silent no-op.
-if ! have_peano; then
-  echo "ERROR: Peano (llvm-aie) is missing -- $SITE/llvm-aie/bin/clang was not provided." >&2
-  echo "       The cp310 Peano wheel cannot install into this py3.14 venv, so it is supplied by copying" >&2
-  echo "       the unpacked llvm-aie tree out of the uv archive cache (~/.cache/uv/archive-v0), and that" >&2
-  echo "       cache entry is absent. Pre-warm it with a network fetch of the pinned version, e.g.:" >&2
-  echo "         uv pip install --python 3.14 \"$PEANO_PIN\" \\" >&2
-  echo "           --find-links https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly" >&2
-  echo "       (this populates ~/.cache/uv/archive-v0 for the tree-copy), or provide a pre-warmed uv cache." >&2
+if ! have_pinned_peano; then
+  echo "ERROR: Peano (llvm-aie) is missing or does not report PEANO_FORK_COMMIT=$PEANO_FORK_COMMIT." >&2
+  echo "       scripts/provision_peano.sh must fetch the checked PEANO_DIST seed and activate codegen" >&2
+  echo "       built from the pinned fork; see its preceding error." >&2
   exit 1
 fi
 if ! have_aie; then

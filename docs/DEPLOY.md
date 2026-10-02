@@ -116,7 +116,7 @@ scripts/setup_kernel_env.sh
   wheel is not reliably fetchable from the network. The script's resolution order is:
   (1) offline install from the **uv archive cache**; (2) `vendor/wheelhouse/` (gitignored;
   auto-rebuilt by `scripts/build_wheelhouse.sh` by repacking the wheel FROM the uv cache);
-  (3) network find-links `latest-wheels-4`. On a truly cold machine where the uv cache is
+  (3) network find-links `latest-wheels-3`. On a truly cold machine where the uv cache is
   empty AND `vendor/wheelhouse/` is absent, tiers (1) and (2) both fail and you are relying
   on tier (3) -- see GAP #2 for how to pre-warm.
 - **Peano prerequisite (see GAP #3, CLOSED):** `llvm-aie` (Peano) ships only a cp310 wheel
@@ -380,9 +380,9 @@ automated from a clean clone.
 - **What breaks:** Step 1 installs `mlir_aie==0.0.1.2026033104+e4f35d6`. Its resolution
   order is (1) offline uv archive cache, (2) `vendor/wheelhouse/` (gitignored; rebuilt by
   `build_wheelhouse.sh` -- which itself ONLY repacks from the uv archive cache and hard-errors
-  on an empty cache), (3) network find-links `latest-wheels-4`. On a brand-new machine the
+  on an empty cache), (3) network find-links `latest-wheels-3`. On a brand-new machine the
   uv cache is empty and `vendor/` is gitignored/absent, so tiers 1 and 2 are dead and you
-  depend entirely on tier 3 -- but nightly `latest-wheels-4` assets rotate out, and this
+  depend entirely on tier 3 -- but nightly `latest-wheels-3` assets rotate out, and this
   specific dated version may 404. Result: `.venv-iron` has no `aie` module and everything
   downstream fails.
 - **Suggested fix:** commit the ~290 MB `vendor/wheelhouse/mlir_aie-*.whl` to a release

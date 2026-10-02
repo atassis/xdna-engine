@@ -30,7 +30,7 @@ if [ -z "${MAR:-}" ] || [ ! -d "$MAR/mlir_aie" ]; then
   echo "ERROR: mlir_aie ${MLIR_AIE_VER} is not in the uv archive cache ($CACHE)." >&2
   echo "       Populate it first, then re-run this script:" >&2
   echo "         uv pip install --python .venv-iron mlir_aie==${MLIR_AIE_VER} \\" >&2
-  echo "           --find-links https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-4" >&2
+  echo "           --find-links https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-3" >&2
   exit 1
 fi
 
