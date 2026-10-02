@@ -17,8 +17,8 @@ Rust side would never know.
 The `weights` input is NOT optional: the shipped pipeline runs embedding_exclude_overlap=true and
 pools WEIGHTED statistics over a speaker's non-overlapping frames.
 
-Run: .venv-export/bin/python scripts/export_pyannote.py
-Needs HF_TOKEN (pyannote/segmentation-3.0 is gated).
+Run: .venv-pyannote/bin/python scripts/export_pyannote.py
+Needs HF_TOKEN only for remote pipeline inputs.
 """
 import json, os, sys, urllib.request
 from pathlib import Path
@@ -27,6 +27,7 @@ import pyannote.audio
 import torchaudio.compliance.kaldi as kaldi
 import yaml
 from pyannote.audio import Model
+from pyannote_local_inputs import local_checkpoint_path, validate_local_pipeline_inputs
 
 PIPELINE = os.environ.get("PYANNOTE_PIPELINE", "pyannote/speaker-diarization-3.1")
 SLUG = PIPELINE.split("/")[-1]
@@ -42,10 +43,14 @@ PIPELINE_CFG = "https://raw.githubusercontent.com/pyannote/hf-speaker-diarizatio
 EMBED_CFG = "https://huggingface.co/pyannote/wespeaker-voxceleb-resnet34-LM/resolve/main/config.yaml"
 
 local_pipeline = Path(PIPELINE).is_dir()
-token = os.environ.get("HF_TOKEN")
-if not token and not local_pipeline:
-    sys.exit("HF_TOKEN is required: pyannote/segmentation-3.0 is a gated repo. Accept its "
-             "conditions on huggingface.co, then export HF_TOKEN=hf_...")
+local_components = {component.name: component for component in validate_local_pipeline_inputs(Path(PIPELINE))} if local_pipeline else {}
+if local_pipeline:
+    token = None
+else:
+    token = os.environ.get("HF_TOKEN")
+    if not token:
+        sys.exit("HF_TOKEN is required: pyannote/segmentation-3.0 is a gated repo. Accept its "
+                 "conditions on huggingface.co, then export HF_TOKEN=hf_...")
 
 # `use_auth_token` was removed from huggingface_hub; pyannote 4.x takes `token`.
 import inspect as _inspect
@@ -81,12 +86,10 @@ pipe_params = pipe_cfg["pipeline"]["params"]
 # below -- the traceable fbank, the weights input, the powerset assertion -- is shared.
 BUNDLED = "community" in SLUG or "precision" in SLUG
 def _load(sub, repo):
-    if BUNDLED:
-        if local_pipeline:
-            return Model.from_pretrained(str(Path(PIPELINE) / sub), **TOKEN_KW).eval()
-        return Model.from_pretrained(PIPELINE, subfolder=sub, **TOKEN_KW).eval()
     if local_pipeline:
-        return Model.from_pretrained(str(Path(PIPELINE) / sub), **TOKEN_KW).eval()
+        return Model.from_pretrained(str(local_checkpoint_path(Path(PIPELINE), sub)), **TOKEN_KW).eval()
+    if BUNDLED:
+        return Model.from_pretrained(PIPELINE, subfolder=sub, **TOKEN_KW).eval()
     return Model.from_pretrained(repo, **TOKEN_KW).eval()
 
 seg = _load("segmentation", "pyannote/segmentation-3.0")
@@ -247,10 +250,10 @@ def clustering_block():
     import numpy as np
     from scipy.linalg import eigh
     if local_pipeline:
-        tf_p = Path(PIPELINE) / "plda/xvec_transform.npz"
-        pl_p = Path(PIPELINE) / "plda/plda.npz"
-        if not tf_p.is_file() or not pl_p.is_file():
-            raise FileNotFoundError(f"local pyannote input lacks {tf_p} or {pl_p}")
+        try:
+            tf_p, pl_p = local_components["plda"].files
+        except KeyError as error:
+            raise ValueError("VBx local pyannote pipeline config lacks plda") from error
     else:
         from huggingface_hub import hf_hub_download
         tf_p = hf_hub_download(PIPELINE, "xvec_transform.npz", subfolder="plda", token=token)

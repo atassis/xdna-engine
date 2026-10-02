@@ -12,9 +12,12 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import tomllib
 from dataclasses import asdict, dataclass
 from pathlib import Path
+
+from pyannote_local_inputs import PipelineComponent, pipeline_components, validate_local_pipeline_inputs
 
 
 @dataclass(frozen=True)
@@ -220,8 +223,6 @@ def required_members(recipe: Recipe, output: bool) -> tuple[tuple[str, ...], ...
             "parakeet": (("encoder-model.onnx",), ("encoder-model.onnx.data",),
                          ("decoder_joint.onnx", "decoder_joint-model.onnx"), ("vocab.txt",), ("preprocessor.onnx",)),
             "bge-base": (("config.json",), ("tokenizer.json",), ("model.safetensors", "pytorch_model.bin")),
-            "pyannote-community-1": (("config.yaml",), ("segmentation",)),
-            "pyannote-3.1": (("config.yaml",),),
             "whisper-turbo": (("config.json",), ("model.safetensors", "pytorch_model.bin")),
             "gemma3-270m": (("config.json",), ("tokenizer.json",), ("*.safetensors",)),
             "qwen3-0.6b": (("config.json",), ("tokenizer.json",), ("*.safetensors",)),
@@ -234,6 +235,9 @@ def required_members(recipe: Recipe, output: bool) -> tuple[tuple[str, ...], ...
 
 def require_members(recipe: Recipe, root: Path, output: bool) -> None:
     kind = "artifact output" if output else "model input"
+    if not output and recipe.model.startswith("pyannote"):
+        validate_local_pipeline_inputs(root)
+        return
     for choices in required_members(recipe, output):
         if not any(candidate for choice in choices for candidate in root.glob(choice)):
             raise FileNotFoundError(f"{recipe.model}: required {kind} missing under {root}: {' or '.join(choices)}")
@@ -429,6 +433,72 @@ def cached_snapshot(repo_id: str) -> Path | None:
     return None
 
 
+def update_pyannote_input(recipe: Recipe) -> None:
+    target = Path(recipe.inputs[0])
+    manifest = source_manifest_path(recipe)
+    try:
+        record = json.loads(manifest.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"{recipe.model}: cannot update local pyannote input without a valid source manifest") from error
+    components = pipeline_components(target)
+    sources: list[tuple[PipelineComponent, Path, tuple[Path, ...]]] = []
+    needs_update = False
+    for component in components:
+        missing = tuple(path for path in component.files if not path.is_file())
+        if component.source is None:
+            if missing:
+                raise FileNotFoundError(f"{recipe.model}: local pyannote input lacks {' or '.join(map(str, missing))}")
+            continue
+        needs_update = needs_update or bool(missing)
+        snapshot = cached_snapshot(component.source)
+        if snapshot is None:
+            raise FileNotFoundError(
+                f"{recipe.model}: authorized local HF cache required for {component.source}; no credential is read by the installer")
+        source_files = tuple(snapshot / path.name for path in component.files)
+        for source in source_files:
+            if not source.is_file():
+                raise FileNotFoundError(f"{recipe.model}: cached dependency lacks {source}")
+        sources.append((component, snapshot, source_files))
+    if not needs_update:
+        return
+    with tempfile.TemporaryDirectory(prefix=f".{target.name}.pyannote-", dir=target.parent) as directory:
+        staged = Path(directory) / target.name
+        copy_tree(target, staged)
+        dependencies = []
+        for component, snapshot, source_files in sources:
+            files = []
+            for source, destination in zip(source_files, component.files, strict=True):
+                staged_destination = staged / destination.relative_to(target)
+                staged_destination.parent.mkdir(parents=True, exist_ok=True)
+                if staged_destination.is_file():
+                    if tree_digest(staged_destination) != tree_digest(source):
+                        raise RuntimeError(f"{recipe.model}: local dependency differs from cached {component.source}: {destination}")
+                else:
+                    shutil.copy2(source, staged_destination)
+                files.append({"source": source.name, "target": str(destination.relative_to(target)),
+                              "sha256": tree_digest(source)})
+            dependencies.append({"component": component.name, "source": component.source,
+                                 "source_path": str(snapshot), "source_digest": tree_digest(snapshot),
+                                 "files": files})
+        validate_local_pipeline_inputs(staged)
+        staged_manifest = staged / manifest.name
+        staged_manifest.unlink(missing_ok=True)
+        record["dependencies"] = dependencies
+        record["materialized_digest"] = tree_digest(staged)
+        staged_manifest.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
+        backup = target.parent / f".{target.name}.pyannote-backup"
+        if backup.exists():
+            shutil.rmtree(backup)
+        os.replace(target, backup)
+        try:
+            os.replace(staged, target)
+        except Exception:
+            if not target.exists() and backup.exists():
+                os.replace(backup, target)
+            raise
+        shutil.rmtree(backup)
+
+
 def materialize_input(recipe: Recipe, source: Path, repo_id: str, authority: str) -> None:
     target = Path(recipe.inputs[0])
     if source.is_file():
@@ -477,7 +547,10 @@ def provision_inputs(recipes: list[Recipe], allow_download: bool) -> None:
                 continue
             raise RuntimeError(f"{recipe.model}: unmanaged local input {target}; use an HF cache source or provide a source manifest")
         except FileNotFoundError:
-            pass
+            if (recipe.model.startswith("pyannote") and target.is_dir()
+                    and (target / "config.yaml").is_file() and source_manifest_path(recipe).is_file()):
+                update_pyannote_input(recipe)
+                continue
         local = local_input_override(recipe)
         if local is not None:
             require_members(recipe, local if local.is_dir() else local.parent, False)

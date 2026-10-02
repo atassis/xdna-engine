@@ -266,6 +266,109 @@ class ModelArtifactDispatchPlanTests(unittest.TestCase):
             with self.assertRaisesRegex(FileNotFoundError, "preprocessor.onnx"):
                 validate_recipe_outputs(recipe)
 
+    def test_pyannote_local_checkpoint_path_is_a_file_and_missing_component_fails_preflight(self) -> None:
+        from pyannote_local_inputs import local_checkpoint_path
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "speaker-diarization-3.1"
+            root.mkdir()
+            (root / "config.yaml").write_text(
+                "pipeline:\n"
+                "  params:\n"
+                "    segmentation: example/segmentation\n"
+                "    embedding: example/embedding\n"
+            )
+            checkpoint = root / "segmentation/pytorch_model.bin"
+            checkpoint.parent.mkdir()
+            checkpoint.write_bytes(b"segmentation")
+            recipe = Recipe("pyannote-3.1", "scenarios/diarize-pyannote-3.1.toml", (str(root),), (), ())
+
+            self.assertEqual(local_checkpoint_path(root, "segmentation"), checkpoint)
+            with self.assertRaisesRegex(FileNotFoundError, "embedding/pytorch_model.bin"):
+                validate_recipe_inputs([recipe])
+
+    def test_pyannote_existing_pipeline_materializes_configured_cached_dependencies(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "inputs/pyannote/speaker-diarization-3.1"
+            target.mkdir(parents=True)
+            (target / "config.yaml").write_text(
+                "pipeline:\n"
+                "  params:\n"
+                "    segmentation: fixture/segmentation-model\n"
+                "    embedding: fixture/embedding-model\n"
+            )
+            source_manifest_path(Recipe("pyannote-3.1", "fixture", (str(target),), (), ())).write_text(
+                json.dumps({"model": "pyannote-3.1", "source": "pipeline-fixture"}) + "\n"
+            )
+            cache = root / "hub"
+            for repo_id, payload in (("fixture/segmentation-model", b"seg"),
+                                     ("fixture/embedding-model", b"emb")):
+                snapshot = cache / f"models--{repo_id.replace('/', '--')}/snapshots/revision"
+                snapshot.mkdir(parents=True)
+                (snapshot / "pytorch_model.bin").write_bytes(payload)
+            recipe = Recipe("pyannote-3.1", "scenarios/diarize-pyannote-3.1.toml", (str(target),), (), ())
+            prior_cache = os.environ.get("HF_HUB_CACHE")
+            prior_token = os.environ.pop("HF_TOKEN", None)
+            os.environ["HF_HUB_CACHE"] = str(cache)
+            try:
+                provision_inputs([recipe], allow_download=False)
+                first_manifest = source_manifest_path(recipe).read_bytes()
+                provision_inputs([recipe], allow_download=False)
+            finally:
+                if prior_cache is None:
+                    os.environ.pop("HF_HUB_CACHE", None)
+                else:
+                    os.environ["HF_HUB_CACHE"] = prior_cache
+                if prior_token is not None:
+                    os.environ["HF_TOKEN"] = prior_token
+
+            self.assertEqual((target / "segmentation/pytorch_model.bin").read_bytes(), b"seg")
+            self.assertEqual((target / "embedding/pytorch_model.bin").read_bytes(), b"emb")
+            record = json.loads(source_manifest_path(recipe).read_text())
+            self.assertEqual(
+                [dependency["source"] for dependency in record["dependencies"]],
+                ["fixture/segmentation-model", "fixture/embedding-model"],
+            )
+            self.assertEqual(source_manifest_path(recipe).read_bytes(), first_manifest)
+
+    def test_pyannote_dependency_manifest_records_the_full_configured_closure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "inputs/pyannote/speaker-diarization-3.1"
+            target.mkdir(parents=True)
+            (target / "config.yaml").write_text(
+                "pipeline:\n"
+                "  params:\n"
+                "    segmentation: fixture/segmentation-model\n"
+                "    embedding: fixture/embedding-model\n"
+            )
+            (target / "segmentation").mkdir()
+            (target / "segmentation/pytorch_model.bin").write_bytes(b"seg")
+            recipe = Recipe("pyannote-3.1", "scenarios/diarize-pyannote-3.1.toml", (str(target),), (), ())
+            source_manifest_path(recipe).write_text(json.dumps({"model": "pyannote-3.1"}) + "\n")
+            cache = root / "hub"
+            for repo_id, payload in (("fixture/segmentation-model", b"seg"),
+                                     ("fixture/embedding-model", b"emb")):
+                snapshot = cache / f"models--{repo_id.replace('/', '--')}/snapshots/revision"
+                snapshot.mkdir(parents=True)
+                (snapshot / "pytorch_model.bin").write_bytes(payload)
+            prior_cache = os.environ.get("HF_HUB_CACHE")
+            os.environ["HF_HUB_CACHE"] = str(cache)
+            try:
+                provision_inputs([recipe], allow_download=False)
+            finally:
+                if prior_cache is None:
+                    os.environ.pop("HF_HUB_CACHE", None)
+                else:
+                    os.environ["HF_HUB_CACHE"] = prior_cache
+
+            record = json.loads(source_manifest_path(recipe).read_text())
+            self.assertEqual(
+                [dependency["source"] for dependency in record["dependencies"]],
+                ["fixture/segmentation-model", "fixture/embedding-model"],
+            )
+
     def test_publish_keeps_the_old_tree_as_rollback_and_writes_verified_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
