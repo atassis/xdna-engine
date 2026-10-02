@@ -36,6 +36,20 @@ CONFIG = Path.home() / ".config/npu/engine.toml"
 
 
 class ModelArtifactDispatchPlanTests(unittest.TestCase):
+    def test_weight_recipes_bind_the_declared_iron_source(self) -> None:
+        for model, scenario, step in (
+            ("gemma3-270m", "scenarios/generate-gemma3-270m.toml", "weights"),
+            ("qwen3-0.6b", "scenarios/generate-qwen3-0.6b.toml", "weights"),
+            ("qwen3.5-4b", "scenarios/generate-qwen3.5-4b.toml", "weights"),
+            ("gemma4-12b", "scenarios/generate-gemma4-12b-resident-256k.toml", "data"),
+        ):
+            with self.subTest(model=model):
+                recipe = recipe_for(model, scenario, REPO, REPO / "data/artifacts",
+                                    REPO / "data/model-inputs", REPO / "data/build")
+                build = next(command for command in recipe.commands if command.step == step)
+                self.assertEqual(build.env.get("IRON_DIR"), str(REPO / "third_party/iron"))
+                self.assertEqual(build.env.get("PYTHONPATH"), str(REPO / "third_party/iron"))
+
     def test_install_provisions_weight_dump_dependencies_before_rust_build(self) -> None:
         install = (REPO / "install.sh").read_text()
         self.assertIn("requirements-model-weights.txt", install)

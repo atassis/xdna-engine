@@ -85,6 +85,7 @@ def recipe_for(model: str, scenario: str, repo: Path, artifacts: Path, inputs: P
         "MODEL_PYANNOTE_COMMUNITY_PY", str(repo / ".venv-pyannote-community/bin/python"))
     npu = os.environ.get("NPU_BIN", "npu")
     scripts = repo / "scripts"
+    weight_env = {"IRON_DIR": str(repo / "third_party/iron"), "PYTHONPATH": str(repo / "third_party/iron")}
     out = lambda rel: path(artifacts, rel)
     src = lambda rel: path(inputs, rel)
 
@@ -137,7 +138,7 @@ def recipe_for(model: str, scenario: str, repo: Path, artifacts: Path, inputs: P
             model, scenario, (src("gemma3-270m/checkpoint"),), (decode, weights, tokenizer),
             (
                 command("weights", [iron_py, str(scripts / "dump_llm_weights.py"), "--spec", model, "--checkpoint-dir", src("gemma3-270m/checkpoint"), "--out", weights, "--quant", "int4", "--quant-group", "32", "--quant-full-range", "--quant-leaves", "gate_proj,up_proj,down_proj,o_proj,embed_tokens"],
-                        IRON=str(repo / "third_party/iron")),
+                        **weight_env),
                 command("decode", ["bash", str(scripts / "build_llm_decode.sh"), model, "", decode], WEIGHTS=weights),
                 command("tokenizer", [py, str(scripts / "model_artifact_dispatch.py"), "--copy-tokenizer", src("gemma3-270m/checkpoint"), tokenizer]),
             ),
@@ -147,7 +148,7 @@ def recipe_for(model: str, scenario: str, repo: Path, artifacts: Path, inputs: P
         return Recipe(
             model, scenario, (src("qwen3-0.6b/checkpoint"),), (decode, prefill, weights, tokenizer),
             (
-                command("weights", [iron_py, str(scripts / "dump_llm_weights.py"), "--spec", model, "--checkpoint-dir", src("qwen3-0.6b/checkpoint"), "--out", weights]),
+                command("weights", [iron_py, str(scripts / "dump_llm_weights.py"), "--spec", model, "--checkpoint-dir", src("qwen3-0.6b/checkpoint"), "--out", weights], **weight_env),
                 command("decode", ["bash", str(scripts / "build_llm_decode.sh"), model, "", decode], WEIGHTS=weights, WINDOW_RUNGS="256,512,1024,2048", KV_BLOCK_T="128", GEN_EXTRA="--max-seq 4096"),
                 command("prefill", ["bash", str(scripts / "build_prefill.sh"), "28", "256", "4096", prefill], WEIGHTS=weights, SPEC=model, DECODE_META=f"{decode}/meta.json"),
                 command("tokenizer", [py, str(scripts / "model_artifact_dispatch.py"), "--copy-tokenizer", src("qwen3-0.6b/checkpoint"), tokenizer]),
@@ -166,7 +167,7 @@ def recipe_for(model: str, scenario: str, repo: Path, artifacts: Path, inputs: P
         return Recipe(
             model, scenario, (src("gemma4-12b/checkpoint"),), (resident, tokenizer, checkpoint, *data_outputs),
             (
-                command("data", ["bash", str(repo / "designs/resident_forward/recipes/gemma4_data.sh"), "--out", str(artifacts), "--checkpoint-dir", src("gemma4-12b/checkpoint")]),
+                command("data", ["bash", str(repo / "designs/resident_forward/recipes/gemma4_data.sh"), "--out", str(artifacts), "--checkpoint-dir", src("gemma4-12b/checkpoint")], **weight_env),
                 command("build", ["bash", str(repo / "designs/resident_forward/recipes/rf48C.sh")], RF_BUILD=rf_build),
                 command("package", [py, str(scripts / "model_artifact_dispatch.py"), "--package-gemma4", "--repo", str(repo), "--artifacts-root", str(artifacts), "--build-dir", rf_build, "--out", resident, "--tokenizer-source", src("gemma4-12b/checkpoint"), "--tokenizer-out", tokenizer]),
             ),
@@ -176,7 +177,7 @@ def recipe_for(model: str, scenario: str, repo: Path, artifacts: Path, inputs: P
         return Recipe(
             model, scenario, (src("qwen3.5-4b/checkpoint"),), (decode, prefill, weights, tokenizer),
             (
-                command("weights", [iron_py, str(scripts / "dump_llm_weights.py"), "--spec", model, "--checkpoint-dir", src("qwen3.5-4b/checkpoint"), "--out", weights]),
+                command("weights", [iron_py, str(scripts / "dump_llm_weights.py"), "--spec", model, "--checkpoint-dir", src("qwen3.5-4b/checkpoint"), "--out", weights], **weight_env),
                 command("decode", ["bash", str(scripts / "build_llm_decode.sh"), model, "", decode], WEIGHTS=weights, GEN_EXTRA="--max-seq 4096", ACT_POLY="1", DECODE_GDR_LIMBS="1", PRECISION='{"mlp": "int4/g32/clip", "attn_o": "int4/g32/clip", "qkv": "int4/g32/clip"}'),
                 command("prefill", ["bash", str(scripts / "build_prefill.sh"), "32", "256", "4096", prefill], WEIGHTS=weights, SPEC=model, NO_GOLDEN="1", PREFILL_SEGMENTS="16", PREFILL_BFP16="0", PREFILL_ACC="1", ACT_POLY="1", PREFILL_ACT_FAST="1", DECODE_META=f"{decode}/meta.json"),
                 command("tokenizer", [py, str(scripts / "model_artifact_dispatch.py"), "--copy-tokenizer", src("qwen3.5-4b/checkpoint"), tokenizer]),
