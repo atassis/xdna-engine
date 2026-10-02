@@ -1,18 +1,15 @@
 #!/usr/bin/env bash
-# Point .venv-iron at a toolchain instance's python (off the wheel), reversibly, via the aie.pth redirect.
-#   toolchain_wire.sh on   -> wire to the current lock's instance (builds it if needed)
-#   toolchain_wire.sh off  -> restore the wheel
+# Bind .venv-iron's aie.pth to the selected toolchain instance.
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PTH="$REPO/.venv-iron/lib/python3.14/site-packages/aie.pth"
-BAK="$PTH.wheel-bak"
+source "$REPO/scripts/lib/fork_python_binding.sh"
 case "${1:-}" in
   on)
     INST="$("$REPO/scripts/toolchain_up.sh")"
-    [ -f "$BAK" ] || cp "$PTH" "$BAK"
-    printf '%s\n' "$INST/python" > "$PTH"
+    bind_fork_python "$REPO/.venv-iron/bin/python" "$INST"
     echo "[wire] aie.pth -> $INST/python" ;;
   off)
-    [ -f "$BAK" ] && mv "$BAK" "$PTH" && echo "[wire] restored wheel aie.pth" || echo "[wire] no backup; already wheel" ;;
-  *) echo "usage: toolchain_wire.sh on|off" >&2; exit 2 ;;
+    echo "[wire] ERROR: wheel Python fallback is unsupported; re-run scripts/toolchain_up.sh" >&2
+    exit 1 ;;
+  *) echo "usage: toolchain_wire.sh on" >&2; exit 2 ;;
 esac

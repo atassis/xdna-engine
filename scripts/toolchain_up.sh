@@ -5,6 +5,7 @@
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$REPO/scripts/lib/init_source_aiebu.sh"
+source "$REPO/scripts/lib/fork_python_binding.sh"
 set -a; . "$REPO/toolchain.lock"; set +a
 source "$REPO/scripts/fast_build_env.sh"   # ccache + lld (no-ops if absent)
 source "$REPO/scripts/toolchain_gc.sh"
@@ -249,6 +250,7 @@ if [ -f "$PYPKG" ] && grep -q "def resolve_program(self, device_name" "$PYPKG"; 
   _apply_kernel_compile_speedups  # tethered: PCH + parallel kernel compiles (byte-identical output)
   _recognise_gorgon_point  # backfill the npu2 device-name entry (else every device runner raises)
   _build_parameter_scratchpad  # backfill the scratchpad host binding (else scratchpad tests silently skip)
+  bind_fork_python "$REPO/.venv-iron/bin/python" "$INST"
   touch "$INST"          # record last-used (for gc_instances keep-newest-N); warm path never GCs
   echo "$INST"; exit 0   # cached, self-consistent
 fi
@@ -335,6 +337,7 @@ ln -sfn "$INST/build/bin" "$INST/bin"
 _build_aie_translate
 _build_vendored_aiebu_asm
 _link_vendored_tools
+bind_fork_python "$REPO/.venv-iron/bin/python" "$INST"
 touch "$INST"                                          # record last-used before GC (protects it as newest)
 gc_instances "${TOOLCHAIN_HOME:-$XDNA_CACHE/instances}" "${TOOLCHAIN_KEEP:-4}" "$INST"
 echo "$INST"
