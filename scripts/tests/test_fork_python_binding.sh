@@ -59,6 +59,16 @@ test_binds_the_selected_fork_over_the_conflicting_wheel() {
     fail "binding did not replace aie.pth with the fork path"
   fi
 
+  mkdir -p "$t/instance/src/python"
+  mv "$t/instance/python/aie/iron" "$t/instance/src/python/iron"
+  ln -s ../../src/python/iron "$t/instance/python/aie/iron"
+  bind_fork_python "$t/venv/bin/python" "$t/instance"
+  if [ "$(import_origin "$t/venv/bin/python")" = "$t/instance/src/python/iron/__init__.py" ]; then
+    pass "binding accepts the selected instance's source symlink layout"
+  else
+    fail "binding rejected the source symlink layout"
+  fi
+
   first="$(cat "$site/aie.pth")"
   bind_fork_python "$t/venv/bin/python" "$t/instance/../instance"
   second="$(cat "$site/aie.pth")"

@@ -11,7 +11,7 @@ bind_fork_python() {
     return 1
   fi
 
-  local python="$1" instance="$2" prefix base_prefix site instance_root fork_python resolved tmp
+  local python="$1" instance="$2" prefix base_prefix site instance_root fork_python resolved expected tmp
   local -a _fork_python_binding_env
   case "$instance" in
     /*) ;;
@@ -52,8 +52,7 @@ bind_fork_python() {
 
   resolved="$(env -u PYTHONPATH "$python" -c 'import pathlib, aie.iron; print(pathlib.Path(aie.iron.__file__).resolve())' 2>&1)" \
     || { _fork_python_binding_error "fork import verification failed: $resolved"; return 1; }
-  case "$resolved" in
-    "$fork_python"/aie/iron/*) ;;
-    *) _fork_python_binding_error "fork import resolved outside selected instance: $resolved"; return 1 ;;
-  esac
+  expected="$(realpath -e -- "$fork_python/aie/iron/__init__.py")" || return 1
+  [ "$resolved" = "$expected" ] \
+    || { _fork_python_binding_error "fork import does not match selected instance: $resolved"; return 1; }
 }
