@@ -22,14 +22,16 @@
 # for the next family added, and a silent overwrite in a published set is indistinguishable from a
 # complete one.
 #
-#   publish_kernels.sh <dest-dir> [<mlir-aie-root>]
+#   publish_kernels.sh <dest-dir> [<mlir-aie-root>] [<engine-config>] [<engine-root>]
 #
 # The source root is an argument because `install.sh` exposes ENGINE_MLIR_AIE as a knob; a publisher
 # that hardcoded $REPO/mlir-aie would silently ignore an operator who set it.
 set -uo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-DEST="${1:?usage: publish_kernels.sh <dest-dir> [<mlir-aie-root>]}"
+DEST="${1:?usage: publish_kernels.sh <dest-dir> [<mlir-aie-root>] [<engine-config>] [<engine-root>]}"
 MLIR_AIE_ROOT="${2:-$REPO/mlir-aie}"
+ENGINE_CONFIG="${3:-${NPU_ENGINE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/npu/engine.toml}}"
+ENGINE_ROOT="${4:-$REPO}"
 [ -d "$MLIR_AIE_ROOT" ] || { echo "[publish-kernels] ERROR: no mlir-aie root at '$MLIR_AIE_ROOT'" >&2; exit 1; }
 PE="$MLIR_AIE_ROOT/programming_examples"
 
@@ -125,12 +127,7 @@ done
 [ "$fail" -eq 0 ] || exit 1
 note "published $n file(s) -> $DEST  (pin $stamp)"
 
-# Regenerate kernel_manifest.json per published family, so kernel_registry::resolve_checked has a
-# content-hash record to verify a load against. Without this the manifest machinery exists but sees
-# nothing: measured 2026-09-12, a full publish leaves every family UNVERIFIED, not because anything
-# is wrong but because nothing had ever called this. Soft failure -- a missing npu-dev
-# binary (a dev-only path, or a standalone run before `cargo build --release`) should not fail an
-# otherwise-successful publish; it should be loud so the gap doesn't go quiet again.
+# Regenerate manifests from the same engine-config closure used for build and verify.
 GEN_MANIFEST="${GEN_KERNEL_MANIFEST_BIN:-}"
 if [ -z "$GEN_MANIFEST" ]; then
   target_dir="$(cd "$REPO/rust" && cargo metadata --format-version 1 --no-deps \
@@ -138,19 +135,13 @@ if [ -z "$GEN_MANIFEST" ]; then
   [ -n "$target_dir" ] || target_dir="$REPO/rust/target"
   GEN_MANIFEST="$target_dir/release/npu-dev"
 fi
-if [ -x "$GEN_MANIFEST" ]; then
-  fam_dirs=()
-  for fam in "$DEST"/*/; do
-    [ -d "$fam" ] || continue
-    fam_dirs+=("${fam%/}")
-  done
-  # --repo-root makes each manifest record the kernel-source digest it was built from, so a
-  # later verify can see a stale-but-intact artifact instead of reporting it Present.
-  if [ "${#fam_dirs[@]}" -gt 0 ] && "$GEN_MANIFEST" kernels-manifest --repo-root "$REPO" "${fam_dirs[@]}"; then
-    note "regenerated kernel_manifest.json for ${#fam_dirs[@]} published famil$([ "${#fam_dirs[@]}" -eq 1 ] && echo y || echo ies)"
-  else
-    note "WARNING: npu-dev kernels-manifest failed on one or more published families -- resolve_checked will report them unverified"
-  fi
-else
-  note "WARNING: npu-dev not found/executable at $GEN_MANIFEST -- published kernels stay UNVERIFIED (no content-hash record). Build the release workspace first, or set GEN_KERNEL_MANIFEST_BIN."
-fi
+[ -x "$GEN_MANIFEST" ] || { err "npu-dev not found/executable at $GEN_MANIFEST"; exit 1; }
+fam_dirs=()
+for fam in "$DEST"/*/; do
+  [ -d "$fam" ] || continue
+  fam_dirs+=("${fam%/}")
+done
+[ "${#fam_dirs[@]}" -gt 0 ] || { err "no published family directories under $DEST"; exit 1; }
+"$GEN_MANIFEST" kernels-manifest --repo-root "$REPO" --engine-root "$ENGINE_ROOT" --config "$ENGINE_CONFIG" "${fam_dirs[@]}" \
+  || { err "npu-dev kernels-manifest failed"; exit 1; }
+note "regenerated kernel_manifest.json for ${#fam_dirs[@]} published famil$([ "${#fam_dirs[@]}" -eq 1 ] && echo y || echo ies)"

@@ -12,7 +12,7 @@
 //!   cargo run -p npu-asr --bin gen_kernel_manifest -- artifacts/parakeet/ln artifacts/asr
 //!
 //! With `--repo-root <path>` each directory's manifest also records the digest of the kernel
-//! SOURCE its family declares (`declared_kernels.json`'s `sources`), so a later verify can tell a
+//! SOURCE its scenario-owned declaration lists, so a later verify can tell a
 //! stale-but-intact artifact from a fresh one. The family is the directory's own basename, which
 //! is how `publish_kernels.sh` lays `<dest>/<family>` out. Without the flag the digest is left
 //! absent, which reports as unverified rather than as fresh.
@@ -22,8 +22,14 @@
 
 use std::path::PathBuf;
 
+use npu_asr::kernel_registry::{
+    default_engine_config_path, load_declared_kernel_set_from_engine_config, source_digest,
+};
+
 pub fn run(argv: Vec<String>) {
     let mut repo_root: Option<PathBuf> = None;
+    let mut config: Option<PathBuf> = None;
+    let mut engine_root: Option<PathBuf> = None;
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut args = argv.into_iter().skip(1);
     while let Some(a) = args.next() {
@@ -35,32 +41,67 @@ pub fn run(argv: Vec<String>) {
                     std::process::exit(2);
                 }
             },
+            "--config" => match args.next() {
+                Some(v) => config = Some(PathBuf::from(v)),
+                None => {
+                    eprintln!("kernels-manifest: --config needs an engine.toml path");
+                    std::process::exit(2);
+                }
+            },
+            "--engine-root" => match args.next() {
+                Some(v) => engine_root = Some(PathBuf::from(v)),
+                None => {
+                    eprintln!("kernels-manifest: --engine-root needs a directory");
+                    std::process::exit(2);
+                }
+            },
             _ => dirs.push(PathBuf::from(a)),
         }
     }
     if dirs.is_empty() {
-        eprintln!("usage: gen_kernel_manifest [--repo-root <path>] <artifact-dir> [<artifact-dir> ...]");
+        eprintln!("usage: kernels-manifest --repo-root <path> [--config <engine.toml>] <artifact-dir> [<artifact-dir> ...]");
         std::process::exit(2);
     }
-    let declared = repo_root
-        .as_deref()
-        .and_then(|r| npu_asr::kernel_registry::load_declared_kernel_set(r).ok());
+    let repo_root = match repo_root {
+        Some(root) => root,
+        None => {
+            eprintln!("kernels-manifest: --repo-root is required to derive source digests");
+            std::process::exit(2);
+        }
+    };
+    let config = config.unwrap_or_else(default_engine_config_path);
+    let engine_root = engine_root.unwrap_or_else(|| repo_root.clone());
+    let declared = match load_declared_kernel_set_from_engine_config(&repo_root, &engine_root, &config) {
+        Ok(declared) => declared,
+        Err(e) => {
+            eprintln!("kernels-manifest: could not resolve served kernel declarations from {}: {e}", config.display());
+            std::process::exit(2);
+        }
+    };
 
     let mut had_error = false;
     for dir in dirs {
-        // The family is the directory's basename; a dir that is not a declared family simply
-        // gets no digest rather than a wrong one.
-        let src = match (&repo_root, &declared) {
-            (Some(root), Some(decl)) => dir
-                .file_name()
-                .and_then(|f| f.to_str())
-                .and_then(|fam| decl.get(fam))
-                .and_then(|d| {
-                    npu_asr::kernel_registry::source_digest(root, &d.sources).ok().flatten()
-                }),
-            _ => None,
+        let family = match dir.file_name().and_then(|f| f.to_str()) {
+            Some(family) => family,
+            None => {
+                eprintln!("kernels-manifest: cannot derive family from {}", dir.display());
+                had_error = true;
+                continue;
+            }
         };
-        match npu_asr::kernel_registry::generate_manifest_with_source(&dir, src.as_deref()) {
+        let Some(declaration) = declared.get(family) else {
+            println!("[kernels-manifest] skip undeclared family {}", dir.display());
+            continue;
+        };
+        let source = match source_digest(&repo_root, &declaration.sources) {
+            Ok(source) => source,
+            Err(e) => {
+                eprintln!("kernels-manifest: digest {}: {e}", dir.display());
+                had_error = true;
+                continue;
+            }
+        };
+        match npu_asr::kernel_registry::generate_manifest_with_source(&dir, source.as_deref()) {
             Ok(manifest) => {
                 let n = manifest.len();
                 match npu_asr::kernel_registry::write_manifest(&dir, &manifest) {

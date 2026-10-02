@@ -11,3 +11,13 @@ max_seq = 400
 precision = "bf16"
 [artifacts]
 weights = "artifacts"
+
+[kernels.whole_array]
+required = [
+  "512x800x768_64x32x96_8c_modalid",
+  "512x800x1536_64x32x96_8c_modalid",
+  "512x800x3072_64x32x96_8c_modalid",
+  "512x800x3072_64x32x96_8c_modalsilu",
+]
+recipe = "scripts/kernel_families/whole_array.sh"
+sources = ["aie_kernels", "designs/whole_array_fused", "scripts/kernel_families/whole_array.sh", "scripts/kernel_families/whole_array_recipe.py"]

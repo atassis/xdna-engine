@@ -11,3 +11,19 @@ max_seq = 2040
 precision = "bf16"
 [artifacts]
 weights = "artifacts/parakeet"
+
+[kernels.whole_array]
+required = ["512x1024x4096_32x32x128_8c_modalsilubf16outpanel1024"]
+one_of = [["512x1024x4096_64x32x128_8c_modalsilukrtp", "512x1024x4096_64x32x128_8c_modalsilu"]]
+recipe = "scripts/kernel_families/whole_array.sh"
+sources = ["aie_kernels", "designs/whole_array_fused", "scripts/kernel_families/whole_array.sh", "scripts/kernel_families/whole_array_recipe.py"]
+
+[kernels.layernorm]
+required = ["ctxln_512x1024", "affcast_512x1024"]
+recipe = "scripts/kernel_families/layernorm.sh"
+sources = ["aie_kernels", "scripts/kernel_families/layernorm.sh"]
+
+[kernels.dwconv1d]
+required = ["dwconv_silu_t_1024x400"]
+recipe = "scripts/kernel_families/dwconv1d.sh"
+sources = ["aie_kernels", "scripts/kernel_families/dwconv1d.sh"]

@@ -17,3 +17,12 @@ kernel = "zeropad"
 
 [artifacts]
 weights = "artifacts/whisper-turbo"
+
+[kernels.whole_array]
+required = [
+  "512x1312x1280_32x32x32_8c_modalid",
+  "512x1312x5120_32x32x32_8c_modalid",
+  "512x1312x5120_32x32x32_8c_modalsilu",
+]
+recipe = "scripts/kernel_families/whole_array.sh"
+sources = ["aie_kernels", "designs/whole_array_fused", "scripts/kernel_families/whole_array.sh", "scripts/kernel_families/whole_array_recipe.py"]

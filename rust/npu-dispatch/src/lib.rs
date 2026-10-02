@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const WA_SUBDIR: &str =
     "mlir-aie/programming_examples/basic/matrix_multiplication/whole_array/build";
+pub const LN_SUBDIR: &str = "mlir-aie/programming_examples/ml/layernorm/build";
 pub const DW_SUBDIR: &str = "mlir-aie/programming_examples/ml/dwconv1d/build";
 
 /// The resident-kernel row-tile forced by the whole-array kernel shape.

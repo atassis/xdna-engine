@@ -16,6 +16,15 @@ weights = "artifacts/bge-base/encoder"
 tokenizer = "artifacts/bge-base/tokenizer.json"
 onnx_ref = "artifacts/bge-base/model.onnx"
 
+[kernels.whole_array]
+required = [
+  "512x800x768_64x32x96_8c_modalid",
+  "512x800x3072_64x32x96_8c_modalid",
+  "512x800x3072_64x32x96_8c_modalsilu",
+]
+recipe = "scripts/kernel_families/whole_array.sh"
+sources = ["aie_kernels", "designs/whole_array_fused", "scripts/kernel_families/whole_array.sh", "scripts/kernel_families/whole_array_recipe.py"]
+
 [embeddings]
 pooling = "mean"
 normalize = true

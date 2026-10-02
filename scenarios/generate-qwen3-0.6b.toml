@@ -76,3 +76,5 @@ tokenizer_dir = "artifacts/qwen3-0.6b/tokenizer"
 
 [generation]
 max_tokens = 1024
+
+[kernels]

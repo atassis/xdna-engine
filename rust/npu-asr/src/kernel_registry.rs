@@ -66,6 +66,24 @@ pub fn resolve_kernel_dir(root: &Path, legacy_subdir: &str) -> PathBuf {
     if published.is_dir() { published } else { root.join(legacy_subdir) }
 }
 
+/// Whether `dir` contains the complete file pair for `stem`.
+pub fn artifact_pair_present(dir: &Path, stem: &str) -> bool {
+    xclbin_path(dir, stem).is_file() && insts_path(dir, stem).is_file()
+}
+
+/// Prefer a complete published-family artifact pair, falling back only when that pair is absent.
+/// This supports installs that are migrating a legacy bundle into `kernels/<family>` without
+/// allowing a half-published family directory to shadow a complete legacy pair.
+pub fn resolve_artifact_dir<'a>(primary: &'a Path, fallback: &'a Path, stem: &str) -> Option<&'a Path> {
+    if artifact_pair_present(primary, stem) {
+        Some(primary)
+    } else if artifact_pair_present(fallback, stem) {
+        Some(fallback)
+    } else {
+        None
+    }
+}
+
 /// The family name a legacy build path publishes under: the directory ABOVE `build`.
 ///
 /// `.../ml/layernorm/build` -> `layernorm`. One subdirectory per family rather than one flat
@@ -241,7 +259,7 @@ pub fn manifest_path(dir: &Path) -> PathBuf {
 pub type Manifest = BTreeMap<String, ManifestEntry>;
 
 /// File extensions that count as kernel source for [`source_digest`].
-const SOURCE_EXTS: [&str; 4] = ["cc", "cpp", "h", "hpp"];
+const SOURCE_EXTS: [&str; 6] = ["cc", "cpp", "h", "hpp", "py", "mk"];
 
 /// Digest every kernel source under `paths` (each a file or directory, relative to `repo_root`).
 ///
@@ -292,7 +310,9 @@ fn collect_sources(path: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
         let p = entry?.path();
         if p.is_dir() {
             collect_sources(&p, out)?;
-        } else if p.extension().and_then(|e| e.to_str()).is_some_and(|e| SOURCE_EXTS.contains(&e)) {
+        } else if p.extension().and_then(|e| e.to_str()).is_some_and(|e| SOURCE_EXTS.contains(&e))
+            || p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("Makefile"))
+        {
             out.push(p);
         }
     }
@@ -613,7 +633,12 @@ pub fn check_toolchain_freshness(dir: &Path, repo_root: &Path) -> Result<(), Fre
 /// One family's declared requirement: every stem that must exist under `kernels/<family>/`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DeclaredFamily {
+    #[serde(default)]
     pub required: Vec<String>,
+    /// Ordered artifact alternatives. Each inner list requires one verified stem; the first entry
+    /// is the build target when none is installed.
+    #[serde(default)]
+    pub one_of: Vec<Vec<String>>,
     /// Path (relative to the repo root) to this family's adapter script. Contract:
     /// `<recipe> build <stem>` produces the artifact `resolve()` expects; `<recipe> list-variants
     /// <range-spec>` optionally prints stems for sweep mode.
@@ -630,20 +655,177 @@ pub struct DeclaredFamily {
 /// declared family maps 1:1 onto `resolve_kernel_dir`'s `kernels/<family>` destination.
 pub type DeclaredKernelSet = BTreeMap<String, DeclaredFamily>;
 
-/// The checked-in declaration file, at `repo_root/config` -- NOT `MANIFEST_FILE`, and not inside any
-/// kernel build/publish directory. Those are per-directory and generated; this is repo-wide and
-/// hand-maintained. Two different files because they answer two different questions, not two
-/// formats racing to answer the same one.
-pub const DECLARED_KERNELS_FILE: &str = "declared_kernels.json";
-
-pub fn declared_kernels_path(repo_root: &Path) -> PathBuf {
-    repo_root.join("config").join(DECLARED_KERNELS_FILE)
+#[derive(serde::Deserialize)]
+struct EngineKernelConfig {
+    #[serde(default, rename = "model")]
+    models: Vec<EngineKernelModel>,
 }
 
-pub fn load_declared_kernel_set(repo_root: &Path) -> std::io::Result<DeclaredKernelSet> {
-    let bytes = std::fs::read(declared_kernels_path(repo_root))?;
-    serde_json::from_slice(&bytes)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+#[derive(serde::Deserialize)]
+struct EngineKernelModel {
+    name: String,
+    scenario: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ScenarioKernelConfig {
+    #[serde(default)]
+    kernels: Option<DeclaredKernelSet>,
+}
+
+fn safe_relative_path(path: &str) -> bool {
+    let path = Path::new(path);
+    !path.as_os_str().is_empty()
+        && !path.is_absolute()
+        && path.components().all(|part| matches!(part, std::path::Component::Normal(_)))
+}
+
+fn safe_kernel_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+fn valid_declared_stem(stem: &str) -> bool {
+    let tokens = parse_stem_tokens(stem);
+    match tokens.shape.as_deref() {
+        Some([_, _]) => tokens.name.is_some(),
+        Some([_, _, _]) => tokens.tile.is_some() && tokens.cols.is_some(),
+        _ => false,
+    }
+}
+
+/// Validate a declaration before a builder can turn it into a filesystem path or subprocess.
+pub fn validate_declared_kernel_set(repo_root: &Path, declared: &DeclaredKernelSet) -> Result<(), String> {
+    for (family, declaration) in declared {
+        if !safe_kernel_name(family) {
+            return Err(format!("unsafe family name {family:?}"));
+        }
+        if !safe_relative_path(&declaration.recipe) {
+            return Err(format!("unsafe recipe path {:?} for family '{family}'", declaration.recipe));
+        }
+        let recipe = repo_root.join(&declaration.recipe);
+        if !recipe.is_file() || !is_executable(&recipe) {
+            return Err(format!("family '{family}' has no runnable recipe at {}", recipe.display()));
+        }
+        for source in &declaration.sources {
+            if !safe_relative_path(source) {
+                return Err(format!("unsafe source path {source:?} for family '{family}'"));
+            }
+            if !repo_root.join(source).exists() {
+                return Err(format!("family '{family}' source path does not exist: {source}"));
+            }
+        }
+        for stem in declaration.required.iter().chain(declaration.one_of.iter().flatten()) {
+            if !safe_kernel_name(stem) {
+                return Err(format!("unsafe stem {stem:?} for family '{family}'"));
+            }
+            if !valid_declared_stem(stem) {
+                return Err(format!(
+                    "stem {stem:?} for family '{family}' does not match the kernel artifact grammar"
+                ));
+            }
+        }
+        if declaration.one_of.iter().any(Vec::is_empty) {
+            return Err(format!("family '{family}' contains an empty one_of alternative"));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the common-kernel closure for the models an engine config actually serves. The lower
+/// registry owns this parser so tools can aggregate scenario declarations without importing the
+/// upper `npu-models` crate.
+pub fn load_declared_kernel_set_from_engine_config(
+    repo_root: &Path,
+    engine_root: &Path,
+    engine_config: &Path,
+) -> Result<DeclaredKernelSet, String> {
+    let engine: EngineKernelConfig = toml::from_str(
+        &std::fs::read_to_string(engine_config)
+            .map_err(|e| format!("read engine config {}: {e}", engine_config.display()))?,
+    )
+    .map_err(|e| format!("parse engine config {}: {e}", engine_config.display()))?;
+
+    if engine.models.is_empty() {
+        return Err(format!("engine config {} declares no [[model]] entries", engine_config.display()));
+    }
+
+    let mut merged = DeclaredKernelSet::new();
+    for model in engine.models {
+        let scenario = Path::new(&model.scenario);
+        if !scenario.is_absolute() && !safe_relative_path(&model.scenario) {
+            return Err(format!(
+                "model '{}' has unsafe scenario path {:?}",
+                model.name, model.scenario
+            ));
+        }
+        let scenario_path = if scenario.is_absolute() {
+            scenario.to_path_buf()
+        } else {
+            engine_root.join(scenario)
+        };
+        let scenario: ScenarioKernelConfig = toml::from_str(
+            &std::fs::read_to_string(&scenario_path)
+                .map_err(|e| format!("model '{}' read scenario {}: {e}", model.name, scenario_path.display()))?,
+        )
+        .map_err(|e| format!("model '{}' parse scenario {}: {e}", model.name, scenario_path.display()))?;
+        let Some(kernels) = scenario.kernels else {
+            return Err(format!(
+                "model '{}' scenario {} omits [kernels]; declare an explicit empty table when it has no common kernels",
+                model.name, model.scenario
+            ));
+        };
+        for (family, mut declaration) in kernels {
+            stable_dedupe(&mut declaration.required);
+            for alternatives in &mut declaration.one_of {
+                stable_dedupe(alternatives);
+            }
+            stable_dedupe_alternatives(&mut declaration.one_of);
+            match merged.get_mut(&family) {
+                None => {
+                    merged.insert(family, declaration);
+                }
+                Some(current) => {
+                    if current.recipe != declaration.recipe || current.sources != declaration.sources {
+                        return Err(format!(
+                            "model '{}' scenario {} conflicts on family '{}': recipe/sources must match every served declaration",
+                            model.name, model.scenario, family
+                        ));
+                    }
+                    current.required.extend(declaration.required);
+                    stable_dedupe(&mut current.required);
+                    current.one_of.extend(declaration.one_of);
+                    stable_dedupe_alternatives(&mut current.one_of);
+                }
+            }
+        }
+    }
+    validate_declared_kernel_set(repo_root, &merged)?;
+    Ok(merged)
+}
+
+fn stable_dedupe(values: &mut Vec<String>) {
+    let mut seen = std::collections::BTreeSet::new();
+    values.retain(|value| seen.insert(value.clone()));
+}
+
+fn stable_dedupe_alternatives(alternatives: &mut Vec<Vec<String>>) {
+    let mut seen = std::collections::BTreeSet::new();
+    alternatives.retain(|alternative| seen.insert(alternative.clone()));
+}
+
+/// The installed service's public-safe config location. Callers may always override this with
+/// `--config`, which is required for staged-install and fixture roots.
+pub fn default_engine_config_path() -> PathBuf {
+    if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME") {
+        return PathBuf::from(dir).join("npu/engine.toml");
+    }
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".config/npu/engine.toml")
 }
 
 /// One declared stem's outcome against `kernels_root/<family>/`.
@@ -703,8 +885,8 @@ pub fn verify_declared_kernel_set_from(
         // Once per family, not per stem: the digest covers the whole declared source set.
         let current = repo_root
             .and_then(|r| source_digest(r, &decl.sources).ok().flatten());
-        for stem in &decl.required {
-            let status = if !xclbin_path(&dir, stem).is_file() {
+        let inspect = |stem: &str| {
+            if !artifact_pair_present(&dir, stem) {
                 DeclaredStatus::Missing
             } else {
                 match resolve_checked(&dir, stem) {
@@ -724,8 +906,26 @@ pub fn verify_declared_kernel_set_from(
                     }
                     Err(e) => DeclaredStatus::HashMismatch(e),
                 }
-            };
+            }
+        };
+        for stem in &decl.required {
+            let status = inspect(stem);
             out.push(DeclaredVerifyEntry { family: family.clone(), stem: stem.clone(), status });
+        }
+        for alternatives in &decl.one_of {
+            let mut statuses: Vec<(String, DeclaredStatus)> = alternatives
+                .iter()
+                .map(|stem| (stem.clone(), inspect(stem)))
+                .collect();
+            if let Some(index) = statuses
+                .iter()
+                .position(|(_, status)| matches!(status, DeclaredStatus::Present))
+            {
+                let (stem, status) = statuses.swap_remove(index);
+                out.push(DeclaredVerifyEntry { family: family.clone(), stem, status });
+            } else if let Some((stem, status)) = statuses.into_iter().next() {
+                out.push(DeclaredVerifyEntry { family: family.clone(), stem, status });
+            }
         }
     }
     out
@@ -1201,7 +1401,7 @@ mod tests {
                     DeclaredFamily {
                         required: stems.iter().map(|s| s.to_string()).collect(),
                         recipe: format!("scripts/kernel_families/{fam}.sh"),
-                        sources: Vec::new(),
+                        sources: Vec::new(), one_of: Vec::new(),
                     },
                 )
             })
@@ -1225,7 +1425,7 @@ mod tests {
 
         let fam = kernels.path().join("layernorm");
         std::fs::create_dir_all(&fam).unwrap();
-        std::fs::write(xclbin_path(&fam, "ctxln_512x1024"), b"xclbin bytes").unwrap();
+        write_fake_kernel(&fam, "ctxln_512x1024", b"xclbin bytes", Some(b"insts"));
 
         // Publish: stamp the manifest with the digest of the source as it is NOW.
         let digest = source_digest(repo.path(), &declared["layernorm"].sources).unwrap();
@@ -1260,7 +1460,7 @@ mod tests {
         let declared = declare(&[("layernorm", &["ctxln_512x1024"])]);
         let fam = kernels.path().join("layernorm");
         std::fs::create_dir_all(&fam).unwrap();
-        std::fs::write(xclbin_path(&fam, "ctxln_512x1024"), b"xclbin bytes").unwrap();
+        write_fake_kernel(&fam, "ctxln_512x1024", b"xclbin bytes", Some(b"insts"));
         write_manifest(&fam, &generate_manifest(&fam).unwrap()).unwrap();
 
         assert!(source_digest(repo.path(), &declared["layernorm"].sources).unwrap().is_none());
@@ -1300,7 +1500,7 @@ mod tests {
         let dir = td.path().join("dwconv1d");
         std::fs::create_dir(&dir).unwrap();
         let stem = "dwconv_silu_1024x400";
-        write_fake_kernel(&dir, stem, b"present-but-never-inventoried", None);
+        write_fake_kernel(&dir, stem, b"present-but-never-inventoried", Some(b"insts"));
         // No generate_manifest/write_manifest: exactly the "ungated" case the design spec names --
         // the file is there, but nothing has verified it, and that must be a distinct outcome from
         // both Present and Missing, not silently folded into either.
@@ -1316,7 +1516,7 @@ mod tests {
         let dir = td.path().join("layernorm");
         std::fs::create_dir(&dir).unwrap();
         let stem = "glu_512x1024";
-        write_fake_kernel(&dir, stem, b"the-original-bytes", None);
+        write_fake_kernel(&dir, stem, b"the-original-bytes", Some(b"insts"));
         let manifest = generate_manifest(&dir).unwrap();
         write_manifest(&dir, &manifest).unwrap();
         std::fs::write(xclbin_path(&dir, stem), b"a-different-build-overwrote-this").unwrap();
@@ -1338,6 +1538,252 @@ mod tests {
     }
 
     #[test]
+    fn shipped_whole_array_adapter_is_runnable() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let scenario: ScenarioKernelConfig = toml::from_str(
+            &std::fs::read_to_string(repo.join("scenarios/asr.toml")).unwrap(),
+        )
+        .unwrap();
+        let kernels = scenario.kernels.unwrap();
+        let mut declared = DeclaredKernelSet::new();
+        declared.insert("whole_array".into(), kernels["whole_array"].clone());
+
+        validate_declared_kernel_set(&repo, &declared)
+            .expect("the shipped whole_array declaration must name a runnable adapter");
+    }
+
+    #[test]
+    fn declared_common_kernel_requires_instruction_bytes_before_build_skips_it() {
+        let repo = tempfile::tempdir().unwrap();
+        let kernels = tempfile::tempdir().unwrap();
+        let family = kernels.path().join("whole_array");
+        std::fs::create_dir(&family).unwrap();
+        let stem = "512x1024x4096_64x32x128_8c_modalsilu";
+        write_fake_kernel(&family, stem, b"xclbin-without-insts", None);
+        write_manifest(&family, &generate_manifest(&family).unwrap()).unwrap();
+
+        let adapter_dir = repo.path().join("scripts/kernel_families");
+        std::fs::create_dir_all(&adapter_dir).unwrap();
+        write_fake_adapter(&adapter_dir, "whole_array.sh", "#!/bin/sh\nexit 0\n");
+        let declared = declare(&[("whole_array", &[stem])]);
+
+        let report = verify_declared_kernel_set(&declared, kernels.path());
+        assert!(matches!(report[0].status, DeclaredStatus::Missing));
+
+        let results = build_missing_declared_kernels(
+            &declared,
+            repo.path(),
+            kernels.path(),
+            repo.path(),
+        );
+        assert!(matches!(results[0].outcome, BuildOutcome::Built));
+    }
+
+    #[test]
+    fn absolute_scenario_path_is_accepted_for_declared_kernel_resolution() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("aie_kernels")).unwrap();
+        let adapter_dir = repo.path().join("scripts/kernel_families");
+        std::fs::create_dir_all(&adapter_dir).unwrap();
+        write_fake_adapter(&adapter_dir, "whole_array.sh", "#!/bin/sh\nexit 0\n");
+
+        let external = tempfile::tempdir().unwrap();
+        let scenario = external.path().join("scenario.toml");
+        std::fs::write(
+            &scenario,
+            "[kernels.whole_array]\nrequired = [\"512x576x256_32x32x32_8c\"]\nrecipe = \"scripts/kernel_families/whole_array.sh\"\nsources = [\"aie_kernels\"]\n",
+        )
+        .unwrap();
+        let engine = external.path().join("engine.toml");
+        std::fs::write(
+            &engine,
+            format!("[[model]]\nname = \"external\"\nscenario = {:?}\n", scenario),
+        )
+        .unwrap();
+
+        load_declared_kernel_set_from_engine_config(repo.path(), external.path(), &engine)
+            .expect("an absolute scenario path has the same meaning to the registry as the service");
+
+        std::fs::create_dir_all(external.path().join("scenarios")).unwrap();
+        std::fs::copy(&scenario, external.path().join("scenarios/relative.toml")).unwrap();
+        std::fs::write(
+            &engine,
+            "[[model]]\nname = \"external\"\nscenario = \"scenarios/relative.toml\"\n",
+        )
+        .unwrap();
+        load_declared_kernel_set_from_engine_config(repo.path(), external.path(), &engine)
+            .expect("relative scenarios must resolve against the explicit engine root");
+
+        std::fs::create_dir_all(repo.path().join("scenarios")).unwrap();
+        std::fs::copy(&scenario, repo.path().join("scenarios/original.toml")).unwrap();
+        std::fs::write(
+            &engine,
+            "[[model]]\nname = \"original\"\nscenario = \"scenarios/original.toml\"\n",
+        )
+        .unwrap();
+        load_declared_kernel_set_from_engine_config(repo.path(), repo.path(), &engine)
+            .expect("a checkout root remains a valid engine root");
+    }
+
+    #[test]
+    fn declared_alternatives_keep_the_served_preference_order() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("aie_kernels")).unwrap();
+        let adapter_dir = repo.path().join("scripts/kernel_families");
+        std::fs::create_dir_all(&adapter_dir).unwrap();
+        write_fake_adapter(&adapter_dir, "whole_array.sh", "#!/bin/sh\nexit 0\n");
+        let krtp = "512x1024x4096_64x32x128_8c_modalsilukrtp";
+        let modal = "512x1024x4096_64x32x128_8c_modalsilu";
+        std::fs::write(
+            repo.path().join("engine.toml"),
+            "[[model]]\nname = \"asr\"\nscenario = \"scenarios/asr.toml\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo.path().join("scenarios")).unwrap();
+        std::fs::write(
+            repo.path().join("scenarios/asr.toml"),
+            format!("[kernels.whole_array]\none_of = [[\"{krtp}\", \"{modal}\"]]\nrecipe = \"scripts/kernel_families/whole_array.sh\"\nsources = [\"aie_kernels\"]\n"),
+        )
+        .unwrap();
+
+        let declared = load_declared_kernel_set_from_engine_config(
+            repo.path(),
+            repo.path(),
+            &repo.path().join("engine.toml"),
+        )
+        .unwrap();
+        assert_eq!(
+            declared["whole_array"].one_of,
+            vec![vec![krtp.to_string(), modal.to_string()]]
+        );
+
+        let kernels = tempfile::tempdir().unwrap();
+        let results = build_missing_declared_kernels(&declared, repo.path(), kernels.path(), repo.path());
+        assert_eq!(results[0].stem, krtp);
+    }
+
+    #[test]
+    fn whole_array_generator_change_makes_an_intact_artifact_stale() {
+        let repo = tempfile::tempdir().unwrap();
+        let design = repo.path().join("designs/whole_array_fused");
+        std::fs::create_dir_all(&design).unwrap();
+        std::fs::write(design.join("whole_array_modal_iron.py"), b"# generator v1\n").unwrap();
+        std::fs::write(design.join("Makefile.modal"), b"# makefile v1\n").unwrap();
+
+        let kernels = tempfile::tempdir().unwrap();
+        let family = kernels.path().join("whole_array");
+        std::fs::create_dir(&family).unwrap();
+        let stem = "512x1024x4096_64x32x128_8c_modalsilu";
+        write_fake_kernel(&family, stem, b"xclbin", Some(b"insts"));
+
+        let mut declared = declare(&[("whole_array", &[stem])]);
+        declared.get_mut("whole_array").unwrap().sources = vec!["designs/whole_array_fused".into()];
+        let digest = source_digest(repo.path(), &declared["whole_array"].sources).unwrap();
+        write_manifest(&family, &generate_manifest_with_source(&family, digest.as_deref()).unwrap()).unwrap();
+
+        std::fs::write(design.join("whole_array_modal_iron.py"), b"# generator v2\n").unwrap();
+        let report = verify_declared_kernel_set_from(&declared, kernels.path(), Some(repo.path()));
+        assert!(matches!(report[0].status, DeclaredStatus::StaleSource { .. }));
+    }
+
+    #[test]
+    fn served_engine_requires_every_scenario_to_declare_kernels_and_dedupes_stems() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("scenarios")).unwrap();
+        std::fs::create_dir_all(repo.path().join("aie_kernels")).unwrap();
+        std::fs::create_dir_all(repo.path().join("scripts/kernel_families")).unwrap();
+        write_fake_adapter(
+            &repo.path().join("scripts/kernel_families"),
+            "whole_array.sh",
+            "#!/bin/sh\nexit 0\n",
+        );
+        std::fs::write(
+            repo.path().join("engine.toml"),
+            "[[model]]\nname = \"one\"\nscenario = \"scenarios/one.toml\"\n\n[[model]]\nname = \"two\"\nscenario = \"scenarios/two.toml\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("scenarios/one.toml"),
+            "[kernels.whole_array]\nrequired = [\"512x576x256_32x32x32_8c\"]\nrecipe = \"scripts/kernel_families/whole_array.sh\"\nsources = [\"aie_kernels\"]\n",
+        )
+        .unwrap();
+        std::fs::write(repo.path().join("scenarios/two.toml"), "[kernels]\n").unwrap();
+
+        let set = load_declared_kernel_set_from_engine_config(
+            repo.path(),
+            repo.path(),
+            &repo.path().join("engine.toml"),
+        )
+            .expect("explicit empty and one declaration are valid");
+        assert_eq!(set["whole_array"].required, ["512x576x256_32x32x32_8c"]);
+
+        std::fs::write(repo.path().join("scenarios/two.toml"), "[scenario]\nname = \"missing\"\n").unwrap();
+        let err = load_declared_kernel_set_from_engine_config(
+            repo.path(),
+            repo.path(),
+            &repo.path().join("engine.toml"),
+        )
+            .expect_err("a served scenario may not omit [kernels]");
+        assert!(err.contains("two") && err.contains("scenarios/two.toml"), "{err}");
+    }
+
+    #[test]
+    fn an_alternative_requirement_accepts_the_served_fallback_but_not_neither_artifact() {
+        let root = tempfile::tempdir().unwrap();
+        let family = root.path().join("whole_array");
+        std::fs::create_dir(&family).unwrap();
+        write_fake_kernel(&family, "modal", b"modal", Some(b"insts"));
+        write_manifest(&family, &generate_manifest(&family).unwrap()).unwrap();
+
+        let mut declared = declare(&[("whole_array", &[])]);
+        declared.get_mut("whole_array").unwrap().one_of = vec![vec!["krtp".into(), "modal".into()]];
+        let report = verify_declared_kernel_set(&declared, root.path());
+        assert_eq!(report.len(), 1);
+        assert_eq!(report[0].stem, "modal");
+        assert!(matches!(report[0].status, DeclaredStatus::Present));
+
+        std::fs::remove_file(xclbin_path(&family, "modal")).unwrap();
+        let report = verify_declared_kernel_set(&declared, root.path());
+        assert!(matches!(report[0].status, DeclaredStatus::Missing));
+    }
+
+    #[test]
+    fn declaration_validation_rejects_unsafe_names_and_unrunnable_recipes() {
+        let repo = tempfile::tempdir().unwrap();
+        let mut declared = declare(&[("whole_array", &["safe_stem"])]);
+        declared.get_mut("whole_array").unwrap().recipe = "../escape.sh".into();
+        let err = validate_declared_kernel_set(repo.path(), &declared).expect_err("unsafe recipe must fail");
+        assert!(err.contains("unsafe recipe"), "{err}");
+
+        declared.get_mut("whole_array").unwrap().recipe = "scripts/kernel_families/missing.sh".into();
+        let err = validate_declared_kernel_set(repo.path(), &declared).expect_err("missing recipe must fail");
+        assert!(err.contains("runnable recipe"), "{err}");
+
+        declared.get_mut("whole_array").unwrap().recipe = "scripts/kernel_families/whole_array.sh".into();
+        let script = repo.path().join("scripts/kernel_families/whole_array.sh");
+        std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+        write_fake_adapter(repo.path().join("scripts/kernel_families").as_path(), "whole_array.sh", "#!/bin/sh\nexit 0\n");
+        declared.get_mut("whole_array").unwrap().required = vec!["../bad".into()];
+        let err = validate_declared_kernel_set(repo.path(), &declared).expect_err("unsafe stem must fail");
+        assert!(err.contains("unsafe stem"), "{err}");
+    }
+
+    #[test]
+    fn declaration_validation_rejects_a_stem_outside_the_artifact_grammar() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("scripts/kernel_families")).unwrap();
+        write_fake_adapter(
+            &repo.path().join("scripts/kernel_families"),
+            "whole_array.sh",
+            "#!/bin/sh\nexit 0\n",
+        );
+        let declared = declare(&[("whole_array", &["not_a_kernel_stem"])]);
+        let err = validate_declared_kernel_set(repo.path(), &declared)
+            .expect_err("a safe filename is not necessarily an artifact stem");
+        assert!(err.contains("does not match the kernel artifact grammar"), "{err}");
+    }
+
+    #[test]
     fn declared_family_carries_a_recipe_path() {
         let mut declared = DeclaredKernelSet::new();
         declared.insert(
@@ -1345,7 +1791,7 @@ mod tests {
             DeclaredFamily {
                 required: vec!["512x768x768_32x32x32_8c".to_string()],
                 recipe: "scripts/kernel_families/whole_array.sh".to_string(),
-                sources: Vec::new(),
+                sources: Vec::new(), one_of: Vec::new(),
             },
         );
         let json = serde_json::to_string_pretty(&declared).unwrap();
@@ -1377,7 +1823,7 @@ mod tests {
         // whole_array's stem already exists -- must not be touched.
         let wa_dir = kernels_root.join("whole_array");
         std::fs::create_dir(&wa_dir).unwrap();
-        write_fake_kernel(&wa_dir, "already_here", b"bytes", None);
+        write_fake_kernel(&wa_dir, "already_here", b"bytes", Some(b"insts"));
 
         // dwconv1d's stem is missing -- the adapter must be called with it.
         let adapter = write_fake_adapter(
@@ -1388,14 +1834,14 @@ mod tests {
         let mut declared = DeclaredKernelSet::new();
         declared.insert(
             "whole_array".to_string(),
-            DeclaredFamily { required: vec!["already_here".to_string()], recipe: "no_such_adapter.sh".to_string(), sources: Vec::new() },
+            DeclaredFamily { required: vec!["already_here".to_string()], one_of: Vec::new(), recipe: "no_such_adapter.sh".to_string(), sources: Vec::new() },
         );
         declared.insert(
             "dwconv1d".to_string(),
             DeclaredFamily {
                 required: vec!["missing_stem".to_string()],
                 recipe: adapter.to_str().unwrap().to_string(),
-                sources: Vec::new(),
+                sources: Vec::new(), one_of: Vec::new(),
             },
         );
 
@@ -1428,7 +1874,7 @@ mod tests {
             DeclaredFamily {
                 required: vec!["ctxln_512x1024".to_string()],
                 recipe: "definitely_does_not_exist.sh".to_string(),
-                sources: Vec::new(),
+                sources: Vec::new(), one_of: Vec::new(),
             },
         );
 
@@ -1459,7 +1905,7 @@ mod tests {
             DeclaredFamily {
                 required: vec!["ctxln_512x1024".to_string()],
                 recipe: recipe.to_str().unwrap().to_string(),
-                sources: Vec::new(),
+                sources: Vec::new(), one_of: Vec::new(),
             },
         );
 
@@ -1481,14 +1927,14 @@ mod tests {
         let mut declared = DeclaredKernelSet::new();
         declared.insert(
             "layernorm".to_string(),
-            DeclaredFamily { required: vec!["will_fail".to_string()], recipe: failing.to_str().unwrap().to_string(), sources: Vec::new() },
+            DeclaredFamily { required: vec!["will_fail".to_string()], one_of: Vec::new(), recipe: failing.to_str().unwrap().to_string(), sources: Vec::new() },
         );
         declared.insert(
             "dwconv1d".to_string(),
             DeclaredFamily {
                 required: vec!["will_succeed".to_string()],
                 recipe: succeeding.to_str().unwrap().to_string(),
-                sources: Vec::new(),
+                sources: Vec::new(), one_of: Vec::new(),
             },
         );
 

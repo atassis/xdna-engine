@@ -247,7 +247,7 @@ fn op_k(op: &Op) -> usize {
 // conv: host im2col -> C[M,Cout] = A[M,Kf] @ B[Kf,Cout] (+bias, +relu). M (=H*W) is tiled to PAD_M=512.
 //
 // Requires final_512x576x256_32x32x32_8c.xclbin + its insts in the whole_array dir; the kernel is
-// declared in declared_kernels.json, so `npu-dev kernels-build` (run by install.sh) builds it.
+// declared by the ESPCN scenario, so `npu-dev kernels-build` (run by install.sh) builds it.
 mod npu_backend {
     use super::{ConvW, Feat};
     use crate::SrError;

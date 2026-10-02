@@ -15,3 +15,8 @@ weights = "scenarios/schedules/espcn.json"
 #   npu checkpoint bake --source path:artifacts/espcn/espcn_x3_dyn.onnx --arch espcn \
 #     --checkpoint artifacts/espcn/espcn.safetensors
 checkpoint = "artifacts/espcn/espcn.safetensors"
+
+[kernels.whole_array]
+required = ["512x576x256_32x32x32_8c"]
+recipe = "scripts/kernel_families/whole_array.sh"
+sources = ["aie_kernels", "designs/whole_array_fused", "scripts/kernel_families/whole_array.sh", "scripts/kernel_families/whole_array_recipe.py"]

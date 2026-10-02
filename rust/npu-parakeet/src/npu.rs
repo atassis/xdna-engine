@@ -17,7 +17,7 @@ use std::time::Instant;
 
 use ndarray::prelude::*;
 use npu_asr::kernel_registry;
-use npu_dispatch::{u16_bytes, PAD_M};
+use npu_dispatch::{u16_bytes, DW_SUBDIR, LN_SUBDIR, PAD_M};
 use npu_xrt::{Bo, Device, Kernel, FLAG_CACHEABLE, FLAG_HOST_ONLY};
 
 use crate::errors::LoadError;
@@ -47,7 +47,47 @@ pub fn preflight(root: &Path) -> Result<(), String> {
              scripts/build_parakeet_kernels.sh (and scripts/build_parakeet_modal_kernels.sh if \
              the modal resident is in use)"
         )
-    })
+    })?;
+    let krtp = format!("{PAD_M}x{KRES}x{DFF}_64x32x128_8c_modalsilukrtp");
+    let modal = format!("{PAD_M}x{KRES}x{DFF}_64x32x128_8c_modalsilu");
+    if !kernel_registry::artifact_pair_present(&base, &krtp)
+        && !kernel_registry::artifact_pair_present(&base, &modal)
+    {
+        return Err(format!(
+            "resident modal kernel missing: require final/insts pair for {krtp} or {modal} under {}",
+            base.display(),
+        ));
+    }
+
+    let layernorm = kernel_registry::resolve_kernel_dir(root, LN_SUBDIR);
+    let dwconv = kernel_registry::resolve_kernel_dir(root, DW_SUBDIR);
+    let legacy = root.join("artifacts/parakeet/ln");
+    if !resident_companion_artifacts_present(&layernorm, &base, &dwconv, &legacy) {
+        return Err(format!(
+            "resident Parakeet companion kernels missing: require ctxln_{}x{}, affcast_{}x{}, {}, and \
+             dwconv_silu_t_1024x400 in published layernorm/whole_array/dwconv1d families or legacy {}",
+            PAD_M,
+            KRES,
+            PAD_M,
+            KRES,
+            fc1_panel_bf16_stem(),
+            legacy.display(),
+        ));
+    }
+
+    for (canonical, stem) in [
+        (&layernorm, format!("ctxln_{PAD_M}x{KRES}")),
+        (&layernorm, format!("affcast_{PAD_M}x{KRES}")),
+        (&base, fc1_panel_bf16_stem()),
+        (&dwconv, "dwconv_silu_t_1024x400".to_string()),
+    ] {
+        if kernel_registry::resolve_artifact_dir(canonical, &legacy, &stem) == Some(canonical.as_path()) {
+            kernel_registry::check_toolchain_freshness(canonical, root).map_err(|e| {
+                format!("resident Parakeet companion {stem} stale or missing: {e}")
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// Activation epilogue baked into the modal resident's per-N instruction stream (RTP-selected at
@@ -116,12 +156,22 @@ fn conveyor_artifact_present(dir: &Path) -> bool {
     dir.join("final.xclbin").exists() && dir.join("insts.bin").exists()
 }
 
-fn resident_ln_artifacts_present(dir: &Path) -> bool {
+fn resident_ln_artifacts_present(primary: &Path, legacy: &Path) -> bool {
     ["ctxln", "affcast"].iter().all(|name| {
         let stem = format!("{name}_{PAD_M}x{KRES}");
-        kernel_registry::xclbin_path(dir, &stem).exists()
-            && kernel_registry::insts_path(dir, &stem).exists()
+        kernel_registry::resolve_artifact_dir(primary, legacy, &stem).is_some()
     })
+}
+
+fn resident_companion_artifacts_present(
+    layernorm: &Path,
+    whole_array: &Path,
+    dwconv: &Path,
+    legacy: &Path,
+) -> bool {
+    resident_ln_artifacts_present(layernorm, legacy)
+        && kernel_registry::resolve_artifact_dir(whole_array, legacy, &fc1_panel_bf16_stem()).is_some()
+        && kernel_registry::resolve_artifact_dir(dwconv, legacy, "dwconv_silu_t_1024x400").is_some()
 }
 
 /// BD-carriage precision for the conveyor query belt (open-item C / SPLITP). Default PLAIN per the
@@ -360,9 +410,10 @@ pub struct NpuMatmul {
     // absent, PARAKEET_CONVEYOR_MHA declines (no retry); Some(Some) = loaded conveyor (H baked,
     // single instance).
     conveyor: RefCell<Option<Option<Rc<ConveyorK>>>>,
-    ln_dir: PathBuf,                               // {root}/artifacts/parakeet/ln (ctxln + affcast xclbins)
-    // Tri-state cache: None = untried; Some(None) = xclbins absent, FF stays host (no retry);
-    // Some(Some) = co-resident on-chip LN + affine-cast chain loaded.
+    ln_dir: PathBuf,
+    dw_dir: PathBuf,
+    legacy_ln_dir: PathBuf,
+    // Tri-state cache: None = untried; Some(Some) = co-resident on-chip LN + affine-cast chain loaded.
     resident_ln: RefCell<Option<Option<Rc<ResidentLn>>>>,
     pub stats: RefCell<NpuStats>,
 }
@@ -657,18 +708,6 @@ fn ln_mode_insts_stem() -> String {
     format!("{}rtp{LN_MODE_RTP}r{PAD_M}g{LN_MODE_GROUP_ROUNDS}ctgc", fc1_panel_bf16_stem())
 }
 
-/// Which of the two directories the panel is served from. `build_parakeet_modal_kernels.sh` copies
-/// it into `artifacts/parakeet/ln` and leaves it in the whole_array build dir; `load_kernel` keys
-/// its context cache on the PATH, so byte-identical copies at two paths are two hw_contexts and a
-/// ~1.5 ms program transition per crossing. Resolving through one picker is what lets the fold
-/// actually merge fc1 into the resident.
-fn fc1_panel_bf16_dir<'a>(base: &'a Path, ln_dir: &'a Path, stem: &str) -> &'a Path {
-    let has = |d: &Path| {
-        kernel_registry::xclbin_path(d, stem).exists() && kernel_registry::insts_path(d, stem).exists()
-    };
-    if has(ln_dir) || !has(base) { ln_dir } else { base }
-}
-
 /// `PARAKEET_FOLD_GLU=1`: apply the conv-module gate in pw1's OWN epilogue (`rtp[0]==3`), taking the
 /// resident conv front from two dispatches (pw1-identity + the standalone GLU brick) to one -- 24/clip
 /// on the 24-block encoder. It also deletes a narrowing: the epilogue still holds pw1's f32
@@ -752,7 +791,9 @@ impl NpuMatmul {
         preflight(root).map_err(LoadError::StaleBuild)?;
         let dev = Device::open(0).map_err(LoadError::Device)?;
         let base = kernel_registry::resolve_kernel_dir(root, WA_SUBDIR);
-        let ln_dir = root.join("artifacts/parakeet/ln");
+        let ln_dir = kernel_registry::resolve_kernel_dir(root, LN_SUBDIR);
+        let dw_dir = kernel_registry::resolve_kernel_dir(root, DW_SUBDIR);
+        let legacy_ln_dir = root.join("artifacts/parakeet/ln");
         // resident kernel tile: fast BFP16 64x32x128, the only served tile.
         let tile = "64x32x128".to_string();
         // resident xclbin = a K=1024 whole_array kernel for this tile. What is N-independent is the
@@ -785,9 +826,9 @@ impl NpuMatmul {
             // krtp artifact is absent, which is correct, just slower.
             let krtp_stem = format!("512x1024x4096_{tile}_8c_modalsilukrtp");
             let modal_stem = format!("512x1024x4096_{tile}_8c_modalsilu");
-            let stem = if kernel_registry::xclbin_path(&base, &krtp_stem).exists() {
+            let stem = if kernel_registry::artifact_pair_present(&base, &krtp_stem) {
                 krtp_stem
-            } else if kernel_registry::xclbin_path(&base, &modal_stem).exists() {
+            } else if kernel_registry::artifact_pair_present(&base, &modal_stem) {
                 modal_stem
             } else {
                 panic!("[npu] modal resident xclbin absent in {} (final_{modal_stem}.xclbin) -- \
@@ -871,6 +912,8 @@ impl NpuMatmul {
             conveyor_dir: root.join("artifacts/conveyor"),
             conveyor: RefCell::new(None),
             ln_dir,
+            dw_dir,
+            legacy_ln_dir,
             resident_ln: RefCell::new(None),
             stats: RefCell::new(NpuStats::default()),
         })
@@ -1367,33 +1410,37 @@ impl NpuMatmul {
         Some(ctx)
     }
 
-    /// Lazy-load the co-resident ctxLN + cast xclbins from {root}/artifacts/parakeet/ln (built at
-    /// PAD_M x KRES = 512 x 1024). Two extra hw-contexts alongside the modal matmul.
+    fn ln_artifact_dir(&self, stem: &str) -> Option<&Path> {
+        kernel_registry::resolve_artifact_dir(&self.ln_dir, &self.legacy_ln_dir, stem)
+    }
+
+    fn panel_artifact_dir(&self, stem: &str) -> Option<&Path> {
+        kernel_registry::resolve_artifact_dir(&self.base, &self.legacy_ln_dir, stem)
+    }
+
+    fn dw_artifact_dir(&self, stem: &str) -> Option<&Path> {
+        kernel_registry::resolve_artifact_dir(&self.dw_dir, &self.legacy_ln_dir, stem)
+    }
+
+    /// Lazy-load the co-resident ctxLN + cast xclbins built at PAD_M x KRES = 512 x 1024.
     fn resident_ln(&self) -> Option<Rc<ResidentLn>> {
         if let Some(cached) = self.resident_ln.borrow().as_ref() {
             return cached.clone();
         }
-        // Graceful: if the ctxln+affcast xclbins aren't present, the FFN LN->fc1 stays on the host
-        // path (no panic) -- so the resident seam can be the DEFAULT without breaking builds/branches
-        // that haven't built these kernels.
-        let present = resident_ln_artifacts_present(&self.ln_dir);
-        let result = if present {
-            Some(self.load_resident_ln())
-        } else {
-            eprintln!("[npu] resident-ln xclbins absent in {} -- FFN LN->fc1 stays host (build ctxln+affcast for the on-NPU seam)", self.ln_dir.display());
-            None
-        };
+        let result = Some(self.load_resident_ln());
         *self.resident_ln.borrow_mut() = Some(result.clone());
         result
     }
 
     fn load_resident_ln(&self) -> Rc<ResidentLn> {
         let load = |name: &str| -> (Rc<Kernel>, Bo, usize) {
-            let art = resolve_verified(&self.ln_dir, &format!("{name}_{PAD_M}x{KRES}"));
+            let stem = format!("{name}_{PAD_M}x{KRES}");
+            let dir = self.ln_artifact_dir(&stem).expect("resident companion preflight");
+            let art = resolve_verified(dir, &stem);
             let kern = self
                 .dev
                 .load_kernel(art.xclbin.to_str().unwrap(), None)
-                .unwrap_or_else(|e| panic!("load resident-ln {} : {e:?}\n  prebuild: build ctxln+cast at {PAD_M}x{KRES} and copy to artifacts/parakeet/ln", art.xclbin.display()));
+                .unwrap_or_else(|e| panic!("load resident-ln {} : {e:?}", art.xclbin.display()));
             let ib = std::fs::read(&art.insts).unwrap_or_else(|e| panic!("read {}: {e}", art.insts.display()));
             let n = ib.len() / 4;
             let bo = self.dev.alloc_bo(&kern, ib.len(), FLAG_CACHEABLE, kern.group_id(1).unwrap()).unwrap();
@@ -1419,24 +1466,20 @@ impl NpuMatmul {
         let lnaffcast = {
             let want = std::env::var("PARAKEET_LN_FUSED").map(|v| v != "0").unwrap_or(true);
             let stem = format!("lnaffcast_{PAD_M}x{KRES}");
-            let present = kernel_registry::xclbin_path(&self.ln_dir, &stem).exists()
-                && kernel_registry::insts_path(&self.ln_dir, &stem).exists();
-            if want && present {
-                let (kern, instr, n) = load_path(&self.ln_dir, &stem);
-                let gg = |i| kern.group_id(i).unwrap();
-                Some(LnFused {
-                    dummy_tmp: self.dev.alloc_bo(&kern, 8, FLAG_HOST_ONLY, gg(6)).unwrap(),
-                    dummy_tr: self.dev.alloc_bo(&kern, 1, FLAG_HOST_ONLY, gg(7)).unwrap(),
-                    kern, instr, n,
-                })
-            } else {
-                // NOT quiet-gated: NPU_QUIET suppresses BANNERS (which precision, which xclbin),
-                // and this is a DEGRADATION -- the run is slower than the one that was asked for.
-                // `npu transcribe`/`embed` set NPU_QUIET=1 by default, which is exactly where a
-                // silently-missing artifact would otherwise go unreported.
-                if want {
-                    eprintln!("[npu] lnaffcast xclbin absent in {} -- LN seam stays a 2-dispatch chain", self.ln_dir.display());
+            if want {
+                if let Some(dir) = self.ln_artifact_dir(&stem) {
+                    let (kern, instr, n) = load_path(dir, &stem);
+                    let gg = |i| kern.group_id(i).unwrap();
+                    Some(LnFused {
+                        dummy_tmp: self.dev.alloc_bo(&kern, 8, FLAG_HOST_ONLY, gg(6)).unwrap(),
+                        dummy_tr: self.dev.alloc_bo(&kern, 1, FLAG_HOST_ONLY, gg(7)).unwrap(),
+                        kern, instr, n,
+                    })
+                } else {
+                    eprintln!("[npu] lnaffcast xclbin absent from published layernorm and legacy bundle -- LN seam stays a 2-dispatch chain");
+                    None
                 }
+            } else {
                 None
             }
         };
@@ -1444,10 +1487,8 @@ impl NpuMatmul {
         // from the modal stream's bo_c (pw1 output); bo_out (g4) is the [PAD_M,KRES] f32 GLU result.
         let glu = {
             let stem = format!("glu_{PAD_M}x{KRES}");
-            let present = kernel_registry::xclbin_path(&self.ln_dir, &stem).exists()
-                && kernel_registry::insts_path(&self.ln_dir, &stem).exists();
-            if present {
-                let (kern, instr, n) = load_path(&self.ln_dir, &stem);
+            if let Some(dir) = self.ln_artifact_dir(&stem) {
+                let (kern, instr, n) = load_path(dir, &stem);
                 let gg = |i| kern.group_id(i).unwrap();
                 Some(ConvGlu {
                     bo_out: self.dev.alloc_bo(&kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gg(4)).unwrap(),
@@ -1457,7 +1498,7 @@ impl NpuMatmul {
                     kern, instr, n,
                 })
             } else {
-                eprintln!("[npu] glu xclbin absent in {} -- conv GLU stays host (build final_glu_{PAD_M}x{KRES})", self.ln_dir.display());
+                eprintln!("[npu] glu xclbin absent from published layernorm and legacy bundle -- conv GLU stays host (build final_glu_{PAD_M}x{KRES})");
                 None
             }
         };
@@ -1477,10 +1518,8 @@ impl NpuMatmul {
         // ping-pong the running sum; `zero` (zeroed once) seeds the first partial (acc = partial0 + 0).
         let acc_add = {
             let stem = format!("accadd_{PAD_M}x{KRES}{bsuf}");
-            let present = kernel_registry::xclbin_path(&self.ln_dir, &stem).exists()
-                && kernel_registry::insts_path(&self.ln_dir, &stem).exists();
-            if present {
-                let (kern, instr, n) = load_path(&self.ln_dir, &stem);
+            if let Some(dir) = self.ln_artifact_dir(&stem) {
+                let (kern, instr, n) = load_path(dir, &stem);
                 let gaa = |i| kern.group_id(i).unwrap();
                 // g4 is the addend slot, so the seed is sized at the addend's width, not the
                 // accumulator's -- an f32-sized seed against a bf16 tap feeds the DMA twice the
@@ -1498,17 +1537,15 @@ impl NpuMatmul {
                     kern, instr, n,
                 })
             } else {
-                eprintln!("[npu] acc_add xclbin absent in {} -- resident_ffn_dev unavailable (build final_{stem})", self.ln_dir.display());
+                eprintln!("[npu] acc_add xclbin absent from published layernorm and legacy bundle -- resident_ffn_dev unavailable (build final_{stem})");
                 None
             }
         };
         // scaled residual-add s050 (out = a + 0.5*b, f32), OPTIONAL: the Macaron FFN residual on-chip.
         let resadd_s050 = {
             let stem = format!("resadd_{PAD_M}x{KRES}_s050{s050suf}");
-            let present = kernel_registry::xclbin_path(&self.ln_dir, &stem).exists()
-                && kernel_registry::insts_path(&self.ln_dir, &stem).exists();
-            if present {
-                let (kern, instr, n) = load_path(&self.ln_dir, &stem);
+            if let Some(dir) = self.ln_artifact_dir(&stem) {
+                let (kern, instr, n) = load_path(dir, &stem);
                 let gr = |i| kern.group_id(i).unwrap();
                 Some(ResidualAdd {
                     scale: 0.5,
@@ -1518,17 +1555,15 @@ impl NpuMatmul {
                     kern, instr, n,
                 })
             } else {
-                eprintln!("[npu] resadd_s050 xclbin absent in {} -- residual_add_dev(0.5) unavailable (build final_{stem})", self.ln_dir.display());
+                eprintln!("[npu] resadd_s050 xclbin absent from published layernorm and legacy bundle -- residual_add_dev(0.5) unavailable (build final_{stem})");
                 None
             }
         };
         // scaled residual-add s100 (out=a+1.0*b f32), OPTIONAL: the full MHSA/conv residual x+sublayer.
         let resadd_s100 = {
             let stem = format!("resadd_{PAD_M}x{KRES}_s100{bsuf}");
-            let present = kernel_registry::xclbin_path(&self.ln_dir, &stem).exists()
-                && kernel_registry::insts_path(&self.ln_dir, &stem).exists();
-            if present {
-                let (kern, instr, n) = load_path(&self.ln_dir, &stem);
+            if let Some(dir) = self.ln_artifact_dir(&stem) {
+                let (kern, instr, n) = load_path(dir, &stem);
                 let gr = |i| kern.group_id(i).unwrap();
                 Some(ResidualAdd {
                     scale: 1.0,
@@ -1538,7 +1573,7 @@ impl NpuMatmul {
                     kern, instr, n,
                 })
             } else {
-                eprintln!("[npu] resadd_s100 xclbin absent in {} -- residual_add_dev(1.0) unavailable (build final_{stem})", self.ln_dir.display());
+                eprintln!("[npu] resadd_s100 xclbin absent from published layernorm and legacy bundle -- residual_add_dev(1.0) unavailable (build final_{stem})");
                 None
             }
         };
@@ -1548,13 +1583,7 @@ impl NpuMatmul {
         // artifact is a build error.
         let fc1_panel_bf16 = {
             let tag = fc1_panel_bf16_stem();
-            let dir = fc1_panel_bf16_dir(&self.base, &self.ln_dir, &tag);
-            let present = kernel_registry::xclbin_path(dir, &tag).exists()
-                && kernel_registry::insts_path(dir, &tag).exists();
-            if !present {
-                panic!("[npu] final_{tag}.xclbin absent in {} -- build it with \
-                        scripts/build_parakeet_modal_kernels.sh", dir.display());
-            }
+            let dir = self.panel_artifact_dir(&tag).expect("resident companion preflight");
             let (kern, instr, n) = load_path(dir, &tag);
             let gg = |i| kern.group_id(i).unwrap();
             Some(Fc1PanelBf16 {
@@ -1572,7 +1601,9 @@ impl NpuMatmul {
             match (ln_mode(), panel) {
                 (true, Some(kern)) => {
                     let stem = ln_mode_insts_stem();
-                    let dir = fc1_panel_bf16_dir(&self.base, &self.ln_dir, &fc1_panel_bf16_stem());
+                    let dir = self
+                        .panel_artifact_dir(&fc1_panel_bf16_stem())
+                        .expect("resident companion preflight");
                     let insts = kernel_registry::insts_path(dir, &stem);
                     let ib = std::fs::read(&insts).unwrap_or_else(|e| panic!("read {}: {e}", insts.display()));
                     let gg = |i| kern.group_id(i).unwrap();
@@ -1604,17 +1635,10 @@ impl NpuMatmul {
         // TIME-MAJOR fused dwconv->SiLU (step 3b), the served conv brick. 3-buffer ABI: in [T+2P,D]
         // bf16 (g3, host-padded), w [K+1,D] bf16 tap-major (g4), out [T,D] f32 (g5). Required: there
         // is no other conv wiring to fall back to, so a missing artifact is a build error.
-        let have = |stem: &str| {
-            kernel_registry::xclbin_path(&self.ln_dir, stem).exists()
-                && kernel_registry::insts_path(&self.ln_dir, stem).exists()
-        };
         let dwconv_silu_t = {
             let stem = format!("dwconv_silu_t_{DW_C}x{DW_T}");
-            if !have(&stem) {
-                panic!("[npu] time-major fused dwconv+silu xclbin absent in {} -- build it with \
-                        scripts/build_parakeet_modal_kernels.sh (final_{stem})", self.ln_dir.display());
-            }
-            let (kern, instr, n) = load_path(&self.ln_dir, &stem);
+            let dir = self.dw_artifact_dir(&stem).expect("resident companion preflight");
+            let (kern, instr, n) = load_path(dir, &stem);
             let gw = |i| kern.group_id(i).unwrap();
             Some(ConvDwSiluT {
                 bo_in: self.dev.alloc_bo(&kern, DW_TPAD * DW_C * 2, FLAG_HOST_ONLY, gw(3)).unwrap(),
@@ -3521,7 +3545,7 @@ mod resident_ln_presence_tests {
     fn accepts_the_complete_current_seam_without_deinterleave() {
         let dir = tempfile::tempdir().unwrap();
         write_seam(dir.path());
-        assert!(resident_ln_artifacts_present(dir.path()));
+        assert!(resident_ln_artifacts_present(dir.path(), dir.path()));
     }
 
     #[test]
@@ -3530,6 +3554,74 @@ mod resident_ln_presence_tests {
         write_seam(dir.path());
         let stem = format!("affcast_{PAD_M}x{KRES}");
         std::fs::remove_file(kernel_registry::insts_path(dir.path(), &stem)).unwrap();
-        assert!(!resident_ln_artifacts_present(dir.path()));
+        assert!(!resident_ln_artifacts_present(dir.path(), dir.path()));
+    }
+}
+
+#[cfg(test)]
+mod resident_kernel_location_tests {
+    use super::*;
+
+    fn write_pair(dir: &Path, stem: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(kernel_registry::xclbin_path(dir, stem), b"stub").unwrap();
+        std::fs::write(kernel_registry::insts_path(dir, stem), b"stub").unwrap();
+    }
+
+    #[test]
+    fn common_families_win_and_legacy_bundle_fills_a_missing_pair() {
+        let root = tempfile::tempdir().unwrap();
+        let layernorm = root.path().join("kernels/layernorm");
+        let whole_array = root.path().join("kernels/whole_array");
+        let dwconv = root.path().join("kernels/dwconv1d");
+        let legacy = root.path().join("artifacts/parakeet/ln");
+        let ctxln = format!("ctxln_{PAD_M}x{KRES}");
+        let affcast = format!("affcast_{PAD_M}x{KRES}");
+        let panel = fc1_panel_bf16_stem();
+        let dwconv_silu_t = "dwconv_silu_t_1024x400";
+
+        write_pair(&layernorm, &ctxln);
+        write_pair(&legacy, &affcast);
+        write_pair(&whole_array, &panel);
+        write_pair(&dwconv, dwconv_silu_t);
+
+        assert!(resident_companion_artifacts_present(
+            &layernorm,
+            &whole_array,
+            &dwconv,
+            &legacy,
+        ));
+        assert_eq!(
+            kernel_registry::resolve_artifact_dir(&layernorm, &legacy, &ctxln),
+            Some(layernorm.as_path()),
+        );
+        assert_eq!(
+            kernel_registry::resolve_artifact_dir(&layernorm, &legacy, &affcast),
+            Some(legacy.as_path()),
+        );
+    }
+
+    #[test]
+    fn missing_companion_pairs_do_not_qualify_for_the_resident_default() {
+        let root = tempfile::tempdir().unwrap();
+        let layernorm = root.path().join("kernels/layernorm");
+        let whole_array = root.path().join("kernels/whole_array");
+        let dwconv = root.path().join("kernels/dwconv1d");
+        let legacy = root.path().join("artifacts/parakeet/ln");
+
+        assert!(!resident_companion_artifacts_present(
+            &layernorm,
+            &whole_array,
+            &dwconv,
+            &legacy,
+        ));
+        assert_eq!(
+            kernel_registry::resolve_artifact_dir(
+                &layernorm,
+                &legacy,
+                &format!("ctxln_{PAD_M}x{KRES}"),
+            ),
+            None,
+        );
     }
 }

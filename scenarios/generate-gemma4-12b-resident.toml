@@ -27,3 +27,5 @@ tokenizer_dir = "artifacts/gemma4-12b/tokenizer"
 
 [generation]
 max_tokens = 64
+
+[kernels]

@@ -366,25 +366,21 @@ dir_has_content() { [ -d "$1" ] && [ -n "$(ls -A "$1" 2>/dev/null)" ]; }
 ENGINE_KERNELS="$ENGINE_ROOT/kernels"
 info "Publishing kernels -> $ENGINE_KERNELS"
 mkdir -p "$ENGINE_ROOT"
+rm -rf "$ENGINE_ROOT/scenarios"
+cp -r "$REPO/scenarios" "$ENGINE_ROOT/scenarios"
 
-# Rebuild whatever the 3 DECLARED families (whole_array/dwconv1d/layernorm) are Missing
-# against the CURRENT pin before the plain publish below -- this is what makes a re-pin
-# self-healing instead of requiring a manual build_parakeet_kernels.sh run every time.
-# Its own exit code is advisory, not a gate: modal/turbo whole_array variants and
-# mha_decode are still adapter-less by design (reported NoRecipe, not built), and the
-# die-checks below (publish_kernels.sh's pin-consistency refusal, section 4c's
-# artifact/pin agreement check) remain the real safety net for anything left missing.
+# The staged engine config owns the required common-kernel closure. Missing declarations,
+# adapters, manifests, or artifacts are install failures rather than warnings.
 DECLARED_KERNELS_BIN="$CARGO_TARGET_DIR_RESOLVED/release/npu-dev"
-if [ -x "$DECLARED_KERNELS_BIN" ]; then
-  "$DECLARED_KERNELS_BIN" kernels-build "$REPO" "$ENGINE_KERNELS" "$ENGINE_MLIR_AIE" \
-    || warn "npu-dev kernels-build reported a problem (see above) -- falling through to the plain publish/preflight below"
-else
-  warn "npu-dev not found at $DECLARED_KERNELS_BIN -- skipping the automatic rebuild step"
-fi
+[ -x "$DECLARED_KERNELS_BIN" ] || die "npu-dev not found at $DECLARED_KERNELS_BIN"
+"$DECLARED_KERNELS_BIN" kernels-build --engine-root "$ENGINE_ROOT" --config "$ENGINE_CONFIG" "$REPO" "$ENGINE_KERNELS" "$ENGINE_MLIR_AIE" \
+  || die "required kernels could not be built and verified for $ENGINE_CONFIG"
 
-bash "$REPO/scripts/publish_kernels.sh" "$ENGINE_KERNELS" "$ENGINE_MLIR_AIE" \
+bash "$REPO/scripts/publish_kernels.sh" "$ENGINE_KERNELS" "$ENGINE_MLIR_AIE" "$ENGINE_CONFIG" "$ENGINE_ROOT" \
   || die "kernel publish refused -- see the message above. The usual cause is a build dir that was
   never rebuilt after a re-pin; scripts/check_kernel_artifact_freshness.sh names every stale one."
+"$DECLARED_KERNELS_BIN" kernels-verify --engine-root "$ENGINE_ROOT" --config "$ENGINE_CONFIG" "$REPO" "$ENGINE_KERNELS" \
+  || die "published kernels do not satisfy the required closure for $ENGINE_CONFIG"
 ok "Kernels published (pin $(cat "$ENGINE_KERNELS/.toolchain-stamp" 2>/dev/null || echo unknown))"
 
 # ---- Stage toolchain.lock BESIDE the kernels it describes ----
@@ -404,24 +400,12 @@ ok "Staged xrt.ini"
 # ---- Parakeet artifacts (MODEL=parakeet) ----
 if [ "$MODEL" = parakeet ]; then
   PK="$ENGINE_ARTIFACTS/parakeet"
-  WA="$ENGINE_KERNELS/whole_array"          # the published copy, not the build tree
   dir_has_content "$PK/encoder" \
     || die "Parakeet encoder weights missing: $PK/encoder — run: $EXPORT_VENV/bin/python scripts/extract_parakeet_encoder.py (needs models/parakeet/encoder-model.onnx)."
   for f in preprocessor.onnx decoder_joint.onnx vocab.txt; do
     [ -f "$PK/$f" ] || die "Parakeet artifact missing: $PK/$f (copy nemo128.onnx / decoder_joint-model.onnx / vocab.txt from the cached istupakov repo + onnx-asr)."
   done
-  # Accept EITHER the modal build or the plain one, in the runtime's own preference order
-  # (npu.rs picks modalsilu > modalid > plain and falls back silently). Checking only for the
-  # plain fallback failed a tree that has just the modal xclbins the engine actually loads.
-  for n in 1024 2048 4096; do
-    have=""
-    for v in "_modalsilu" "_modalid" ""; do
-      [ -f "$WA/final_512x1024x${n}_64x32x128_8c${v}.xclbin" ] && { have="$v"; break; }
-    done
-    [ -n "${have+x}" ] && [ -f "$WA/final_512x1024x${n}_64x32x128_8c${have}.xclbin" ] \
-      || die "Parakeet NPU xclbin missing from the PUBLISHED set: final_512x1024x${n}_64x32x128_8c{_modalsilu,_modalid,}.xclbin in $WA — run scripts/build_parakeet_kernels.sh (needs the mlir-aie toolchain), then re-run this installer to republish."
-  done
-  ok "Parakeet artifacts present: $PK (encoder weights + preproc/decoder_joint/vocab) + NPU xclbins"
+  ok "Parakeet artifacts present: $PK (encoder weights + preproc/decoder_joint/vocab)"
   # skip the GigaAM artifact generation below
   PARAKEET_DONE=1
 fi
@@ -511,8 +495,6 @@ fi
 # ENGINE_ARTIFACTS still says where the SOURCE lives (another partition is fine).
 info "Staging production root -> $ENGINE_ROOT"
 mkdir -p "$ENGINE_ROOT"
-rm -rf "$ENGINE_ROOT/scenarios"
-cp -r "$REPO/scenarios" "$ENGINE_ROOT/scenarios"
 # Tuning profile config/profiles/<hw-class>.toml (rust/npu-models/src/tuning_profile.rs), staged
 # the same way scenarios are: without this the service silently runs its baked-in default profile
 # instead of the checked-in one.

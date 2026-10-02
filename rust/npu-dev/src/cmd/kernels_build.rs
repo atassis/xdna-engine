@@ -1,6 +1,5 @@
-//! Build every declared kernel that `verify_declared_kernels` reports Missing, then publish and
-//! re-verify. This is the "then go build it" half `declared_kernels.json` was missing when it
-//! landed.
+//! Build every kernel missing from the selected engine configuration's scenario closure, then
+//! publish and re-verify.
 //!
 //! For each Missing declared stem, dispatches to its family's `recipe` adapter script
 //! (`<recipe> build <stem> <mlir-aie-root>`) -- see `kernel_registry::build_missing_declared_kernels`.
@@ -22,24 +21,82 @@
 
 use std::path::PathBuf;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn publication_receives_the_selected_engine_root() {
+        let root = PathBuf::from("/checkout");
+        let kernels = PathBuf::from("/artifacts/kernels");
+        let mlir = PathBuf::from("/toolchain");
+        let config = PathBuf::from("/configuration/engine.toml");
+        let engine = PathBuf::from("/installed/engine");
+        let command = publish_command(&root, &kernels, &mlir, &config, &engine);
+        let args: Vec<_> = command.get_args().map(PathBuf::from).collect();
+        assert_eq!(args, vec![root.join("scripts/publish_kernels.sh"), kernels, mlir, config, engine]);
+        assert_eq!(command.get_current_dir(), Some(root.as_path()));
+    }
+}
+
 use npu_asr::kernel_registry::{
-    build_missing_declared_kernels, load_declared_kernel_set, verify_declared_kernel_set, BuildOutcome,
-    DeclaredStatus, PUBLISHED_KERNELS_DIR,
+    build_missing_declared_kernels, default_engine_config_path, load_declared_kernel_set_from_engine_config,
+    verify_declared_kernel_set_from, BuildOutcome, DeclaredStatus, PUBLISHED_KERNELS_DIR,
 };
 
+fn publish_command(
+    repo_root: &std::path::Path,
+    kernels_root: &std::path::Path,
+    mlir_aie_root: &std::path::Path,
+    config: &std::path::Path,
+    engine_root: &std::path::Path,
+) -> std::process::Command {
+    let mut command = std::process::Command::new("bash");
+    command.arg(repo_root.join("scripts/publish_kernels.sh"))
+        .arg(kernels_root)
+        .arg(mlir_aie_root)
+        .arg(config)
+        .arg(engine_root)
+        .current_dir(repo_root);
+    command
+}
+
 pub fn run(argv: Vec<String>) {
+    let mut config = None;
+    let mut engine_root = None;
+    let mut positional = Vec::new();
     let mut args = argv.into_iter().skip(1);
-    let repo_root = args.next().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    while let Some(arg) = args.next() {
+        if arg == "--config" {
+            config = args.next().map(PathBuf::from);
+            if config.is_none() {
+                eprintln!("kernels-build: --config needs an engine.toml path");
+                std::process::exit(2);
+            }
+        } else if arg == "--engine-root" {
+            engine_root = args.next().map(PathBuf::from);
+            if engine_root.is_none() {
+                eprintln!("kernels-build: --engine-root needs a directory");
+                std::process::exit(2);
+            }
+        } else {
+            positional.push(arg);
+        }
+    }
+    let mut positional = positional.into_iter();
+    let repo_root = positional.next().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
     // Recipe/script paths built from repo_root get passed to Command::current_dir(repo_root) --
     // if repo_root were still relative, the child resolves them against ITS new cwd, not ours.
     let repo_root = repo_root.canonicalize().unwrap_or(repo_root);
-    let kernels_root = args.next().map(PathBuf::from).unwrap_or_else(|| repo_root.join(PUBLISHED_KERNELS_DIR));
-    let mlir_aie_root = args.next().map(PathBuf::from).unwrap_or_else(|| repo_root.join("mlir-aie"));
+    let kernels_root = positional.next().map(PathBuf::from).unwrap_or_else(|| repo_root.join(PUBLISHED_KERNELS_DIR));
+    let mlir_aie_root = positional.next().map(PathBuf::from).unwrap_or_else(|| repo_root.join("mlir-aie"));
+    let config = config.unwrap_or_else(default_engine_config_path);
+    let engine_root = engine_root.unwrap_or_else(|| repo_root.clone());
 
-    let declared = match load_declared_kernel_set(&repo_root) {
+    let declared = match load_declared_kernel_set_from_engine_config(&repo_root, &engine_root, &config) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("[build-declared-kernels] could not load declared_kernels.json under {}: {e}", repo_root.display());
+            eprintln!("[kernels-build] could not resolve served kernel declarations from {}: {e}", config.display());
             std::process::exit(2);
         }
     };
@@ -64,16 +121,17 @@ pub fn run(argv: Vec<String>) {
 
     if attempted > 0 {
         println!("[build-declared-kernels] {attempted} build(s) attempted -- publishing");
-        let publish = std::process::Command::new("bash")
-            .arg(repo_root.join("scripts/publish_kernels.sh"))
-            .arg(&kernels_root)
-            .arg(&mlir_aie_root)
-            .current_dir(&repo_root)
-            .status();
+        let publish = publish_command(&repo_root, &kernels_root, &mlir_aie_root, &config, &engine_root).status();
         match publish {
             Ok(s) if s.success() => {}
-            Ok(s) => println!("[build-declared-kernels] WARNING: publish_kernels.sh exited {s}"),
-            Err(e) => println!("[build-declared-kernels] WARNING: could not run publish_kernels.sh: {e}"),
+            Ok(s) => {
+                eprintln!("[kernels-build] publish_kernels.sh exited {s}");
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("[kernels-build] could not run publish_kernels.sh: {e}");
+                std::process::exit(1);
+            }
         }
     } else if no_recipe > 0 {
         println!(
@@ -83,13 +141,13 @@ pub fn run(argv: Vec<String>) {
         println!("[build-declared-kernels] nothing was Missing -- publish skipped");
     }
 
-    let final_report = verify_declared_kernel_set(&declared, &kernels_root);
+    let final_report = verify_declared_kernel_set_from(&declared, &kernels_root, Some(&repo_root));
     let mut missing = 0usize;
     let mut mismatched = 0usize;
     for entry in &final_report {
         match &entry.status {
             DeclaredStatus::Missing => missing += 1,
-            DeclaredStatus::HashMismatch(_) => mismatched += 1,
+            DeclaredStatus::HashMismatch(_) | DeclaredStatus::PresentUnverified | DeclaredStatus::StaleSource { .. } => mismatched += 1,
             _ => {}
         }
     }

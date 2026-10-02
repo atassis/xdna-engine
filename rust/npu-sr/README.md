@@ -47,7 +47,7 @@ pretrained model, converted by the `espcn` / `edsr` arch):
       --checkpoint target/test-checkpoints/edsr.safetensors --force
 
 Build the whole-array GEMM kernel the NPU frontier uses (once; aie2p / NPU2, bf16). It is
-declared in the repo's `declared_kernels.json` (`whole_array`, stem
+declared by `scenarios/upscale-espcn.toml` (`whole_array`, stem
 `512x576x256_32x32x32_8c`), so `npu-dev kernels-build` (what `install.sh` runs) builds it like
 any other kernel. Equivalent by hand:
 

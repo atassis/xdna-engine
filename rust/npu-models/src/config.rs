@@ -1,6 +1,7 @@
 //! Declarative scenario manifest: everything that varies between models.
 
 use serde::Deserialize;
+use npu_asr::kernel_registry::DeclaredKernelSet;
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct ScenarioConfig {
@@ -33,6 +34,10 @@ pub struct ScenarioConfig {
     /// `MultimodalCfg`'s own doc.
     #[serde(default)]
     pub multimodal: MultimodalCfg,
+    /// `None` records that the scenario has not declared its common-kernel closure; an explicit
+    /// empty table means its loader uses only self-contained or ONNX artifacts.
+    #[serde(default)]
+    pub kernels: Option<DeclaredKernelSet>,
 }
 
 /// Where to find the vision/audio tower weights for THIS model, if it has any. Deliberately a
@@ -372,6 +377,78 @@ normalize = true
         assert_eq!(c.model.as_ref().unwrap().hidden, 768);
         assert_eq!(c.model.as_ref().unwrap().precision, "bf16"); // default applied
         assert!(c.embeddings.normalize);
+    }
+
+    #[test]
+    fn kernels_presence_is_distinct_from_an_explicit_empty_table() {
+        let base = "[scenario]\nkind = \"diarize\"\nname = \"d\"\n[artifacts]\nweights = \"artifacts/d\"\n";
+        let absent = ScenarioConfig::from_str(base).expect("scenario without kernels parses");
+        assert!(absent.kernels.is_none(), "an omitted declaration is not an empty declaration");
+
+        let empty = ScenarioConfig::from_str(&format!("{base}\n[kernels]\n"))
+            .expect("an explicit empty table parses");
+        assert!(empty.kernels.is_some());
+        assert!(empty.kernels.unwrap().is_empty());
+    }
+
+    #[test]
+    fn every_shipped_scenario_declares_its_common_kernel_closure() {
+        for scenario in [
+            "asr.toml",
+            "asr-gigaam.toml",
+            "asr-whisper-small.toml",
+            "asr-whisper-turbo.toml",
+            "bge-base.toml",
+            "diarize-pyannote-3.1.toml",
+            "diarize-pyannote-community-1.toml",
+            "generate-gemma3-270m.toml",
+            "generate-gemma4-12b-resident.toml",
+            "generate-gemma4-12b-resident-256k.toml",
+            "generate-qwen3-0.6b.toml",
+            "generate-qwen3.5-4b.toml",
+            "nli-openjev-4b.toml",
+            "upscale-espcn.toml",
+        ] {
+            let path = format!("../../scenarios/{scenario}");
+            let config = ScenarioConfig::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert!(config.kernels.is_some(), "{scenario} must declare [kernels]");
+        }
+    }
+
+    #[test]
+    fn self_contained_scenarios_do_not_inherit_encoder_kernel_requirements() {
+        for scenario in [
+            "diarize-pyannote-3.1.toml",
+            "diarize-pyannote-community-1.toml",
+            "generate-gemma3-270m.toml",
+            "generate-qwen3-0.6b.toml",
+        ] {
+            let path = format!("../../scenarios/{scenario}");
+            let config = ScenarioConfig::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            assert!(config.kernels.unwrap().is_empty(), "{scenario} must remain self-contained");
+        }
+        let bge = ScenarioConfig::from_str(&std::fs::read_to_string("../../scenarios/bge-base.toml").unwrap()).unwrap();
+        assert!(bge.kernels.unwrap().contains_key("whole_array"));
+    }
+
+    #[test]
+    fn ctx2_scenarios_declare_the_default_identity_stream_producers() {
+        for (scenario, identity_streams) in [
+            ("asr-gigaam.toml", &[768, 1536, 3072][..]),
+            ("asr-whisper-small.toml", &[768, 3072][..]),
+            ("asr-whisper-turbo.toml", &[1280, 5120][..]),
+            ("bge-base.toml", &[768, 3072][..]),
+        ] {
+            let path = format!("../../scenarios/{scenario}");
+            let config = ScenarioConfig::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            let family = &config.kernels.unwrap()["whole_array"];
+            for &n in identity_streams {
+                assert!(
+                    family.required.iter().any(|stem| stem.contains(&format!("x{n}_")) && stem.contains("modalid")),
+                    "{scenario} must build the modal identity stream producer for N={n}",
+                );
+            }
+        }
     }
 
     #[test]

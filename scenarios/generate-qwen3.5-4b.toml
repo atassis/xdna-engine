@@ -61,3 +61,5 @@ prefill = "artifacts/qwen3.5-4b/prefill_m256f_s4096_p8e3958"
 
 [generation]
 max_tokens = 1024
+
+[kernels]

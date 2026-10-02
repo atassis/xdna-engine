@@ -44,3 +44,5 @@ name = "gemma3-270m"
 decode = "artifacts/gemma3-270m/decode_qat_int4_pe8e957d"
 weights = "artifacts/gemma3-270m/weights_qat_int4g32"
 tokenizer_dir = "artifacts/gemma3-270m/tokenizer_qat"
+
+[kernels]

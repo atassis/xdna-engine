@@ -9,3 +9,5 @@ weights = "artifacts/pyannote/speaker-diarization-community-1"
 
 [diarization]
 manifest = "artifacts/pyannote/speaker-diarization-community-1/diarize.json"
+
+[kernels]

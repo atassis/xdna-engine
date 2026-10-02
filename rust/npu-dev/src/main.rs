@@ -5,9 +5,9 @@
 mod cmd;
 
 const SUBCOMMANDS: &[(&str, &str)] = &[
-    ("kernels-build", "Build every declared kernel reported Missing, then publish and re-verify."),
-    ("kernels-manifest", "Regenerate kernel_manifest.json for one or more artifact directories."),
-    ("kernels-verify", "Check declared_kernels.json against what actually exists under a kernels root."),
+    ("kernels-build", "Build the selected engine.toml closure, then publish and re-verify."),
+    ("kernels-manifest", "Regenerate manifests with source digests for the selected engine.toml closure."),
+    ("kernels-verify", "Check the selected engine.toml closure against a kernels root."),
     ("s2-chain", "Device probe for the full S2 decoder-chain driver loop (head/stage/tail/chain)."),
     ("s2-design", "Device probe for one exported S2 codec design (rel-L2 + determinism gate)."),
     ("verify-parakeet", "Verify the Rust Parakeet host reference encoder vs ONNX reference activations."),

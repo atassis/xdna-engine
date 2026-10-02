@@ -12,3 +12,5 @@ weights = "artifacts/openjev-4b/decode_s4096_gdrl/buffers"
 tokenizer_dir = "artifacts/openjev-4b/tokenizer"
 prefill = "artifacts/openjev-4b/prefill_m256f_s4096"
 nli_head = "artifacts/openjev-4b/nli_head"
+
+[kernels]

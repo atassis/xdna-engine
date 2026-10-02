@@ -31,3 +31,5 @@ max_tokens = 262144
 # LadderResidentForward::set_media.
 [multimodal]
 tower_checkpoint = "artifacts/gemma4-12b-qat/checkpoint"
+
+[kernels]
