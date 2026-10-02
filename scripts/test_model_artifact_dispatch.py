@@ -36,6 +36,15 @@ CONFIG = Path.home() / ".config/npu/engine.toml"
 
 
 class ModelArtifactDispatchPlanTests(unittest.TestCase):
+    def test_install_provisions_weight_dump_dependencies_before_rust_build(self) -> None:
+        install = (REPO / "install.sh").read_text()
+        self.assertIn("requirements-model-weights.txt", install)
+        self.assertLess(install.index("requirements-model-weights.txt"), install.index("cargo build --release"))
+        requirements = (REPO / "scripts/requirements-model-weights.txt").read_text().splitlines()
+        self.assertIn("torch==2.12.0+cpu", requirements)
+        self.assertIn("safetensors==0.8.0", requirements)
+        self.assertIn("huggingface-hub==0.36.2", requirements)
+
     def test_community_sdk_pins_checkpoint_loader_fix(self) -> None:
         requirements = (REPO / "scripts/requirements-pyannote-community.txt").read_text().splitlines()
         self.assertIn("pyannote.audio==4.0.3", requirements)

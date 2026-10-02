@@ -91,6 +91,7 @@ PYANNOTE_VENV="${PYANNOTE_VENV:-$REPO/.venv-pyannote}"
 PYANNOTE_COMMUNITY_VENV="${PYANNOTE_COMMUNITY_VENV:-$REPO/.venv-pyannote-community}"
 MODEL_PYANNOTE_PY="${MODEL_PYANNOTE_PY:-$PYANNOTE_VENV/bin/python}"
 MODEL_PYANNOTE_COMMUNITY_PY="${MODEL_PYANNOTE_COMMUNITY_PY:-$PYANNOTE_COMMUNITY_VENV/bin/python}"
+MODEL_IRON_PY="${MODEL_IRON_PY:-${VENV_IRON:-$REPO/.venv-iron}/bin/python}"
 
 # Stable PRODUCTION root. The service must not depend on a working directory or on a git
 # worktree: a checkout can be moved, rebased onto a branch, or pruned, and the running service
@@ -198,6 +199,13 @@ fi
 if printf '%s\n' "$PYANNOTE_SDKS" | grep -qx legacy; then
   PYANNOTE_VENV="$PYANNOTE_VENV" "$REPO/scripts/setup_pyannote_venv.sh"
 fi
+
+[ -x "$MODEL_IRON_PY" ] || die "model build interpreter missing: $MODEL_IRON_PY; run scripts/bootstrap_public_env.sh"
+uv pip install --python "$MODEL_IRON_PY" \
+  --extra-index-url https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match \
+  -r "$REPO/scripts/requirements-model-weights.txt"
+"$MODEL_IRON_PY" -c 'import torch, safetensors, huggingface_hub' \
+  || die "model weight dependencies are not importable in $MODEL_IRON_PY"
 
 # 2c. XRT headers + libs
 [ -f "$XRT_INC_DIR/xrt/xrt_bo.h" ] || [ -f "$XRT_INC_DIR/xrt.h" ] \
@@ -340,7 +348,6 @@ fi
 # ---------------------------------------------------------------------------
 MODEL_INPUT_ROOT="${MODEL_INPUT_ROOT:-$XDNA_DATA/model-inputs}"
 MODEL_INSTALL_REPORT="${MODEL_INSTALL_REPORT:-$XDNA_LOGS/model-install-report.json}"
-MODEL_IRON_PY="${MODEL_IRON_PY:-${VENV_IRON:-$REPO/.venv-iron}/bin/python}"
 info "Building configured model artifacts from $MODEL_INPUT_ROOT"
 MODEL_EXPORT_PY="$ONNX_ASR_PY" MODEL_IRON_PY="$MODEL_IRON_PY" \
 MODEL_PYANNOTE_PY="$MODEL_PYANNOTE_PY" MODEL_PYANNOTE_COMMUNITY_PY="$MODEL_PYANNOTE_COMMUNITY_PY" NPU_BIN="$BUILT_BIN" \
