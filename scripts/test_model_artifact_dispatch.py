@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from model_artifact_dispatch import (
@@ -14,11 +15,13 @@ from model_artifact_dispatch import (
     copy_tree,
     materialize_input,
     build_recipe,
+    configured_pyannote_sdks,
     ensure_outputs_ready,
     plan as build_plan,
     publish_recipe,
     provision_inputs,
     recipe_key,
+    recipe_for,
     source_manifest_path,
     run_commands,
     validate_recipe_inputs,
@@ -33,6 +36,93 @@ CONFIG = Path.home() / ".config/npu/engine.toml"
 
 
 class ModelArtifactDispatchPlanTests(unittest.TestCase):
+    def test_install_provisions_only_the_pyannote_sdks_selected_by_config(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "engine.toml"
+            config.write_text(
+                "[[model]]\nname = 'pyannote-community-1'\nscenario = 'scenarios/diarize-pyannote-community-1.toml'\n"
+                "[[model]]\nname = 'pyannote-3.1'\nscenario = 'scenarios/diarize-pyannote-3.1.toml'\n"
+            )
+            self.assertEqual(configured_pyannote_sdks(config), ("community", "legacy"))
+
+        install = (REPO / "install.sh").read_text()
+        self.assertIn("--pyannote-sdks", install)
+        self.assertIn("setup_pyannote_community_venv.sh", install)
+        self.assertIn("setup_pyannote_venv.sh", install)
+        self.assertLess(install.index("--pyannote-sdks"), install.index("cargo build --release"))
+
+    def test_community_recipe_uses_its_own_sdk_and_validates_local_checkpoints_first(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            community_python = root / "pyannote-community/bin/python"
+            legacy_python = root / "pyannote-3.1/bin/python"
+            with patch.dict(os.environ, {
+                "MODEL_PYANNOTE_COMMUNITY_PY": str(community_python),
+                "MODEL_PYANNOTE_PY": str(legacy_python),
+            }, clear=False):
+                community = recipe_for(
+                    "pyannote-community-1",
+                    "scenarios/diarize-pyannote-community-1.toml",
+                    REPO,
+                    root / "artifacts",
+                    root / "inputs",
+                    root / "build",
+                )
+                legacy = recipe_for(
+                    "pyannote-3.1",
+                    "scenarios/diarize-pyannote-3.1.toml",
+                    REPO,
+                    root / "artifacts",
+                    root / "inputs",
+                    root / "build",
+                )
+
+            self.assertEqual([command.step for command in community.commands], ["validate", "export"])
+            self.assertEqual(community.commands[0].argv[0], str(community_python))
+            self.assertEqual(legacy.commands[0].argv[0], str(legacy_python))
+            self.assertIn("verify_pyannote_local_load.py", community.commands[0].argv[1])
+            self.assertEqual(community.commands[0].argv[2], community.inputs[0])
+
+    def test_community_sdk_identity_invalidates_the_recipe_key(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "scenarios").mkdir()
+            (root / "scripts").mkdir()
+            (root / "designs/decode_fused").mkdir(parents=True)
+            (root / "designs/resident_forward").mkdir(parents=True)
+            (root / "aie_kernels").mkdir()
+            (root / "third_party/iron").mkdir(parents=True)
+            (root / "toolchain.lock").write_text("PIN=one\n")
+            (root / "scenarios/diarize-pyannote-community-1.toml").write_text("[scenario]\nkind = 'diarize'\n")
+            config = root / "engine.toml"
+            config.write_text("[[model]]\nname = 'pyannote-community-1'\nscenario = 'scenarios/diarize-pyannote-community-1.toml'\n")
+            source = root / "input"
+            source.mkdir()
+            (source / "config.yaml").write_text("pipeline:\n  params:\n    segmentation: $model/segmentation\n    embedding: $model/embedding\n")
+            for name in ("segmentation", "embedding"):
+                checkpoint = source / name / "pytorch_model.bin"
+                checkpoint.parent.mkdir()
+                checkpoint.write_bytes(name.encode())
+            exporter = root / "scripts/export_pyannote.py"
+            validator = root / "scripts/verify_pyannote_local_load.py"
+            exporter.write_text("export = 1\n")
+            validator.write_text("validate = 1\n")
+            recipe = Recipe(
+                "pyannote-community-1",
+                "scenarios/diarize-pyannote-community-1.toml",
+                (str(source),),
+                (str(root / "output"),),
+                (Command("validate", (str(root / "community-python"), str(validator), str(source)), {}),
+                 Command("export", (str(root / "community-python"), str(exporter)), {})),
+            )
+
+            with patch("model_artifact_dispatch.pyannote_sdk_identity", return_value="sdk-one"):
+                first = recipe_key(recipe, root, config)
+            with patch("model_artifact_dispatch.pyannote_sdk_identity", return_value="sdk-two"):
+                second = recipe_key(recipe, root, config)
+
+            self.assertNotEqual(first, second)
+
     def test_onnx_external_data_gets_a_private_inode(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

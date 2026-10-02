@@ -87,6 +87,10 @@ CARGO_TARGET_DIR_RESOLVED="$(cd "$REPO/rust" && cargo metadata --format-version 
 [ -n "$CARGO_TARGET_DIR_RESOLVED" ] || CARGO_TARGET_DIR_RESOLVED="$REPO/rust/target"
 BUILT_BIN="$CARGO_TARGET_DIR_RESOLVED/release/npu"
 ENGINE_CONFIG="${ENGINE_CONFIG:-$HOME/.config/npu/engine.toml}"
+PYANNOTE_VENV="${PYANNOTE_VENV:-$REPO/.venv-pyannote}"
+PYANNOTE_COMMUNITY_VENV="${PYANNOTE_COMMUNITY_VENV:-$REPO/.venv-pyannote-community}"
+MODEL_PYANNOTE_PY="${MODEL_PYANNOTE_PY:-$PYANNOTE_VENV/bin/python}"
+MODEL_PYANNOTE_COMMUNITY_PY="${MODEL_PYANNOTE_COMMUNITY_PY:-$PYANNOTE_COMMUNITY_VENV/bin/python}"
 
 # Stable PRODUCTION root. The service must not depend on a working directory or on a git
 # worktree: a checkout can be moved, rebased onto a branch, or pruned, and the running service
@@ -184,6 +188,16 @@ ONNX_ASR_PY="$ONNX_ASR_VENV/bin/python"
 "$ONNX_ASR_PY" -c "import onnx_asr" 2>/dev/null \
   || die "'import onnx_asr' failed in $ONNX_ASR_VENV — venv is missing onnx_asr."
 ok "onnx-asr venv: $ONNX_ASR_VENV (import onnx_asr OK)"
+
+# The export SDK is selected by the served model recipe, not by a shared venv.
+[ -f "$ENGINE_CONFIG" ] || die "engine config missing: $ENGINE_CONFIG"
+PYANNOTE_SDKS="$("$ONNX_ASR_PY" "$REPO/scripts/model_artifact_dispatch.py" --pyannote-sdks --config "$ENGINE_CONFIG")"
+if printf '%s\n' "$PYANNOTE_SDKS" | grep -qx community; then
+  PYANNOTE_COMMUNITY_VENV="$PYANNOTE_COMMUNITY_VENV" "$REPO/scripts/setup_pyannote_community_venv.sh"
+fi
+if printf '%s\n' "$PYANNOTE_SDKS" | grep -qx legacy; then
+  PYANNOTE_VENV="$PYANNOTE_VENV" "$REPO/scripts/setup_pyannote_venv.sh"
+fi
 
 # 2c. XRT headers + libs
 [ -f "$XRT_INC_DIR/xrt/xrt_bo.h" ] || [ -f "$XRT_INC_DIR/xrt.h" ] \
@@ -327,10 +341,9 @@ fi
 MODEL_INPUT_ROOT="${MODEL_INPUT_ROOT:-$XDNA_DATA/model-inputs}"
 MODEL_INSTALL_REPORT="${MODEL_INSTALL_REPORT:-$XDNA_LOGS/model-install-report.json}"
 MODEL_IRON_PY="${MODEL_IRON_PY:-${VENV_IRON:-$REPO/.venv-iron}/bin/python}"
-MODEL_PYANNOTE_PY="${MODEL_PYANNOTE_PY:-${PYANNOTE_VENV:-$REPO/.venv-pyannote}/bin/python}"
 info "Building configured model artifacts from $MODEL_INPUT_ROOT"
 MODEL_EXPORT_PY="$ONNX_ASR_PY" MODEL_IRON_PY="$MODEL_IRON_PY" \
-MODEL_PYANNOTE_PY="$MODEL_PYANNOTE_PY" NPU_BIN="$BUILT_BIN" \
+MODEL_PYANNOTE_PY="$MODEL_PYANNOTE_PY" MODEL_PYANNOTE_COMMUNITY_PY="$MODEL_PYANNOTE_COMMUNITY_PY" NPU_BIN="$BUILT_BIN" \
   "$ONNX_ASR_PY" "$REPO/scripts/model_artifact_dispatch.py" --build \
   --config "$ENGINE_CONFIG" --repo "$REPO" --artifacts-root "$ENGINE_ARTIFACTS" \
   --model-input-root "$MODEL_INPUT_ROOT" --report "$MODEL_INSTALL_REPORT" \

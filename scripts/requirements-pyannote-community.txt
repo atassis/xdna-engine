@@ -1,0 +1,8 @@
+# CPU-only dependencies for pyannote/speaker-diarization-community-1 export.
+torch==2.8.0+cpu
+torchaudio==2.8.0+cpu
+torchcodec==0.6.0+cpu
+pyannote.audio==4.0.0
+onnx
+numpy
+PyYAML

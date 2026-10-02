@@ -58,11 +58,31 @@ def configured_models(config: Path) -> list[dict]:
     return selected
 
 
+PYANNOTE_SDKS = {
+    "pyannote-3.1": ("legacy", ("pyannote-audio", "torch", "torchaudio", "huggingface-hub", "onnx", "PyYAML")),
+    "pyannote-community-1": ("community", ("pyannote-audio", "torch", "torchaudio", "torchcodec", "onnx", "numpy", "PyYAML")),
+}
+
+
+def pyannote_sdk_for_model(model: str) -> str:
+    return PYANNOTE_SDKS[model][0]
+
+
+def configured_pyannote_sdks(config: Path) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(
+        pyannote_sdk_for_model(entry["name"])
+        for entry in configured_models(config)
+        if entry["name"] in PYANNOTE_SDKS
+    ))
+
+
 def recipe_for(model: str, scenario: str, repo: Path, artifacts: Path, inputs: Path, build: Path) -> Recipe:
     py = sys.executable
     export_py = os.environ.get("MODEL_EXPORT_PY", sys.executable)
     iron_py = os.environ.get("MODEL_IRON_PY", str(repo / ".venv-iron/bin/python"))
     pyannote_py = os.environ.get("MODEL_PYANNOTE_PY", str(repo / ".venv-pyannote/bin/python"))
+    pyannote_community_py = os.environ.get(
+        "MODEL_PYANNOTE_COMMUNITY_PY", str(repo / ".venv-pyannote-community/bin/python"))
     npu = os.environ.get("NPU_BIN", "npu")
     scripts = repo / "scripts"
     out = lambda rel: path(artifacts, rel)
@@ -88,11 +108,16 @@ def recipe_for(model: str, scenario: str, repo: Path, artifacts: Path, inputs: P
         if scenario != expected:
             raise ValueError(f"{model} is bound to {expected}, not {scenario}")
         slug = "speaker-diarization-community-1" if model == "pyannote-community-1" else "speaker-diarization-3.1"
+        sdk_python = pyannote_community_py if model == "pyannote-community-1" else pyannote_py
+        pipeline = src(f"pyannote/{slug}")
         return Recipe(
-            model, scenario, (src(f"pyannote/{slug}"),), (out(f"pyannote/{slug}"),),
-            (command("export", [pyannote_py, str(scripts / "export_pyannote.py")],
-                     PYANNOTE_PIPELINE=src(f"pyannote/{slug}"),
-                     PYANNOTE_OUT=out(f"pyannote/{slug}"), HF_HUB_OFFLINE="1"),),
+            model, scenario, (pipeline,), (out(f"pyannote/{slug}"),),
+            (
+                command("validate", [sdk_python, str(scripts / "verify_pyannote_local_load.py"), pipeline],
+                        HF_HUB_OFFLINE="1"),
+                command("export", [sdk_python, str(scripts / "export_pyannote.py")],
+                        PYANNOTE_PIPELINE=pipeline, PYANNOTE_OUT=out(f"pyannote/{slug}"), HF_HUB_OFFLINE="1"),
+            ),
         )
     if model == "whisper-turbo" and scenario == "scenarios/asr-whisper-turbo.toml":
         whisper = out("whisper-turbo")
@@ -284,13 +309,32 @@ def authority_digest(recipe: Recipe, repo: Path) -> str:
     for candidate in candidates:
         digest.update(str(candidate.relative_to(root)).encode())
         digest.update(tree_digest(candidate).encode())
-    for name in ("MODEL_IRON_PY", "MODEL_EXPORT_PY", "MODEL_PYANNOTE_PY", "MODEL_AIECC"):
+    for name in ("MODEL_IRON_PY", "MODEL_EXPORT_PY", "MODEL_PYANNOTE_PY", "MODEL_PYANNOTE_COMMUNITY_PY", "MODEL_AIECC"):
         value = os.environ.get(name)
         if value:
             candidate = Path(value)
             digest.update(name.encode())
             digest.update(tree_digest(candidate).encode())
+    if recipe.model in PYANNOTE_SDKS:
+        digest.update(pyannote_sdk_identity(recipe).encode())
     return digest.hexdigest()
+
+
+def pyannote_sdk_identity(recipe: Recipe) -> str:
+    executable = recipe.commands[0].argv[0]
+    packages = PYANNOTE_SDKS[recipe.model][1]
+    probe = (
+        "import hashlib,json;from importlib.metadata import distribution;"
+        f"names={packages!r};"
+        "print(json.dumps({name:{'version':(d:=distribution(name)).version,"
+        "'record':hashlib.sha256((d.read_text('RECORD') or d.read_text('METADATA') or '').encode()).hexdigest()}"
+        " for name in names},sort_keys=True))"
+    )
+    try:
+        return subprocess.check_output([executable, "-c", probe], text=True, stderr=subprocess.STDOUT).strip()
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise RuntimeError(
+            f"{recipe.model}: SDK identity probe failed for {executable}; run its selected setup script") from error
 
 
 def recipe_key(recipe: Recipe, repo: Path, config: Path, *, authority: str | None = None,
@@ -694,6 +738,7 @@ def main() -> int:
     parser.add_argument("--build-dir", type=Path)
     parser.add_argument("--plan", action="store_true")
     parser.add_argument("--build", action="store_true")
+    parser.add_argument("--pyannote-sdks", action="store_true")
     parser.add_argument("--report", type=Path)
     parser.add_argument("--copy-tokenizer", nargs=2, metavar=("SOURCE", "OUT"))
     parser.add_argument("--package-gemma4", action="store_true")
@@ -712,8 +757,13 @@ def main() -> int:
         package_gemma4(args.repo.resolve(), args.artifacts_root.resolve(), args.build_dir.resolve(), args.out.resolve(), args.tokenizer_source.resolve(), args.tokenizer_out.resolve())
         return 0
 
-    if args.plan == args.build:
-        parser.error("choose exactly one of --plan or --build")
+    if sum((args.plan, args.build, args.pyannote_sdks)) != 1:
+        parser.error("choose exactly one of --plan, --build, or --pyannote-sdks")
+    if args.pyannote_sdks:
+        if args.config is None:
+            parser.error("--pyannote-sdks needs --config")
+        print("\n".join(configured_pyannote_sdks(args.config.resolve())))
+        return 0
     for name in ("config", "repo", "artifacts_root", "model_input_root"):
         if getattr(args, name) is None:
             parser.error(f"--{name.replace('_', '-')} is required")
