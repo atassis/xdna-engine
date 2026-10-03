@@ -304,7 +304,12 @@ stage_rf_stack() {
   d=$(decide "$dir")
   log "rf_stack ($dir): $d"
   case "$d" in
-    skip) return ;;
+    skip)
+      if [ ! -f "$dir/w_head.npy" ]; then
+        _build_rf_head "$dir"
+        write_manifest "$dir" rf_stack "python stack_prep.py 0 47; rhead.head_stream()" "{}"
+      fi
+      return ;;
     adopt) write_manifest "$dir" rf_stack "python stack_prep.py 0 47 (RF_STORE/RF_STACK_OUT)" "{}"; return ;;
     build)
       [ -d "$STORE_DIR" ] || { log "rf_stack needs $STORE_DIR (run the store stage first)"; exit 1; }
@@ -317,6 +322,11 @@ stage_rf_stack() {
 _build_rf_stack() {
   local tmp=$1
   ( cd "$RF" && RF_WDIR="$WEIGHTS_DIR" RF_STORE="$STORE_DIR" RF_STACK_OUT="$tmp" "$PY" stack_prep.py 0 47 )
+  _build_rf_head "$tmp"
+}
+_build_rf_head() {
+  local dir=$1
+  ( cd "$RF" && RF_STORE="$STORE_DIR" RF_STACK_OUT="$dir" "$PY" -c 'import rhead; rhead.head_stream()' )
 }
 
 # ---------------------------------------------------------------------------

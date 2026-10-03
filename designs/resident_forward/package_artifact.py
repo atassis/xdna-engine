@@ -28,7 +28,7 @@ def require_dir(path: Path) -> None:
 
 def copy_file(source: str, destination: str) -> str:
     try:
-        os.link(source, destination)
+        os.link(Path(source).resolve(), destination)
     except OSError:
         shutil.copy2(source, destination)
     return destination

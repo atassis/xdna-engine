@@ -177,6 +177,13 @@ print("host preparation does not require pyxrt")
                 out = Path(os.environ["RF_STACK_OUT"])
                 (out / "input.json").write_text(json.dumps({{"weights": os.environ["RF_WDIR"]}}))
             """))
+            (rf / "rhead.py").write_text(textwrap.dedent("""
+                import os
+                from pathlib import Path
+                def head_stream():
+                    out = Path(os.environ["RF_STACK_OUT"])
+                    (out / "w_head.npy").write_bytes(b"head-stream")
+            """))
             bins = root / "bin"
             bins.mkdir()
             df = bins / "df"
@@ -191,6 +198,7 @@ print("host preparation does not require pyxrt")
             self.assertEqual(result.returncode, 0, result.stderr)
             recorded = json.loads((artifacts / "gemma4-12b/rf_stack/input.json").read_text())
             self.assertEqual(recorded["weights"], str(weights))
+            self.assertEqual((artifacts / "gemma4-12b/rf_stack/w_head.npy").read_bytes(), b"head-stream")
 
 
 if __name__ == "__main__":

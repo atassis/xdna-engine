@@ -16,6 +16,7 @@ from model_artifact_dispatch import (
     materialize_input,
     build_recipe,
     configured_pyannote_sdks,
+    package_gemma4,
     ensure_outputs_ready,
     plan as build_plan,
     publish_recipe,
@@ -37,6 +38,52 @@ CONFIG = Path.home() / ".config/npu/engine.toml"
 
 
 class ModelArtifactDispatchPlanTests(unittest.TestCase):
+    def test_copy_tree_dereferences_file_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, target = root / "source", root / "target"
+            source.mkdir()
+            blob = root / "blob.bin"
+            blob.write_bytes(b"weights")
+            (source / "weights.bin").symlink_to(blob)
+            copy_tree(source, target)
+            blob.unlink()
+            self.assertEqual((target / "weights.bin").read_bytes(), b"weights")
+
+    def test_gemma4_packages_tower_checkpoint_without_full_text_weights(self) -> None:
+        import numpy as np
+        from safetensors.numpy import load_file
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifacts, source = root / "artifacts", root / "source"
+            source.mkdir()
+            (source / "config.json").write_text("{}")
+            (source / "tokenizer.json").write_text("{}")
+            (source / "model.safetensors").write_bytes(b"unneeded-text-stack")
+            store = artifacts / "gemma4-12b/store"
+            (store / "blobs").mkdir(parents=True)
+            array = np.array([1.25, 2.5], dtype=np.float32)
+            (store / "blobs/tower.bin").write_bytes(array.tobytes())
+            (store / "manifest.json").write_text(json.dumps({"towers": {
+                "model.embed_audio.embedding_projection.weight": {
+                    "blob": "tower", "offset": 0, "length": array.nbytes,
+                    "shape": list(array.shape), "dtype": "float32", "layout": "raw_native"}}}))
+            with patch("model_artifact_dispatch.subprocess.run"):
+                package_gemma4(REPO, artifacts, root / "build", root / "out", source, root / "tokenizer")
+            checkpoint = artifacts / "gemma4-12b-qat/checkpoint"
+            saved = load_file(checkpoint / "model.safetensors")
+            self.assertEqual(list(saved), ["model.embed_audio.embedding_projection.weight"])
+            np.testing.assert_array_equal(next(iter(saved.values())), array)
+
+    def test_gemma4_build_consumes_its_staged_store(self) -> None:
+        artifacts, build = REPO / "data/artifacts", REPO / "data/build"
+        recipe = recipe_for("gemma4-12b", "scenarios/generate-gemma4-12b-resident-256k.toml",
+                            REPO, artifacts, REPO / "data/model-inputs", build)
+        stage = build / "staging/gemma4"
+        staged = rebase_recipe(recipe, artifacts, stage / "artifacts", build, stage / "build")
+        command = next(item for item in staged.commands if item.step == "build")
+        self.assertEqual(command.env.get("RF_STORE"), str(stage / "artifacts/gemma4-12b/store"))
+
     def test_published_prefill_metadata_resolves_its_published_decode(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

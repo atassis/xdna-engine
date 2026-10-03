@@ -168,7 +168,8 @@ def recipe_for(model: str, scenario: str, repo: Path, artifacts: Path, inputs: P
             model, scenario, (src("gemma4-12b/checkpoint"),), (resident, tokenizer, checkpoint, *data_outputs),
             (
                 command("data", ["bash", str(repo / "designs/resident_forward/recipes/gemma4_data.sh"), "--out", str(artifacts), "--checkpoint-dir", src("gemma4-12b/checkpoint")], **weight_env),
-                command("build", ["bash", str(repo / "designs/resident_forward/recipes/rf48C.sh")], RF_BUILD=rf_build),
+                command("build", ["bash", str(repo / "designs/resident_forward/recipes/rf48C.sh")],
+                        RF_BUILD=rf_build, RF_STORE=out("gemma4-12b/store")),
                 command("package", [py, str(scripts / "model_artifact_dispatch.py"), "--package-gemma4", "--repo", str(repo), "--artifacts-root", str(artifacts), "--build-dir", rf_build, "--out", resident, "--tokenizer-source", src("gemma4-12b/checkpoint"), "--tokenizer-out", tokenizer]),
             ),
         )
@@ -405,7 +406,7 @@ def link_or_copy(source: str, destination: str) -> str:
     if Path(source).name.endswith(".onnx.data"):
         return shutil.copy2(source, destination)
     try:
-        os.link(source, destination)
+        os.link(Path(source).resolve(), destination)
     except OSError:
         shutil.copy2(source, destination)
     return destination
@@ -416,8 +417,27 @@ def copy_tree(source: Path, target: Path) -> None:
 
 
 def package_gemma4(repo: Path, artifacts: Path, build: Path, out: Path, tokenizer_source: Path, tokenizer_out: Path) -> None:
+    import numpy as np
+    from safetensors.numpy import save_file
+
     checkpoint = artifacts / "gemma4-12b-qat/checkpoint"
-    copy_tree(tokenizer_source, checkpoint)
+    copy_tokenizer(tokenizer_source, checkpoint)
+    store = artifacts / "gemma4-12b/store"
+    manifest = json.loads((store / "manifest.json").read_text())
+    towers = {}
+    for name, entry in manifest["towers"].items():
+        dtype = np.dtype(entry["dtype"])
+        if entry["layout"] != "raw_native" or entry["length"] % dtype.itemsize:
+            raise ValueError(f"{name}: invalid tower storage layout")
+        towers[name] = np.fromfile(store / "blobs" / f"{entry['blob']}.bin", dtype=dtype,
+                                   count=entry["length"] // dtype.itemsize,
+                                   offset=entry["offset"]).reshape(entry["shape"])
+    save_file(towers, checkpoint / "model.safetensors")
+    subprocess.run([
+        sys.executable, str(repo / "designs/resident_forward/artifact_meta.py"),
+        "--build", str(build / "rf48C"), "--store", str(store),
+        "--config", str(checkpoint / "config.json"),
+    ], check=True, cwd=repo)
     cmd = [
         sys.executable,
         str(repo / "designs/resident_forward/package_artifact.py"),
