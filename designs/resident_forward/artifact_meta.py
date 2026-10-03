@@ -55,12 +55,12 @@ def metadata(build: Path, store: Path, config: Path) -> dict:
         "xrows": plan.XROWS, "rope_s_off": plan.RS, "rope_g_off": plan.RG,
         "widths_s_off": plan.WS, "widths_g_off": plan.WG, "widths_bytes": attention.WB,
         "xbuf": layout["XF"], "hidden_slot_bytes": plan.OB, "logits_off": plan.LOGITS,
-        "obuf_f1": layout["OF"], "obuf_f2": layout["OF"],
+        "obuf_f1": layout["OF"], "obuf_f2": forward.Plan(layer, lo, hi, False).OF,
         "layer_weight_off": layout["wbase"], "layer_kv_off": layout["kvbase"],
         "head_off": layout["hbase"], "scratch_bytes": layout["SF"], "cache_bytes": layout["KF"],
         "vocab": cfg["vocab_size"], "logit_softcap": cfg.get("final_logit_softcapping"),
         "scratchpad_params": slots,
-        "split_widths_x_off": [plan.RG + rsplitl.widths_x(layer, col) - plan.XROWS for col in range(layer.NC)],
+        "split_widths_x_off": [rsplitl.widths_x(layer, col) for col in range(layer.NC)],
     }
 
 
