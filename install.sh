@@ -39,7 +39,7 @@ set -euo pipefail
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 REPO="$(dirname "$SCRIPT_PATH")"
 
-ONNX_ASR_VENV="${ONNX_ASR_VENV:-$REPO/.venv-export}"
+export ONNX_ASR_VENV="${ONNX_ASR_VENV:-$REPO/.venv-export}"
 
 # Repo export venv (has onnx + onnxruntime). Used to (re)generate the
 # artifacts/encoder/ encoder weights via extract_encoder.py.

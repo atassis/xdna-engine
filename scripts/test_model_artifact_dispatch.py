@@ -39,6 +39,19 @@ CONFIG = Path.home() / ".config/npu/engine.toml"
 
 
 class ModelArtifactDispatchPlanTests(unittest.TestCase):
+    def test_install_exports_its_selected_onnx_runtime_environment(self) -> None:
+        import re
+        import shlex
+        install = (REPO / "install.sh").read_text()
+        assignment = re.search(r"^(?:export )?ONNX_ASR_VENV=.*$", install, re.MULTILINE)
+        self.assertIsNotNone(assignment)
+        assert assignment is not None
+        env = {key: value for key, value in os.environ.items() if key != "ONNX_ASR_VENV"}
+        probe = "import os; assert os.environ.get('ONNX_ASR_VENV') == '/repo/.venv-export'"
+        script = "REPO=/repo; " + assignment.group(0) + "; " + shlex.quote(sys.executable) + " -c " + shlex.quote(probe)
+        result = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_tokenizer_embeds_its_declared_jinja_template(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             source, target = Path(directory) / "source", Path(directory) / "target"
