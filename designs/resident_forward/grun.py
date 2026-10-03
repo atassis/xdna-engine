@@ -6,7 +6,6 @@ import os
 import sys
 import time
 import numpy as np
-import pyxrt
 import rf_paths
 import rlayer_design as L
 import rattn2_design as A2
@@ -87,6 +86,8 @@ def rel(a, b):
 
 
 def main():
+    import pyxrt
+
     build, n_past = sys.argv[1], int(sys.argv[2])
     ps = [int(v) for v in sys.argv[3].split(",")]
     reps = int(sys.argv[4]) if len(sys.argv) > 4 else 0

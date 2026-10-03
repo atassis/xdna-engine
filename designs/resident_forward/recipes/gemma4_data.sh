@@ -316,7 +316,7 @@ stage_rf_stack() {
 }
 _build_rf_stack() {
   local tmp=$1
-  ( cd "$RF" && RF_STORE="$STORE_DIR" RF_STACK_OUT="$tmp" "$PY" stack_prep.py 0 47 )
+  ( cd "$RF" && RF_WDIR="$WEIGHTS_DIR" RF_STORE="$STORE_DIR" RF_STACK_OUT="$tmp" "$PY" stack_prep.py 0 47 )
 }
 
 # ---------------------------------------------------------------------------

@@ -18,6 +18,7 @@ int4g32 bytes, unchanged (still int4, still one copy, just not chain-resident) -
 papered over. MLP (gate/up/down) is geometry-invariant across all 48 layers and IS fully chain-laid
 out everywhere.
 """
+import argparse
 import glob
 import hashlib
 import json
@@ -274,9 +275,7 @@ def gate_layer0():
     return results
 
 
-# ---- driver ----------------------------------------------------------------
-def main():
-    os.makedirs(BLOBS, exist_ok=True)
+def verify_layer0():
     t0 = time.time()
 
     print("=== gate: byte-identity against prototypes' own wstream.npy files (layer 0) ===", flush=True)
@@ -285,9 +284,15 @@ def main():
         all_ok &= ok
         print(f"  {'OK ' if ok else 'FAIL'} {label}: {nbytes} B (ref {ref_bytes} B)", flush=True)
     if not all_ok:
-        print("GATE FAILED -- not writing the store.", flush=True)
+        print("GATE FAILED", flush=True)
         sys.exit(1)
     print(f"gate passed in {time.time() - t0:.1f}s", flush=True)
+
+
+# ---- driver ----------------------------------------------------------------
+def main():
+    os.makedirs(BLOBS, exist_ok=True)
+    t0 = time.time()
 
     manifest = {
         "model": "gemma4-12b",
@@ -330,5 +335,16 @@ def main():
     print(f"manifest: {STORE}/manifest.json", flush=True)
 
 
+def cli(argv=None):
+    parser = argparse.ArgumentParser(description="Pack resident weights or verify prototype streams.")
+    parser.add_argument("--verify-prototypes", action="store_true",
+                        help="Check layer-0 byte identity against RF_SCRATCH; do not build a store.")
+    args = parser.parse_args(argv)
+    if args.verify_prototypes:
+        verify_layer0()
+    else:
+        main()
+
+
 if __name__ == "__main__":
-    main()
+    cli()
