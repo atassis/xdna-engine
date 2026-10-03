@@ -39,7 +39,7 @@ def metadata(build: Path, store: Path, config: Path) -> dict:
     if sorted(slots.values()) != list(range(len(slots))):
         raise ValueError("compiled scratchpad slots must be unique and contiguous")
     plan = forward.Plan(layer, lo, hi, True)
-    row_block = layer.XB // (layer.D * 2)
+    row_block = plan.XROWS // (layer.PCAP_T * layer.D * 2)
     layer.set_geo(False)
     kvrow_s = layer.KVROW
     return {
