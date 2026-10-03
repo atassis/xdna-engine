@@ -13,6 +13,7 @@ from model_artifact_dispatch import (
     Recipe,
     authority_digest,
     copy_tree,
+    copy_tokenizer,
     materialize_input,
     build_recipe,
     configured_pyannote_sdks,
@@ -38,6 +39,17 @@ CONFIG = Path.home() / ".config/npu/engine.toml"
 
 
 class ModelArtifactDispatchPlanTests(unittest.TestCase):
+    def test_tokenizer_embeds_its_declared_jinja_template(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source, target = Path(directory) / "source", Path(directory) / "target"
+            source.mkdir()
+            (source / "tokenizer_config.json").write_text("{}")
+            template = "{{ bos_token }}{% for message in messages %}{{ message.content }}{% endfor %}"
+            (source / "chat_template.jinja").write_text(template)
+            copy_tokenizer(source, target)
+            self.assertEqual(json.loads((target / "tokenizer_config.json").read_text())["chat_template"], template)
+            self.assertEqual((target / "chat_template.jinja").read_text(), template)
+
     def test_copy_tree_dereferences_file_symlinks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

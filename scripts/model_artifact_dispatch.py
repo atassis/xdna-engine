@@ -394,12 +394,18 @@ def ensure_outputs_ready(recipe: Recipe, key: str) -> None:
 
 
 def copy_tokenizer(source: Path, target: Path) -> None:
-    files = [p for p in source.iterdir() if p.is_file() and (p.suffix == ".json" or p.name.endswith(".model"))]
+    files = [p for p in source.iterdir() if p.is_file() and (p.suffix in {".json", ".jinja"} or p.name.endswith(".model"))]
     if not files:
         raise FileNotFoundError(f"no tokenizer/config JSON files in {source}")
     target.mkdir(parents=True, exist_ok=True)
     for item in files:
         shutil.copy2(item, target / item.name)
+    template, config = target / "chat_template.jinja", target / "tokenizer_config.json"
+    if template.is_file() and config.is_file():
+        data = json.loads(config.read_text())
+        if not data.get("chat_template"):
+            data["chat_template"] = template.read_text()
+            config.write_text(json.dumps(data, indent=2) + "\n")
 
 
 def link_or_copy(source: str, destination: str) -> str:
