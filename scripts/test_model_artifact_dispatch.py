@@ -20,6 +20,7 @@ from model_artifact_dispatch import (
     plan as build_plan,
     publish_recipe,
     provision_inputs,
+    rebase_recipe,
     recipe_key,
     recipe_for,
     source_manifest_path,
@@ -36,6 +37,46 @@ CONFIG = Path.home() / ".config/npu/engine.toml"
 
 
 class ModelArtifactDispatchPlanTests(unittest.TestCase):
+    def test_published_prefill_metadata_resolves_its_published_decode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "scripts").mkdir()
+            (root / "scenario.toml").write_text("[scenario]\nkind = 'generate'\n")
+            config = root / "engine.toml"
+            config.write_text("[[model]]\nname = 'fixture'\nscenario = 'scenario.toml'\n")
+            artifacts, build = root / "artifacts", root / "build"
+            decode, prefill = artifacts / "decode", artifacts / "prefill"
+            builder = root / "scripts/builder.py"
+            builder.write_text(
+                "import os,json\nfrom pathlib import Path\n"
+                "d=Path(os.environ['DECODE']);p=Path(os.environ['PREFILL'])\n"
+                "(d/'buffers').mkdir(parents=True);p.mkdir(parents=True)\n"
+                "(d/'meta.json').write_text('{}');(d/'buffers/W.bin').write_bytes(b'weights')\n"
+                "(p/'prefill.elf').write_bytes(b'program')\n"
+                "(p/'meta.json').write_text(json.dumps({'weights_from':str(d/'buffers'),"
+                "'decode_artifact':{'meta':str(d/'meta.json')}}))\n")
+            recipe = Recipe("fixture", "scenario.toml", (), (str(decode), str(prefill)),
+                            (Command("build", (sys.executable, str(builder)),
+                                     {"DECODE": str(decode), "PREFILL": str(prefill)}),))
+            self.assertEqual(build_recipe(recipe, root, config, artifacts, build), "BUILT")
+            metadata = json.loads((prefill / "meta.json").read_text())
+            self.assertEqual(metadata["weights_from"], str(decode / "buffers"))
+            self.assertEqual(metadata["decode_artifact"]["meta"], str(decode / "meta.json"))
+            self.assertEqual((Path(metadata["weights_from"]) / "W.bin").read_bytes(), b"weights")
+            self.assertEqual((prefill / "prefill.elf").read_bytes(), b"program")
+            self.assertEqual(build_recipe(recipe, root, config, artifacts, build), "HIT")
+
+    def test_staging_rebase_does_not_rewrite_a_replacement_twice(self) -> None:
+        artifacts, build = Path("/data/artifacts"), Path("/data/build")
+        stage = build / "model-artifacts/staging/model"
+        recipe = Recipe("fixture", "scenario", (), (str(artifacts / "model"),),
+                        (Command("build", ("builder", str(build / "work")),
+                                 {"META": str(artifacts / "decode/meta.json")}),))
+        staged = rebase_recipe(recipe, artifacts, stage / "artifacts", build, stage / "build")
+        self.assertEqual(staged.outputs, (str(stage / "artifacts/model"),))
+        self.assertEqual(staged.commands[0].argv[1], str(stage / "build/work"))
+        self.assertEqual(staged.commands[0].env["META"], str(stage / "artifacts/decode/meta.json"))
+
     def test_source_identity_ignores_bytecode_and_git_administration(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

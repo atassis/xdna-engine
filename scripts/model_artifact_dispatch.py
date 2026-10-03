@@ -635,7 +635,10 @@ def provision_inputs(recipes: list[Recipe], allow_download: bool) -> None:
 def rebase_recipe(recipe: Recipe, live_artifacts: Path, staged_artifacts: Path,
                   live_build: Path, staged_build: Path) -> Recipe:
     def replace(value: str) -> str:
-        return value.replace(str(live_artifacts), str(staged_artifacts)).replace(str(live_build), str(staged_build))
+        for live, staged in ((live_artifacts, staged_artifacts), (live_build, staged_build)):
+            if value == str(live) or value.startswith(str(live) + os.sep):
+                return str(staged) + value[len(str(live)):]
+        return value
     return Recipe(recipe.model, recipe.scenario, recipe.inputs,
                   tuple(replace(value) for value in recipe.outputs),
                   tuple(Command(item.step, tuple(replace(value) for value in item.argv),
@@ -649,6 +652,29 @@ def write_receipt(recipe: Recipe, key: str) -> None:
     target = manifest_path(recipe)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
+
+
+def relocate_recipe_metadata(recipe: Recipe, staged: Recipe) -> None:
+    pairs = sorted(zip(staged.outputs, recipe.outputs, strict=True),
+                   key=lambda pair: len(pair[0]), reverse=True)
+
+    def relocate(value):
+        if isinstance(value, str):
+            for source, destination in pairs:
+                if value == source or value.startswith(source + os.sep):
+                    return destination + value[len(source):]
+        elif isinstance(value, list):
+            return [relocate(item) for item in value]
+        elif isinstance(value, dict):
+            return {key: relocate(item) for key, item in value.items()}
+        return value
+
+    for raw in staged.outputs:
+        for metadata in Path(raw).rglob("meta.json"):
+            original = json.loads(metadata.read_text())
+            relocated = relocate(original)
+            if relocated != original:
+                metadata.write_text(json.dumps(relocated, indent=2) + "\n")
 
 
 def no_staging_references(recipe: Recipe, staging_root: Path) -> None:
@@ -718,6 +744,7 @@ def build_recipe(recipe: Recipe, repo: Path, config: Path, artifacts: Path, buil
     staged_artifacts, staged_build = stage_root / "artifacts", stage_root / "build"
     staged = rebase_recipe(recipe, artifacts, staged_artifacts, build, staged_build)
     run_commands(staged, repo)
+    relocate_recipe_metadata(recipe, staged)
     validate_recipe_outputs(staged)
     no_staging_references(staged, stage_root)
     if authority_before != authority_digest(recipe, repo) or inputs_before != source_digest(recipe.inputs):
