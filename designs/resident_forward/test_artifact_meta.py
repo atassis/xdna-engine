@@ -40,6 +40,7 @@ class ArtifactMetaTests(unittest.TestCase):
             self.assertEqual(result["rungs"], layout["rungs"])
             self.assertEqual(result["nlayer"], 6)
             self.assertEqual(result["row_block"], 16)
+            self.assertEqual(result["pmax"], max(rung["nt"] for rung in layout["rungs"]) * result["row_block"])
             self.assertEqual(result["weight_dir"], "weights")
             layout["SF"] += 8
             (root / "fwd_layout.json").write_text(json.dumps(layout))
