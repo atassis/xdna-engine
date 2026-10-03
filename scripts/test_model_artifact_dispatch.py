@@ -36,6 +36,25 @@ CONFIG = Path.home() / ".config/npu/engine.toml"
 
 
 class ModelArtifactDispatchPlanTests(unittest.TestCase):
+    def test_source_identity_ignores_bytecode_and_git_administration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            helper = root / "scripts/helper.py"
+            helper.parent.mkdir()
+            helper.write_text("value = 1\n")
+            (root / "third_party/iron").mkdir(parents=True)
+            recipe = Recipe("fixture", "scenario.toml", (), (), ())
+            first = authority_digest(recipe, root)
+            for rel in ("scripts/__pycache__/helper.cpython-314.pyc",
+                        "third_party/iron/.git",
+                        "third_party/iron/.pytest_cache/v/cache/nodeids"):
+                generated = root / rel
+                generated.parent.mkdir(parents=True, exist_ok=True)
+                generated.write_bytes(b"generated")
+            self.assertEqual(authority_digest(recipe, root), first)
+            helper.write_text("value = 2\n")
+            self.assertNotEqual(authority_digest(recipe, root), first)
+
     def test_weight_recipes_bind_the_declared_iron_source(self) -> None:
         for model, scenario, step in (
             ("gemma3-270m", "scenarios/generate-gemma3-270m.toml", "weights"),

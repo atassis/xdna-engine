@@ -217,12 +217,16 @@ def source_digest(paths: tuple[str, ...]) -> str:
     return digest.hexdigest()
 
 
-def tree_digest(root: Path) -> str:
+def tree_digest(root: Path, *, source: bool = False) -> str:
     if not root.exists():
         return "absent"
     digest = hashlib.sha256()
     files = [root] if root.is_file() else sorted(path for path in root.rglob("*") if path.is_file())
     for item in files:
+        if source and (any(part in {".git", "__pycache__", ".pytest_cache"}
+                           for part in item.relative_to(root.parent).parts)
+                       or item.suffix in {".pyc", ".pyo"}):
+            continue
         digest.update(str(item.relative_to(root.parent)).encode())
         with item.open("rb") as handle:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
@@ -309,7 +313,7 @@ def authority_digest(recipe: Recipe, repo: Path) -> str:
     candidates += tuple(command_files)
     for candidate in candidates:
         digest.update(str(candidate.relative_to(root)).encode())
-        digest.update(tree_digest(candidate).encode())
+        digest.update(tree_digest(candidate, source=True).encode())
     for name in ("MODEL_IRON_PY", "MODEL_EXPORT_PY", "MODEL_PYANNOTE_PY", "MODEL_PYANNOTE_COMMUNITY_PY", "MODEL_AIECC"):
         value = os.environ.get(name)
         if value:
