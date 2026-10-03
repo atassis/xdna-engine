@@ -139,7 +139,7 @@ from iron.operators.elementwise_mul.op import ElementwiseMul  # noqa: E402
 from iron.operators.elementwise_add.op import ElementwiseAdd  # noqa: E402
 from iron.operators.strided_copy.op import StridedCopy  # noqa: E402
 from iron.operators.dequant_rows.op import DequantRows  # noqa: E402
-from gen_llm_decode import _site_of, wo_rows_padded  # noqa: E402 -- single owners, not restated
+from gen_llm_decode import _site_of, wo_rows_padded, iron_provenance  # noqa: E402 -- single owners, not restated
 
 # Decode's ACT_POLY, mirrored: SiLU and sigmoid in f32 polynomial math instead of the SFU tanh LUT.
 # The two halves must agree, or prefill and decode compute different activations over one cache.
@@ -2570,6 +2570,7 @@ def main():
     byte_classes = operand_bytes(dims["rl"], fused.get_layout_for_buffer, set(dims["shared"]))
     meta = {
         "spec": sp.name, "elf": "prefill.elf", "kernel_name": "main:sequence",
+        "iron": iron_provenance(),
         "input_size": int(in_sz), "output_size": int(out_sz), "scratch_size": int(scr),
         "layout": {n: {"type": v[0], "offset": int(v[1]), "len": int(v[2])}
                    for n, v in lay.items()},

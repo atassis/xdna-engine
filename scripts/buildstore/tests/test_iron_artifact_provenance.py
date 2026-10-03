@@ -1,5 +1,6 @@
 """Release artifact IRON provenance must identify the clean pinned source."""
 import json
+import ast
 import pathlib
 import subprocess
 import sys
@@ -7,6 +8,22 @@ import sys
 
 CHECK = pathlib.Path(__file__).resolve().parents[2] / "check_iron_artifact_provenance.py"
 WANT = "a" * 40
+
+
+def test_prefill_metadata_records_the_resolved_iron_source(tmp_path):
+    repo = CHECK.parents[1]
+    tree = ast.parse((repo / "designs/decode_fused/gen_llm_prefill.py").read_text())
+    metadata = next(node.value for node in ast.walk(tree)
+                    if isinstance(node, ast.Assign) and isinstance(node.value, ast.Dict)
+                    and any(isinstance(target, ast.Name) and target.id == "meta" for target in node.targets))
+    entry = next((value for key, value in zip(metadata.keys, metadata.values)
+                  if isinstance(key, ast.Constant) and key.value == "iron"), None)
+    assert entry is not None, "prefill producer omits the provenance required by installation"
+    expected = {"commit": WANT, "dirty": False, "identity": f"pinned:{WANT}"}
+    recorded = eval(compile(ast.Expression(entry), "prefill-metadata", "eval"),
+                    {"iron_provenance": lambda: expected})
+    assert recorded == expected
+    assert check(tmp_path, recorded).returncode == 0
 
 
 def check(tmp_path, iron):
