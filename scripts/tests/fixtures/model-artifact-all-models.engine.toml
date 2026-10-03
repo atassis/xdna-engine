@@ -1,0 +1,39 @@
+[[model]]
+name = "parakeet"
+scenario = "scenarios/asr.toml"
+
+[[model]]
+name = "bge-base"
+scenario = "scenarios/bge-base.toml"
+
+[[model]]
+name = "pyannote-community-1"
+scenario = "scenarios/diarize-pyannote-community-1.toml"
+
+[[model]]
+name = "pyannote-3.1"
+scenario = "scenarios/diarize-pyannote-3.1.toml"
+
+[[model]]
+name = "whisper-turbo"
+scenario = "scenarios/asr-whisper-turbo.toml"
+
+[[model]]
+name = "gemma3-270m"
+scenario = "scenarios/generate-gemma3-270m.toml"
+
+[[model]]
+name = "qwen3-0.6b"
+scenario = "scenarios/generate-qwen3-0.6b.toml"
+
+[[model]]
+name = "gemma4-12b"
+scenario = "scenarios/generate-gemma4-12b-resident-256k.toml"
+
+[[model]]
+name = "qwen3.5-4b"
+scenario = "scenarios/generate-qwen3.5-4b.toml"
+
+[[model]]
+name = "espcn"
+scenario = "scenarios/upscale-espcn.toml"

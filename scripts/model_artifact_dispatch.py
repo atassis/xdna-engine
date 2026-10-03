@@ -37,7 +37,7 @@ class Recipe:
 
 
 def path(root: Path, value: str) -> str:
-    return str((root / value).resolve())
+    return str(root / value)
 
 
 def command(step: str, argv: list[str], **env: str) -> Command:

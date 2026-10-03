@@ -35,7 +35,7 @@ from model_artifact_dispatch import (
 
 REPO = Path(__file__).resolve().parents[1]
 DISPATCH = REPO / "scripts/model_artifact_dispatch.py"
-CONFIG = Path.home() / ".config/npu/engine.toml"
+CONFIG = REPO / "scripts/tests/fixtures/model-artifact-all-models.engine.toml"
 
 
 class ModelArtifactDispatchPlanTests(unittest.TestCase):
@@ -74,6 +74,20 @@ class ModelArtifactDispatchPlanTests(unittest.TestCase):
             copy_tree(source, target)
             blob.unlink()
             self.assertEqual((target / "weights.bin").read_bytes(), b"weights")
+
+    def test_recipe_keeps_symlinked_outputs_inside_its_staging_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifacts, snapshot = root / "artifacts", root / "snapshot"
+            (artifacts / "qwen3-0.6b").mkdir(parents=True)
+            snapshot.mkdir()
+            (artifacts / "qwen3-0.6b/tokenizer").symlink_to(snapshot, target_is_directory=True)
+            recipe = recipe_for("qwen3-0.6b", "scenarios/generate-qwen3-0.6b.toml",
+                                REPO, artifacts, root / "inputs", root / "build")
+            staged = rebase_recipe(recipe, artifacts, root / "staging", root / "build", root / "staged-build")
+            tokenizer = next(item for item in staged.commands if item.step == "tokenizer")
+            self.assertEqual(tokenizer.argv[-1], str(root / "staging/qwen3-0.6b/tokenizer"))
+            self.assertIn(str(root / "staging/qwen3-0.6b/tokenizer"), staged.outputs)
 
     def test_gemma4_packages_tower_checkpoint_without_full_text_weights(self) -> None:
         import numpy as np
