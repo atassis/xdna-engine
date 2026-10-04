@@ -110,6 +110,7 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 from types import SimpleNamespace
 
 import numpy as np
@@ -420,7 +421,14 @@ def pack_quant_weights(quant_pack, bdir, quant_plan):
                                               e["tile_n"], e["group_size"], e["weight_dtype"],
                                               mmul_s, mmul_t, e["cols"],
                                               scale_dtype=e["scale_dtype"])
-        packed.tofile(dest)
+        fd, temporary = tempfile.mkstemp(dir=bdir, prefix=".pack-")
+        try:
+            with os.fdopen(fd, "wb") as output:
+                packed.tofile(output)
+            os.replace(temporary, dest)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
         if use_cache:
             store.put(key, dest)
     cache_note = f" (cache: {hits} hit, {misses} miss)" if use_cache else ""

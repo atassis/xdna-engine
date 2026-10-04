@@ -1,4 +1,6 @@
+import fcntl
 import json
+import multiprocessing
 import os
 import subprocess
 import sys
@@ -38,7 +40,180 @@ DISPATCH = REPO / "scripts/model_artifact_dispatch.py"
 CONFIG = REPO / "scripts/tests/fixtures/model-artifact-all-models.engine.toml"
 
 
+def concurrent_build(root, recipe, artifacts, build, entered, release, result,
+                     fail_publish=False, attempting=None, forced_key=None, contended=None):
+    import model_artifact_dispatch as dispatch
+
+    def toy_builder(staged, repo):
+        for raw in staged.outputs:
+            target = Path(raw)
+            target.mkdir(parents=True, exist_ok=True)
+            (target / "value").write_text("new")
+        entered.set()
+        if not release.wait(10):
+            raise RuntimeError("fixture release timed out")
+
+    original_hit = dispatch.cache_hit
+    original_flock = fcntl.flock
+
+    def observed_flock(handle, mode):
+        try:
+            original_flock(handle, mode | fcntl.LOCK_NB)
+        except BlockingIOError:
+            if contended is not None:
+                contended.set()
+            original_flock(handle, mode)
+
+    def checked_hit(candidate, key):
+        if fail_publish and candidate.outputs == recipe.outputs:
+            return False
+        return original_hit(candidate, key)
+
+    with patch.object(dispatch, "LOCK_ROOT", root / "locks", create=True), \
+            patch.object(dispatch, "run_commands", toy_builder), \
+            patch.object(dispatch, "cache_hit", checked_hit), \
+            patch.object(fcntl, "flock", observed_flock):
+        if forced_key is not None:
+            dispatch.recipe_key = lambda *args, **kwargs: forced_key
+        if attempting is not None:
+            attempting.set()
+        try:
+            result.put(("ok", build_recipe(recipe, root, root / "engine.toml", artifacts, build)))
+        except Exception as error:
+            result.put(("error", str(error)))
+
+
+class ModelArtifactConcurrencyTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        (self.root / "scenario.toml").write_text("fixture")
+        (self.root / "engine.toml").write_text("fixture")
+        self.context = multiprocessing.get_context("spawn")
+
+    def recipe(self, outputs=("model",), model="fixture", changed=False):
+        return Recipe(model, "scenario.toml", (),
+                      tuple(str(self.root / "artifacts" / name) for name in outputs),
+                      (Command("toy", ("toy",), {"VERSION": "two"}),) if changed else ())
+
+    def start(self, recipe, *, artifacts=None, build=None, fail_publish=False, forced_key=None):
+        entered, release, attempting, contended = (self.context.Event() for _ in range(4))
+        result = self.context.Queue()
+        process = self.context.Process(target=concurrent_build, args=(
+            self.root, recipe, artifacts or self.root / "artifacts",
+            build or self.root / "build", entered, release, result, fail_publish, attempting,
+            forced_key, contended))
+        process.start()
+        self.addCleanup(self.stop, process, release)
+        self.assertTrue(attempting.wait(5))
+        return process, entered, release, result, contended
+
+    @staticmethod
+    def stop(process, release):
+        release.set()
+        process.join(5)
+        if process.is_alive():
+            process.terminate()
+            process.join(5)
+
+    def finish(self, worker):
+        process, entered, release, result = worker[:4]
+        release.set()
+        process.join(10)
+        self.assertFalse(process.is_alive())
+        self.assertEqual(process.exitcode, 0)
+        return result.get(timeout=2)
+
+    def serialized(self, first_recipe, second_recipe, **second_options):
+        first = self.start(first_recipe)
+        self.assertTrue(first[1].wait(5))
+        second = self.start(second_recipe, **second_options)
+        self.assertTrue(second[4].wait(5), "second writer did not contend on the shared resource")
+        self.assertFalse(second[1].is_set())
+        inodes = {path.name: path.stat().st_ino for path in (self.root / "locks").iterdir()}
+        self.assertEqual(self.finish(first), ("ok", "BUILT"))
+        outcome = self.finish(second)
+        self.assertEqual({name: (self.root / "locks" / name).stat().st_ino for name in inodes}, inodes)
+        return outcome
+
+    def test_same_output_same_key_waits_then_reuses(self):
+        recipe = self.recipe()
+        self.assertEqual(self.serialized(recipe, recipe), ("ok", "HIT"))
+
+    def test_changed_key_same_output_with_different_build_root_waits(self):
+        self.assertEqual(self.serialized(self.recipe(), self.recipe(changed=True),
+                                        build=self.root / "other-build"), ("ok", "BUILT"))
+
+    def test_shared_staging_across_artifact_roots_waits(self):
+        first = self.start(self.recipe(), forced_key="shared-stage-key")
+        self.assertTrue(first[1].wait(5))
+        artifacts = self.root / "other-artifacts"
+        recipe = Recipe("fixture", "scenario.toml", (), (str(artifacts / "model"),), ())
+        second = self.start(recipe, artifacts=artifacts, forced_key="shared-stage-key")
+        self.assertTrue(second[4].wait(5), "shared stage did not contend through a different output root")
+        self.assertFalse(second[1].is_set())
+        self.assertEqual(self.finish(first), ("ok", "BUILT"))
+        self.assertEqual(self.finish(second), ("ok", "BUILT"))
+
+    def test_overlapping_output_sets_in_reverse_order_wait(self):
+        self.assertEqual(self.serialized(self.recipe(("a", "b")),
+                                        self.recipe(("b", "a"), changed=True)), ("ok", "BUILT"))
+
+    def test_independent_targets_can_build_together(self):
+        first = self.start(self.recipe())
+        self.assertTrue(first[1].wait(5))
+        second = self.start(self.recipe(("other",), model="other"))
+        self.assertTrue(second[1].wait(5), "independent target blocked")
+        self.assertEqual(self.finish(second), ("ok", "BUILT"))
+        self.assertEqual(self.finish(first), ("ok", "BUILT"))
+
+    def test_failed_publication_recovery_is_not_overwritten_on_retry(self):
+        recipe = self.recipe()
+        live = Path(recipe.outputs[0])
+        live.mkdir(parents=True)
+        (live / "value").write_text("old")
+        first = self.start(recipe, fail_publish=True)
+        self.assertTrue(first[1].wait(5))
+        retry = self.start(recipe, fail_publish=True)
+        self.assertTrue(retry[4].wait(5))
+        self.assertFalse(retry[1].is_set())
+        outcome = self.finish(first)
+        self.assertEqual(outcome[0], "error")
+        self.assertIn("published receipt did not verify", outcome[1])
+        backup = next((self.root / "artifacts/.model-artifact-rollback").rglob("value"))
+        self.assertEqual(backup.read_text(), "old")
+        outcome = self.finish(retry)
+        self.assertEqual(outcome[0], "error")
+        self.assertIn("publication recovery requires inspection", outcome[1])
+        self.assertFalse(retry[1].is_set())
+        self.assertEqual(backup.read_text(), "old")
+
+    def test_parent_output_excludes_a_nested_writer(self):
+        self.assertEqual(self.serialized(self.recipe(), self.recipe(("model/child",), changed=True),
+                                        build=self.root / "other-build"), ("ok", "BUILT"))
+
+
 class ModelArtifactDispatchPlanTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        lock_patch = patch("model_artifact_dispatch.LOCK_ROOT", Path(directory.name) / "locks", create=True)
+        lock_patch.start()
+        self.addCleanup(lock_patch.stop)
+
+    def test_coordination_locks_follow_data_root_without_creating_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = root / "selected-data"
+            env = dict(os.environ, XDNA_DATA=str(data), HOME=str(root / "home"))
+            result = subprocess.run(
+                [sys.executable, "-c", "from model_artifact_dispatch import LOCK_ROOT; print(LOCK_ROOT)"],
+                cwd=REPO / "scripts", env=env, capture_output=True, text=True, check=True,
+            )
+            self.assertEqual(Path(result.stdout.strip()), data / "locks/model-artifacts")
+            self.assertFalse(data.exists())
+
     def test_install_exports_its_selected_onnx_runtime_environment(self) -> None:
         import re
         import shlex
@@ -635,7 +810,7 @@ class ModelArtifactDispatchPlanTests(unittest.TestCase):
                 ["fixture/segmentation-model", "fixture/embedding-model"],
             )
 
-    def test_publish_keeps_the_old_tree_as_rollback_and_writes_verified_receipt(self) -> None:
+    def test_verified_publish_removes_its_transaction_backup(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             live = root / "artifacts/model"
@@ -648,10 +823,40 @@ class ModelArtifactDispatchPlanTests(unittest.TestCase):
             staged_recipe = Recipe("fixture", "scenarios/asr.toml", (), (str(staged),), ())
             publish_recipe(recipe, staged_recipe, "key", root / "rollback")
             self.assertEqual((live / "value").read_text(), "new")
-            backups = list((root / "rollback").rglob("value"))
-            self.assertEqual(len(backups), 1)
-            self.assertEqual(backups[0].read_text(), "old")
+            self.assertFalse((root / "rollback/key").exists())
             self.assertTrue((live / ".model-recipe.json").is_file())
+
+    def test_failed_publish_verification_retains_recovery_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            live, staged = root / "artifacts/model", root / "staging/model"
+            live.mkdir(parents=True)
+            staged.mkdir(parents=True)
+            (live / "value").write_text("old")
+            (staged / "value").write_text("new")
+            recipe = Recipe("fixture", "scenarios/asr.toml", (), (str(live),), ())
+            staged_recipe = Recipe("fixture", "scenarios/asr.toml", (), (str(staged),), ())
+            with patch("model_artifact_dispatch.cache_hit", side_effect=[True, False]):
+                with self.assertRaisesRegex(RuntimeError, "published receipt did not verify"):
+                    publish_recipe(recipe, staged_recipe, "key", root / "rollback")
+            self.assertEqual((root / "rollback/key/0/model/value").read_text(), "old")
+
+    def test_publish_does_not_collect_another_transaction_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            live, staged = root / "artifacts/model", root / "staging/model"
+            live.mkdir(parents=True)
+            staged.mkdir(parents=True)
+            (live / "value").write_text("old")
+            (staged / "value").write_text("new")
+            recovery = root / "rollback/other/value"
+            recovery.parent.mkdir(parents=True)
+            recovery.write_text("recovery")
+            recipe = Recipe("fixture", "scenarios/asr.toml", (), (str(live),), ())
+            staged_recipe = Recipe("fixture", "scenarios/asr.toml", (), (str(staged),), ())
+            publish_recipe(recipe, staged_recipe, "key", root / "rollback")
+            self.assertEqual(recovery.read_text(), "recovery")
+            self.assertFalse((root / "rollback/key").exists())
 
     def test_fresh_gemma4_provenance_is_verified_without_rebuilding(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

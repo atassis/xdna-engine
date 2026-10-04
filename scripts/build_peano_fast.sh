@@ -49,25 +49,23 @@
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 
-# fast-build levers: ccache, mold, -j nproc, and the fb_* cmake flag fragments.
-# shellcheck source=/dev/null
-. "$REPO/scripts/fast_build_env.sh"
-
 if [ -z "${LLVM_AIE_SRC:-}" ]; then
   echo "ERROR: LLVM_AIE_SRC is not set. Point it at your llvm-aie checkout." >&2
   exit 1
 fi
+if [ ! -f "$LLVM_AIE_SRC/llvm/CMakeLists.txt" ]; then
+  echo "ERROR: no llvm-aie checkout at $LLVM_AIE_SRC (set LLVM_AIE_SRC)." >&2
+  exit 1
+fi
+export CCACHE_BASEDIR="${CCACHE_BASEDIR:-$(realpath "$LLVM_AIE_SRC")}"
+# shellcheck source=/dev/null
+. "$REPO/scripts/fast_build_env.sh"
 BUILD_DIR="${BUILD_DIR:-$LLVM_AIE_SRC/build-fast}"
 # Default target set: the tools a Peano dist actually invokes. With dylib they all share
 # libLLVM.so, so this is cheap on the incremental path.
 DEFAULT_TARGETS="llc opt clang lld"
 # Representative AIE-backend TU touched by --bench-incremental (one .cpp -> libLLVM.so relink).
 BENCH_TU="llvm/lib/Target/AIE/AIE2Subtarget.cpp"
-
-if [ ! -f "$LLVM_AIE_SRC/llvm/CMakeLists.txt" ]; then
-  echo "ERROR: no llvm-aie checkout at $LLVM_AIE_SRC (set LLVM_AIE_SRC)." >&2
-  exit 1
-fi
 
 fb_print_status
 echo "[build_peano_fast] src=$LLVM_AIE_SRC"

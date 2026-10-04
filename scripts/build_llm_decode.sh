@@ -83,7 +83,13 @@ export AIE_DEVICE="${AIE_DEVICE:-npu2}"   # build off the device lock; see gen_l
 if [ -n "${KEEP_WORK:-}" ]; then
     WORK="$KEEP_WORK"; mkdir -p "$WORK"; echo "[build] keeping intermediates in $WORK"
 else
-    WORK="${BUILD_CACHE:-$XDNA_CACHE/llm-build/$SPEC}"
+    if [ -n "${BUILD_CACHE:-}" ]; then
+        WORK="$BUILD_CACHE"
+    else
+        CHECKOUT_PATH="$(realpath "$REPO")"
+        CHECKOUT_ID="$(printf '%s' "$CHECKOUT_PATH" | sha256sum)"
+        WORK="$XDNA_BUILD/${CHECKOUT_ID%% *}/llm/$SPEC"
+    fi
     mkdir -p "$WORK"
 fi
 # Serialise builds sharing one dir. The cache is shared BY DESIGN (kernel objects do not depend on

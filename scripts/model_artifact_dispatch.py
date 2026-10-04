@@ -6,6 +6,7 @@ actual build/export commands and their declared inputs, but performs no device,
 service, package, or toolchain action on its own.
 """
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -14,10 +15,41 @@ import subprocess
 import sys
 import tempfile
 import tomllib
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from lib.data_root import XDNA_DATA
 from pyannote_local_inputs import PipelineComponent, pipeline_components, validate_local_pipeline_inputs
+
+
+LOCK_ROOT = XDNA_DATA / "locks/model-artifacts"
+
+
+@contextmanager
+def resource_locks(resources):
+    """Stable coordination inodes; shared ancestors allow disjoint targets to proceed."""
+    modes = {}
+    for raw in resources:
+        raw = Path(raw)
+        target = raw.parent.resolve() / raw.name
+        if LOCK_ROOT.resolve().is_relative_to(target):
+            raise ValueError(f"recipe resource contains the coordination locks: {target}")
+        modes[target] = fcntl.LOCK_EX
+        for parent in target.parents:
+            modes.setdefault(parent, fcntl.LOCK_SH)
+    LOCK_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with ExitStack() as stack:
+        for target, mode in sorted(modes.items(), key=lambda item: str(item[0])):
+            name = hashlib.sha256(os.fsencode(target)).hexdigest() + ".lock"
+            handle = stack.enter_context((LOCK_ROOT / name).open("a+b"))
+            fcntl.flock(handle, mode)
+        yield
+
+
+def require_no_recovery(rollback: Path, key: str) -> None:
+    if (rollback / key).exists():
+        raise RuntimeError(f"publication recovery requires inspection before retry: {rollback / key}")
 
 
 @dataclass(frozen=True)
@@ -713,6 +745,12 @@ def no_staging_references(recipe: Recipe, staging_root: Path) -> None:
 
 
 def publish_recipe(recipe: Recipe, staged: Recipe, key: str, rollback: Path) -> None:
+    with resource_locks((*recipe.outputs, *staged.outputs, rollback / key)):
+        _publish_recipe(recipe, staged, key, rollback)
+
+
+def _publish_recipe(recipe: Recipe, staged: Recipe, key: str, rollback: Path) -> None:
+    require_no_recovery(rollback, key)
     validate_recipe_outputs(staged)
     write_receipt(staged, key)
     if not cache_hit(staged, key):
@@ -735,6 +773,9 @@ def publish_recipe(recipe: Recipe, staged: Recipe, key: str, rollback: Path) -> 
         raise
     if not cache_hit(recipe, key):
         raise RuntimeError(f"published receipt did not verify: {recipe.model}")
+    backup_root = rollback / key
+    if backup_root.exists():
+        shutil.rmtree(backup_root)
 
 
 def verified_existing_gemma4(recipe: Recipe, key: str) -> bool:
@@ -759,12 +800,21 @@ def build_recipe(recipe: Recipe, repo: Path, config: Path, artifacts: Path, buil
     authority_before = authority_digest(recipe, repo)
     inputs_before = source_digest(recipe.inputs)
     key = recipe_key(recipe, repo, config, authority=authority_before, inputs=inputs_before)
+    stage_root = build / "model-artifact-staging" / f"{recipe.model}-{key[:16]}"
+    rollback = artifacts / ".model-artifact-rollback"
+    with resource_locks((*recipe.outputs, stage_root, rollback / key)):
+        return _build_recipe(recipe, repo, artifacts, build, key, stage_root,
+                             rollback, authority_before, inputs_before)
+
+
+def _build_recipe(recipe: Recipe, repo: Path, artifacts: Path, build: Path, key: str,
+                  stage_root: Path, rollback: Path, authority_before: str, inputs_before: str) -> str:
+    require_no_recovery(rollback, key)
     if cache_hit(recipe, key):
         return "HIT"
     if verified_existing_gemma4(recipe, key):
         return "VERIFIED"
     ensure_outputs_ready(recipe, key)
-    stage_root = build / "model-artifact-staging" / f"{recipe.model}-{key[:16]}"
     if stage_root.exists():
         shutil.rmtree(stage_root)
     staged_artifacts, staged_build = stage_root / "artifacts", stage_root / "build"
@@ -775,7 +825,7 @@ def build_recipe(recipe: Recipe, repo: Path, config: Path, artifacts: Path, buil
     no_staging_references(staged, stage_root)
     if authority_before != authority_digest(recipe, repo) or inputs_before != source_digest(recipe.inputs):
         raise RuntimeError(f"{recipe.model}: source authority changed while the staged build ran")
-    publish_recipe(recipe, staged, key, artifacts / ".model-artifact-rollback")
+    _publish_recipe(recipe, staged, key, rollback)
     if not cache_hit(recipe, key):
         raise RuntimeError(f"recipe manifest did not verify after publish: {recipe.model}")
     return "BUILT"
