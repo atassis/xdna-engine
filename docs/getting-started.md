@@ -79,10 +79,17 @@ npu model ls                    # what this install is configured to serve
 clients of the running service's control socket -- `npu serve` is the one process that
 owns the NPU and answers both the socket and HTTP requests.
 
+`npu generate` and `npu chat` display reasoning on stderr by default, in a
+`[reasoning]` block before the answer. `--hide-reasoning` hides that display;
+`--think` and `--no-think` control whether the model generates reasoning.
+The answer stays on stdout, so `npu generate "..." > answer.txt` saves only the
+answer. JSON output retains reasoning in `reasoning_content`, even with
+`--hide-reasoning`.
+
 Every generation prints a one-line measurement to stderr (tokens/s, ms/token, the latency
 tail, and which layer the time actually went to). `npu generate --stats` prints the full
-breakdown instead. `--output json` streams the whole thing as NDJSON on stdout -- one line
-per token, carrying that token's own timing -- so `> run.jsonl` gives you a file `npu
+breakdown instead. `--output json` streams the whole thing as NDJSON on stdout -- measured
+token lines and separate reasoning deltas -- so `> run.jsonl` gives you a file `npu
 stats` and `npu replay` read back. `npu decide --stats` prints the same kind of breakdown
 for a decision: queue, load, the shared prefix, and each question. See
 [measurement.md](measurement.md).

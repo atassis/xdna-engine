@@ -168,7 +168,7 @@ the run you did not know you would need to explain, which you only find out abou
 
 ```
 npu generate "..." --stats               # full breakdown after the answer, on stderr
-npu generate "..." --output json         # NDJSON on stdout, one line per token, live
+npu generate "..." --output json         # NDJSON on stdout: tokens and reasoning deltas, live
 npu generate "..." --output json --no-stream   # one chat.completion object instead
 npu stats run.jsonl                      # render a log
 npu stats a.jsonl --diff b.jsonl         # compare two runs
@@ -178,10 +178,13 @@ npu top                                  # live: who is resident, serving, and f
 
 `--output json` follows the stream flag, the way `/v1/chat/completions` does, so the streaming form
 IS the run-log format: `> run.jsonl` produces a file the two readers below accept, `| tee run.jsonl`
-keeps one while you watch, and `| jq 'select(.object=="chat.completion.chunk") | .x_npu.time.dt_ms'`
+keeps one while you watch, and `| jq 'select(.x_npu != null) | .x_npu.time.dt_ms'`
 prints inter-token latencies as they happen. Lines are flushed individually, because a
 block-buffered pipe would otherwise hold the whole run and emit it at the end. In JSON mode the
 completion text is not echoed separately -- it is inside each chunk's `delta.content`.
+Reasoning arrives as separate `delta.reasoning_content` chunks, without `x_npu`;
+the buffered JSON form carries it in `message.reasoning_content`. `--hide-reasoning`
+only hides the text-mode stderr block, not these structured fields.
 
 `npu stats --diff` reports **token divergence first**. A timing difference between two runs that
 produced different tokens is not a regression, it is a different computation, and printing the

@@ -111,10 +111,10 @@ fn run(cli: &Cli, path: &Path) -> Result<()> {
         Cmd::Transcribe { input, model } => transcribe(input, model.as_deref(), as_json),
         Cmd::Speak { text, voice, model, out, play, format } =>
             speak(text, voice.as_deref(), model.as_deref(), out.as_deref(), *play, *format),
-        Cmd::Generate { prompt, model, sampling, no_stream, raw, stats } =>
-            generate(prompt, model.as_deref(), sampling, *no_stream, *raw, *stats, as_json),
-        Cmd::Chat { prompt, model, sampling, no_stream } =>
-            chat(prompt.as_deref(), model.as_deref(), sampling, *no_stream, as_json),
+        Cmd::Generate { prompt, model, sampling, no_stream, raw, stats, hide_reasoning } =>
+            generate(prompt, model.as_deref(), sampling, *no_stream, *raw, *stats, as_json, *hide_reasoning),
+        Cmd::Chat { prompt, model, sampling, no_stream, hide_reasoning } =>
+            chat(prompt.as_deref(), model.as_deref(), sampling, *no_stream, as_json, *hide_reasoning),
         Cmd::Embed { text, model } => embed(text, model.as_deref(), as_json),
         Cmd::Decide { state, question, kind, options, questions, model, stats } =>
             decide(state, question.as_deref(), *kind, options, questions.as_deref(), model, *stats, as_json),
@@ -570,6 +570,7 @@ _npu_models() {
 /// What one generation produced: the text, and everything measured about producing it.
 struct Generated {
     text: String,
+    reasoning: String,
     /// Tool calls the model made. Echoed as JSON rather than as prose: a call is something to
     /// EXECUTE, and printing it as text would put it in the transcript as if the model had said it.
     calls: Vec<npu_models::ToolCall>,
@@ -615,7 +616,56 @@ fn generated_from_buffered(v: &serde_json::Value, chat: bool) -> Result<Generate
     let reason = parse_finish_reason(choice["finish_reason"].as_str().unwrap_or("stop"));
     let report = serde_json::from_value(v["x_npu_report"].clone())
         .context("response missing x_npu_report")?;
-    Ok(Generated { text, calls, reason, report })
+    let reasoning = choice["message"]["reasoning_content"].as_str().unwrap_or("").to_string();
+    Ok(Generated { text, reasoning, calls, reason, report })
+}
+
+struct ReasoningOutput<'a> {
+    out: Option<&'a mut dyn Write>,
+    active: bool,
+    ends_with_newline: bool,
+}
+
+impl<'a> ReasoningOutput<'a> {
+    fn new(out: Option<&'a mut dyn Write>) -> Self {
+        Self { out, active: false, ends_with_newline: false }
+    }
+
+    fn push(&mut self, text: &str) -> std::io::Result<()> {
+        if text.is_empty() { return Ok(()); }
+        if let Some(out) = self.out.as_mut() {
+            if !self.active { writeln!(out, "[reasoning]")?; }
+            write!(out, "{text}")?;
+            out.flush()?;
+            self.active = true;
+            self.ends_with_newline = text.ends_with('\n');
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> std::io::Result<()> {
+        if self.active {
+            if let Some(out) = self.out.as_mut() {
+                if !self.ends_with_newline { writeln!(out)?; }
+                writeln!(out)?;
+                out.flush()?;
+            }
+            self.active = false;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ReasoningOutput<'_> {
+    fn drop(&mut self) { self.finish().ok(); }
+}
+
+fn print_reasoning(text: &str) -> Result<()> {
+    let mut stderr = std::io::stderr();
+    let mut output = ReasoningOutput::new(Some(&mut stderr));
+    output.push(text)?;
+    output.finish()?;
+    Ok(())
 }
 
 /// The streaming twin of `generated_from_buffered`, and `drain_generation`'s replacement: an SSE
@@ -629,17 +679,16 @@ fn generated_from_buffered(v: &serde_json::Value, chat: bool) -> Result<Generate
 /// first frame arrives -- every frame shape carries `"model"`, including the terminal ones, so
 /// peeking it there costs nothing extra.
 ///
-/// The wire has no separate "internal" frame for a token: `wire::chunk_line` (sent as the sole
-/// per-token frame once `stats` is on, which every socket request now requests) reuses the SAME
-/// `chat.completion.chunk`/`text_completion` object OpenAI clients read, just with an extra
-/// `"x_npu"` sibling key -- that key is what marks a frame as "the one NDJSON wants", not the
-/// `object` tag, which is shared with the plain role/finish frames that carry no token at all.
+/// NDJSON carries measured token frames (`x_npu`) and separate `reasoning_content` deltas.
+/// Role/finish frames share the chunk's `object` tag but carry neither payload.
 /// `npu.prefill` never reaches the wire (only the run LOG gets it); it is reconstructed here the
 /// moment the report itself is known, from `report.prefill`, the same field `drain_generation`
 /// read directly off `StreamItem::Done`.
 fn drain_sse<R: BufRead>(mut sse: socket_client::SseCall<R>, echo: bool, chat: bool,
-             mut json: Option<&mut dyn Write>) -> Result<(wire::RunMeta, Generated)> {
+             mut json: Option<&mut dyn Write>, reasoning_out: Option<&mut dyn Write>) -> Result<(wire::RunMeta, Generated)> {
     let mut text = String::new();
+    let mut reasoning = String::new();
+    let mut reasoning_output = ReasoningOutput::new(reasoning_out);
     let mut calls: Vec<npu_models::ToolCall> = Vec::new();
     let mut reason = npu_models::FinishReason::Stop;
     let mut report: Option<npu_models::GenerationReport> = None;
@@ -677,7 +726,7 @@ fn drain_sse<R: BufRead>(mut sse: socket_client::SseCall<R>, echo: bool, chat: b
             if let Some(w) = json.as_mut() { writeln!(w, "{v}")?; w.flush()?; }
             continue;
         }
-        if v.get("x_npu").is_some() {
+        if v.get("x_npu").is_some() || v.pointer("/choices/0/delta/reasoning_content").is_some() {
             if let Some(w) = json.as_mut() {
                 // Per line, not per run: the point of streaming is that the consumer sees a token
                 // when it happens, and a pipe is block-buffered by default, so without this `| jq`
@@ -688,11 +737,17 @@ fn drain_sse<R: BufRead>(mut sse: socket_client::SseCall<R>, echo: bool, chat: b
         }
         let choice = &v["choices"][0];
         if let Some(delta) = choice.get("delta") {
+            if let Some(t) = delta.get("reasoning_content").and_then(|c| c.as_str()) {
+                reasoning_output.push(t)?;
+                reasoning.push_str(t);
+            }
             if let Some(t) = delta.get("content").and_then(|c| c.as_str()) {
+                if !t.is_empty() { reasoning_output.finish()?; }
                 if echo { print!("{t}"); std::io::stdout().flush().ok(); }
                 text.push_str(t);
             }
             for c in delta.get("tool_calls").and_then(|c| c.as_array()).into_iter().flatten() {
+                reasoning_output.finish()?;
                 let call = tool_call_from_json(c);
                 if echo {
                     println!("\n[tool_call] {} {}", call.name, call.arguments);
@@ -708,9 +763,10 @@ fn drain_sse<R: BufRead>(mut sse: socket_client::SseCall<R>, echo: bool, chat: b
             reason = parse_finish_reason(fr);
         }
     }
+    reasoning_output.finish()?;
     let meta = meta.context("control socket: stream produced no frames")?;
     let report = report.context("control socket: stream ended without a report frame")?;
-    Ok((meta, Generated { text, calls, reason, report }))
+    Ok((meta, Generated { text, reasoning, calls, reason, report }))
 }
 
 /// One generation call over the control socket, buffered or streamed -- the only two shapes
@@ -718,11 +774,13 @@ fn drain_sse<R: BufRead>(mut sse: socket_client::SseCall<R>, echo: bool, chat: b
 /// server's echo, same as `Served::model` before this task) alongside the drained result.
 fn socket_generate(path: &str, base: serde_json::Value, model: Option<&str>,
                     params: &npu_models::GenerateParams, chat: bool, stream: bool, echo: bool,
-                    json: Option<&mut dyn Write>) -> Result<(String, Generated)> {
+                    json: Option<&mut dyn Write>, show_reasoning: bool) -> Result<(String, Generated)> {
     let body = socket_client::generate_request_json(base, model, params, stream);
     if stream {
         let sse = socket_client::SseCall::open(path, &body)?;
-        let (meta, g) = drain_sse(sse, echo, chat, json)?;
+        let mut stderr = std::io::stderr();
+        let reasoning_out = if echo && show_reasoning { Some(&mut stderr as &mut dyn Write) } else { None };
+        let (meta, g) = drain_sse(sse, echo, chat, json, reasoning_out)?;
         Ok((meta.model, g))
     } else {
         let v = socket_client::call_json(path, &body)?;
@@ -775,7 +833,7 @@ fn print_stats_footer(g: &Generated, full: bool) {
 /// is exactly what `--no-stream` asks for.
 #[allow(clippy::too_many_arguments)]
 fn generate(prompt: &str, model: Option<&str>, sampling: &SamplingArgs,
-            no_stream: bool, raw: bool, stats: bool, as_json: bool) -> Result<()> {
+            no_stream: bool, raw: bool, stats: bool, as_json: bool, hide_reasoning: bool) -> Result<()> {
     quiet_one_shot();
     // Code::Failure, the documented generic bucket: this closed set has no invalid-argument code,
     // and NoService (2) would tell a caller to start a server for what is a bad flag value.
@@ -794,9 +852,9 @@ fn generate(prompt: &str, model: Option<&str>, sampling: &SamplingArgs,
     let ndjson = as_json && !no_stream;
     let result = if ndjson {
         let mut out = std::io::stdout();
-        socket_generate(path, base, model, &params, chat, true, false, Some(&mut out))
+        socket_generate(path, base, model, &params, chat, true, false, Some(&mut out), !hide_reasoning)
     } else {
-        socket_generate(path, base, model, &params, chat, !no_stream, !no_stream && !as_json, None)
+        socket_generate(path, base, model, &params, chat, !no_stream, !no_stream && !as_json, None, !hide_reasoning)
     }.map_err(|e| {
         // A base LM with no chat template is a legitimate case; name the flag rather than silently
         // answering a different request than the one that was sent. The code the server tagged the
@@ -812,10 +870,17 @@ fn generate(prompt: &str, model: Option<&str>, sampling: &SamplingArgs,
         // The streaming arm already wrote every line; only the buffered arm has anything left.
         if !ndjson {
             let meta = cli_meta(&served_model, chat);
-            println!("{}", wire::completion_object_with_calls(&g.text, &g.calls, g.reason, &g.report, &meta));
+            let mut object = wire::completion_object_with_calls(&g.text, &g.calls, g.reason, &g.report, &meta);
+            if chat && !g.reasoning.is_empty() {
+                object["choices"][0]["message"]["reasoning_content"] = serde_json::Value::String(g.reasoning.clone());
+            }
+            println!("{object}");
         }
     } else {
-        if no_stream { print!("{}", g.text); }
+        if no_stream {
+            if !hide_reasoning { print_reasoning(&g.reasoning)?; }
+            print!("{}", g.text);
+        }
         println!();
     }
     // stderr either way, so it never lands in the JSON a pipe is reading.
@@ -863,7 +928,7 @@ fn replay_cmd(log: &Path, realtime: bool, frames: bool) -> Result<()> {
 /// `npu generate`, which builds the identical single-message `Prompt::Chat`; duplicating it here
 /// would add a second name for a command we have and drop the history that makes this one a REPL.
 fn chat(opening: Option<&str>, model: Option<&str>, sampling: &SamplingArgs,
-        no_stream: bool, as_json: bool) -> Result<()> {
+        no_stream: bool, as_json: bool, hide_reasoning: bool) -> Result<()> {
     quiet_one_shot();
     // Code::Failure, the documented generic bucket: this closed set has no invalid-argument code,
     // and NoService (2) would tell a caller to start a server for what is a bad flag value.
@@ -903,12 +968,15 @@ fn chat(opening: Option<&str>, model: Option<&str>, sampling: &SamplingArgs,
         // preserved from the in-process design, where every chat turn drained the same way.
         let (_, g) = if as_json {
             let mut out = std::io::stdout();
-            socket_generate("/v1/chat/completions", base, model, &params, true, true, false, Some(&mut out))?
+            socket_generate("/v1/chat/completions", base, model, &params, true, true, false, Some(&mut out), !hide_reasoning)?
         } else {
-            socket_generate("/v1/chat/completions", base, model, &params, true, !no_stream, !no_stream, None)?
+            socket_generate("/v1/chat/completions", base, model, &params, true, !no_stream, !no_stream, None, !hide_reasoning)?
         };
         if !as_json {
-            if no_stream { print!("{}", g.text); }
+            if no_stream {
+                if !hide_reasoning { print_reasoning(&g.reasoning)?; }
+                print!("{}", g.text);
+            }
             println!();
             print_stats_footer(&g, false);
         }
@@ -2822,7 +2890,7 @@ mod tests {
         let g = {
             let w: &mut dyn Write = &mut buf;
             let sse_call = socket_client::SseCall::from_reader(std::io::BufReader::new(sse.as_bytes()));
-            drain_sse(sse_call, false, true, Some(w)).unwrap().1
+            drain_sse(sse_call, false, true, Some(w), None).unwrap().1
         };
         let out = String::from_utf8(buf).unwrap();
 

@@ -454,6 +454,7 @@ pub fn parse_run(text: &str) -> Result<Run, String> {
                 };
             }
             "chat.completion.chunk" | "text_completion" => {
+                if !v["x_npu"].is_object() { continue; }
                 run.chat = obj == "chat.completion.chunk";
                 run.frames.push(line.to_string());
                 let ch = &v["choices"][0];
@@ -669,6 +670,20 @@ mod tests {
         let mut s = render(&a_report());
         s.push_str("\n{\"object\":\"npu.future.thing\",\"whatever\":1}");
         assert_eq!(parse_run(&s).unwrap().steps.len(), 4);
+    }
+
+    #[test]
+    fn unmeasured_deltas_do_not_create_steps_or_replay_frames() {
+        let mut s = render(&a_report());
+        for delta in [json!({"role": "assistant"}), json!({"reasoning_content": "Think first."}), json!({})] {
+            s.push_str(&format!("\n{}", json!({
+                "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": delta}]
+            })));
+        }
+        let run = parse_run(&s).unwrap();
+        assert_eq!(run.steps.len(), 4);
+        assert_eq!(run.frames.len(), 4);
+        assert_eq!(run.steps.iter().map(|s| s.emit.as_str()).collect::<String>(), "t0t1t2t3");
     }
 
     #[test]

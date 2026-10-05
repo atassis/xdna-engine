@@ -35,11 +35,10 @@ pub struct Cli {
     pub config: Option<PathBuf>,
     /// Output format for commands that have a machine-readable form.
     ///
-    /// For `generate` and `chat`, `json` follows the stream flag the way `/v1/chat/completions`
-    /// does: streaming (the default) writes NDJSON to stdout -- a conditions header, one
-    /// `chat.completion.chunk` per decoded token carrying that token's own timing under `x_npu`,
-    /// then a summary -- flushed per line, so `> run.jsonl` produces a file `npu stats` and
-    /// `npu replay` read. `--no-stream` writes the single `chat.completion` object instead.
+    /// `generate` streams NDJSON to stdout: a conditions header, measured token chunks
+    /// (`x_npu`), separate reasoning deltas, and a summary. Lines are flushed individually;
+    /// `npu stats` and `npu replay` read the redirected log. `--no-stream` writes one
+    /// `chat.completion` object. `chat` writes NDJSON per turn, including with `--no-stream`.
     ///
     /// For `decide`, `json` prints the answer object, or with `--questions` the answers keyed by
     /// id.
@@ -199,6 +198,8 @@ pub enum Cmd {
         #[arg(long)] no_stream: bool,
         /// Send the prompt verbatim, with no chat template -- raw continuation.
         #[arg(long)] raw: bool,
+        /// Hide reasoning on stderr without disabling its generation or removing it from JSON.
+        #[arg(long)] hide_reasoning: bool,
     },
     /// Interactive chat REPL: reads a line from stdin, streams the reply, keeps history across
     /// turns. Ctrl-D exits.
@@ -213,6 +214,8 @@ pub enum Cmd {
         #[arg(long)] model: Option<String>,
         #[command(flatten)] sampling: SamplingArgs,
         #[arg(long)] no_stream: bool,
+        /// Hide reasoning on stderr without disabling its generation or removing it from JSON.
+        #[arg(long)] hide_reasoning: bool,
     },
     /// Model lifecycle and inventory: what's configured, what's resident, start/stop it now,
     /// enable/disable it always-on, add/remove it from config, set capability defaults.
