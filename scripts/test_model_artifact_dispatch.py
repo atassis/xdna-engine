@@ -194,6 +194,276 @@ class ModelArtifactConcurrencyTests(unittest.TestCase):
                                         build=self.root / "other-build"), ("ok", "BUILT"))
 
 
+class Qwen35StoragePilotTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.repo = self.root / "repo"
+        (self.repo / "scenarios").mkdir(parents=True)
+        (self.repo / "scripts").mkdir()
+        self.scenario = "scenarios/generate-qwen3.5-4b.toml"
+        (self.repo / self.scenario).write_text("fixture")
+        self.config = self.repo / "engine.toml"
+        self.config.write_text("fixture")
+        self.artifacts, self.build = self.root / "artifacts", self.root / "build"
+        self.recipe = recipe_for("qwen3.5-4b", self.scenario, self.repo,
+                                 self.artifacts, self.root / "inputs", self.build)
+        source = Path(self.recipe.inputs[0])
+        source.mkdir(parents=True)
+        for name in ("config.json", "tokenizer.json", "tokenizer_config.json", "model.safetensors"):
+            (source / name).write_text("{}")
+        self.dump = self.build / "not-started"
+        self.calls = []
+        self.missing = None
+        self.metadata_update = lambda step, meta: None
+        lock_patch = patch("model_artifact_dispatch.LOCK_ROOT", self.root / "locks")
+        lock_patch.start()
+        self.addCleanup(lock_patch.stop)
+
+    def subprocess_output(self, argv, *, check, cwd, env):
+        self.assertEqual(cwd, self.repo)
+        self.calls.append(argv)
+        step = next(c.step for c in self.recipe.commands if Path(c.argv[1]).name == Path(argv[1]).name
+                    and (c.step != "tokenizer" or "--copy-tokenizer" in argv))
+        if step == "weights":
+            self.dump = Path(argv[argv.index("--out") + 1])
+            self.dump.mkdir(parents=True)
+            (self.dump / "tensor.npy").write_bytes(b"raw-fixture")
+        elif step in {"decode", "prefill"}:
+            self.assertEqual(Path(env["WEIGHTS"]), self.dump)
+            self.assertTrue((self.dump / "tensor.npy").is_file())
+            out = Path(argv[-1])
+            (out / "buffers").mkdir(parents=True)
+            meta = {"elf": f"{step}.elf", "weights": ["W"],
+                    "layout": {"W": {"len": 6}}}
+            (out / f"{step}.elf.zst").write_bytes(b"controlled-elf")
+            if step == "decode":
+                meta["embed_blob"] = "W_embed"
+                (out / "buffers/W.bin").write_bytes(b"packed")
+                (out / "buffers/W_embed.bin").write_bytes(b"embed")
+            else:
+                decode = Path(env["DECODE_META"])
+                meta.update(weights_from=str(decode.parent / "buffers"),
+                            decode_artifact={"meta": str(decode)}, arena_shared=True)
+                meta["weights"].append("P")
+                meta["layout"]["P"] = {"len": 5}
+                (out / "buffers/P.bin").write_bytes(b"local")
+            self.metadata_update(step, meta)
+            (out / "meta.json").write_text(json.dumps(meta))
+            if self.missing and step == self.missing[0]:
+                (out / self.missing[1]).unlink()
+        else:
+            copy_tokenizer(Path(argv[-2]), Path(argv[-1]))
+            if self.missing and self.missing[0] == "tokenizer":
+                (Path(argv[-1]) / self.missing[1]).unlink()
+        return subprocess.CompletedProcess(argv, 0)
+
+    def run_build(self):
+        with patch("model_artifact_dispatch.subprocess.run", self.subprocess_output):
+            return build_recipe(self.recipe, self.repo, self.config, self.artifacts, self.build)
+
+    def test_missing_final_blob_refuses_publication_and_retains_dump(self):
+        self.missing = ("decode", "buffers/W.bin")
+        live = Path(self.recipe.outputs[0])
+        live.mkdir(parents=True)
+        (live / "old.bin").write_bytes(b"old")
+        with self.assertRaisesRegex(FileNotFoundError, "W.bin"):
+            self.run_build()
+        self.assertEqual((live / "old.bin").read_bytes(), b"old")
+        self.assertTrue(self.dump.is_dir())
+
+    def test_missing_required_companions_fail_before_publication(self):
+        for step, filename in (("decode", "decode.elf.zst"), ("decode", "buffers/W_embed.bin"),
+                               ("prefill", "prefill.elf.zst"), ("prefill", "buffers/P.bin"),
+                               ("prefill", "meta.json"), ("tokenizer", "tokenizer.json"),
+                               ("tokenizer", "tokenizer_config.json"), ("tokenizer", "config.json")):
+            with self.subTest(step=step, filename=filename):
+                self.missing = (step, filename)
+                with self.assertRaises(FileNotFoundError):
+                    self.run_build()
+                self.assertTrue(self.dump.is_dir())
+                self.assertFalse(Path(self.recipe.outputs[0]).exists())
+
+    def test_invalid_blob_length_is_not_accepted(self):
+        self.metadata_update = lambda step, meta: meta["layout"]["W"].update(len=7)
+        with self.assertRaisesRegex(ValueError, "blob length"):
+            self.run_build()
+        self.assertTrue(self.dump.exists())
+
+    def test_shared_prefill_weight_must_be_uploaded_by_decode(self):
+        def missing_upload(step, meta):
+            if step == "decode":
+                meta["layout"]["P"] = {"len": 5}
+        self.metadata_update = missing_upload
+        with self.assertRaisesRegex(ValueError, "not uploaded by decode"):
+            self.run_build()
+        self.assertTrue(self.dump.exists())
+
+    def test_existing_persistent_dump_and_checkpoint_are_not_collected(self):
+        retained = self.artifacts / "qwen3.5-4b/weights/tensor.npy"
+        retained.parent.mkdir(parents=True)
+        retained.write_bytes(b"retained")
+        checkpoint = Path(self.recipe.inputs[0], "model.safetensors")
+        original = checkpoint.read_bytes()
+        self.assertEqual(self.run_build(), "BUILT")
+        self.assertEqual(retained.read_bytes(), b"retained")
+        self.assertEqual(checkpoint.read_bytes(), original)
+
+    def test_partial_publication_preserves_recovery_and_raw_dump(self):
+        import model_artifact_dispatch as dispatch
+        for raw in self.recipe.outputs:
+            live = Path(raw)
+            live.mkdir(parents=True)
+            (live / "old.bin").write_bytes(b"old")
+        original_replace = dispatch.os.replace
+
+        def fail_prefill(source, target):
+            if Path(target) == Path(self.recipe.outputs[1]) and "model-artifact-staging" in str(source):
+                raise OSError("fixture publication failure")
+            return original_replace(source, target)
+
+        with patch.object(dispatch.os, "replace", fail_prefill):
+            with self.assertRaisesRegex(OSError, "fixture publication failure"):
+                self.run_build()
+        recovery = next((self.artifacts / ".model-artifact-rollback").rglob("old.bin"))
+        self.assertEqual(recovery.read_bytes(), b"old")
+        self.assertEqual(Path(self.recipe.outputs[1], "old.bin").read_bytes(), b"old")
+        self.assertEqual(Path(self.recipe.outputs[2], "old.bin").read_bytes(), b"old")
+        self.assertTrue(self.dump.exists())
+
+    def test_prefill_cannot_require_dump_as_its_weight_source(self):
+        def require_dump(step, meta):
+            if step == "prefill":
+                meta["weights_from"] = str(self.dump)
+        self.metadata_update = require_dump
+        with self.assertRaisesRegex(ValueError, "published decode"):
+            self.run_build()
+        self.assertTrue(self.dump.exists())
+
+    def test_unknown_dump_reference_is_rejected_not_stripped(self):
+        self.metadata_update = lambda step, meta: meta.update(unknown_dependency=str(self.dump))
+        with self.assertRaisesRegex(RuntimeError, "staged path leaked"):
+            self.run_build()
+        metadata = next(self.dump.parents[2].glob("artifacts/**/meta.json"))
+        self.assertEqual(json.loads(metadata.read_text())["unknown_dependency"], str(self.dump))
+        self.assertTrue(self.dump.exists())
+
+    def test_command_failure_preserves_old_output_and_raw_recovery(self):
+        live = Path(self.recipe.outputs[0])
+        live.mkdir(parents=True)
+        (live / "old.bin").write_bytes(b"old")
+        original = self.subprocess_output
+
+        def fail_prefill(argv, **kwargs):
+            result = original(argv, **kwargs)
+            if Path(argv[1]).name == "build_prefill.sh":
+                raise subprocess.CalledProcessError(17, argv)
+            return result
+
+        with patch("model_artifact_dispatch.subprocess.run", fail_prefill):
+            with self.assertRaises(subprocess.CalledProcessError):
+                build_recipe(self.recipe, self.repo, self.config, self.artifacts, self.build)
+        self.assertEqual((live / "old.bin").read_bytes(), b"old")
+        self.assertTrue(self.dump.is_dir())
+
+    def test_publication_rejection_retains_dump_and_previous_outputs(self):
+        import model_artifact_dispatch as dispatch
+        live = Path(self.recipe.outputs[0])
+        live.mkdir(parents=True)
+        (live / "old.bin").write_bytes(b"old")
+        original_hit = dispatch.cache_hit
+
+        def reject(candidate, key, **kwargs):
+            if candidate.outputs == self.recipe.outputs:
+                return False
+            return original_hit(candidate, key, **kwargs)
+
+        with patch.object(dispatch, "cache_hit", reject):
+            with self.assertRaisesRegex(RuntimeError, "published receipt did not verify"):
+                self.run_build()
+        self.assertTrue(self.dump.is_dir())
+        recovery = next((self.artifacts / ".model-artifact-rollback").rglob("old.bin"))
+        self.assertEqual(recovery.read_bytes(), b"old")
+        calls = len(self.calls)
+        with self.assertRaisesRegex(RuntimeError, "recovery requires inspection"):
+            self.run_build()
+        self.assertEqual(len(self.calls), calls)
+        self.assertTrue(self.dump.is_dir())
+
+    def test_changed_checkpoint_and_quant_authority_rebuild(self):
+        self.assertEqual(self.run_build(), "BUILT")
+        first_calls = len(self.calls)
+        Path(self.recipe.inputs[0], "model.safetensors").write_bytes(b"changed")
+        self.assertEqual(self.run_build(), "BUILT")
+        self.assertEqual(len(self.calls), first_calls * 2)
+        quant = self.repo / "designs/decode_fused/quant.py"
+        quant.parent.mkdir(parents=True)
+        quant.write_text("quant = 2\n")
+        self.assertEqual(self.run_build(), "BUILT")
+        self.assertEqual(len(self.calls), first_calls * 3)
+        self.assertEqual(self.run_build(), "HIT")
+        self.assertEqual(len(self.calls), first_calls * 3)
+
+    def test_missing_published_blob_invalidates_receipt(self):
+        self.assertEqual(self.run_build(), "BUILT")
+        Path(self.recipe.outputs[0], "buffers/W.bin").unlink()
+        self.assertEqual(self.run_build(), "BUILT")
+        self.assertEqual(len(self.calls), 8)
+
+    def test_different_data_roots_build_only_in_their_own_stage(self):
+        self.assertEqual(self.run_build(), "BUILT")
+        first_dump = self.dump
+        self.artifacts, self.build = self.root / "other/artifacts", self.root / "other/build"
+        self.recipe = recipe_for("qwen3.5-4b", self.scenario, self.repo,
+                                 self.artifacts, self.root / "inputs", self.build)
+        self.assertEqual(self.run_build(), "BUILT")
+        self.assertNotEqual(first_dump, self.dump)
+        self.assertTrue(self.dump.is_relative_to(self.build / "model-artifact-staging"))
+        self.assertFalse(self.dump.exists())
+
+    def test_pilot_keeps_checkpoint_and_quantization_contract(self):
+        commands = {command.step: command for command in self.recipe.commands}
+        weights = commands["weights"]
+        self.assertEqual(weights.argv[2:-1], ("--spec", "qwen3.5-4b", "--checkpoint-dir",
+                                            self.recipe.inputs[0], "--out"))
+        self.assertEqual(json.loads(commands["decode"].env["PRECISION"]),
+                         {site: "int4/g32/clip" for site in ("mlp", "attn_o", "qkv")})
+        self.assertEqual(commands["decode"].env["WEIGHTS"], weights.argv[-1])
+        self.assertEqual(commands["prefill"].env["WEIGHTS"], weights.argv[-1])
+
+    def test_verified_publication_expires_only_transaction_local_dump(self):
+        import model_artifact_dispatch as dispatch
+        accepted = []
+        original_hit = dispatch.cache_hit
+
+        def observe(candidate, key, **kwargs):
+            hit = original_hit(candidate, key, **kwargs)
+            if candidate.outputs == self.recipe.outputs and hit:
+                self.assertTrue(self.dump.is_dir())
+                accepted.append(True)
+            return hit
+
+        with patch.object(dispatch, "cache_hit", observe):
+            self.assertEqual(self.run_build(), "BUILT")
+        self.assertTrue(accepted)
+        self.assertTrue(self.dump.is_relative_to(self.build / "model-artifact-staging"))
+        self.assertIn("build", self.dump.relative_to(self.build / "model-artifact-staging").parts)
+        self.assertNotIn(str(self.artifacts / "qwen3.5-4b/weights"), self.recipe.outputs)
+        self.assertFalse(self.dump.exists())
+        self.assertFalse((self.artifacts / "qwen3.5-4b/weights").exists())
+        decode, prefill, tokenizer = map(Path, self.recipe.outputs)
+        meta = json.loads((prefill / "meta.json").read_text())
+        self.assertEqual(meta["weights_from"], str(decode / "buffers"))
+        self.assertEqual(meta["decode_artifact"]["meta"], str(decode / "meta.json"))
+        validate_recipe_outputs(self.recipe)
+        receipt = (decode / ".model-recipe.json").read_text()
+        self.assertNotIn("model-artifact-staging", receipt)
+        calls = len(self.calls)
+        self.assertEqual(self.run_build(), "HIT")
+        self.assertEqual(len(self.calls), calls)
+
+
 class ModelArtifactDispatchPlanTests(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()

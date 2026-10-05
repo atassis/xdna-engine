@@ -206,9 +206,10 @@ def recipe_for(model: str, scenario: str, repo: Path, artifacts: Path, inputs: P
             ),
         )
     if model == "qwen3.5-4b" and scenario == "scenarios/generate-qwen3.5-4b.toml":
-        weights, decode, prefill, tokenizer = out("qwen3.5-4b/weights"), out("qwen3.5-4b/decode_s4096_gdrl_p8e3958"), out("qwen3.5-4b/prefill_m256f_s4096_p8e3958"), out("qwen3.5-4b/tokenizer")
+        weights = path(build, "qwen3.5-4b/weight-dump")
+        decode, prefill, tokenizer = out("qwen3.5-4b/decode_s4096_gdrl_p8e3958"), out("qwen3.5-4b/prefill_m256f_s4096_p8e3958"), out("qwen3.5-4b/tokenizer")
         return Recipe(
-            model, scenario, (src("qwen3.5-4b/checkpoint"),), (decode, prefill, weights, tokenizer),
+            model, scenario, (src("qwen3.5-4b/checkpoint"),), (decode, prefill, tokenizer),
             (
                 command("weights", [iron_py, str(scripts / "dump_llm_weights.py"), "--spec", model, "--checkpoint-dir", src("qwen3.5-4b/checkpoint"), "--out", weights], **weight_env),
                 command("decode", ["bash", str(scripts / "build_llm_decode.sh"), model, "", decode], WEIGHTS=weights, GEN_EXTRA="--max-seq 4096", ACT_POLY="1", DECODE_GDR_LIMBS="1", PRECISION='{"mlp": "int4/g32/clip", "attn_o": "int4/g32/clip", "qkv": "int4/g32/clip"}'),
@@ -315,11 +316,52 @@ def validate_recipe_inputs(recipes: list[Recipe]) -> None:
             require_members(recipe, root if root.is_dir() else root.parent, False)
 
 
-def validate_recipe_outputs(recipe: Recipe) -> None:
+def validate_recipe_outputs(recipe: Recipe, *, references: Recipe | None = None) -> None:
     for raw in recipe.outputs:
         if not Path(raw).exists():
             raise FileNotFoundError(f"{recipe.model}: recipe output missing: {raw}")
     require_members(recipe, Path(recipe.outputs[0]), True)
+    if recipe.model == "qwen3.5-4b":
+        validate_qwen35_closure(recipe, references or recipe)
+
+
+def validate_qwen35_closure(recipe: Recipe, references: Recipe) -> None:
+    decode, prefill, tokenizer = map(Path, recipe.outputs)
+    reference_decode = Path(references.outputs[0])
+
+    def require_file(target: Path) -> None:
+        if not target.is_file():
+            raise FileNotFoundError(f"{recipe.model}: required artifact dependency missing: {target}")
+        if not any(target.resolve().is_relative_to(Path(raw).resolve()) for raw in recipe.outputs):
+            raise ValueError(f"{recipe.model}: artifact dependency escapes published outputs: {target}")
+
+    decode_meta = json.loads((decode / "meta.json").read_text())
+    for root in (decode, prefill):
+        require_file(root / "meta.json")
+        meta = json.loads((root / "meta.json").read_text())
+        elf = root / meta["elf"]
+        require_file(elf if elf.is_file() else Path(str(elf) + ".zst"))
+        if root == prefill:
+            if (meta.get("weights_from") != str(reference_decode / "buffers")
+                    or (meta.get("decode_artifact") or {}).get("meta") != str(reference_decode / "meta.json")):
+                raise ValueError(f"{recipe.model}: prefill must reference its published decode output")
+        for name in meta["weights"]:
+            # Shared prefill weights are uploaded by decode; prefill-only weights are local.
+            owner = decode if root == prefill and name in decode_meta["layout"] else root
+            if owner == decode and name not in decode_meta["weights"]:
+                raise ValueError(f"{recipe.model}: shared weight is not uploaded by decode: {name}")
+            blob = owner / "buffers" / f"{name}.bin"
+            require_file(blob)
+            if blob.stat().st_size != meta["layout"][name]["len"]:
+                raise ValueError(f"{recipe.model}: blob length disagrees with layout: {blob}")
+        if root == decode:
+            host_blobs = [meta.get("embed_blob") or "W_head"]
+            protocol = meta.get("host_protocol", {})
+            host_blobs += [protocol[key] for key in ("pos_blob", "logit_bias_blob") if protocol.get(key)]
+            for name in host_blobs:
+                require_file(decode / "buffers" / f"{name}.bin")
+    for name in ("tokenizer.json", "tokenizer_config.json", "config.json"):
+        require_file(tokenizer / name)
 
 
 def authority_digest(recipe: Recipe, repo: Path) -> str:
@@ -408,16 +450,20 @@ def manifest_path(recipe: Recipe) -> Path:
     return Path(recipe.outputs[0]) / ".model-recipe.json"
 
 
-def cache_hit(recipe: Recipe, key: str) -> bool:
+def cache_hit(recipe: Recipe, key: str, *, references: Recipe | None = None) -> bool:
     manifest = manifest_path(recipe)
     if not manifest.is_file():
         return False
     try:
-        validate_recipe_outputs(recipe)
+        validate_recipe_outputs(recipe, references=references)
         record = json.loads(manifest.read_text())
         return record["recipe_key"] == key and record["output_digest"] == output_digest(recipe.outputs)
     except (OSError, KeyError, json.JSONDecodeError, FileNotFoundError):
         return False
+    except (ValueError, TypeError):
+        if recipe.model == "qwen3.5-4b":
+            return False
+        raise
 
 
 def ensure_outputs_ready(recipe: Recipe, key: str) -> None:
@@ -704,9 +750,10 @@ def rebase_recipe(recipe: Recipe, live_artifacts: Path, staged_artifacts: Path,
                         for item in recipe.commands))
 
 
-def write_receipt(recipe: Recipe, key: str) -> None:
+def write_receipt(recipe: Recipe, key: str, *, commands: tuple[Command, ...] | None = None) -> None:
     record = {"model": recipe.model, "scenario": recipe.scenario, "recipe_key": key,
-              "output_digest": output_digest(recipe.outputs), "commands": [asdict(c) for c in recipe.commands]}
+              "output_digest": output_digest(recipe.outputs),
+              "commands": [asdict(c) for c in (recipe.commands if commands is None else commands)]}
     target = manifest_path(recipe)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
@@ -751,9 +798,10 @@ def publish_recipe(recipe: Recipe, staged: Recipe, key: str, rollback: Path) -> 
 
 def _publish_recipe(recipe: Recipe, staged: Recipe, key: str, rollback: Path) -> None:
     require_no_recovery(rollback, key)
-    validate_recipe_outputs(staged)
-    write_receipt(staged, key)
-    if not cache_hit(staged, key):
+    reference_args = {"references": recipe} if recipe.model == "qwen3.5-4b" else {}
+    validate_recipe_outputs(staged, **reference_args)
+    write_receipt(staged, key, commands=recipe.commands if recipe.model == "qwen3.5-4b" else None)
+    if not cache_hit(staged, key, **reference_args):
         raise RuntimeError(f"recipe manifest did not verify in staging: {recipe.model}")
     moved: list[tuple[Path, Path]] = []
     try:
@@ -820,14 +868,18 @@ def _build_recipe(recipe: Recipe, repo: Path, artifacts: Path, build: Path, key:
     staged_artifacts, staged_build = stage_root / "artifacts", stage_root / "build"
     staged = rebase_recipe(recipe, artifacts, staged_artifacts, build, staged_build)
     run_commands(staged, repo)
+    if recipe.model == "qwen3.5-4b":
+        validate_recipe_outputs(staged)
     relocate_recipe_metadata(recipe, staged)
-    validate_recipe_outputs(staged)
+    validate_recipe_outputs(staged, references=recipe if recipe.model == "qwen3.5-4b" else None)
     no_staging_references(staged, stage_root)
     if authority_before != authority_digest(recipe, repo) or inputs_before != source_digest(recipe.inputs):
         raise RuntimeError(f"{recipe.model}: source authority changed while the staged build ran")
     _publish_recipe(recipe, staged, key, rollback)
     if not cache_hit(recipe, key):
         raise RuntimeError(f"recipe manifest did not verify after publish: {recipe.model}")
+    if recipe.model == "qwen3.5-4b":
+        shutil.rmtree(staged_build / "qwen3.5-4b/weight-dump")
     return "BUILT"
 
 
