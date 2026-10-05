@@ -128,6 +128,7 @@ const FREE_FORM_ARGS: &[(&str, &str)] = &[
     ("config", "engine.toml path -- arbitrary filesystem location"),
     ("port", "TCP port number -- not a finite set"),
     ("input", "input audio/video file path"),
+    ("images", "repeatable local image file paths"),
     ("out", "output file path"),
     ("model", "model name -- from the operator's [[model]] list, not a fixed set"),
     ("asr", "ASR model name, same reason as `model`"),

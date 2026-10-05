@@ -217,12 +217,33 @@ impl<R: BufRead> SseCall<R> {
 }
 
 /// `Prompt::Chat`'s wire shape: `messages`, sent the same way an OpenAI client would build it. The
-/// CLI never sends `tool_calls`/`tool_call_id` on an outgoing turn -- those only ever come BACK from
-/// the model -- so a message is exactly its role and content.
+/// Media uses multipart content; a text-only turn retains the string form.
 pub fn chat_messages_json(history: &[npu_models::ChatMessage]) -> serde_json::Value {
-    serde_json::json!(history.iter()
-        .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
-        .collect::<Vec<_>>())
+    use base64::Engine;
+    serde_json::json!(history.iter().map(|m| {
+        let content = if m.media.is_empty() {
+            serde_json::json!(m.content)
+        } else {
+            let mut parts = vec![serde_json::json!({"type": "text", "text": m.content})];
+            for media in &m.media {
+                let part = match media {
+                    npu_models::ChatMedia::Image(bytes) => {
+                        let mime = image::guess_format(bytes).map(|format| format.to_mime_type())
+                            .unwrap_or("application/octet-stream");
+                        let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+                        serde_json::json!({"type": "image_url", "image_url": {"url": format!("data:{mime};base64,{data}")}})
+                    }
+                    npu_models::ChatMedia::Audio(bytes) => {
+                        let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+                        serde_json::json!({"type": "input_audio", "input_audio": {"format": "wav", "data": data}})
+                    }
+                };
+                parts.push(part);
+            }
+            serde_json::json!(parts)
+        };
+        serde_json::json!({"role": m.role, "content": content})
+    }).collect::<Vec<_>>())
 }
 
 /// `GenerateParams` onto the wire, OMITTING every field the caller did not set -- `None` must not

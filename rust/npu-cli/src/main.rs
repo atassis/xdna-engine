@@ -111,10 +111,10 @@ fn run(cli: &Cli, path: &Path) -> Result<()> {
         Cmd::Transcribe { input, model } => transcribe(input, model.as_deref(), as_json),
         Cmd::Speak { text, voice, model, out, play, format } =>
             speak(text, voice.as_deref(), model.as_deref(), out.as_deref(), *play, *format),
-        Cmd::Generate { prompt, model, sampling, no_stream, raw, stats, hide_reasoning } =>
-            generate(prompt, model.as_deref(), sampling, *no_stream, *raw, *stats, as_json, *hide_reasoning),
-        Cmd::Chat { prompt, model, sampling, no_stream, hide_reasoning } =>
-            chat(prompt.as_deref(), model.as_deref(), sampling, *no_stream, as_json, *hide_reasoning),
+        Cmd::Generate { prompt, model, sampling, no_stream, raw, stats, images, hide_reasoning } =>
+            generate(prompt, model.as_deref(), sampling, *no_stream, *raw, *stats, as_json, images, *hide_reasoning),
+        Cmd::Chat { prompt, model, sampling, no_stream, images, hide_reasoning } =>
+            chat(prompt.as_deref(), model.as_deref(), sampling, *no_stream, as_json, images, *hide_reasoning),
         Cmd::Embed { text, model } => embed(text, model.as_deref(), as_json),
         Cmd::Decide { state, question, kind, options, questions, model, stats } =>
             decide(state, question.as_deref(), *kind, options, questions.as_deref(), model, *stats, as_json),
@@ -833,7 +833,7 @@ fn print_stats_footer(g: &Generated, full: bool) {
 /// is exactly what `--no-stream` asks for.
 #[allow(clippy::too_many_arguments)]
 fn generate(prompt: &str, model: Option<&str>, sampling: &SamplingArgs,
-            no_stream: bool, raw: bool, stats: bool, as_json: bool, hide_reasoning: bool) -> Result<()> {
+            no_stream: bool, raw: bool, stats: bool, as_json: bool, images: &[PathBuf], hide_reasoning: bool) -> Result<()> {
     quiet_one_shot();
     // Code::Failure, the documented generic bucket: this closed set has no invalid-argument code,
     // and NoService (2) would tell a caller to start a server for what is a bad flag value.
@@ -843,8 +843,9 @@ fn generate(prompt: &str, model: Option<&str>, sampling: &SamplingArgs,
     let base = if raw {
         serde_json::json!({ "prompt": prompt })
     } else {
-        serde_json::json!({ "messages": socket_client::chat_messages_json(
-            &[npu_models::ChatMessage::new("user", prompt)]) })
+        let mut message = npu_models::ChatMessage::new("user", prompt);
+        message.media = read_images(images)?;
+        serde_json::json!({ "messages": socket_client::chat_messages_json(&[message]) })
     };
     // `--output json` follows the stream flag, the way /v1/chat/completions does: streaming means
     // NDJSON on stdout, buffered means one object printed below. In either JSON mode the text is
@@ -923,17 +924,28 @@ fn replay_cmd(log: &Path, realtime: bool, frames: bool) -> Result<()> {
     Ok(())
 }
 
+fn read_images(paths: &[PathBuf]) -> Result<Vec<npu_models::ChatMedia>> {
+    paths.iter().map(|path| {
+        let bytes = std::fs::read(path).with_context(|| format!("read image {}", path.display()))?;
+        let format = image::guess_format(&bytes).with_context(|| format!("identify image {}", path.display()))?;
+        anyhow::ensure!(matches!(format, image::ImageFormat::Png | image::ImageFormat::Jpeg),
+                        "unsupported image format {format:?} for {}; supported: PNG, JPEG", path.display());
+        Ok(npu_models::ChatMedia::Image(bytes))
+    }).collect()
+}
+
 /// `opening` is the turn given on the command line. It is answered before stdin is read once, and
 /// then the REPL continues from it -- a seeded session, not a one-shot. The one-shot spelling is
 /// `npu generate`, which builds the identical single-message `Prompt::Chat`; duplicating it here
 /// would add a second name for a command we have and drop the history that makes this one a REPL.
 fn chat(opening: Option<&str>, model: Option<&str>, sampling: &SamplingArgs,
-        no_stream: bool, as_json: bool, hide_reasoning: bool) -> Result<()> {
+        no_stream: bool, as_json: bool, images: &[PathBuf], hide_reasoning: bool) -> Result<()> {
     quiet_one_shot();
     // Code::Failure, the documented generic bucket: this closed set has no invalid-argument code,
     // and NoService (2) would tell a caller to start a server for what is a bad flag value.
     let params = build_params(sampling).map_err(|m| Tagged(Code::Failure, m))?;
     let mut history: Vec<npu_models::ChatMessage> = Vec::new();
+    let mut media = read_images(images)?;
     let stdin = std::io::stdin();
     // Whitespace-only counts as absent: `npu chat ""` must open the REPL, not send an empty turn.
     let mut opening = opening.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
@@ -960,7 +972,9 @@ fn chat(opening: Option<&str>, model: Option<&str>, sampling: &SamplingArgs,
                 line
             }
         };
-        history.push(npu_models::ChatMessage::new("user", line));
+        let mut message = npu_models::ChatMessage::new("user", line);
+        message.media = std::mem::take(&mut media);
+        history.push(message);
         let base = serde_json::json!({ "messages": socket_client::chat_messages_json(&history) });
         // One NDJSON run per turn -- header, tokens, summary -- so a piped chat session is a
         // concatenation of run logs rather than a format of its own. Always streamed in JSON mode

@@ -198,6 +198,8 @@ pub enum Cmd {
         #[arg(long)] no_stream: bool,
         /// Send the prompt verbatim, with no chat template -- raw continuation.
         #[arg(long)] raw: bool,
+        /// Attach a local PNG/JPEG image. May be repeated.
+        #[arg(long = "image", conflicts_with = "raw", value_hint = ValueHint::FilePath)] images: Vec<PathBuf>,
         /// Hide reasoning on stderr without disabling its generation or removing it from JSON.
         #[arg(long)] hide_reasoning: bool,
     },
@@ -214,6 +216,8 @@ pub enum Cmd {
         #[arg(long)] model: Option<String>,
         #[command(flatten)] sampling: SamplingArgs,
         #[arg(long)] no_stream: bool,
+        /// Attach local PNG/JPEG images to the first user turn. May be repeated.
+        #[arg(long = "image", value_hint = ValueHint::FilePath)] images: Vec<PathBuf>,
         /// Hide reasoning on stderr without disabling its generation or removing it from JSON.
         #[arg(long)] hide_reasoning: bool,
     },
