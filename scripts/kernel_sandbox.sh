@@ -52,10 +52,23 @@ ensure_fresh_sandbox() {
   local bd="$1"
   [ "${KERNEL_SANDBOX_GC:-1}" = "0" ] && return 0
   local repo="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-  # path guard: only ever operate under the mlir-aie build tree
+  # Family adapters declare mlir_aie_root; direct builders use the checkout.
+  local source_root pe resolved mode=-m
+  [ -z "${mlir_aie_root:-}" ] || mode=-e
+  source_root="$(realpath "$mode" -- "${mlir_aie_root:-$repo/mlir-aie}")" || {
+    echo "[kernel_sandbox] refuse: unknown mlir-aie source root" >&2; return 1; }
+  pe="$(realpath "$mode" -- "$source_root/programming_examples")" || {
+    echo "[kernel_sandbox] refuse: no programming_examples under '$source_root'" >&2; return 1; }
+  [ "$pe" = "$source_root/programming_examples" ] && [ ! -L "$bd" ] || {
+    echo "[kernel_sandbox] refuse: source/build symlink escape at '$bd'" >&2; return 1; }
+  resolved="$(realpath -m -- "$bd")" || return 1
   case "$bd" in
-    *mlir-aie/programming_examples/*) : ;;
-    *) echo "[kernel_sandbox] refuse: '$bd' is not under the mlir-aie build tree" >&2; return 1 ;;
+    */build) : ;;
+    *) echo "[kernel_sandbox] refuse: '$bd' is not a build directory" >&2; return 1 ;;
+  esac
+  case "$resolved" in
+    "$pe"/*/build) bd="$resolved" ;;
+    *) echo "[kernel_sandbox] refuse: '$bd' is outside the declared mlir-aie build tree" >&2; return 1 ;;
   esac
   local cur; cur="$(current_toolchain_hash "$repo")" || return 1
   local stamp="$bd/.toolchain-stamp"
