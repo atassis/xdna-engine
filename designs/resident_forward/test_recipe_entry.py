@@ -91,11 +91,11 @@ print(json.dumps({"rungs": layer.f_rungs(),
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("AssertionError: (20, 1216", result.stderr)
 
-    def test_runtime_and_builder_use_the_shared_window_constant(self) -> None:
+    def test_runtime_and_builder_use_the_model_owned_window(self) -> None:
         kvring = HERE / "kvring.py"
         self.assertIn("DEFAULT_WINDOW_ROWS = 1024", kvring.read_text())
-        self.assertTrue(imports_name(HERE / "rld_run.py", "kvring", "DEFAULT_WINDOW_ROWS"))
-        self.assertTrue(imports_name(HERE / "rlayer_design.py", "kvring", "DEFAULT_WINDOW_ROWS"))
+        self.assertTrue(imports_name(HERE / "rld_run.py", "rf_model", "MODEL"))
+        self.assertTrue(imports_name(HERE / "rlayer_design.py", "rf_model", "MODEL"))
 
     def test_global_weight_preparation_does_not_import_pyxrt(self) -> None:
         probe = """

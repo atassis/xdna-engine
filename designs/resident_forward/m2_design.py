@@ -10,13 +10,16 @@ differs by phase.
 """
 import sys
 import rf_paths
+from rf_model import MODEL
 from m1_design import M, core_name, NC, NR, KC, NB, ELEM, ABLK, OBLK, NBLK, NSUB, PCAP_T, HT, KERN
 
-NDB, NSP = 30, 4
+NDB = MODEL.D // NR // 32                 # down N blocks of 32 per chain row
+NSP = MODEL.FF // NC // KC                # down K sub-passes per column
+YNB = MODEL.D // NC // 32                 # down N blocks landing in one MemTile (y_d slice)
 WB = KC * NB * 9 // 8                     # gate/up W block; down uses its first DOWN_W bytes
 DOWN_W = KC * 32 * 9 // 8
 YB = 1024                                 # one y_d N block of 16 rows, bf16
-YT = 15 * YB                              # one 16-row block of a MemTile's y_d
+YT = YNB * YB                             # one 16-row block of a MemTile's y_d
 WCOL_GU = NBLK * NSUB * 2 * NR * ELEM
 WCOL_D = NDB * NSP * NSUB * NR * ELEM
 WCOL = WCOL_GU + WCOL_D
@@ -362,7 +365,7 @@ def sequence(m, nt):
 
 def kernels():
     return [(KERN, rf_paths.iron_kernel("chain_mm_bfp16.cc"),
-             ["-DKC=480", "-DNB=64", "-DSUB_K=96"])]
+             [f"-DKC={KC}", f"-DNB={NB}", "-DSUB_K=96"])]
 
 
 def build_text(args):

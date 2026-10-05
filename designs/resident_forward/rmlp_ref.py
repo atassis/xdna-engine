@@ -5,7 +5,9 @@ from chain_ref import bf16, bf16_bits, acc_add
 from mlp_ref import (load_layer0, gemm_chain, h_from_gateup, gemm_down_chain, gateup_stream,
                      down_stream, D, ELEM, NCOL, NROW)
 
-EPS = np.float32(1e-6)
+from rf_model import MODEL
+
+EPS = np.float32(MODEL.physical_norm_eps)
 W = D // NCOL
 
 

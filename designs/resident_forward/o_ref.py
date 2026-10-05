@@ -12,8 +12,9 @@ from chain_ref import bf16, bf16_bits, mac_block, acc_add
 from mlp_ref import _unplanar, pack_elem, bfp16_blocks, WDIR, PFX, D, SUB_K, ELEM, NCOL, NROW
 from rmlp_ref import rmsnorm, gain_elements
 import rf_paths
+from rf_model import MODEL
 
-HD, HQ = 256, 16
+HD, HQ = MODEL.HD, MODEL.HQ
 KO = HQ * HD                      # 4096
 KCOL = KO // NCOL                 # 512 real context columns per MemTile
 KCO, NSPO = 288, 2                # chain K slice and sub-passes per column

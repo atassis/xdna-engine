@@ -12,17 +12,18 @@ like x. Gains ride the weight stream (2 elements per core before gate/up and aft
 import os
 import sys
 import rf_paths
-from m1_design import M, core_name, NC, NR, KC, NB, ELEM, ABLK, OBLK, NBLK, NSUB, PCAP_T, HT, KERN
-from m2_design import convert_loop, act_call, NDB, NSP, WB, DOWN_W, WCOL_GU, WCOL_D
+from rf_model import MODEL
+from m1_design import M, core_name, NC, NR, KC, NB, ELEM, ABLK, AB_UNIT, OBLK, NBLK, NSUB, PCAP_T, HT, KERN
+from m2_design import convert_loop, act_call, NDB, NSP, YNB, WB, DOWN_W, WCOL_GU, WCOL_D
 
 NORM = "norm.o"
 STANDIN = "standin.o"
-D = 3840
-XROW = 480 * 2                            # one row of a column slice, bf16
+D = MODEL.D
+XROW = KC * 2                             # one row of a column slice, bf16
 XB = 16 * XROW                            # one 16-row block
 UNITB = 8 * XROW
-XRB = (16 * PCAP_T + 1) * XROW            # resident x (+1 row: the last unit's spill)
-XYB = max(PCAP_T * ABLK, XRB)             # xn2 blocks, then y_d rows
+XRB = (16 * PCAP_T + 1) * XROW + AB_UNIT - (UNITB + XROW)   # resident x (+ the last unit's spill)
+XYB = max(PCAP_T * ABLK, XRB) + AB_UNIT - ABLK   # xn2 blocks, then y_d rows
 WGAIN = 2 * NR * ELEM
 WCOL = WGAIN + WCOL_GU + WCOL_D + WGAIN
 OUT_OFF = 2 * UNITB                       # rf_norm.cc: xn2 block, over the y slots
@@ -289,7 +290,7 @@ def core_body(m, c, r, last):
     mm = "chain_mm_first_r2" if c == 0 else ("chain_mm_last_geluup_r2" if last else "chain_mm_mid_r2")
     m(f"%core_{t} = aie.core(%t_{t}) {{")
     I = 6
-    for v in (0, 1, 2, 3, 4, 5, 10, 15, 30, 60, 120):
+    for v in sorted({0, 1, 2, 3, 4, 5, NSUB, 2 * NSUB, NSP, NSP - 1, YNB, NDB, NBLK // 2, NBLK}):
         m(f"%c{v} = arith.constant {v} : index", I)
     m("%one = arith.constant 1 : i32", I)
     m("%two = arith.constant 2 : i32", I)
@@ -321,11 +322,11 @@ def core_body(m, c, r, last):
     gains(m, t, I)
     norm_pass(m, c, r, I, post=False)
     # gate/up (element and activation parities are unchanged: both passes above consume evens)
-    for oj, cnt in ([(None, 120)] if not last else [(0, 60), (1, 60)]):
+    for oj, cnt in ([(None, NBLK)] if not last else [(0, NBLK // 2), (1, NBLK // 2)]):
         m(f"scf.for %n = %c0 to %c{cnt} step %c1 {{", I)
         I += 2
-        m("%n10 = arith.muli %n, %c10 : index", I)
-        convert_loop(m, t, I, "%n10", 10, True)
+        m(f"%n10 = arith.muli %n, %c{2 * NSUB} : index", I)
+        convert_loop(m, t, I, "%n10", 2 * NSUB, True)
         m("%nnt = arith.muli %n, %nt : index", I)
         m("scf.for %tb = %c0 to %nt step %c1 {", I)
         I += 2
@@ -348,14 +349,14 @@ def core_body(m, c, r, last):
         m("}", I)
     # down
     dmm = "chain_down_first_r2" if c == 0 else ("chain_down_last_r2" if last else "chain_down_mid_r2")
-    m("scf.for %n = %c0 to %c30 step %c1 {", I)
+    m(f"scf.for %n = %c0 to %c{NDB} step %c1 {{", I)
     I += 2
-    m("scf.for %s = %c0 to %c4 step %c1 {", I)
+    m(f"scf.for %s = %c0 to %c{NSP} step %c1 {{", I)
     I += 2
-    m("%ns = arith.muli %n, %c4 : index", I)
+    m(f"%ns = arith.muli %n, %c{NSP} : index", I)
     m("%nsi = arith.addi %ns, %s : index", I)
-    m("%ns5 = arith.muli %nsi, %c5 : index", I)
-    convert_loop(m, t, I, "%ns5", 5, False)
+    m(f"%ns5 = arith.muli %nsi, %c{NSUB} : index", I)
+    convert_loop(m, t, I, "%ns5", NSUB, False)
     m("%s32 = arith.index_cast %s : index to i32", I)
     m("%nsnt = arith.muli %nsi, %nt : index", I)
     m("scf.for %tb = %c0 to %nt step %c1 {", I)
@@ -373,16 +374,16 @@ def core_body(m, c, r, last):
     if last:
         # y_d rows: two 1024 B buffers in gscr, alternating per emitted block; channel 1 starts
         # its own alternation at n = 15, so both buffers drain first
-        m("%s3 = arith.cmpi eq, %s, %c3 : index", I)
+        m(f"%s3 = arith.cmpi eq, %s, %c{NSP - 1} : index", I)
         m("scf.if %s3 {", I)
         J = I + 2
-        m("%sw = arith.cmpi eq, %n, %c15 : index", J)
+        m(f"%sw = arith.cmpi eq, %n, %c{YNB} : index", J)
         m("scf.if %sw {", J)
         m(f"aie.use_lock(%cyp_{t}, AcquireGreaterEqual, %two)", J + 2)
         m(f"aie.use_lock(%cyp_{t}, Release, %two)", J + 2)
         m("}", J)
-        m("%lo = arith.cmpi ult, %n, %c15 : index", J)
-        m("%n15 = arith.subi %n, %c15 : index", J)
+        m(f"%lo = arith.cmpi ult, %n, %c{YNB} : index", J)
+        m(f"%n15 = arith.subi %n, %c{YNB} : index", J)
         m("%nl = arith.select %lo, %n, %n15 : index", J)
         m("%nlnt = arith.muli %nl, %nt : index", J)
         m("scf.for %tb = %c0 to %nt step %c1 {", J)
@@ -447,7 +448,7 @@ def sequence(m, nt, blocks=1, part=None, switches=0, attn=False, res=None):
         m(f"aiex.npu.rtp_write(@rtp_{core_name(k % NC, 0)}, 1, %ntv) : i32", I)
     for c in range(NC):
         for nm, v in (("xf", 1), ("xp", 1 if part == "b2" or res in ("mid", "out") else 0), ("xw", 1), ("xr", 0), ("hf", 1), ("hr", 0),
-                      ("yf", 15), ("yr", 0), ("ow", 1), ("od", 0)):
+                      ("yf", YNB), ("yr", 0), ("ow", 1), ("od", 0)):
             m(f"aiex.set_lock(%{nm}_{c}, {v})", I)
     for c in range(NC):
         for r in range(NR):
@@ -472,7 +473,7 @@ def sequence(m, nt, blocks=1, part=None, switches=0, attn=False, res=None):
         issued.append(name)
         m(f"%{name} = aiex.dma_configure_task(%{tile}, {d}, {ch}) {{", I)
         m("%one = arith.constant 1 : i32", I + 2)
-        m("%v15 = arith.constant 15 : i32", I + 2)
+        m(f"%v{YNB} = arith.constant {YNB} : i32", I + 2)
         for line in body:
             m(line, I + 2)
         m("aie.end", I + 2)
@@ -510,12 +511,12 @@ def sequence(m, nt, blocks=1, part=None, switches=0, attn=False, res=None):
             hb = [locked(f"hr_{c}", f"aie.dma_bd({H} offset = {sp * ABLK} len = {nt * ABLK} sizes = [{nt}, 3, {ABLK // 3}] strides = [{HT}, {ABLK // 3}, 1]) {{bd_id = {14 + sp} : i32}}", f"hr_{c}")
                   for sp in range(NSP)]
             task(f"hb{c}{sfx}", f"mem_{c}", "MM2S", 4, chain(hb), f" {{repeat_count = {NDB - 1} : i32}}")
-            task(f"ld{c}{sfx}", f"mem_{c}", "S2MM", 2, locked(f"hf_{c}", f"aie.dma_bd({H} offset = 0 len = {60 * nt * OBLK} sizes = [60, {nt}, {OBLK}] strides = [{OBLK}, {HT}, 1]) {{bd_id = 20 : i32}}", f"hr_{c}"))
+            task(f"ld{c}{sfx}", f"mem_{c}", "S2MM", 2, locked(f"hf_{c}", f"aie.dma_bd({H} offset = 0 len = {NBLK // 2 * nt * OBLK} sizes = [{NBLK // 2}, {nt}, {OBLK}] strides = [{OBLK}, {HT}, 1]) {{bd_id = 20 : i32}}", f"hr_{c}"))
             task(f"ly{c}{sfx}", f"mem_{c}", "S2MM", 2, locked(f"yf_{c}",
-                 f"aie.dma_bd({XY} offset = 0 len = {nt * 16 * 64} sizes = [15, {nt}, 16, 64] strides = [64, {XB}, {XROW}, 1]) {{bd_id = 21 : i32}}", f"yr_{c}"),
-                 " {repeat_count = 14 : i32}")
+                 f"aie.dma_bd({XY} offset = 0 len = {nt * 16 * 64} sizes = [{YNB}, {nt}, 16, 64] strides = [64, {XB}, {XROW}, 1]) {{bd_id = 21 : i32}}", f"yr_{c}"),
+                 f" {{repeat_count = {YNB - 1} : i32}}")
             task(f"pp{c}{sfx}", f"mem_{c}", "MM2S", 4, chain([locked(f"xp_{c}", units(XR, 2 * nt, 18), f"xp_{c}"),
-                                                              locked(f"yr_{c}", units(XY, 2 * nt, 19), f"yr_{c}", "%v15")]),
+                                                              locked(f"yr_{c}", units(XY, 2 * nt, 19), f"yr_{c}", f"%v{YNB}")]),
                  f" {{repeat_count = {2 * nt - 1} : i32}}")
             task(f"ol{c}{sfx}", f"mem_{c}", "S2MM", wbq[0], locked(f"ow_{c}", f"aie.dma_bd({XR} offset = 0 len = {X}) {{bd_id = {wbq[2]} : i32}}", f"od_{c}"))
             if b < blocks - 1 or part == "b1" or res in ("in", "mid"):
@@ -542,10 +543,10 @@ def sequence(m, nt, blocks=1, part=None, switches=0, attn=False, res=None):
                 o0, o1 = f"%ob{j}0_{t} : memref<{OBLK}xi8>", f"%ob{j}1_{t} : memref<{OBLK}xi8>"
                 body = chain([locked(f"coc{j}_{t}", f"aie.dma_bd({o0} offset = 0 len = {OBLK}) {{bd_id = {8 + 2 * j} : i32}}", f"cop{j}_{t}"),
                               locked(f"coc{j}_{t}", f"aie.dma_bd({o1} offset = 0 len = {OBLK}) {{bd_id = {9 + 2 * j} : i32}}", f"cop{j}_{t}")])
-                task(f"go{j}_{r}{sfx}", f"t_{t}", "MM2S", j, body, f" {{repeat_count = {30 * nt - 1} : i32}}")
+                task(f"go{j}_{r}{sfx}", f"t_{t}", "MM2S", j, body, f" {{repeat_count = {NDB * nt - 1} : i32}}")
                 task(f"yd{j}_{r}{sfx}", f"t_{t}", "MM2S", j,
                      locked(f"cyc{j}_{t}", f"aie.dma_bd(%gscr_{t} : memref<1024xi16> offset = 0 len = 512 sizes = [2, 2, 2, 128] strides = [512, 256, 128, 1]) {{bd_id = {12 + j} : i32}}", f"cyp_{t}"),
-                     f" {{repeat_count = {15 * nt - 1} : i32}}")
+                     f" {{repeat_count = {YNB * nt - 1} : i32}}")
         for f in later:
             f()
 
@@ -617,7 +618,7 @@ def sequence(m, nt, blocks=1, part=None, switches=0, attn=False, res=None):
                     task(f"sw{c}_{b}", f"shim_{c}", "MM2S", 0, [f"aie.dma_bd(%w : memref<{NC * WCOL}xi8> offset = {c * WCOL} len = {WCOL})"])
             for c in range(NC):
                 for nm, v in (("xp", 1), ("xw", 1), ("xr", 0), ("hf", 1), ("hr", 0),
-                              ("yf", 15), ("yr", 0), ("ow", 1), ("od", 0)):
+                              ("yf", YNB), ("yr", 0), ("ow", 1), ("od", 0)):
                     m(f"aiex.set_lock(%{nm}_{c}, {v})", I)
         block_tasks(b)
     if res in ("in", "mid"):
@@ -690,8 +691,9 @@ def ring_tasks(m, nt, I, task, locked, chain):
 
 
 def kernels():
-    return [(KERN, os.environ.get("RF_CHAIN_SRC", rf_paths.iron_kernel("chain_mm_bfp16.cc")), ["-DKC=480", "-DNB=64", "-DSUB_K=96"]),
-            (NORM, os.environ.get("RF_NORM_SRC", rf_paths.iron_kernel("rf_norm.cc")), os.environ.get("RF_NORM_DEFS", "").split())] + (
+    from rf_model import norm_defines
+    return [(KERN, os.environ.get("RF_CHAIN_SRC", rf_paths.iron_kernel("chain_mm_bfp16.cc")), [f"-DKC={KC}", f"-DNB={NB}", "-DSUB_K=96"]),
+            (NORM, os.environ.get("RF_NORM_SRC", rf_paths.iron_kernel("rf_norm.cc")), norm_defines(KC) + os.environ.get("RF_NORM_DEFS", "").split())] + (
             [(STANDIN, os.path.join(os.path.dirname(os.path.abspath(__file__)), "attn_standin.cc"), [])])
 
 

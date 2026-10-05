@@ -4,14 +4,18 @@ GELU*up epilogue of chain_mm_bfp16.cc, and the DDR/MemTile layouts the designs u
 import os
 import numpy as np
 import rf_paths
+from rf_model import MODEL
 from bfp16_model import f32_to_bfp16
 from chain_ref import bf16, bf16_bits, bf16_val, mac_block, acc_add
 
 WDIR = os.environ.get("RF_WDIR", str(rf_paths.ARTIFACTS / "weights_int4g32sbf16_planar_qat_rg"))
 CACHE = os.environ.get("RF_W0_CACHE", str(rf_paths.BUILD_ROOT / "scratch/w0"))
 PFX = "model.language_model.layers.0."
-D, FF, KC, NCOL, NROW = 3840, 15360, 480, 8, 4
+NCOL, NROW = 8, 4
+D, FF = MODEL.D, MODEL.FF
 SUB_K, ELEM = 96, 1728          # weight element: 96 K rows x 32 columns, int4 g32 + bf16 scales
+KC = D // NCOL                  # one column's K slice (also FF's per core: FF / 32)
+assert KC == FF // NCOL // NROW and KC % SUB_K == 0, (D, FF)
 
 
 def _unplanar(name, M, K, row_group=2):

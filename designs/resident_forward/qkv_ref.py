@@ -4,11 +4,12 @@
 import os
 import numpy as np
 import rf_paths
+from rf_model import MODEL
 from chain_ref import bf16, bf16_bits
 from mlp_ref import _unplanar, pack_elem, gemm_chain, WDIR, PFX, D, KC, SUB_K, ELEM, NCOL, NROW
 from rmlp_ref import rmsnorm, gain_elements
 
-HD, HQ, HKV = 256, 16, 8
+HD, HQ, HKV = MODEL.HD, MODEL.HQ, MODEL.HKV
 NQKV = (HQ + 2 * HKV) * HD            # 8192
 NBLK_Q = NQKV // NROW // 64           # 32 N blocks of 64 per chain row
 CACHE = str(rf_paths.BUILD_ROOT / "scratch/w0/layer0_qkv.npz")

@@ -20,8 +20,8 @@ import rf_paths
 import rattn2_design as A2
 import rattnh as AH
 import rmlp_design as R
-from kvring import DEFAULT_WINDOW_ROWS
-from rmlp_design import (M, core_name, NC, NR, ELEM, ABLK, PCAP_T, KERN, NORM, XROW, XB, UNITB, XRB,
+from rf_model import MODEL
+from rmlp_design import (M, core_name, NC, NR, ELEM, ABLK, AB_UNIT, PCAP_T, KERN, NORM, XROW, XB, UNITB, XRB,
                          WB, WGAIN, OUT_OFF, convert_loop, act_call, norm_pass, scale_core, gains)
 from o_ref import NDB as NDBO, NSPO, KCO
 from mlp_ref import SUB_K
@@ -39,7 +39,7 @@ SLACK = 448              # an 8640-B unit read over a 8192-B record spills this 
 HS_B = PCAP_T * 16 * 256 * 2               # one head plane of the head-major q/k/v, bytes
 HSPILL = 112             # a head-pass unit reads 2160 B per plane: 4 rows (2048 B) and this spill
 QKB = 4 * HS_B + HSPILL
-NW = 2 + NQ * 10 + 2     # weight elements per core per dispatch: gains, QKV, head gains
+NW = 2 + NQ * 2 * NSUB + 2     # weight elements per core per dispatch: gains, QKV, head gains
 ATTN = False             # step C: the attention phase in the same image (`attn`, `nbw=N`)
 ROLE_OF = {0: "qk", 1: "pv0", 2: "pv1", 3: "sm"}
 ROW_OF = {v: k for k, v in ROLE_OF.items()}
@@ -86,7 +86,7 @@ GEO_G = False            # the geometry in effect is the global layer's (set_geo
 # pinned MemTile layout (bytes): x and q/k/v persist; the gemm staging and the attention rings
 # overlay (the rings start at q/k/v plane 2, free once the new K/V rows are in the cache); W and CT
 # in the tail are written before that
-MT_XR, MT_QK = 0, 108480
+MT_XR, MT_QK = 0, XRB
 MT_GEMM = (MT_QK + 4 * PCAP_T * 16 * 256 * 2 + 112 + 63) // 64 * 64
 MT_ATT = MT_QK + 2 * PCAP_T * 16 * 256 * 2
 OA_B = PCAP_T * 2 * A2.ABO + (A2.AB - A2.ABO)        # O's A blocks, [pass][sub-pass][5184 B] + read spill
@@ -165,7 +165,7 @@ def set_geo(glob):
     global NQ, NW, NSPO, NW_O, WCOL_O, CT_O, KVROW, GEO_G
     import rglobal
     NQ = rglobal.NQG if glob else 32
-    NW = 2 + NQ * 10 + 2
+    NW = 2 + NQ * 2 * NSUB + 2
     NSPO = 4 if glob else NSPO_S
     NW_O = NDBO * NSPO * NSUBO + 2
     WCOL_O = NW_O * NR * ELEM
@@ -194,8 +194,15 @@ def mlp_grouped(stream):
     return np.ascontiguousarray(out).reshape(-1)
 
 
+def a_blocks(n):
+    """BD extent of n A blocks sent to the cores' ab ring: AB_UNIT each, ABLK apart (contiguous when equal)."""
+    if AB_UNIT == ABLK:
+        return f"len = {n * ABLK}"
+    return f"len = {n * AB_UNIT} sizes = [{n}, 3, {AB_UNIT // 3}] strides = [{ABLK}, {AB_UNIT // 3}, 1]"
+
+
 def wcol():
-    return WGAIN + NQ * 5 * 2 * NR * ELEM + (WGAIN if HEAD else 0)
+    return WGAIN + NQ * NSUB * 2 * NR * ELEM + (WGAIN if HEAD else 0)
 
 
 def xbuf():
@@ -281,7 +288,7 @@ def emit(nts):
                 m("} {keep_pkt_header = true}")
         for line in (AH.attn_decls() if ATTN_H else A2.attn_decls()):
             m(line)
-    A, W, G = f"memref<{ABLK}xi8>", f"memref<{WB}xi8>", "memref<1024xi16>"
+    A, W, G = f"memref<{AB_UNIT}xi8>", f"memref<{WB}xi8>", "memref<1024xi16>"
     for name, sig, obj in (
             ("chain_convert_half_k", f"memref<{ELEM}xi8>, {W}, i32, i32, i32", KERN),
             ("chain_mm_first_r2", f"{A}, {W}", KERN), ("chain_mm_mid_r2", f"{A}, {W}", KERN),
@@ -355,7 +362,6 @@ def emit(nts):
     m("}", 0)
     return "\n".join(mul32(m.lines) if os.environ.get("RF_MUL32") == "1" else m.lines) + "\n"
 
-
 MULI = re.compile(r"^(\s*)(%[\w.]+) = arith\.muli (%[\w.]+), (%[\w.]+) : index$")
 
 
@@ -379,9 +385,9 @@ def mul32(lines):
 
 def mt_layout():
     """(name, size, pinned address or None, alloc_group or None) of one MemTile's buffers."""
-    gemm = [("wst", 2 * NR * ELEM), ("XY", PCAP_T * ABLK), ("RP", PCAP_T * ROPE_T + SLACK)]
+    gemm = [("wst", 2 * NR * ELEM), ("XY", PCAP_T * ABLK + AB_UNIT - ABLK), ("RP", PCAP_T * ROPE_T + SLACK)]
     if not ATTN:
-        return [("wst", 2 * NR * ELEM, None, None), ("XR", XRB, None, None), ("XY", PCAP_T * ABLK, None, None),
+        return [("wst", 2 * NR * ELEM, None, None), ("XR", XRB, None, None), ("XY", PCAP_T * ABLK + AB_UNIT - ABLK, None, None),
                 ("QK", QKB, None, None), ("RP", PCAP_T * ROPE_T + SLACK, None, None)]
     # q/k/v is in the gemm group only so the attention rings may overlay its k/v planes; its q planes
     # are outside every ring's pinned range and are read, by DMA, in the attention phase
@@ -402,7 +408,7 @@ def mt_layout():
     if MPH:
         # the MLP after O: everything but x is free
         a_ = XRB
-        for nm, sz in (("XYM", R.XYB), ("HM", PCAP_T * HT), ("wsm", 2 * NR * GW * ELEM)):
+        for nm, sz in (("XYM", R.XYB), ("HM", PCAP_T * HT + AB_UNIT - ABLK), ("wsm", 2 * NR * GW * ELEM)):
             out.append((nm, sz, a_, "mlp"))
             a_ += (sz + 63) // 64 * 64
         assert a_ <= 524288, a_
@@ -462,7 +468,7 @@ def core(m, c, r, stack):
             m(f"%{nm}_{t} = aie.lock(%t_{t}) {{init = {init} : i32, sym_name = \"{nm}_{t}\"}}")
     for i in range(2):
         m(f"%wb{i}_{t} = aie.buffer(%t_{t}) {{sym_name = \"wb{i}_{t}\"}} : memref<{ELEM}xi8>")
-        m(f"%ab{i}_{t} = aie.buffer(%t_{t}) {{sym_name = \"ab{i}_{t}\"}} : memref<{ABLK}xi8>")
+        m(f"%ab{i}_{t} = aie.buffer(%t_{t}) {{sym_name = \"ab{i}_{t}\"}} : memref<{AB_UNIT}xi8>")
     for nm, init in (("wp", 2), ("wc", 0), ("ap", 2), ("ac", 0), ("go", 0)):
         m(f"%c{nm}_{t} = aie.lock(%t_{t}) {{init = {init} : i32, sym_name = \"c{nm}_{t}\"}}")
     if own_xlocks(c, r):
@@ -484,7 +490,7 @@ def core(m, c, r, stack):
             m(f"%{nm}_{t} = aie.lock(%t_{t}) {{init = {init} : i32, sym_name = \"{nm}_{t}\"}}")
     m(f"%cdma_{t} = aie.mem(%t_{t}) {{")
     m("%one = arith.constant 1 : i32", 6)
-    chans = [("S2MM", 0, "wb", "cwp", "cwc", ELEM), ("S2MM", 1, "ab", "cap", "cac", ABLK)]
+    chans = [("S2MM", 0, "wb", "cwp", "cwc", ELEM), ("S2MM", 1, "ab", "cap", "cac", AB_UNIT)]
     for q, (d, ch, buf, acq, rel, ln) in enumerate(chans):
         end = f"^q{q + 1}" if q < len(chans) - 1 else "^qend"
         m(f"%s{q} = aie.dma_start({d}, {ch}, ^q{q}a, {end})", 6)
@@ -503,11 +509,11 @@ def core(m, c, r, stack):
 
 def core_body(m, c, r, last):
     t = core_name(c, r)
-    A, W, G = f"memref<{ABLK}xi8>", f"memref<{WB}xi8>", "memref<1024xi16>"
+    A, W, G = f"memref<{AB_UNIT}xi8>", f"memref<{WB}xi8>", "memref<1024xi16>"
     mm = "chain_mm_first_r2" if c == 0 else "chain_mm_mid_r2"
     m(f"%core_{t} = aie.core(%t_{t}) {{")
     I = 6
-    for v in sorted({0, 1, 2, 3, 4, 5, 10, 16, 32} | set(range(NF))):
+    for v in sorted({0, 1, 2, 3, 4, 5, 2 * NSUB, 16, 32} | set(range(NF))):
         m(f"%c{v} = arith.constant {v} : index", I)
     m("%one = arith.constant 1 : i32", I)
     m("%two = arith.constant 2 : i32", I)
@@ -530,8 +536,8 @@ def core_body(m, c, r, last):
     for oj, cnt in ([(None, NQ)] if not last else [(0, 16), (1, 16)]):
         m(f"scf.for %n = %c0 to %c{cnt} step %c1 {{", I)
         I += 2
-        m("%n10 = arith.muli %n, %c10 : index", I)
-        convert_loop(m, t, I, "%n10", 10, True, fn="chain_convert_half_k", kb=KB_Q)
+        m(f"%n10 = arith.muli %n, %c{2 * NSUB} : index", I)
+        convert_loop(m, t, I, "%n10", 2 * NSUB, True, fn="chain_convert_half_k", kb=KB_Q)
         m("%nnt = arith.muli %n, %nt : index", I)
         m("scf.for %tb = %c0 to %nt step %c1 {", I)
         I += 2
@@ -562,7 +568,7 @@ def head_pass(m, c, r, I):
     column (the norm pass's) processes them and hands each result to its write-back DMA, the
     other cores only drain the broadcast."""
     t = core_name(c, r)
-    A, W = f"memref<{ABLK}xi8>", f"memref<{WB}xi8>"
+    A, W = f"memref<{AB_UNIT}xi8>", f"memref<{WB}xi8>"
     work = head_core(c, r)
     gains_c(m, c, t, I)
     m("scf.for %tb = %c0 to %nt step %c1 {", I)
@@ -618,7 +624,7 @@ def down_loop(m, c, r, I, ndb, nsp, nsub, kb, half, nsp1):
     extents are SSA values (index; kb i32)."""
     t = core_name(c, r)
     last = c == NC - 1
-    A, W, G = f"memref<{ABLK}xi8>", f"memref<{WB}xi8>", "memref<1024xi16>"
+    A, W, G = f"memref<{AB_UNIT}xi8>", f"memref<{WB}xi8>", "memref<1024xi16>"
     dmm = "chain_down_" + ("first_k" if c == 0 else ("last_k" if last else "mid_k"))
     m(f"scf.for %n = %c0 to {ndb} step %c1 {{", I)
     I += 2
@@ -682,7 +688,7 @@ def gate_loop(m, c, r, I, nblk, half, gelu):
     splits the N blocks into two halves, one per output channel, in one loop body."""
     t = core_name(c, r)
     last = c == NC - 1
-    A, W, G, O = f"memref<{ABLK}xi8>", f"memref<{WB}xi8>", "memref<1024xi16>", f"memref<{OBLK}xi8>"
+    A, W, G, O = f"memref<{AB_UNIT}xi8>", f"memref<{WB}xi8>", "memref<1024xi16>", f"memref<{OBLK}xi8>"
     mm = "chain_mm_first_r2" if c == 0 else "chain_mm_mid_r2"
     if last:
         m("scf.for %oj = %c0 to %c2 step %c1 {", I)
@@ -772,7 +778,7 @@ def norm_rt(m, c, r, I, post):
     """rmlp_design.norm_pass for both forms in one body, `post` an i1 value: units in (pre x0 x1;
     post x0 y0 x1 y1), the row-0 cascade sum of squares, rstd to the scaling cores, scale."""
     t = core_name(c, r)
-    W, A = f"memref<{WB}xi8>", f"memref<{ABLK}xi8>"
+    W, A = f"memref<{WB}xi8>", f"memref<{AB_UNIT}xi8>"
     partial, scale = r == 0, scale_core(c, r)
     m(f"%nu = arith.select {post}, %c4, %c2 : index", I)
     m("scf.for %tb = %c0 to %nt step %c1 {", I)
@@ -845,7 +851,7 @@ def knorm(m, c, r, I):
     if r != 0:
         return
     t = core_name(c, r)
-    A, W = f"memref<{ABLK}xi8>", f"memref<{WB}xi8>"
+    A, W = f"memref<{AB_UNIT}xi8>", f"memref<{WB}xi8>"
     m("scf.for %tb = %c0 to %nt step %c1 {", I)
     J = I + 2
     m("%kq = arith.remui %tb, %c2 : index", J)
@@ -1011,7 +1017,7 @@ def o_tasks(m, nt, I, task, locked, chain, issued, freed):
             m(f"aiex.dma_free_task(%{name})", I)
             freed.add(name)
     for c in range(NC):
-        for nm, v in (("yf", 15), ("yr", 0), ("ow", 1), ("od", 0)):
+        for nm, v in (("yf", NDBO // 2), ("yr", 0), ("ow", 1), ("od", 0)):
             m(f"aiex.set_lock(%{nm}_{c}, {v})", I)
         for r in range(NR):
             m(f"aiex.set_lock(%wp_{c}_{r}, 2)", I)
@@ -1021,8 +1027,8 @@ def o_tasks(m, nt, I, task, locked, chain, issued, freed):
     n2 = f"%v{NSPO * nt}"
 
     def units(buf, n, bd):
-        return (f"aie.dma_bd({buf} offset = 0 len = {UNITB + XROW} sizes = [{n}, 3, 2, {(UNITB + XROW) // 6}] "
-                f"strides = [{UNITB}, {(UNITB + XROW) // 3}, {(UNITB + XROW) // 6}, 1]) {{bd_id = {bd} : i32}}")
+        return (f"aie.dma_bd({buf} offset = 0 len = {AB_UNIT} sizes = [{n}, 3, 2, {AB_UNIT // 6}] "
+                f"strides = [{UNITB}, {AB_UNIT // 3}, {AB_UNIT // 6}, 1]) {{bd_id = {bd} : i32}}")
     for c in range(NC):
         W_ = f"%wst_{c} : memref<{2 * NR * ELEM}xi8>"
         task(f"owi{c}", f"mem_{c}", "S2MM", 0, chain([locked(f"wp_{c}_{r}", f"aie.dma_bd({W_} offset = {(s_ * NR + r) * ELEM} len = {ELEM}) {{bd_id = {s_ * NR + r} : i32}}", f"wc_{c}_{r}")
@@ -1036,7 +1042,7 @@ def o_tasks(m, nt, I, task, locked, chain, issued, freed):
         XR_, XY_, OA_ = f"%XR_{c} : memref<{XRB}xi8>", f"%XYO_{c} : memref<{XRB}xi8>", f"%OA_{c} : memref<{OA_B}xi8>"
         wbq = (3, 31) if c < NC - 1 else (2, 23)
         # per (N block, sub-pass): nt A blocks, each an 8640-B read of its 5184-B record
-        ob = [locked(f"oaf_{c}", f"aie.dma_bd({OA_} offset = {sp * A2.ABO} len = {nt * ABLK} sizes = [{nt}, 3, {ABLK // 3}] strides = [{CT_O}, {ABLK // 3}, 1]) {{bd_id = {14 + sp} : i32}}", f"oaf_{c}", n2, n2)
+        ob = [locked(f"oaf_{c}", f"aie.dma_bd({OA_} offset = {sp * A2.ABO} len = {nt * AB_UNIT} sizes = [{nt}, 3, {AB_UNIT // 3}] strides = [{CT_O}, {AB_UNIT // 3}, 1]) {{bd_id = {14 + sp} : i32}}", f"oaf_{c}", n2, n2)
               for sp in range(NSPO)]
         task(f"oob{c}", f"mem_{c}", "MM2S", 4, chain(ob), f" {{repeat_count = {NDBO - 1} : i32}}")
         task(f"oly{c}", f"mem_{c}", "S2MM", 2, locked(f"yf_{c}",
@@ -1096,8 +1102,8 @@ def mlp_tasks(m, nt, I, task, locked, chain, issued, freed):
              [f"aie.dma_bd(%w : memref<{wbytes()}xi8> offset = {NC * (wcol() + WCOL_O) + c * WCOL_MP} len = {WCOL_MP})"])
 
     def units(buf, n, bd):
-        return (f"aie.dma_bd({buf} offset = 0 len = {UNITB + XROW} sizes = [{n}, 3, 2, {(UNITB + XROW) // 6}] "
-                f"strides = [{UNITB}, {(UNITB + XROW) // 3}, {(UNITB + XROW) // 6}, 1]) {{bd_id = {bd} : i32}}")
+        return (f"aie.dma_bd({buf} offset = 0 len = {AB_UNIT} sizes = [{n}, 3, 2, {AB_UNIT // 6}] "
+                f"strides = [{UNITB}, {AB_UNIT // 3}, {AB_UNIT // 6}, 1]) {{bd_id = {bd} : i32}}")
     for c in range(NC):
         GE = GW * ELEM
         W_ = f"%wsm_{c} : memref<{2 * NR * GE}xi8>"
@@ -1107,15 +1113,15 @@ def mlp_tasks(m, nt, I, task, locked, chain, issued, freed):
             ids = ((8, 9), (24, 25), (10, 11), (26, 27))[r]
             task(f"mwo{c}_{r}", f"mem_{c}", "MM2S", r, chain([locked(f"wc_{c}_{r}", f"aie.dma_bd({W_} offset = {(s_ * NR + r) * GE} len = {GE}) {{bd_id = {ids[s_]} : i32}}", f"wp_{c}_{r}")
                                                             for s_ in range(2)]), f" {{repeat_count = {NW_MP // (2 * GW) - 1} : i32}}")
-        XR_, XY_, H_ = f"%XR_{c} : memref<{XRB}xi8>", f"%XYM_{c} : memref<{R.XYB}xi8>", f"%HM_{c} : memref<{PCAP_T * HT}xi8>"
+        XR_, XY_, H_ = f"%XR_{c} : memref<{XRB}xi8>", f"%XYM_{c} : memref<{R.XYB}xi8>", f"%HM_{c} : memref<{PCAP_T * HT + AB_UNIT - ABLK}xi8>"
         wbq = (3, 30, 31) if c < NC - 1 else (2, 22, 23)
         task(f"mnb{c}", f"mem_{c}", "MM2S", 4, locked(f"xp_{c}",
-             f"aie.dma_bd({XR_} offset = 0 len = {2 * nt * (UNITB + XROW)} sizes = [{2 * nt}, 3, {(UNITB + XROW) // 3}] "
-             f"strides = [{UNITB}, {(UNITB + XROW) // 3}, 1]) {{bd_id = 12 : i32}}", f"xp_{c}"))
+             f"aie.dma_bd({XR_} offset = 0 len = {2 * nt * AB_UNIT} sizes = [{2 * nt}, 3, {AB_UNIT // 3}] "
+             f"strides = [{UNITB}, {AB_UNIT // 3}, 1]) {{bd_id = 12 : i32}}", f"xp_{c}"))
         task(f"mxl{c}", f"mem_{c}", "S2MM", wbq[0], locked(f"xw_{c}", f"aie.dma_bd({XY_} offset = 0 len = {nt * ABLK}) {{bd_id = {wbq[1]} : i32}}", f"xr_{c}"))
-        task(f"mbc{c}", f"mem_{c}", "MM2S", 4, locked(f"xr_{c}", f"aie.dma_bd({XY_} offset = 0 len = {nt * ABLK}) {{bd_id = 13 : i32}}", f"xr_{c}"),
+        task(f"mbc{c}", f"mem_{c}", "MM2S", 4, locked(f"xr_{c}", f"aie.dma_bd({XY_} offset = 0 {a_blocks(nt)}) {{bd_id = 13 : i32}}", f"xr_{c}"),
              f" {{repeat_count = {NBLK - 1} : i32}}")
-        hb = [locked(f"mhr_{c}", f"aie.dma_bd({H_} offset = {sp * ABLK} len = {nt * ABLK} sizes = [{nt}, 3, {ABLK // 3}] strides = [{HT}, {ABLK // 3}, 1]) {{bd_id = {14 + sp} : i32}}", f"mhr_{c}")
+        hb = [locked(f"mhr_{c}", f"aie.dma_bd({H_} offset = {sp * ABLK} len = {nt * AB_UNIT} sizes = [{nt}, 3, {AB_UNIT // 3}] strides = [{HT}, {AB_UNIT // 3}, 1]) {{bd_id = {14 + sp} : i32}}", f"mhr_{c}")
               for sp in range(NSPM)]
         task(f"mhb{c}", f"mem_{c}", "MM2S", 4, chain(hb), f" {{repeat_count = {NDBM - 1} : i32}}")
         task(f"mld{c}", f"mem_{c}", "S2MM", 2, locked(f"mhf_{c}", f"aie.dma_bd({H_} offset = 0 len = {NBLK // 2 * nt * OBLK} sizes = [{NBLK // 2}, {nt}, {OBLK}] strides = [{OBLK}, {HT}, 1]) {{bd_id = 20 : i32}}", f"mhr_{c}"))
@@ -1263,17 +1269,17 @@ def sequence(m, nt, nb=None, split=False):
         if HEAD:
             task(f"sr{c}", f"shim_{c}", "MM2S", 1, [f"aie.dma_bd(%x : memref<{xbuf()}xi8> offset = {16 * PCAP_T * D * 2} len = {nt * (4096 if GEO_G else ROPE_T)})"])
     for c in range(NC):
-        XR_, XY_, QK_ = f"%XR_{c} : memref<{XRB}xi8>", f"%XY_{c} : memref<{PCAP_T * ABLK}xi8>", f"%QK_{c} : memref<{QKB}xi8>"
+        XR_, XY_, QK_ = f"%XR_{c} : memref<{XRB}xi8>", f"%XY_{c} : memref<{PCAP_T * ABLK + AB_UNIT - ABLK}xi8>", f"%QK_{c} : memref<{QKB}xi8>"
         wbq = (3, 30) if c < NC - 1 else (2, 17)
         task(f"xin{c}", f"mem_{c}", "S2MM", 1, locked(f"xf_{c}", f"aie.dma_bd({XR_} offset = 0 len = {X}) {{bd_id = 28 : i32}}", f"xp_{c}"))
         RP_ = f"%RP_{c} : memref<{PCAP_T * ROPE_T + SLACK}xi8>"
         if HEAD:
             task(f"rin{c}", f"mem_{c}", "S2MM", 1, locked(f"rf_{c}", f"aie.dma_bd({RP_} offset = 0 len = {nt * (4096 if GEO_G else ROPE_T)}) {{bd_id = 33 : i32}}", f"rr_{c}"))
         task(f"nb{c}", f"mem_{c}", "MM2S", 4, locked(f"xp_{c}",
-             f"aie.dma_bd({XR_} offset = 0 len = {2 * nt * (UNITB + XROW)} sizes = [{2 * nt}, 3, {(UNITB + XROW) // 3}] "
-             f"strides = [{UNITB}, {(UNITB + XROW) // 3}, 1]) {{bd_id = 12 : i32}}", f"xp_{c}"))
+             f"aie.dma_bd({XR_} offset = 0 len = {2 * nt * AB_UNIT} sizes = [{2 * nt}, 3, {AB_UNIT // 3}] "
+             f"strides = [{UNITB}, {AB_UNIT // 3}, 1]) {{bd_id = 12 : i32}}", f"xp_{c}"))
         task(f"xl{c}", f"mem_{c}", "S2MM", wbq[0], locked(f"xw_{c}", f"aie.dma_bd({XY_} offset = 0 len = {nt * ABLK}) {{bd_id = {wbq[1]} : i32}}", f"xr_{c}"))
-        task(f"bc{c}", f"mem_{c}", "MM2S", 4, locked(f"xr_{c}", f"aie.dma_bd({XY_} offset = 0 len = {nt * ABLK}) {{bd_id = 13 : i32}}", f"xr_{c}"),
+        task(f"bc{c}", f"mem_{c}", "MM2S", 4, locked(f"xr_{c}", f"aie.dma_bd({XY_} offset = 0 {a_blocks(nt)}) {{bd_id = 13 : i32}}", f"xr_{c}"),
              f" {{repeat_count = {(2 * NQ if QKV_DOWN else NQ) - 1} : i32}}")     # A blocks once per N block
         if GEO_G:
             G_, L_ = RG(), sys.modules[__name__]
@@ -1291,12 +1297,12 @@ def sequence(m, nt, nb=None, split=False):
         if HEAD:
             # per 16-row block: the rope unit, then 4 q/k/v units of 4 rows, each an 8640-B read
             # of an 8192-B record (the spill is ignored by the cores)
-            hh = locked(f"rr_{c}", f"aie.dma_bd({RP_} offset = 0 len = 8640 sizes = [{nt}, 3, 2, 1440] strides = [{ROPE_T}, 2880, 1440, 1]) {{bd_id = 14 : i32}}", f"rr_{c}") + \
+            hh = locked(f"rr_{c}", f"aie.dma_bd({RP_} offset = 0 len = {A2.AB} sizes = [{nt}, 3, 2, 1440] strides = [{ROPE_T}, 2880, 1440, 1]) {{bd_id = 14 : i32}}", f"rr_{c}") + \
                 ["aie.next_bd ^h1", "^h1:"] + \
-                locked(f"qr_{c}", f"aie.dma_bd({QK_} offset = 0 len = {4 * 8640} sizes = [{nt}, 4, 4, 2160] strides = [8192, 2048, {HS_B}, 1]) {{bd_id = 15 : i32}}", f"qr_{c}", "%v4", "%v4")
+                locked(f"qr_{c}", f"aie.dma_bd({QK_} offset = 0 len = {4 * A2.AB} sizes = [{nt}, 4, 4, 2160] strides = [8192, 2048, {HS_B}, 1]) {{bd_id = 15 : i32}}", f"qr_{c}", "%v4", "%v4")
             task(f"hh{c}", f"mem_{c}", "MM2S", 4, hh, f" {{repeat_count = {nt - 1} : i32}}")
             if nt % 2:
-                task(f"hp{c}", f"mem_{c}", "MM2S", 4, locked(f"rr_{c}", f"aie.dma_bd({RP_} offset = 0 len = 8640) {{bd_id = 16 : i32}}", f"rr_{c}"), " {issue_token = true}" if ATTN else "")
+                task(f"hp{c}", f"mem_{c}", "MM2S", 4, locked(f"rr_{c}", f"aie.dma_bd({RP_} offset = 0 len = {A2.AB}) {{bd_id = 16 : i32}}", f"rr_{c}"), " {issue_token = true}" if ATTN else "")
             hbq = (3, 31) if c < NC - 1 or head_core(c, 0) else (2, 18)
             task(f"hl{c}", f"mem_{c}", "S2MM", hbq[0], locked(f"hw_{c}", f"aie.dma_bd({QK_} offset = 0 len = {nt * QT} sizes = [{4 * nt}, 4, 2048] strides = [2048, {HS_B}, 1]) {{bd_id = {hbq[1]} : i32}}", f"hr_{c}"))
             if ATTN:     # the new K/V rows (planes 2, 3) to the cache
@@ -1493,6 +1499,7 @@ def aiecc_options():
 
 def kernels():
     import os
+    from rf_model import norm_defines
     # program memory (rf_textbudget.py): rf_head at -Oz (head unit 3136 B at -O2, 1696 at -Oz), and
     # column 7's rf_ss_last from an -Oz build (2400 B -> 464)
     here = os.path.dirname(os.path.abspath(__file__))
@@ -1500,7 +1507,7 @@ def kernels():
     # exact sqrt/div from (7,0)); the global layer's K norm needs it
     fast = ["-DRF_FAST_RSQRT"] if os.environ.get("RF_FAST") == "1" else []
     return R.kernels() + [(HEADN, rf_paths.iron_kernel("rf_head.cc"), [os.environ.get("RF_HEAD_OPT", "-Oz")] + fast),
-                          (NORMZ, os.path.join(here, "rf_norm_z.cc"), ["-Oz", f"-I{rf_paths.iron_kernel_dir()}"] + fast)] + [
+                          (NORMZ, os.path.join(here, "rf_norm_z.cc"), ["-Oz", f"-I{rf_paths.iron_kernel_dir()}"] + norm_defines(R.KC) + fast)] + [
         (o, src, d + (["-Os"] if o == A2.QK_O else [])) for o, src, d in (AH.kernels() if ATTN_H else A2.kernels())]
 
 
@@ -1587,7 +1594,7 @@ def configure(args):
     if SRING_FWD:        # K059 over every parameter value a host can pass, on the region rforward sizes
         import kvring
         import rforward
-        kvring.check(SRING_FWD, NBW_S, (1,) + tuple(nt for nt, _ in FNTS), DEFAULT_WINDOW_ROWS,
+        kvring.check(SRING_FWD, NBW_S, (1,) + tuple(nt for nt, _ in FNTS), MODEL.sliding_window,
                      rforward.s_rows(sys.modules[__name__]) * KVROW)
     return [int(a) for a in args]
 

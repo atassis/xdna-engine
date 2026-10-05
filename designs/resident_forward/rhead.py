@@ -10,8 +10,10 @@ elements a MemTile BD (GW) so the distribution fits one task."""
 import os
 import numpy as np
 import rf_paths
+from rf_model import MODEL
+from rmlp_design import XRB, ABLK, AB_UNIT
 
-V, KH = 262144, 3840
+V, KH = MODEL.V, MODEL.D
 NROW, NCOL, ELEM, SUBK = 4, 8, 1728, 96
 NDB = V // NROW // 32               # 2048 down blocks per chain row
 NSUB = KH // NCOL // SUBK           # 5
@@ -23,8 +25,11 @@ BC_CHAIN, QD_CHAIN = 8, 4            # identical BDs a chain: 8 x 256 >= NDB, 4 
 RL_BLK = 16                          # blocks a relay slot
 OUTB = 16 * V * 2                    # logits [16][262144] bf16
 STREAM = os.environ.get("RF_STACK_OUT", str(rf_paths.BUILD_ROOT / "scratch/stack")) + "/w_head.npy"
+HEAD_STREAM_LAYOUT = "column_group_row_gw_element"
 # head-phase MemTile buffers (alloc_group "head"), after x
-XYH, WSH, RL = 108480, 117184, 117184 + 2 * NROW * GW * ELEM
+XYH = XRB                            # after the resident x
+WSH = XYH + AB_UNIT + 64             # after one 16-row xn A block (sent as an ab-ring unit) and a 64-B gap the layout has always had
+RL = WSH + 2 * NROW * GW * ELEM
 assert RL + 2 * RL_BLK * 1024 <= 524288
 
 
@@ -82,7 +87,7 @@ def steps(L):
 
 
 def mem_bufs():
-    return [("XYH", 8640, XYH, "head"), ("WSH", 2 * NROW * GW * ELEM, WSH, "head"), ("RL", 2 * RL_BLK * 1024, RL, "head")]
+    return [("XYH", AB_UNIT, XYH, "head"), ("WSH", 2 * NROW * GW * ELEM, WSH, "head"), ("RL", 2 * RL_BLK * 1024, RL, "head")]
 
 
 def sequence(L, m):
@@ -157,14 +162,14 @@ def sequence(L, m):
         task(f"hsw{c}", f"shim_{c}", "MM2S", 0, [f"aie.dma_bd(%w : memref<{NCOL * WCOL}xi8> offset = {c * WCOL} len = {WCOL})"])
         task(f"hsx{c}", f"shim_{c}", "MM2S", 1, [f"aie.dma_bd(%x : memref<{L.xbuf()}xi8> offset = {c * L.XROW} len = {X} sizes = [{16 * nt}, {L.XROW}] strides = [{L.D * 2}, 1])"])
     for c in range(NCOL):
-        XR_, XY_, RL_ = f"%XR_{c} : memref<{L.XRB}xi8>", f"%XYH_{c} : memref<8640xi8>", f"%RL_{c} : memref<{2 * RL_BLK * 1024}xi8>"
+        XR_, XY_, RL_ = f"%XR_{c} : memref<{L.XRB}xi8>", f"%XYH_{c} : memref<{AB_UNIT}xi8>", f"%RL_{c} : memref<{2 * RL_BLK * 1024}xi8>"
         wbq = (3, 30) if c < NCOL - 1 else (2, 17)
         task(f"hxin{c}", f"mem_{c}", "S2MM", 1, locked(f"xf_{c}", f"aie.dma_bd({XR_} offset = 0 len = {X}) {{bd_id = 28 : i32}}", f"xp_{c}"))
         task(f"hnb{c}", f"mem_{c}", "MM2S", 4, locked(f"xp_{c}",
-             f"aie.dma_bd({XR_} offset = 0 len = {2 * nt * (L.UNITB + L.XROW)} sizes = [{2 * nt}, 3, {(L.UNITB + L.XROW) // 3}] "
-             f"strides = [{L.UNITB}, {(L.UNITB + L.XROW) // 3}, 1]) {{bd_id = 12 : i32}}", f"xp_{c}"))
-        task(f"hxl{c}", f"mem_{c}", "S2MM", wbq[0], locked(f"xw_{c}", f"aie.dma_bd({XY_} offset = 0 len = 8640) {{bd_id = {wbq[1]} : i32}}", f"xr_{c}"))
-        task(f"hbc{c}", f"mem_{c}", "MM2S", 4, chain([locked(f"xr_{c}", f"aie.dma_bd({XY_} offset = 0 len = 8640) {{bd_id = {(13, 14, 15, 16, 18, 19, 20, 23)[i]} : i32}}", f"xr_{c}")
+             f"aie.dma_bd({XR_} offset = 0 len = {2 * nt * AB_UNIT} sizes = [{2 * nt}, 3, {AB_UNIT // 3}] "
+             f"strides = [{L.UNITB}, {AB_UNIT // 3}, 1]) {{bd_id = 12 : i32}}", f"xp_{c}"))
+        task(f"hxl{c}", f"mem_{c}", "S2MM", wbq[0], locked(f"xw_{c}", f"aie.dma_bd({XY_} offset = 0 len = {ABLK}) {{bd_id = {wbq[1]} : i32}}", f"xr_{c}"))
+        task(f"hbc{c}", f"mem_{c}", "MM2S", 4, chain([locked(f"xr_{c}", f"aie.dma_bd({XY_} offset = 0 len = {AB_UNIT}) {{bd_id = {(13, 14, 15, 16, 18, 19, 20, 23)[i]} : i32}}", f"xr_{c}")
                                                       for i in range(BC_CHAIN)]), f" {{repeat_count = {NDB // BC_CHAIN - 1} : i32}}")
         # column 7's rows relay: 16 blocks a slot in, out to the logits at this MemTile's 32768 columns
         task(f"hrin{c}", f"mem_{c}", "S2MM", 2, chain([locked(f"yf_{c}", f"aie.dma_bd({RL_} offset = {i * RL_BLK * 1024} len = {RL_BLK * 1024}) {{bd_id = {21 + i} : i32}}", f"yr_{c}")

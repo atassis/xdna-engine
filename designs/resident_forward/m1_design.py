@@ -7,17 +7,19 @@ tasks whose extent depends on the rows -- x in, the broadcast of x 120 times, th
 """
 import sys
 import rf_paths
+from rf_model import MODEL
 
 NC, NR = 8, 4
-KC, NB = 480, 64
+KC, NB = MODEL.D // NC, 64
 ELEM = 1728                 # weight element: 96 K rows x 32 columns (int4 g32, bf16 scales)
 ABLK = 16 * KC * 9 // 8     # one 16-row bfp16 activation block of a K slice: 8640
+AB_UNIT = max(ABLK, 8640)   # what a core's ab ring receives: the A block, or the head/attention unit (rattn2.AB)
 OBLK = 576                  # chain-end h output per (N block, 16-row block): 8 subtiles
-NBLK = 120                  # N blocks per chain row (gate/up interleaved, Nb = 64)
+NBLK = 2 * MODEL.FF // NR // NB   # N blocks per chain row (gate/up interleaved, Nb = 64)
 NSUB = KC // 96             # weight sub-blocks per K slice
 PCAP_T = 7                  # 16-row blocks at P_cap = 112
 WCOL = NBLK * NSUB * 2 * NR * ELEM        # one column's weight stream per dispatch
-HT = 240 * 2 * 72                         # one 16-row block of a MemTile's h (1920 cols)
+HT = 16 * (MODEL.FF // NC) * 9 // 8        # one 16-row block of a MemTile's h (FF / 8 cols, bfp16)
 KERN = "kern.o"
 
 
@@ -382,7 +384,7 @@ if __name__ == "__main__":
 
 def kernels():
     return [(KERN, rf_paths.iron_kernel("chain_mm_bfp16.cc"),
-             ["-DKC=480", "-DNB=64", "-DSUB_K=96"])]
+             [f"-DKC={KC}", f"-DNB={NB}", "-DSUB_K=96"])]
 
 
 def build_text(args):
