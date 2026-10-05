@@ -260,7 +260,7 @@ def emit(nts):
                 m(f"aie.flow(%t_{core_name(7, r)}, DMA : {j}, %mem_{2 * r + j}, DMA : 2)")
         for c in range(NC - 1):
             m(f"aie.cascade_flow(%t_{core_name(c, r)}, %t_{core_name(c + 1, r)})")
-    if SEG:            # MemTile task-complete tokens to the controller (K057): segments await them
+    if SEG or (ATTN and HEAD and (FWD or any(nt % 2 for nt in nts))):
         import rseg_design
         for c in range(NC):
             rseg_design.tct_flow(m, f"%mem_{c}", f"%shim_{c}")
@@ -1296,7 +1296,7 @@ def sequence(m, nt, nb=None, split=False):
                 locked(f"qr_{c}", f"aie.dma_bd({QK_} offset = 0 len = {4 * 8640} sizes = [{nt}, 4, 4, 2160] strides = [8192, 2048, {HS_B}, 1]) {{bd_id = 15 : i32}}", f"qr_{c}", "%v4", "%v4")
             task(f"hh{c}", f"mem_{c}", "MM2S", 4, hh, f" {{repeat_count = {nt - 1} : i32}}")
             if nt % 2:
-                task(f"hp{c}", f"mem_{c}", "MM2S", 4, locked(f"rr_{c}", f"aie.dma_bd({RP_} offset = 0 len = 8640) {{bd_id = 16 : i32}}", f"rr_{c}"))
+                task(f"hp{c}", f"mem_{c}", "MM2S", 4, locked(f"rr_{c}", f"aie.dma_bd({RP_} offset = 0 len = 8640) {{bd_id = 16 : i32}}", f"rr_{c}"), " {issue_token = true}" if ATTN else "")
             hbq = (3, 31) if c < NC - 1 or head_core(c, 0) else (2, 18)
             task(f"hl{c}", f"mem_{c}", "S2MM", hbq[0], locked(f"hw_{c}", f"aie.dma_bd({QK_} offset = 0 len = {nt * QT} sizes = [{4 * nt}, 4, 2048] strides = [2048, {HS_B}, 1]) {{bd_id = {hbq[1]} : i32}}", f"hr_{c}"))
             if ATTN:     # the new K/V rows (planes 2, 3) to the cache
@@ -1453,6 +1453,9 @@ def attention_tasks(m, nt, I, task, locked, chain, issued, freed):
         m(f"aiex.dma_await_task(%kws{c})", I)
     if os.environ.get("RF_GSTOP") == "kv":    # bisection: end the command after the new K/V rows land
         return True
+    for name, tile in issued:
+        if name.startswith("hp"):
+            m(f"aiex.dma_await_task(%{name})", I)
     for name, tile in issued:
         if tile.startswith("mem_") and not name.startswith("kws"):
             m(f"aiex.dma_free_task(%{name})", I)

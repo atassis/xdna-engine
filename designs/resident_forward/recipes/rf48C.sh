@@ -19,10 +19,10 @@ iron_require_source
 iron_require_fused_attn
 
 exec "$RF/fwd_ladder.sh" rf48C \
-  "m g h arena seg=64,256,1024,4096 fseg=64,256,1024 split=128,256,512,1024,2048,4096 gcap=262144 sring=1280 s64 fwd=0-47+h nbw=20 1 2" \
+  "m g h arena seg=64,256,1024,4096 fseg=64,256,1024 split=128,256,512,1024,2048,4096 gcap=262144 sring=1280 s64 fwd=0-47+h nbw=20 fnt=2,3:256 1 2" \
   "p1,p2,g1w64,g1w256,g1w1024,g1w4096,g2w64,g2w256,g2w1024,g2w4096,g1s128,g1s256,g1s512,g1s1024,g1s2048,g1s4096,h1,f1" \
-  "f2,f1s256" \
+  "f2,f1s256,f3" \
   "f1s512,f1s1024" \
   "f1s2048,f1s4096" \
-  "f2w256" \
+  "f2w256,f3w256" \
   "f2w1024"

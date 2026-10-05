@@ -59,6 +59,31 @@ print(len(rlayer_design.build_text(sys.argv[2:])))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertGreater(int(result.stdout.strip()), 0)
 
+    def test_rf48c_recipe_emits_48_row_prefill_in_the_same_image(self) -> None:
+        words = shlex.split(RECIPE.read_text().replace("\\\n", " "), comments=True)
+        index = words.index("rf48C")
+        self.assertIn("fnt=2,3:256", words[index + 1].split())
+        emitted = {name for part in words[index + 2:] for name in part.split(",")}
+        self.assertTrue({"f2", "f2w256", "f2w1024", "f3", "f3w256"} <= emitted)
+        probe = """
+import json, re, sys
+sys.path.insert(0, sys.argv[1])
+sys.modules["pyxrt"] = None
+import rlayer_design as layer
+text = layer.build_text(sys.argv[2:])
+print(json.dumps({"rungs": layer.f_rungs(),
+                  "sequences": re.findall(r"aie.runtime_sequence @(\\w+)", text)}))
+"""
+        flags = rf48c_flags()
+        flags.insert(flags.index("1"), "emit=f3,f3w256")
+        result = subprocess.run([sys.executable, "-c", textwrap.dedent(probe), str(HERE), *flags],
+                                cwd=HERE, env=os.environ | {"RF_FAST": "1"},
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        graph = json.loads(result.stdout)
+        self.assertIn([3, [64, 256]], graph["rungs"])
+        self.assertEqual(set(graph["sequences"]), {"boot", "f3", "f3w256"})
+
     def test_sring_k059_rejects_a_ring_smaller_than_the_recipe_window(self) -> None:
         flags = rf48c_flags()
         flags[flags.index("sring=1280")] = "sring=1216"
