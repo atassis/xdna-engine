@@ -307,3 +307,21 @@ class TestPlanSpecForSite:
 
     def test_bf16_is_unaffected(self):
         assert iron_gen.plan_spec_for_site("bf16", "kv").dtype == "bf16"
+
+
+def test_prefill_weights_exclude_shared_activation_buffers():
+    dims = dict(shared=["L0_Wqkv", "xf", "L0_kc", "L0_Wgu"],
+                cache_names=["L0_kc"], quant_pack=[], const_pack=[])
+    decode = {"weights": ["L0_Wqkv", "L0_Wgu", "W_head"]}
+    assert iron_gen.prefill_weight_names(dims, decode) == ["L0_Wqkv", "L0_Wgu"]
+
+
+def test_prefill_weights_exclude_declared_cache_buffers():
+    dims = dict(shared=["W", "kc"], cache_names=["kc"], quant_pack=[], const_pack=[])
+    assert iron_gen.prefill_weight_names(dims, {"weights": ["W", "kc"]}) == ["W"]
+
+
+def test_prefill_local_weights_do_not_require_decode_metadata():
+    dims = dict(shared=[], cache_names=[], quant_pack=[{"buf": "Q"}, {"buf": "Q"}],
+                const_pack={"C": object()})
+    assert iron_gen.prefill_weight_names(dims, None) == ["Q", "C"]

@@ -485,6 +485,13 @@ def dq_group_for_length(n: int, rows: int, K: int, *, site: str | None = None,
     return group
 
 
+def prefill_weight_names(dims, decode_meta):
+    uploaded = set(decode_meta["weights"]) if decode_meta is not None else set()
+    return ([n for n in dims["shared"] if n in uploaded and n not in dims["cache_names"]]
+            + sorted({e["buf"] for e in dims["quant_pack"]})
+            + sorted(dims["const_pack"]))
+
+
 def decode_arena_plan(meta_path):
     """Reconstruct the decode ELF's scratch arena as an ordered (name, size) list.
 
@@ -2566,10 +2573,12 @@ def main():
     lay_names = [*dims["inputs"], "xout", *dims["shared"], *dims["prefill_local"]]
     lay = {n: fused.get_layout_for_buffer(n) for n in lay_names}
     dec_ref = None
+    decode_meta = None
     if dec_meta_path:
         import hashlib
+        decode_meta = json.load(open(dec_meta_path))
         elf_path = os.path.join(os.path.dirname(dec_meta_path),
-                                json.load(open(dec_meta_path))["elf"])
+                                decode_meta["elf"])
         md5 = (hashlib.md5(read_elf(elf_path)).hexdigest()
                if os.path.isfile(elf_path) or os.path.isfile(elf_path + ".zst") else None)
         dec_ref = {"meta": os.path.abspath(dec_meta_path), "elf_md5": md5,
@@ -2590,9 +2599,7 @@ def main():
         # ("a prefill-only weight stays legal", npu_decode.rs) -- it just had no producer before.
         # Cache names are excluded too: decode ships no `.bin` for them (they're zero-filled by
         # length, not read), and `cache_buffers` below is where a consumer looks for them.
-        "weights": [n for n in dims["shared"] if n not in dims["cache_names"]]
-        + sorted({e["buf"] for e in dims["quant_pack"]})
-        + sorted(dims["const_pack"]),
+        "weights": prefill_weight_names(dims, decode_meta),
         "weights_from": (os.path.join(os.path.dirname(os.path.abspath(dec_meta_path)), "buffers")
                          if dec_meta_path else None),
         "cache_buffers": dims["cache_names"],
