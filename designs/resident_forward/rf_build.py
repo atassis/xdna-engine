@@ -4,10 +4,11 @@ generator's KERN_DEFS.
 
 Kernels compile through IRON's compile_cxx_core_function (intrinsics PCH, ccache launcher), with
 kcc.sh's flags. RF_DUMP=1 passes --dump-intermediates; RF_KCC=1 compiles with kcc.sh instead."""
-import importlib, logging, os, shutil, subprocess, sys
+import fcntl, importlib, logging, os, shutil, subprocess, sys
 from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import rf_paths
+from rf_input import prepare_input
 sys.path.insert(0, rf_paths.iron_dir())
 os.environ.setdefault("AIE_KERNEL_COMPILER_LAUNCHER", "ccache")
 os.environ.setdefault("CCACHE_SLOPPINESS", "time_macros")
@@ -39,14 +40,20 @@ def kcc(src, out, defs):
 
 
 def main():
-    name, gen = sys.argv[1], sys.argv[2]
+    work = Path(os.environ.get("RF_BUILD", str(rf_paths.BUILD_ROOT))) / sys.argv[1]
+    work.mkdir(parents=True, exist_ok=True)
+    with (work / ".build.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        build(work)
+
+
+def build(work):
+    gen = sys.argv[2]
     args = sys.argv[3:]
     lg = logging.getLogger("aie.utils.compile.utils")
     lg.setLevel(logging.DEBUG)
     lg.addHandler(_CacheLog())
     G = importlib.import_module(gen)
-    work = Path(os.environ.get("RF_BUILD", str(rf_paths.BUILD_ROOT))) / name
-    work.mkdir(parents=True, exist_ok=True)
     text = G.build_text(args)          # first: build flags can select kernel objects
     (work / "gen_args.txt").write_text(" ".join([gen] + args) + "\n")
     (work / "gen_env.txt").write_text("".join(f"{k}={v}\n" for k, v in sorted(os.environ.items()) if k.startswith("RF_")))
@@ -71,7 +78,7 @@ def main():
             place(cached_compile(run_dir, kobj_key([(src, defs)]),
                                   lambda tmp, src=src, defs=defs: kcc(src, tmp, defs)), dest)
     extra = getattr(G, "aiecc_options", lambda: [])()
-    (work / "design.mlir").write_text(text)
+    prepare_input(work, text)
     compile_mlir_module(text, full_elf_path=str(work / "design.elf"), work_dir=str(work),
                         options=[f"-j{os.environ.get('AIECC_JOBS', '8')}"] + extra
                         + (["--dump-intermediates"] if os.environ.get("RF_DUMP") else [])
