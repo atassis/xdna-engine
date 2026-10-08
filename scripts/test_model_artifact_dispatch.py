@@ -140,6 +140,7 @@ class ModelArtifactConcurrencyTests(unittest.TestCase):
     def test_same_output_same_key_waits_then_reuses(self):
         recipe = self.recipe()
         self.assertEqual(self.serialized(recipe, recipe), ("ok", "HIT"))
+        self.assertEqual(list((self.root / "build/model-artifact-staging").iterdir()), [])
 
     def test_changed_key_same_output_with_different_build_root_waits(self):
         self.assertEqual(self.serialized(self.recipe(), self.recipe(changed=True),
@@ -192,6 +193,108 @@ class ModelArtifactConcurrencyTests(unittest.TestCase):
     def test_parent_output_excludes_a_nested_writer(self):
         self.assertEqual(self.serialized(self.recipe(), self.recipe(("model/child",), changed=True),
                                         build=self.root / "other-build"), ("ok", "BUILT"))
+
+
+class ModelArtifactStageLifetimeTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        (self.root / "scenario.toml").write_text("fixture")
+        self.config = self.root / "engine.toml"
+        self.config.write_text("fixture")
+        self.artifacts, self.build = self.root / "artifacts", self.root / "build"
+        self.recipe = Recipe("fixture", "scenario.toml", (),
+                             (str(self.artifacts / "model"),), ())
+        self.shared = self.artifacts / "shared-blobs/value.bin"
+        self.shared.parent.mkdir(parents=True)
+        self.shared.write_bytes(b"packed")
+        self.external = self.root / "outside-stage"
+        self.external.mkdir()
+        (self.external / "source").write_bytes(b"unique")
+        self.stage = self.build / "not-started"
+        self.fail_builder = False
+        self.calls = 0
+
+    def builder(self, staged, repo):
+        self.calls += 1
+        output = Path(staged.outputs[0])
+        output.mkdir(parents=True)
+        (output / "value").write_bytes(b"published")
+        self.stage = output.parents[1]
+        pool = self.stage / "artifacts/shared-blobs"
+        pool.mkdir()
+        os.link(self.shared, pool / "value.bin")
+        (self.stage / "build").mkdir()
+        (self.stage / "build/intermediate").write_bytes(b"disposable")
+        (self.stage / "external").symlink_to(self.external, target_is_directory=True)
+        if self.fail_builder:
+            raise RuntimeError("builder failed")
+
+    def run_build(self):
+        import model_artifact_dispatch as dispatch
+        with patch.object(dispatch, "LOCK_ROOT", self.root / "locks"), \
+                patch.object(dispatch, "run_commands", self.builder):
+            return build_recipe(self.recipe, self.root, self.config, self.artifacts, self.build)
+
+    def test_verified_publication_expires_all_transaction_residue(self):
+        self.assertEqual(self.run_build(), "BUILT")
+        self.assertFalse(self.stage.exists())
+        self.assertEqual((self.artifacts / "model/value").read_bytes(), b"published")
+        self.assertEqual(self.shared.read_bytes(), b"packed")
+        self.assertEqual(self.shared.stat().st_nlink, 1)
+        self.assertEqual((self.external / "source").read_bytes(), b"unique")
+
+    def test_failed_builder_retains_its_stage_and_live_output(self):
+        live = self.artifacts / "model/value"
+        live.parent.mkdir()
+        live.write_bytes(b"previous")
+        self.fail_builder = True
+        with self.assertRaisesRegex(RuntimeError, "builder failed"):
+            self.run_build()
+        self.assertEqual((self.stage / "build/intermediate").read_bytes(), b"disposable")
+        self.assertEqual(live.read_bytes(), b"previous")
+
+    def test_published_receipt_uses_canonical_command_paths(self):
+        output = str(self.artifacts / "model")
+        input_path = str(self.build / "input")
+        self.recipe = Recipe("fixture", "scenario.toml", (), (output,),
+                             (Command("builder", ("fixture", output, input_path),
+                                      {"WEIGHTS": input_path}),))
+        self.assertEqual(self.run_build(), "BUILT")
+        receipt = Path(output) / ".model-recipe.json"
+        recorded = json.loads(receipt.read_text())["commands"][0]
+        self.assertEqual(recorded["argv"], ["fixture", output, input_path])
+        self.assertEqual(recorded["env"], {"WEIGHTS": input_path})
+        self.assertNotIn("model-artifact-staging", receipt.read_text())
+        self.assertFalse(self.stage.exists())
+
+    def test_publication_rejection_retains_stage_and_rollback(self):
+        import model_artifact_dispatch as dispatch
+        live = self.artifacts / "model/value"
+        live.parent.mkdir()
+        live.write_bytes(b"previous")
+        original_hit = dispatch.cache_hit
+
+        def reject(recipe, key, **kwargs):
+            return False if recipe.outputs == self.recipe.outputs else original_hit(recipe, key, **kwargs)
+
+        with patch.object(dispatch, "cache_hit", reject):
+            with self.assertRaisesRegex(RuntimeError, "published receipt did not verify"):
+                self.run_build()
+        self.assertTrue(self.stage.is_dir())
+        backup = next((self.artifacts / ".model-artifact-rollback").rglob("value"))
+        self.assertEqual(backup.read_bytes(), b"previous")
+
+    def test_repeat_hit_does_not_build_or_collect_other_transaction(self):
+        self.assertEqual(self.run_build(), "BUILT")
+        other = self.build / "model-artifact-staging/fixture-other-key/input"
+        other.parent.mkdir(parents=True)
+        other.write_bytes(b"pending")
+        self.assertEqual(self.run_build(), "HIT")
+        self.assertEqual(self.calls, 1)
+        self.assertEqual(other.read_bytes(), b"pending")
+        self.assertFalse(self.stage.exists())
 
 
 class Qwen35StoragePilotTests(unittest.TestCase):
@@ -432,7 +535,7 @@ class Qwen35StoragePilotTests(unittest.TestCase):
         self.assertEqual(commands["decode"].env["WEIGHTS"], weights.argv[-1])
         self.assertEqual(commands["prefill"].env["WEIGHTS"], weights.argv[-1])
 
-    def test_verified_publication_expires_only_transaction_local_dump(self):
+    def test_verified_publication_expires_transaction_local_stage(self):
         import model_artifact_dispatch as dispatch
         accepted = []
         original_hit = dispatch.cache_hit
@@ -451,6 +554,7 @@ class Qwen35StoragePilotTests(unittest.TestCase):
         self.assertIn("build", self.dump.relative_to(self.build / "model-artifact-staging").parts)
         self.assertNotIn(str(self.artifacts / "qwen3.5-4b/weights"), self.recipe.outputs)
         self.assertFalse(self.dump.exists())
+        self.assertFalse(self.dump.parents[2].exists())
         self.assertFalse((self.artifacts / "qwen3.5-4b/weights").exists())
         decode, prefill, tokenizer = map(Path, self.recipe.outputs)
         meta = json.loads((prefill / "meta.json").read_text())

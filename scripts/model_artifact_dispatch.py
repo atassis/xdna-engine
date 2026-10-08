@@ -800,7 +800,7 @@ def _publish_recipe(recipe: Recipe, staged: Recipe, key: str, rollback: Path) ->
     require_no_recovery(rollback, key)
     reference_args = {"references": recipe} if recipe.model == "qwen3.5-4b" else {}
     validate_recipe_outputs(staged, **reference_args)
-    write_receipt(staged, key, commands=recipe.commands if recipe.model == "qwen3.5-4b" else None)
+    write_receipt(staged, key, commands=recipe.commands)
     if not cache_hit(staged, key, **reference_args):
         raise RuntimeError(f"recipe manifest did not verify in staging: {recipe.model}")
     moved: list[tuple[Path, Path]] = []
@@ -878,8 +878,7 @@ def _build_recipe(recipe: Recipe, repo: Path, artifacts: Path, build: Path, key:
     _publish_recipe(recipe, staged, key, rollback)
     if not cache_hit(recipe, key):
         raise RuntimeError(f"recipe manifest did not verify after publish: {recipe.model}")
-    if recipe.model == "qwen3.5-4b":
-        shutil.rmtree(staged_build / "qwen3.5-4b/weight-dump")
+    shutil.rmtree(stage_root)
     return "BUILT"
 
 
