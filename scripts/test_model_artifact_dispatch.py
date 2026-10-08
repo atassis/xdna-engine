@@ -1,4 +1,5 @@
 import fcntl
+import io
 import json
 import multiprocessing
 import os
@@ -296,6 +297,135 @@ class ModelArtifactStageLifetimeTests(unittest.TestCase):
         self.assertEqual(other.read_bytes(), b"pending")
         self.assertFalse(self.stage.exists())
 
+    def fail_stage_cleanup(self, *, partial=False):
+        import model_artifact_dispatch as dispatch
+        original = dispatch.shutil.rmtree
+
+        def fail(target, *args, **kwargs):
+            if Path(target) == self.stage:
+                if partial:
+                    (self.stage / "build/intermediate").unlink(missing_ok=True)
+                raise PermissionError("injected stage cleanup failure")
+            return original(target, *args, **kwargs)
+
+        stderr = io.StringIO()
+        with patch.object(dispatch.shutil, "rmtree", fail), patch("sys.stderr", stderr):
+            try:
+                status = self.run_build()
+            except OSError as error:
+                self.fail(f"verified publication was reported as a build failure: {error}")
+        self.assertEqual(status, "BUILT")
+        self.assertIn("cleanup pending", stderr.getvalue())
+        self.assertIn(str(self.stage), stderr.getvalue())
+        self.assertEqual((self.artifacts / "model/value").read_bytes(), b"published")
+        return self.stage.parent / f".{self.stage.name}.published.json"
+
+    def test_cleanup_failure_keeps_publication_success_and_retries_without_build(self):
+        witness = self.fail_stage_cleanup()
+        self.assertTrue(witness.is_file())
+        inodes = {p.name: p.stat().st_ino for p in (self.root / "locks").iterdir()}
+        self.assertEqual(self.run_build(), "HIT")
+        self.assertEqual(self.calls, 1)
+        self.assertFalse(self.stage.exists())
+        self.assertFalse(witness.exists())
+        self.assertEqual(self.shared.read_bytes(), b"packed")
+        self.assertEqual(self.shared.stat().st_nlink, 1)
+        self.assertEqual((self.external / "source").read_bytes(), b"unique")
+        self.assertEqual({p.name: p.stat().st_ino for p in (self.root / "locks").iterdir()}, inodes)
+
+    def test_partial_stage_removal_keeps_retry_witness(self):
+        witness = self.fail_stage_cleanup(partial=True)
+        self.assertFalse((self.stage / "build/intermediate").exists())
+        self.assertTrue(witness.is_file())
+        self.assertEqual(self.run_build(), "HIT")
+        self.assertFalse(self.stage.exists())
+        self.assertFalse(witness.exists())
+
+    def test_hit_preserves_unwitnessed_residue(self):
+        self.assertEqual(self.run_build(), "BUILT")
+        self.stage.mkdir()
+        retained = self.stage / "unknown"
+        retained.write_bytes(b"unpublished")
+        with patch("sys.stderr", io.StringIO()) as stderr:
+            self.assertEqual(self.run_build(), "HIT")
+        self.assertIn("cleanup pending", stderr.getvalue())
+        self.assertEqual(retained.read_bytes(), b"unpublished")
+
+    def test_hit_refuses_mismatched_or_invalid_witness(self):
+        witness = self.fail_stage_cleanup()
+        original = json.loads(witness.read_text())
+        for field, value in (("recipe_key", "wrong-full-key"), ("output_digest", "wrong-digest"),
+                             ("outputs", [str(self.external)]), ("stage_identity", [0, 0]),
+                             ("stage", str(self.external))):
+            with self.subTest(field=field):
+                witness.write_text(json.dumps({**original, field: value}))
+                with patch("sys.stderr", io.StringIO()) as stderr:
+                    self.assertEqual(self.run_build(), "HIT")
+                self.assertIn("cleanup pending", stderr.getvalue())
+                self.assertEqual((self.stage / "build/intermediate").read_bytes(), b"disposable")
+        for invalid in ("{", "[]"):
+            with self.subTest(invalid=invalid):
+                witness.write_text(invalid)
+                with patch("sys.stderr", io.StringIO()) as stderr:
+                    self.assertEqual(self.run_build(), "HIT")
+                self.assertIn("cleanup pending", stderr.getvalue())
+                self.assertTrue(self.stage.exists())
+
+    def test_hit_preserves_replaced_stage_and_external_symlinks(self):
+        witness = self.fail_stage_cleanup()
+        retained = self.stage.with_name(self.stage.name + "-retained")
+        self.stage.rename(retained)
+        self.stage.symlink_to(self.external, target_is_directory=True)
+        with patch("sys.stderr", io.StringIO()):
+            self.assertEqual(self.run_build(), "HIT")
+        self.assertTrue(self.stage.is_symlink())
+        self.assertEqual((self.external / "source").read_bytes(), b"unique")
+        self.stage.unlink()
+        self.stage.mkdir()
+        (self.stage / "unknown").write_bytes(b"replacement")
+        with patch("sys.stderr", io.StringIO()):
+            self.assertEqual(self.run_build(), "HIT")
+        self.assertEqual((self.stage / "unknown").read_bytes(), b"replacement")
+        self.assertTrue(witness.exists())
+
+    def test_hit_preserves_symlinked_witness(self):
+        witness = self.fail_stage_cleanup()
+        external = self.external / "witness"
+        witness.rename(external)
+        witness.symlink_to(external)
+        with patch("sys.stderr", io.StringIO()):
+            self.assertEqual(self.run_build(), "HIT")
+        self.assertTrue(witness.is_symlink())
+        self.assertTrue(self.stage.exists())
+        self.assertTrue(external.is_file())
+
+    def test_hit_cleanup_failure_warns_and_retains_success(self):
+        import model_artifact_dispatch as dispatch
+        self.fail_stage_cleanup()
+        original = dispatch.shutil.rmtree
+
+        def fail(target, *args, **kwargs):
+            if Path(target) == self.stage:
+                raise PermissionError("still blocked")
+            return original(target, *args, **kwargs)
+
+        with patch.object(dispatch.shutil, "rmtree", fail), patch("sys.stderr", io.StringIO()) as stderr:
+            self.assertEqual(self.run_build(), "HIT")
+        self.assertIn("cleanup pending", stderr.getvalue())
+        self.assertEqual(self.calls, 1)
+        self.assertTrue(self.stage.exists())
+
+    def test_unresolved_rollback_blocks_witnessed_cleanup(self):
+        witness = self.fail_stage_cleanup()
+        key = json.loads(witness.read_text())["recipe_key"]
+        recovery = self.artifacts / ".model-artifact-rollback" / key / "0/model"
+        recovery.mkdir(parents=True)
+        (recovery / "value").write_bytes(b"recovery")
+        with self.assertRaisesRegex(RuntimeError, "recovery requires inspection"):
+            self.run_build()
+        self.assertEqual((recovery / "value").read_bytes(), b"recovery")
+        self.assertTrue(self.stage.exists())
+        self.assertTrue(witness.exists())
 
 class Qwen35StoragePilotTests(unittest.TestCase):
     def setUp(self):

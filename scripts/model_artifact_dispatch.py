@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -844,13 +845,52 @@ def verified_existing_gemma4(recipe: Recipe, key: str) -> bool:
     return cache_hit(recipe, key)
 
 
+def stage_witness_path(stage_root: Path) -> Path:
+    return stage_root.parent / f".{stage_root.name}.published.json"
+
+
+def expire_published_stage(recipe: Recipe, key: str, stage_root: Path, *, record: bool = False) -> None:
+    witness = stage_witness_path(stage_root)
+    try:
+        if not record and not witness.exists() and not witness.is_symlink():
+            if stage_root.exists() or stage_root.is_symlink():
+                raise ValueError("transaction stage has no publication witness")
+            return
+        receipt = json.loads(manifest_path(recipe).read_text())
+        expected = {"recipe_key": key, "output_digest": receipt["output_digest"],
+                    "outputs": list(recipe.outputs),
+                    "stage": str(stage_root.parent.resolve() / stage_root.name)}
+        if record:
+            info = stage_root.lstat()
+            if not stat.S_ISDIR(info.st_mode):
+                raise ValueError("transaction stage is not a directory")
+            expected["stage_identity"] = [info.st_dev, info.st_ino]
+            # Outside the stage: partial rmtree must not erase retry authority.
+            with witness.open("x") as handle:
+                json.dump(expected, handle, sort_keys=True)
+                handle.write("\n")
+        if not stat.S_ISREG(witness.lstat().st_mode):
+            raise ValueError("publication witness is not a regular file")
+        saved = json.loads(witness.read_text())
+        if not isinstance(saved, dict) or any(saved.get(name) != value for name, value in expected.items()):
+            raise ValueError("publication witness does not match verified outputs")
+        if stage_root.exists() or stage_root.is_symlink():
+            info = stage_root.lstat()
+            if not stat.S_ISDIR(info.st_mode) or saved.get("stage_identity") != [info.st_dev, info.st_ino]:
+                raise ValueError("transaction stage identity changed")
+            shutil.rmtree(stage_root)
+        witness.unlink()
+    except (OSError, ValueError, KeyError) as error:
+        print(f"WARNING {recipe.model}: cleanup pending at {stage_root}: {error}", file=sys.stderr)
+
+
 def build_recipe(recipe: Recipe, repo: Path, config: Path, artifacts: Path, build: Path) -> str:
     authority_before = authority_digest(recipe, repo)
     inputs_before = source_digest(recipe.inputs)
     key = recipe_key(recipe, repo, config, authority=authority_before, inputs=inputs_before)
     stage_root = build / "model-artifact-staging" / f"{recipe.model}-{key[:16]}"
     rollback = artifacts / ".model-artifact-rollback"
-    with resource_locks((*recipe.outputs, stage_root, rollback / key)):
+    with resource_locks((*recipe.outputs, stage_root, stage_witness_path(stage_root), rollback / key)):
         return _build_recipe(recipe, repo, artifacts, build, key, stage_root,
                              rollback, authority_before, inputs_before)
 
@@ -859,6 +899,7 @@ def _build_recipe(recipe: Recipe, repo: Path, artifacts: Path, build: Path, key:
                   stage_root: Path, rollback: Path, authority_before: str, inputs_before: str) -> str:
     require_no_recovery(rollback, key)
     if cache_hit(recipe, key):
+        expire_published_stage(recipe, key, stage_root)
         return "HIT"
     if verified_existing_gemma4(recipe, key):
         return "VERIFIED"
@@ -878,7 +919,7 @@ def _build_recipe(recipe: Recipe, repo: Path, artifacts: Path, build: Path, key:
     _publish_recipe(recipe, staged, key, rollback)
     if not cache_hit(recipe, key):
         raise RuntimeError(f"recipe manifest did not verify after publish: {recipe.model}")
-    shutil.rmtree(stage_root)
+    expire_published_stage(recipe, key, stage_root, record=True)
     return "BUILT"
 
 
