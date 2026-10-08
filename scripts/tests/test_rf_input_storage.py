@@ -13,13 +13,14 @@ BUILD_SCRIPT = REPO / "designs" / "resident_forward" / "rf_build.py"
 
 
 class ResidentInputStorage(unittest.TestCase):
-    def run_builder(self, work, text="module {}\n", fail=False):
+    def run_builder(self, work, text="module {}\n", fail=False, script=BUILD_SCRIPT):
         generator = types.ModuleType("storage_test_generator")
         setattr(generator, "build_text", lambda args: text)
         setattr(generator, "kernels", lambda: [])
         compiler = types.ModuleType("aie.utils.compile.utils")
 
         def compile_module(source, *, full_elf_path, work_dir, options):
+            self.assertEqual(Path(work_dir, "aie.mlir").read_text(), source)
             Path(work_dir, "aie.mlir").write_text(source)
             if fail:
                 raise RuntimeError("compiler failed")
@@ -30,14 +31,13 @@ class ResidentInputStorage(unittest.TestCase):
         modules = {"storage_test_generator": generator,
                    "aie.utils.compile.utils": compiler}
         with patch.dict(sys.modules, modules), patch.dict(os.environ, RF_BUILD=str(work.parent)), \
-                patch.object(sys, "argv", [str(BUILD_SCRIPT), work.name, generator.__name__]), \
+                patch.object(sys, "argv", [str(script), work.name, generator.__name__]), \
                 patch.object(sys, "path", sys.path.copy()):
-            runpy.run_path(str(BUILD_SCRIPT), run_name="__main__")
+            runpy.run_path(str(script), run_name="__main__")
 
     def assert_single_input(self, work, text):
-        self.assertTrue((work / "design.mlir").is_symlink())
-        self.assertEqual(os.readlink(work / "design.mlir"), "aie.mlir")
-        self.assertEqual((work / "design.mlir").read_text(), text)
+        self.assertFalse(os.path.lexists(work / "design.mlir"))
+        self.assertFalse((work / "aie.mlir").is_symlink())
         self.assertEqual((work / "aie.mlir").read_text(), text)
 
     def test_success_keeps_one_physical_input(self):
@@ -47,7 +47,7 @@ class ResidentInputStorage(unittest.TestCase):
             self.assert_single_input(work, "module {}\n")
             self.assertEqual((work / "design.elf").read_bytes(), b"compiler-output-fixture")
 
-    def test_changed_input_replaces_both_pathnames(self):
+    def test_changed_input_replaces_only_the_canonical_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             work = Path(tmp) / "arm"
             self.run_builder(work)
@@ -61,7 +61,7 @@ class ResidentInputStorage(unittest.TestCase):
                 self.run_builder(work, fail=True)
             self.assert_single_input(work, "module {}\n")
 
-    def test_matching_regular_inputs_can_be_consolidated(self):
+    def test_matching_redundant_input_is_retired(self):
         with tempfile.TemporaryDirectory() as tmp:
             work = Path(tmp) / "arm"
             work.mkdir()
@@ -69,6 +69,23 @@ class ResidentInputStorage(unittest.TestCase):
                 (work / name).write_text("old input\n")
             self.run_builder(work)
             self.assert_single_input(work, "module {}\n")
+
+    def test_known_relative_alias_is_retired(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp) / "arm"
+            work.mkdir()
+            (work / "aie.mlir").write_text("old input\n")
+            (work / "design.mlir").symlink_to("aie.mlir")
+            self.run_builder(work)
+            self.assert_single_input(work, "module {}\n")
+
+    def test_failed_rebuild_retains_only_the_new_canonical_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp) / "arm"
+            self.run_builder(work)
+            with self.assertRaisesRegex(RuntimeError, "compiler failed"):
+                self.run_builder(work, "changed input\n", fail=True)
+            self.assert_single_input(work, "changed input\n")
 
     def test_divergent_regular_input_is_not_overwritten(self):
         with tempfile.TemporaryDirectory() as tmp:
