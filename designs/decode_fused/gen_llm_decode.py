@@ -320,9 +320,9 @@ def _quantize_cached(w, group_size, dtype, kw):
                "packer": pack_cache.sha256_file(sys.modules[quantize_weight.__module__].__file__)}
     key = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
     store = pack_cache.ContentStore(pack_cache.default_cache_dir())
-    hit = store.get(key)
-    if hit is not None:
-        return np.load(hit)
+    with store.open(key) as hit:
+        if hit is not None:
+            return np.load(hit)
     out = quantize_weight(w, group_size, dtype, **kw)
     tmp = os.path.join(store.objects, f".pack-{os.getpid()}.npy")
     os.makedirs(store.objects, exist_ok=True)
