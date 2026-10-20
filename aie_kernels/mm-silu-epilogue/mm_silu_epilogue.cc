@@ -398,7 +398,9 @@ template <int rows, int cols, int r, int t>
 static inline void mm_glu_epilogue_f32o(const float *__restrict pC_in,
                                         float *__restrict pC_out) {
   event0();
-  static_assert(r == t, "the +half-row-block pairing assumes square mmul sub-tiles");
+  // The half-row-block offset works for native 4x8 and emulated 8x8 C sub-tiles;
+  // column alignment below, not square sub-tiles, establishes the pairing.
+  static_assert(r > 0 && t > 0, "mmul sub-tile axes must be positive");
   static_assert(cols % (2 * t) == 0, "value/gate split must fall on a sub-tile boundary");
   static_assert(rows % r == 0, "tile rows must be a whole number of sub-tile rows");
   // One row-block = r rows x cols columns, laid out contiguously by the blocked store.
@@ -583,7 +585,9 @@ template <int rows, int cols, int r, int t>
 static inline void mm_glu_epilogue_bf16o(const float *__restrict pC_in,
                                          bfloat16 *__restrict pC_out) {
   event0();
-  static_assert(r == t, "the +half-row-block pairing assumes square mmul sub-tiles");
+  // The half-row-block offset works for native 4x8 and emulated 8x8 C sub-tiles;
+  // column alignment below, not square sub-tiles, establishes the pairing.
+  static_assert(r > 0 && t > 0, "mmul sub-tile axes must be positive");
   static_assert(cols % (2 * t) == 0, "value/gate split must fall on a sub-tile boundary");
   static_assert(rows % r == 0, "tile rows must be a whole number of sub-tile rows");
   constexpr int kRowBlock = r * cols;

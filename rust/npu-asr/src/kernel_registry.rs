@@ -139,6 +139,66 @@ pub fn resolve(dir: &Path, stem: &str) -> KernelArtifacts {
     }
 }
 
+/// Required emitted operand extents for a Native ctxA artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeArtifactShape {
+    pub rows: usize,
+    pub k: usize,
+    pub n: usize,
+    pub tile: [usize; 3],
+}
+
+#[derive(serde::Deserialize)]
+struct NativeArtifactContract {
+    rows: usize,
+    k: usize,
+    n: usize,
+    tile: [usize; 3],
+    precision: String,
+    xclbin_sha256: String,
+    insts_sha256: String,
+}
+
+fn check_artifact_hash(path: &Path, expected: &str) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    if bytes.is_empty() || format!("{:x}", Sha256::digest(&bytes)) != expected {
+        return Err(format!("ctxA artifact hash mismatch: {}", path.display()));
+    }
+    Ok(())
+}
+
+/// Validate the original build receipt against the instruction file the runtime actually selects.
+pub fn validate_native_artifact_contract(dir: &Path, stem: &str, expected: &NativeArtifactShape) -> Result<(), String> {
+    let path = dir.join(format!("contract_{stem}.json"));
+    let bytes = std::fs::read(&path).map_err(|e| format!("read {}: {e}; build the matching native whole_array recipe", path.display()))?;
+    let contract: NativeArtifactContract = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("parse {}: {e}", path.display()))?;
+    if contract.rows != expected.rows || contract.k != expected.k || contract.n != expected.n
+        || contract.tile != expected.tile || contract.precision != "native" {
+        return Err(format!("ctxA artifact extent/precision mismatch: {}", path.display()));
+    }
+    check_artifact_hash(&xclbin_path(dir, stem), &contract.xclbin_sha256)?;
+    check_artifact_hash(&insts_path(dir, stem), &contract.insts_sha256)
+}
+
+/// Only the unprefixed whole_array Native ctxA grammar establishes receipt expectations.
+/// Best-effort inventory annotations are not an authority for other kernel families.
+pub fn declared_native_artifact_shape(family: &str, stem: &str) -> Result<Option<NativeArtifactShape>, String> {
+    if family != "whole_array" { return Ok(None); }
+    let parts: Vec<_> = stem.split('_').collect();
+    if !matches!(parts.last(), Some(&"modalidnat") | Some(&"modalsilunat")) { return Ok(None); }
+    let invalid = || format!("invalid declared Native ctxA stem: {stem}");
+    if parts.len() != 4 || parts[1] != "32x32x32" || parts[2] != "8c" { return Err(invalid()); }
+    let dims: Vec<usize> = parts[0].split('x').map(|v| v.parse().map_err(|_| invalid())).collect::<Result<_, _>>()?;
+    if dims.len() != 3 || dims.iter().any(|&v| v == 0 || v % 32 != 0)
+        || dims[0] % 128 != 0
+        || dims[2] % (32 * 8) != 0 || dims[1] <= 32 {
+        return Err(invalid());
+    }
+    Ok(Some(NativeArtifactShape { rows: dims[0], k: dims[1], n: dims[2], tile: [32,32,32] }))
+}
+
 // ---------------------------------------------------------------------------------------------
 // The op manifest: content-hash-pinned, filename-token-annotated, generated FROM the artifacts.
 // ---------------------------------------------------------------------------------------------
@@ -816,6 +876,28 @@ fn stable_dedupe_alternatives(alternatives: &mut Vec<Vec<String>>) {
     alternatives.retain(|alternative| seen.insert(alternative.clone()));
 }
 
+/// Check only the selected declared Native closure, without creating a manifest or receipt.
+/// This is also the publisher's source-bundle preflight; unrelated experiments are not gates.
+pub fn validate_declared_native_contracts(dir: &Path, family: &str, declaration: &DeclaredFamily) -> Result<(), String> {
+    let inspect = |stem: &str| -> Result<(), String> {
+        if let Some(shape) = declared_native_artifact_shape(family, stem)? {
+            validate_native_artifact_contract(dir, stem, &shape)?;
+        }
+        Ok(())
+    };
+    for stem in &declaration.required { inspect(stem)?; }
+    for alternatives in &declaration.one_of {
+        // An installed Fast alternative keeps its existing pair-only semantics.
+        if alternatives.iter().any(|stem| artifact_pair_present(dir, stem) && inspect(stem).is_ok()) {
+            continue;
+        }
+        if alternatives.iter().any(|stem| declared_native_artifact_shape(family, stem).map_or(true, |s| s.is_some())) {
+            return Err(format!("no valid declared alternative in {}: {}", dir.display(), alternatives.join(", ")));
+        }
+    }
+    Ok(())
+}
+
 /// The installed service's public-safe config location. Callers may always override this with
 /// `--config`, which is required for staged-install and fixture roots.
 pub fn default_engine_config_path() -> PathBuf {
@@ -838,6 +920,8 @@ pub enum DeclaredStatus {
     PresentUnverified,
     /// The artifact exists but its content hash disagrees with the family manifest.
     HashMismatch(ManifestError),
+    /// A present Native receipt is malformed or does not bind the required shape/actual pair.
+    InvalidContract(String),
     /// The artifact exists and its bytes match, but it was built from DIFFERENT kernel source
     /// than the tree currently holds. A stale-but-intact artifact, which every other status here
     /// reports as healthy -- `Present` is exactly what a two-day-old `residual_add.xclbin` looked
@@ -889,6 +973,18 @@ pub fn verify_declared_kernel_set_from(
             if !artifact_pair_present(&dir, stem) {
                 DeclaredStatus::Missing
             } else {
+                match declared_native_artifact_shape(family, stem) {
+                    Err(e) => return DeclaredStatus::InvalidContract(e),
+                    Ok(Some(expected)) => {
+                        if !dir.join(format!("contract_{stem}.json")).is_file() {
+                            return DeclaredStatus::Missing;
+                        }
+                        if let Err(e) = validate_native_artifact_contract(&dir, stem, &expected) {
+                            return DeclaredStatus::InvalidContract(e);
+                        }
+                    }
+                    Ok(None) => {}
+                }
                 match resolve_checked(&dir, stem) {
                     Ok(_) => match (&current, recorded_source_digest(&dir, stem)) {
                         // Only a digest we can compute AND that disagrees is stale. An absent
@@ -1015,6 +1111,7 @@ pub fn build_missing_declared_kernels(
                     }
                 }
             }
+            DeclaredStatus::InvalidContract(e) => BuildOutcome::BuildFailed(format!("invalid Native contract (not auto-repaired): {e}")),
             _ => BuildOutcome::AlreadyPresent,
         };
         results.push(BuildResult { family: entry.family, stem: entry.stem, outcome });
@@ -1024,6 +1121,107 @@ pub fn build_missing_declared_kernels(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn native_cls_staged_root_closure_has_no_build_tree_dependency() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let staged = tempfile::tempdir().unwrap();
+        std::fs::create_dir(staged.path().join("scenarios")).unwrap();
+        std::fs::copy(repo.join("scenarios/bge-base-cls.toml"), staged.path().join("scenarios/bge-base-cls.toml")).unwrap();
+        let config = staged.path().join("engine.toml");
+        std::fs::write(&config, "[[model]]\nname='cls'\nscenario='scenarios/bge-base-cls.toml'\n").unwrap();
+        let declared = load_declared_kernel_set_from_engine_config(&repo, staged.path(), &config).unwrap();
+        let dir = staged.path().join("kernels/whole_array");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(staged.path().join("kernels/.toolchain-stamp"), b"fixture-pin").unwrap();
+        std::fs::write(dir.join(".toolchain-stamp"), b"fixture-pin").unwrap();
+        let declaration = &declared["whole_array"];
+        let hash = format!("{:x}", Sha256::digest(b"fixture"));
+        for stem in &declaration.required {
+            let shape = declared_native_artifact_shape("whole_array", stem).unwrap().unwrap();
+            write_fake_kernel(&dir, stem, b"fixture", Some(b"fixture"));
+            let receipt = serde_json::json!({"rows":shape.rows,"k":shape.k,"n":shape.n,"tile":shape.tile,
+                "precision":"native","xclbin_sha256":hash,"insts_sha256":hash});
+            std::fs::write(dir.join(format!("contract_{stem}.json")), receipt.to_string()).unwrap();
+        }
+        let source = source_digest(&repo, &declaration.sources).unwrap();
+        write_manifest(&dir, &generate_manifest_with_source(&dir, source.as_deref()).unwrap()).unwrap();
+        assert!(!staged.path().join("mlir-aie").exists());
+        let verify = || verify_declared_kernel_set_from(&declared, &staged.path().join("kernels"), Some(&repo));
+        assert!(verify().iter().all(|e| matches!(e.status, DeclaredStatus::Present)));
+        validate_declared_native_contracts(&dir, "whole_array", declaration).unwrap();
+        let removed = dir.join(format!("contract_{}.json", declaration.required[0]));
+        let source_copy = staged.path().join("source-only-receipt.json");
+        std::fs::copy(&removed, source_copy).unwrap();
+        std::fs::remove_file(removed).unwrap();
+        assert!(matches!(verify()[0].status, DeclaredStatus::Missing));
+        assert!(validate_declared_native_contracts(&dir, "whole_array", declaration).is_err());
+    }
+
+    #[test]
+    fn native_closure_ignores_unselected_experiments_and_preserves_fast() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("whole_array");
+        std::fs::create_dir(&dir).unwrap();
+        let fast = "512x800x768_64x32x96_8c_modalid";
+        let experiment = "1536x800x768_32x32x32_8c_modalidnat";
+        write_fake_kernel(&dir, fast, b"fast", Some(b"insts"));
+        write_fake_kernel(&dir, experiment, b"experiment", Some(b"insts"));
+        let declared = declare(&[("whole_array", &[fast])]);
+        validate_declared_native_contracts(&dir, "whole_array", &declared["whole_array"]).unwrap();
+        write_manifest(&dir, &generate_manifest(&dir).unwrap()).unwrap();
+        assert!(matches!(verify_declared_kernel_set(&declared, root.path())[0].status, DeclaredStatus::Present));
+        for stem in ["1025x800x768_32x32x32_8c_modalidnat", "1024x800x768_64x32x32_8c_modalidnat", "1024x800x768_32x32x32_4c_modalidnat"] {
+            assert!(declared_native_artifact_shape("whole_array", stem).is_err());
+        }
+        assert!(declared_native_artifact_shape("other", experiment).unwrap().is_none());
+    }
+
+    #[test]
+    fn native_declared_bundle_requires_shape_and_pair_bound_contract() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("whole_array");
+        std::fs::create_dir(&dir).unwrap();
+        let stem = "1024x800x768_32x32x32_8c_modalidnat";
+        write_fake_kernel(&dir, stem, b"kernel", Some(b"instructions"));
+        let declared = declare(&[("whole_array", &[stem])]);
+        let refresh = || write_manifest(&dir, &generate_manifest(&dir).unwrap()).unwrap();
+        let status = || verify_declared_kernel_set(&declared, root.path()).remove(0).status;
+        refresh();
+        assert!(matches!(status(), DeclaredStatus::Missing), "pair manifest cannot replace build receipt");
+        let good = serde_json::json!({"rows":1024,"k":800,"n":768,"tile":[32,32,32],"precision":"native",
+            "xclbin_sha256":format!("{:x}", Sha256::digest(b"kernel")),
+            "insts_sha256":format!("{:x}", Sha256::digest(b"instructions"))});
+        let receipt = dir.join(format!("contract_{stem}.json"));
+        let put = |v: &serde_json::Value| std::fs::write(&receipt, serde_json::to_vec(v).unwrap()).unwrap();
+        put(&good);
+        assert!(matches!(status(), DeclaredStatus::Present));
+        for (key, value) in [("rows", serde_json::json!(512)), ("k", serde_json::json!(768)),
+            ("n", serde_json::json!(3072)), ("tile", serde_json::json!([64,32,32])),
+            ("precision", serde_json::json!("bf16"))] {
+            let mut bad = good.clone(); bad[key] = value; put(&bad);
+            assert!(matches!(status(), DeclaredStatus::InvalidContract(_)));
+        }
+        std::fs::write(&receipt, b"not json").unwrap();
+        assert!(matches!(status(), DeclaredStatus::InvalidContract(_)));
+        let builds = build_missing_declared_kernels(&declared, root.path(), root.path(), root.path());
+        assert!(matches!(builds[0].outcome, BuildOutcome::BuildFailed(_)), "corruption must not be AlreadyPresent or rebuilt");
+        put(&good);
+        for bytes in [b"replaced".as_slice(), b"".as_slice()] {
+            std::fs::write(xclbin_path(&dir, stem), bytes).unwrap(); refresh();
+            assert!(!matches!(status(), DeclaredStatus::Present), "fresh manifest cannot bless replaced pair");
+        }
+        std::fs::write(xclbin_path(&dir, stem), b"kernel").unwrap();
+        std::fs::rename(insts_path(&dir, stem), dir.join(format!("insts_{stem}.bin"))).unwrap(); refresh();
+        assert!(matches!(status(), DeclaredStatus::Present));
+        std::fs::write(dir.join(format!("insts_{stem}.txt")), b"stale preferred txt").unwrap(); refresh();
+        assert!(matches!(status(), DeclaredStatus::InvalidContract(_)));
+        std::fs::remove_file(dir.join(format!("insts_{stem}.txt"))).unwrap();
+        for bytes in [b"replaced instructions".as_slice(), b"".as_slice()] {
+            std::fs::write(dir.join(format!("insts_{stem}.bin")), bytes).unwrap(); refresh();
+            assert!(matches!(status(), DeclaredStatus::InvalidContract(_)), "fresh manifest cannot bless replaced instructions");
+        }
+    }
 
     /// The published directory wins when it exists; the legacy path applies only in its absence, so
     /// an install carrying both cannot serve from the build tree by accident.

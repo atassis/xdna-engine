@@ -16,8 +16,8 @@
 //! repo-root defaults to ".". kernels-root defaults to <repo-root>/kernels. mlir-aie-root
 //! defaults to <repo-root>/mlir-aie (passed through to publish_kernels.sh unchanged).
 //!
-//! Exit code: 0 if the final re-verify shows everything declared as Present; 1 otherwise. Nothing
-//! upstream reads this exit code yet -- same observability-first posture as verify_declared_kernels.
+//! Exit code: 0 if the final re-verify shows everything declared as Present; 1 otherwise. The
+//! installation accepts a set only when this gate and final verification succeed.
 
 use std::path::PathBuf;
 
@@ -101,6 +101,18 @@ pub fn run(argv: Vec<String>) {
         }
     };
 
+    // Corrupt Native receipts are not rebuild requests. In particular, do not count an invalid
+    // contract as an attempted build and publish over it from a different source bundle.
+    let initial = verify_declared_kernel_set_from(&declared, &kernels_root, Some(&repo_root));
+    let mut invalid_contract = false;
+    for entry in &initial {
+        if let DeclaredStatus::InvalidContract(error) = &entry.status {
+            eprintln!("[kernels-build] invalid contract {}/{}: {error}", entry.family, entry.stem);
+            invalid_contract = true;
+        }
+    }
+    if invalid_contract { std::process::exit(1); }
+
     let results = build_missing_declared_kernels(&declared, &repo_root, &kernels_root, &mlir_aie_root);
     let attempted =
         results.iter().filter(|r| matches!(r.outcome, BuildOutcome::Built | BuildOutcome::BuildFailed(_))).count();
@@ -147,7 +159,7 @@ pub fn run(argv: Vec<String>) {
     for entry in &final_report {
         match &entry.status {
             DeclaredStatus::Missing => missing += 1,
-            DeclaredStatus::HashMismatch(_) | DeclaredStatus::PresentUnverified | DeclaredStatus::StaleSource { .. } => mismatched += 1,
+            DeclaredStatus::InvalidContract(_) | DeclaredStatus::HashMismatch(_) | DeclaredStatus::PresentUnverified | DeclaredStatus::StaleSource { .. } => mismatched += 1,
             _ => {}
         }
     }

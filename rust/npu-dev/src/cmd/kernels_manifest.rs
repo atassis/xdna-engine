@@ -31,9 +31,11 @@ pub fn run(argv: Vec<String>) {
     let mut config: Option<PathBuf> = None;
     let mut engine_root: Option<PathBuf> = None;
     let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut check_only = false;
     let mut args = argv.into_iter().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
+            "--check-native-contracts-only" => check_only = true,
             "--repo-root" => match args.next() {
                 Some(v) => repo_root = Some(PathBuf::from(v)),
                 None => {
@@ -81,7 +83,10 @@ pub fn run(argv: Vec<String>) {
 
     let mut had_error = false;
     for dir in dirs {
-        let family = match dir.file_name().and_then(|f| f.to_str()) {
+        let family_path = if check_only && dir.file_name().is_some_and(|f| f == "build") {
+            dir.parent().unwrap_or(&dir)
+        } else { &dir };
+        let family = match family_path.file_name().and_then(|f| f.to_str()) {
             Some(family) => family,
             None => {
                 eprintln!("kernels-manifest: cannot derive family from {}", dir.display());
@@ -93,6 +98,12 @@ pub fn run(argv: Vec<String>) {
             println!("[kernels-manifest] skip undeclared family {}", dir.display());
             continue;
         };
+        if let Err(e) = npu_asr::kernel_registry::validate_declared_native_contracts(&dir, family, declaration) {
+            eprintln!("kernels-manifest: Native closure {}: {e}", dir.display());
+            had_error = true;
+            continue;
+        }
+        if check_only { continue; }
         let source = match source_digest(&repo_root, &declaration.sources) {
             Ok(source) => source,
             Err(e) => {

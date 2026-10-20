@@ -814,6 +814,16 @@ impl Handle {
             other => Err(wrong_shape(Capability::EMBED, &s.model, &other)),
         }
     }
+    pub fn embed_batch(&self, model: Option<&str>, texts: &[String]) -> Result<Served<Vec<Vec<f32>>>, EngineError> {
+        let s = self.serve(Capability::EMBED, model, Request::Texts(texts.to_vec()))?;
+        match s.value {
+            Response::Vectors(v) if v.len() == texts.len() =>
+                Ok(Served { model: s.model, value: v, queue_us: s.queue_us, load_us: s.load_us }),
+            Response::Vectors(v) => Err(EngineError::Unsupported(format!(
+                "embedding batch returned {} vectors for {} inputs", v.len(), texts.len()))),
+            other => Err(wrong_shape(Capability::EMBED, &s.model, &other)),
+        }
+    }
     pub fn diarize(&self, model: Option<&str>, pcm: Vec<i16>, sr: u32)
         -> Result<Served<Vec<Segment>>, EngineError> {
         let s = self.serve(Capability::DIARIZE, model, Request::Audio { pcm, sample_rate: sr })?;

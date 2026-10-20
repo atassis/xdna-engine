@@ -71,6 +71,20 @@ done
 [ "$fail" -eq 0 ] || { note "refusing to publish"; exit 1; }
 [ -n "$stamp" ] || { err "no source directory had anything to publish"; exit 1; }
 
+# Resolve the existing runtime-owned checker before touching the destination. It validates only
+# declared Native bundles and never synthesizes attestations from filenames or current hashes.
+GEN_MANIFEST="${GEN_KERNEL_MANIFEST_BIN:-}"
+if [ -z "$GEN_MANIFEST" ]; then
+  target_dir="$(cd "$REPO/rust" && cargo metadata --format-version 1 --no-deps \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])' 2>/dev/null)"
+  [ -n "$target_dir" ] || target_dir="$REPO/rust/target"
+  GEN_MANIFEST="$target_dir/release/npu-dev"
+fi
+[ -x "$GEN_MANIFEST" ] || { err "npu-dev not found/executable at $GEN_MANIFEST"; exit 1; }
+"$GEN_MANIFEST" kernels-manifest --check-native-contracts-only --repo-root "$REPO" \
+  --engine-root "$ENGINE_ROOT" --config "$ENGINE_CONFIG" "${SRC_DIRS[@]}" \
+  || { err "selected Native source bundle is incomplete or invalid"; exit 1; }
+
 mkdir -p "$DEST"
 # Collision check BEFORE copying anything, so a refusal leaves the destination untouched rather than
 # half-written -- a partially published set reads as a complete one.
@@ -85,7 +99,7 @@ for d in "${SRC_DIRS[@]}"; do
     else
       owner[$key]="$d"
     fi
-  done < <(find "$d" -maxdepth 1 -type f \( -name '*.xclbin' -o -name 'insts*.txt' -o -name 'insts*.bin' \))
+  done < <(find "$d" -maxdepth 1 -type f \( -name '*.xclbin' -o -name 'insts*.txt' -o -name 'insts*.bin' -o -name 'contract_*.json' \))
 done
 [ "$fail" -eq 0 ] || { note "refusing to publish"; exit 1; }
 
@@ -128,14 +142,6 @@ done
 note "published $n file(s) -> $DEST  (pin $stamp)"
 
 # Regenerate manifests from the same engine-config closure used for build and verify.
-GEN_MANIFEST="${GEN_KERNEL_MANIFEST_BIN:-}"
-if [ -z "$GEN_MANIFEST" ]; then
-  target_dir="$(cd "$REPO/rust" && cargo metadata --format-version 1 --no-deps \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])' 2>/dev/null)"
-  [ -n "$target_dir" ] || target_dir="$REPO/rust/target"
-  GEN_MANIFEST="$target_dir/release/npu-dev"
-fi
-[ -x "$GEN_MANIFEST" ] || { err "npu-dev not found/executable at $GEN_MANIFEST"; exit 1; }
 fam_dirs=()
 for fam in "$DEST"/*/; do
   [ -d "$fam" ] || continue

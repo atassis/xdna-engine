@@ -45,6 +45,9 @@ pub trait Head {
 pub trait Embedder {
     fn embed_one(&self, text: String) -> Result<Vec<f32>, EngineError>;
 
+    /// Ordered array operation. Each implementation declares native batching or serial compatibility.
+    fn embed_many(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EngineError>;
+
     /// See `AsrModel::bo_bytes`.
     fn bo_bytes(&self) -> u64 { 0 }
 }

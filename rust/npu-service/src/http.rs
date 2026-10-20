@@ -789,20 +789,17 @@ fn embeddings(req: &Request, handle: &Handle) -> Response {
         Ok(v) => v,
         Err(e) => return (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e)).into()),
     };
+    let served = match handle.embed_batch(model.as_deref(), &inputs) {
+        Ok(s) => s,
+        Err(e) => return (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e.to_string())).into()),
+    };
     let mut data = String::new();
-    let mut served = String::new();
-    for (i, text) in inputs.iter().enumerate() {
-        match handle.embed(model.as_deref(), text) {
-            Ok(s) => {
-                served = s.model;
-                let arr = s.value.iter().map(|x| format!("{x}")).collect::<Vec<_>>().join(",");
-                if i > 0 { data.push(','); }
-                data.push_str(&format!("{{\"object\":\"embedding\",\"index\":{i},\"embedding\":[{arr}]}}"));
-            }
-            Err(e) => return (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e.to_string())).into()),
-        }
+    for (i, vector) in served.value.iter().enumerate() {
+        let arr = vector.iter().map(|x| format!("{x}")).collect::<Vec<_>>().join(",");
+        if i > 0 { data.push(','); }
+        data.push_str(&format!("{{\"object\":\"embedding\",\"index\":{i},\"embedding\":[{arr}]}}"));
     }
-    (200, format!("{{\"object\":\"list\",\"data\":[{data}],\"model\":\"{}\"}}", parse::json_escape(&served)).into())
+    (200, format!("{{\"object\":\"list\",\"data\":[{data}],\"model\":\"{}\"}}", parse::json_escape(&served.model)).into())
 }
 
 fn transcriptions(req: &Request, handle: &Handle) -> Response {
@@ -2668,6 +2665,74 @@ mod route_tests {
         let cfg = Config::load(&p).unwrap();
         assert_eq!(cfg.find("bge").unwrap().scenario, "y");
         assert!(cfg.find("bge").unwrap().resident, "add-model must not unpin what it is re-pointing");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn embeddings_array_is_one_native_request_with_order_errors_and_count_checked() {
+        use crate::loader::{ModelLoader, Servable, StreamServable};
+        use npu_models::capability::{Request as ModelRequest, Response as ModelResponse};
+        use std::sync::{Arc, Mutex};
+        struct Spy(Arc<Mutex<Vec<Vec<String>>>>);
+        impl Servable for Spy {
+            fn capabilities(&self) -> Capability { Capability::EMBED }
+            fn run(&mut self, req: ModelRequest) -> Result<ModelResponse, npu_models::EngineError> {
+                let ModelRequest::Texts(texts) = req else { panic!("array reached single-text path"); };
+                self.0.lock().unwrap().push(texts.clone());
+                if texts.iter().any(|t| t == "fail") {
+                    return Err(npu_models::EngineError::Unsupported("fixture batch failure".into()));
+                }
+                let mut vectors: Vec<_> = texts.iter().map(|t| vec![t.len() as f32]).collect();
+                if texts.iter().any(|t| t == "short") { vectors.pop(); }
+                Ok(ModelResponse::Vectors(vectors))
+            }
+        }
+        impl StreamServable for Spy {}
+        struct Loader(Arc<Mutex<Vec<Vec<String>>>>);
+        impl ModelLoader for Loader {
+            fn declared_capability(&self, _: &ModelCfg) -> Option<Capability> { Some(Capability::EMBED) }
+            fn load(&self, _: &ModelCfg) -> Result<Box<dyn StreamServable>, npu_models::EngineError> {
+                Ok(Box::new(Spy(self.0.clone())))
+            }
+        }
+        let calls = Arc::new(Mutex::new(vec![]));
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("engine.toml");
+        let cfg = Config { models: vec![ModelCfg { name: "bge".into(), scenario: "fixture".into(), resident: false }], ..Default::default() };
+        cfg.save(&p).unwrap();
+        let (h,j) = start(cfg, Box::new(Loader(calls.clone()))).unwrap();
+        let (code, body) = route(&post("/v1/embeddings", r#"{"input":["bbb","a","bbb",""]}"#), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        let result: serde_json::Value = serde_json::from_str(&body.text()).unwrap();
+        assert_eq!(result["data"].as_array().unwrap().len(), 4);
+        for (i, length) in [3.,1.,3.,0.].iter().enumerate() {
+            assert_eq!(result["data"][i]["index"], i);
+            assert_eq!(result["data"][i]["embedding"][0], *length);
+        }
+        assert_eq!(*calls.lock().unwrap(), vec![vec!["bbb", "a", "bbb", ""]]);
+        for input in [r#"{"input":"x"}"#, r#"{"input":["x"]}"#] {
+            let before = calls.lock().unwrap().len();
+            let (code, body) = route(&post("/v1/embeddings", input), &h, &p);
+            assert_eq!(code, 200, "{body}");
+            let result: serde_json::Value = serde_json::from_str(&body.text()).unwrap();
+            assert_eq!(result["data"].as_array().unwrap().len(), 1);
+            assert_eq!(result["data"][0]["embedding"][0], 1.);
+            let recorded = calls.lock().unwrap();
+            assert_eq!(recorded.len(), before + 1);
+            assert_eq!(recorded[before], vec!["x"]);
+        }
+        let texts = vec!["quoted \"[x]\"", "雪", "", "雪"];
+        let request = serde_json::json!({"input":texts}).to_string();
+        assert_eq!(route(&post("/v1/embeddings", &request), &h, &p).0, 200);
+        assert_eq!(calls.lock().unwrap().last().unwrap(), &texts);
+        for input in [r#"{"input":[]}"#, r#"{"input":["ok",3]}"#, r#"{"input":[null]}"#] {
+            let before = calls.lock().unwrap().len();
+            assert_eq!(route(&post("/v1/embeddings", input), &h, &p).0, 400);
+            assert_eq!(calls.lock().unwrap().len(), before, "bad request must not reach model");
+        }
+        for input in [r#"{"input":["ok","fail"]}"#, r#"{"input":["ok","short"]}"#] {
+            assert_eq!(route(&post("/v1/embeddings", input), &h, &p).0, 400);
+        }
         h.shutdown(); j.join().unwrap();
     }
 

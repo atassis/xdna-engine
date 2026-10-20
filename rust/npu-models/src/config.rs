@@ -329,9 +329,13 @@ pub struct EmbeddingsCfg {
     pub pooling: String, // mean | cls
     #[serde(default = "default_true")]
     pub normalize: bool,
+    /// Opt-in packed CLS instance: native bf16 32x32x32, with this physical GEMM row capacity.
+    /// None uses the single-text encoder and serial array compatibility path.
+    #[serde(default)]
+    pub batch_rows: Option<usize>,
 }
 impl Default for EmbeddingsCfg {
-    fn default() -> Self { EmbeddingsCfg { pooling: default_pooling(), normalize: true } }
+    fn default() -> Self { EmbeddingsCfg { pooling: default_pooling(), normalize: true, batch_rows: None } }
 }
 fn default_pooling() -> String { "mean".into() }
 fn default_true() -> bool { true }

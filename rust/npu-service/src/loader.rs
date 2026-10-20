@@ -94,6 +94,10 @@ impl Servable for EngineModel {
                     .map(|(pcm, sample_rate)| Response::Audio { pcm, sample_rate }),
                 _ => self.model.embed(&text).map(Response::Vector),
             },
+            Request::Texts(texts) => {
+                let refs: Vec<_> = texts.iter().map(String::as_str).collect();
+                self.model.embed_batch(&refs).map(Response::Vectors)
+            }
             // Neither engine scenario takes an image, so this is a routing bug rather than a user
             // error -- but still a Result, because the actor must not be panicked by one.
             Request::Image { .. } => Err(EngineError::WrongKind {
@@ -285,6 +289,7 @@ pub mod mock {
             match (self.cap, &req) {
                 (Capability::ASR, Request::Audio { .. }) => Ok(Response::Text("mock-text".into())),
                 (Capability::EMBED, Request::Text(_)) => Ok(Response::Vector(vec![0.0; 8])),
+                (Capability::EMBED, Request::Texts(texts)) => Ok(Response::Vectors(vec![vec![0.0; 8]; texts.len()])),
                 (Capability::GENERATE, Request::Text(_)) => Ok(Response::Text("mock-completion".into())),
                 (Capability::TTS, Request::Text(_)) =>
                     Ok(Response::Audio { pcm: vec![0i16; 8], sample_rate: 24_000 }),

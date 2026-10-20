@@ -32,4 +32,10 @@ fi
 
 built="$MMW/$target"
 [ -f "$built" ] || { echo "[whole_array] build did not produce $built" >&2; exit 1; }
+case "$stem" in
+  *_32x32x32_8c_modalidnat|*_32x32x32_8c_modalsilunat)
+    python3 "$REPO/scripts/kernel_families/whole_array_recipe.py" \
+      --record-native-contract "$stem" "$MMW/build"
+    ;;
+esac
 echo "[whole_array] built $stem in $MMW/build"

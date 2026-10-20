@@ -29,6 +29,9 @@ pub struct EsmEmbedPipeline {
 }
 impl EsmEmbedPipeline {
     pub fn build(cfg: &ScenarioConfig, root: &Path, dev: Rc<Device>) -> Result<Self, EngineError> {
+        if cfg.embeddings.batch_rows.is_some() {
+            return Err(EngineError::Load("batch_rows is supported only by the BERT packed CLS encoder".into()));
+        }
         let m = cfg.model_or_err().map_err(EngineError::Load)?;
         // Uniform declarative entry point: checkpoint (bake-on-missing) when artifacts.source is set,
         // else NPU_WEIGHTS_CHECKPOINT env, else the legacy npy dir -- all behind one call.
@@ -59,6 +62,10 @@ impl EsmEmbedPipeline {
 impl crate::pipeline::Embedder for EsmEmbedPipeline {
     fn embed_one(&self, text: String) -> Result<Vec<f32>, EngineError> {
         Ok(self.embed(text))
+    }
+    fn embed_many(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EngineError> {
+        // ESM has no passage-aware encoder batch; preserve its public array API explicitly.
+        texts.iter().map(|text| self.embed_one((*text).to_string())).collect()
     }
     fn bo_bytes(&self) -> u64 {
         self.dev.resident_bo_bytes()

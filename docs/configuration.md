@@ -330,3 +330,21 @@ Status codes carry meaning: `503` means "the server has no model for this capabi
 no NPU device" (nothing a client can fix by retrying differently); `400` means the
 request itself is malformed or asks for something unsupported; `500` means a device or
 load error.
+
+### Packed BERT CLS instances
+
+`[embeddings].batch_rows` opts a separate native-BF16 CLS instance into bounded
+packed-row encoding; omission retains existing behavior. The complete opt-in
+[`scenarios/bge-base-cls.toml`](../scenarios/bge-base-cls.toml) selects native precision,
+normalized CLS, a 1024-row physical capacity and exactly three matching whole-array
+kernel stems. The existing `bge-base.toml` stays mean-pooled; selecting the new scenario
+does not change defaults or aliases automatically.
+
+Each declared Native stem requires its xclbin, runtime-selected instructions and
+original build contract, plus the usual pair/source manifest and toolchain stamps.
+Publication and declared verification enforce shape/precision and actual-byte binding;
+Fast kernels do not require Native contracts. Per-passage input is limited to 512
+tokens including special tokens, without silent truncation at the configured CLS
+fallible/service boundary. HTTP scalar and singleton arrays share the packed array
+route. See [packed CLS encoder](batched-cls-encoder.md) for recipes, legacy/internal
+API distinctions, staged-root checks and the remaining real-service/device boundary.

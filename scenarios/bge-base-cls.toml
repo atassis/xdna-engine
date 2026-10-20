@@ -1,0 +1,31 @@
+[scenario]
+kind = "embeddings"
+name = "bge-base-en-v1.5-cls"
+
+[model]
+hidden = 768
+ff = 3072
+n_heads = 12
+head_dim = 64
+n_layers = 12
+max_seq = 512
+precision = "native"
+
+[artifacts]
+weights = "artifacts/bge-base/encoder"
+tokenizer = "artifacts/bge-base/tokenizer.json"
+onnx_ref = "artifacts/bge-base/model.onnx"
+
+[kernels.whole_array]
+required = [
+  "1024x800x3072_32x32x32_8c_modalsilunat",
+  "1024x800x768_32x32x32_8c_modalidnat",
+  "1024x800x3072_32x32x32_8c_modalidnat",
+]
+recipe = "scripts/kernel_families/whole_array.sh"
+sources = ["aie_kernels", "designs/whole_array_fused", "scripts/kernel_families/whole_array.sh", "scripts/kernel_families/whole_array_recipe.py"]
+
+[embeddings]
+pooling = "cls"
+normalize = true
+batch_rows = 1024

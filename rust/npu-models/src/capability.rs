@@ -77,6 +77,8 @@ impl Capability {
 pub enum Request {
     /// `EmbedPipeline`/`EsmEmbedPipeline`'s shape: one string in.
     Text(String),
+    /// Ordered independent passages, delivered to an embedder as one request.
+    Texts(Vec<String>),
     /// `Model::transcribe`'s shape: mono PCM plus the rate it was sampled at. The rate travels with
     /// the samples rather than being assumed 16 kHz -- the models resample, and a silently wrong
     /// rate is a wrong transcript, not an error.
@@ -97,6 +99,7 @@ impl Request {
     pub fn shape(&self) -> &'static str {
         match self {
             Request::Text(_) => "text",
+            Request::Texts(_) => "texts",
             Request::Audio { .. } => "audio",
             Request::Image { .. } => "image",
             Request::Decide(_) => "decide",
@@ -120,6 +123,8 @@ pub struct Segment {
 pub enum Response {
     /// `EmbedPipeline::embed`'s shape: one embedding vector out.
     Vector(Vec<f32>),
+    /// One vector per independent passage in request order.
+    Vectors(Vec<Vec<f32>>),
     /// A transcript or a generated completion -- ASR and generate differ in what produces the text,
     /// not in its shape.
     Text(String),
@@ -143,6 +148,7 @@ impl Response {
     pub fn shape(&self) -> &'static str {
         match self {
             Response::Vector(_) => "vector",
+            Response::Vectors(_) => "vectors",
             Response::Text(_) => "text",
             Response::Audio { .. } => "audio",
             Response::Image { .. } => "image",

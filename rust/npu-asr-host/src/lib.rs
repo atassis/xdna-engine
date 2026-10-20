@@ -6,6 +6,7 @@
 use ndarray::prelude::*;
 
 pub mod prof;
+pub mod batch;
 
 /// bf16 round-to-nearest-even of an f32 (truncate-with-round of the mantissa). Matches numpy
 /// ml_dtypes.bfloat16.

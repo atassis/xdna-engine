@@ -24,6 +24,13 @@ pub fn try_build(cfg_path: &Path, root: &Path) -> Result<Scenario, EngineError> 
     // load, so a declared capability and the built one cannot disagree.
     let scen = match crate::ModelKind::from_scenario_kind(&cfg.scenario.kind) {
         Some(crate::ModelKind::Embed) => {
+            if cfg.scenario.name.to_lowercase().starts_with("esm") {
+                if cfg.embeddings.batch_rows.is_some() {
+                    return Err(EngineError::Load("batch_rows is supported only by the BERT packed CLS encoder".into()));
+                }
+            } else {
+                crate::bert::preflight_batch(&cfg, root)?;
+            }
             let dev = open_dev()?;
             if cfg.scenario.name.to_lowercase().starts_with("esm") {
                 Scenario::Embed(Box::new(crate::esm::EsmEmbedPipeline::build(&cfg, root, dev)?))

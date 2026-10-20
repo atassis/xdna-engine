@@ -160,8 +160,15 @@ impl Model {
         }
     }
 
+    /// Ordered independent passages. A BERT instance configured with `embeddings.batch_rows`
+    /// executes packed native-BF16 CLS batches; unconfigured BERT and ESM use explicit serial
+    /// compatibility. Overlength rejection applies to the configured packed boundary.
     pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EngineError> {
-        texts.iter().map(|t| self.embed(t)).collect()
+        match &self.scen {
+            Scenario::Embed(m) => m.embed_many(texts),
+            other => Err(EngineError::WrongKind {
+                wanted: ModelKind::Embed.capability(), got: kind_of(other).capability() }),
+        }
     }
 
     /// Text generation: prompt -> tokens, streamed to `sink` as they are produced.
@@ -287,5 +294,32 @@ mod tests {
         assert_eq!(ModelKind::from_scenario_kind("embeddings"), Some(ModelKind::Embed));
         assert_eq!(ModelKind::from_scenario_kind("diarize"), Some(ModelKind::Diarize));
         assert_eq!(ModelKind::from_scenario_kind("generate"), Some(ModelKind::Generate));
+    }
+}
+
+#[cfg(test)]
+mod embedding_batch_tests {
+    use super::*;
+    use std::{cell::Cell, rc::Rc};
+
+    struct NativeBatchSpy(Rc<Cell<usize>>);
+    impl crate::pipeline::Embedder for NativeBatchSpy {
+        fn embed_one(&self, _: String) -> Result<Vec<f32>, EngineError> {
+            panic!("array must not invoke single-text embedding")
+        }
+        fn embed_many(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EngineError> {
+            self.0.set(self.0.get() + 1);
+            Ok(texts.iter().map(|t| vec![t.len() as f32]).collect())
+        }
+    }
+
+    #[test]
+    fn model_embedding_array_reaches_native_batch_once_in_order() {
+        let calls = Rc::new(Cell::new(0));
+        let model = Model { scen: Scenario::Embed(Box::new(NativeBatchSpy(calls.clone()))), hidden: None };
+        assert_eq!(model.embed_batch(&["bbb", "a", "bbb", ""]).unwrap(), vec![vec![3.], vec![1.], vec![3.], vec![0.]]);
+        assert_eq!(calls.get(), 1);
+        assert!(model.embed_batch(&[]).unwrap().is_empty());
+        assert_eq!(calls.get(), 2);
     }
 }

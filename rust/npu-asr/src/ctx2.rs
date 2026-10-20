@@ -131,6 +131,8 @@ impl Precision {
 /// different resident xclbin and a different set of instruction streams, not a different parameter.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CtxAShape {
+    /// Physical GEMM row capacity, shared by the program, streams and activation/output BOs.
+    pub rows: usize,
     /// Contraction width K: every op on this context takes `[m, ka]` activations.
     pub ka: usize,
     /// Widest output width served. The resident xclbin is built at this N; narrower ops run on it
@@ -154,11 +156,11 @@ impl CtxAShape {
     /// here because ESM rounds its 1280-wide FFN up to it (`esm::encoder::round_stream`), and every
     /// model on this context shares one stream list.
     pub fn whisper_small() -> CtxAShape {
-        CtxAShape { ka: 768, na: 3072, mm2_out: 768, streams: vec![768, 1536, 3072], tile: None }
+        CtxAShape { rows: PAD_M, ka: 768, na: 3072, mm2_out: 768, streams: vec![768, 1536, 3072], tile: None }
     }
     /// whisper-large-v3-turbo: d_model 1280, ffn 5120.
     pub fn whisper_turbo() -> CtxAShape {
-        CtxAShape { ka: 1280, na: 5120, mm2_out: 1280, streams: vec![1280, 5120],
+        CtxAShape { rows: PAD_M, ka: 1280, na: 5120, mm2_out: 1280, streams: vec![1280, 5120],
                     tile: Some((32, 32, 32)) }
     }
     /// The ctxA shape for a Whisper encoder of this width, or an error naming what is missing.
@@ -176,12 +178,80 @@ impl CtxAShape {
         }
     }
 
+    pub fn check_rows(&self, rows: usize) -> Result<(), String> {
+        if rows > self.rows {
+            Err(format!("ctxA: {rows} rows exceed artifact capacity {}", self.rows))
+        } else { Ok(()) }
+    }
+
+    pub fn activation_bytes(&self, cfg: &crate::tuning::TuningConfig) -> Result<usize, String> {
+        let k = if cfg.precision.is_int8() { self.ka } else {
+            self.ka.checked_add(32).ok_or("ctxA K-augmentation overflow")?
+        };
+        self.rows.checked_mul(k).and_then(|v| v.checked_mul(cfg.precision.in_bytes()))
+            .ok_or_else(|| "ctxA activation size overflow".into())
+    }
+
+    pub fn output_bytes(&self) -> Result<usize, String> {
+        self.rows.checked_mul(self.na).and_then(|v| v.checked_mul(4))
+            .ok_or_else(|| "ctxA output size overflow".into())
+    }
+
+    pub fn validate(&self, cfg: &crate::tuning::TuningConfig) -> Result<(), String> {
+        let (m, k, n) = self.tile.unwrap_or_else(|| cfg.precision.tile());
+        let row_grid = m.checked_mul(4).filter(|&v| v != 0);
+        let col_grid = n.checked_mul(8).filter(|&v| v != 0);
+        let device_k = if cfg.precision.is_int8() { Some(self.ka) } else { self.ka.checked_add(32) };
+        if k == 0 || self.rows == 0
+            || row_grid.map(|grid| self.rows % grid != 0).unwrap_or(true)
+            || col_grid.is_none() || device_k.map(|v| k == 0 || v % k != 0).unwrap_or(true)
+            || self.ka == 0 || self.na == 0 || (self.ka != 0 && self.na % self.ka != 0)
+            || !self.streams.contains(&self.mm2_out) || !self.streams.contains(&self.na)
+            || self.streams.iter().any(|&v| v == 0 || v > self.na || col_grid.map(|g| v % g != 0).unwrap_or(true)) {
+            return Err(format!("invalid ctxA shape {self:?} at tile {m}x{k}x{n}"));
+        }
+        self.activation_bytes(cfg)?;
+        self.output_bytes()?;
+        Ok(())
+    }
+
+    pub fn stream_stem(&self, cfg: &crate::tuning::TuningConfig, n: usize, mode: u8) -> String {
+        let (mt, kt, nt) = self.tile.unwrap_or_else(|| cfg.precision.tile());
+        let rows = self.rows;
+        if cfg.precision.is_int8() {
+            format!("{rows}x{}x{n}_{mt}x{kt}x{nt}_8c", self.ka)
+        } else {
+            let tag = match mode { 0 => "modalid", 1 => "modalsilu", 2 => "modalgelu", _ => panic!("invalid ctxA mode {mode}") };
+            format!("{rows}x{}x{n}_{mt}x{kt}x{nt}_8c_{tag}{}", self.kaug(), cfg.precision.nat_tag())
+        }
+    }
+
+    /// Host-only preflight for the native packed-row rail. Receipts bind emitted operand shapes
+    /// to artifact hashes; a filename alone cannot establish an xclbin's row capacity.
+    pub fn preflight_native(&self, root: &Path, cfg: &crate::tuning::TuningConfig) -> Result<(), String> {
+        self.validate(cfg)?;
+        if cfg.precision != Precision::NativeBf16 || self.tile != Some((32, 32, 32)) {
+            return Err("packed ctxA requires explicit native bf16, tile 32x32x32".into());
+        }
+        let dir = crate::kernel_registry::resolve_kernel_dir(root, WA_SUBDIR);
+        let mut stems = vec![(xclbin_stem(self, cfg), self.na)];
+        stems.extend(self.streams.iter().map(|&n| (self.stream_stem(cfg, n, 0), n)));
+        for (stem, n) in stems {
+            crate::kernel_registry::validate_native_artifact_contract(&dir, &stem,
+                &crate::kernel_registry::NativeArtifactShape {
+                    rows: self.rows, k: self.kaug(), n, tile: [32, 32, 32],
+                })?;
+        }
+        Ok(())
+    }
+
     /// Contraction width the DEVICE sees under the modal epilogue: one extra 32-wide k-block carries
     /// the bias (`A_aug=[A|ones]`, `B_aug=[B;bias]`), so no host bias-add and no third DMA channel.
     pub fn kaug(&self) -> usize { self.ka + 32 }
     /// How many `[ka, mm2_out]` partials the FFN's second matmul splits into.
     pub fn mm2_ksplit(&self) -> usize { self.na / self.ka }
 }
+
 
 impl Default for CtxAShape {
     fn default() -> Self { CtxAShape::whisper_small() }
@@ -217,8 +287,8 @@ pub struct SharedCtxA {
     kern: Rc<Kernel>,
     /// per-shape instruction streams: (N, instr BO, n_instr). Same resident kernel; swap per op.
     streams: Vec<(usize, Bo, usize)>,
-    bo_a: Bo, // activation bf16 [PAD_M, KA] (reused, written per dispatch)
-    bo_c: Bo, // output f32 [PAD_M, NA] (reused; an N=n stream writes [PAD_M, n] contiguous = prefix)
+    bo_a: Bo, // activation bf16 [rows, KA] (reused, written per dispatch)
+    bo_c: Bo, // output f32 [rows, NA] (reused; an N=n stream writes [rows, n] contiguous = prefix)
     bo_tmp: Bo,
     bo_tr: Bo,
     /// group_id(4) so each op can allocate its weight BO against the shared kernel's B slot.
@@ -226,9 +296,9 @@ pub struct SharedCtxA {
     prec: Precision,
     a_buf: RefCell<Vec<u16>>,  // bf16 paths: host activation scratch (bf16 bits), zero-padded once
     a_buf_i8: RefCell<Vec<i8>>, // int8 path: host activation scratch (quantized), empty for bf16
-    cbuf: RefCell<Vec<f32>>,  // reused output readback buffer (PAD_M*NA, 4B/elem; f32 for bf16, i32-bits for int8)
+    cbuf: RefCell<Vec<f32>>,  // reused output readback buffer (rows*NA, 4B/elem; f32 for bf16, i32-bits for int8)
     // LE = native x86 f32, so we read straight into this aligned f32 buffer (no per-elem from_le_bytes)
-    // first dispatch writes the FULL activation BO (zeroing device padding rows mp..PAD_M); later
+    // first dispatch writes the FULL activation BO (zeroing device padding rows mp..rows); later
     // dispatches write only the mp prefix (the padding rows stay zero on device thereafter).
     a_inited: std::cell::Cell<bool>,
     /// Goal-1 async overlap: double-buffer slots for pipelining the INDEPENDENT mm2 K-split partials
@@ -293,13 +363,7 @@ pub fn required_stems(cfg: &crate::tuning::TuningConfig) -> Vec<String> {
 }
 
 pub fn xclbin_stem(shape: &CtxAShape, cfg: &crate::tuning::TuningConfig) -> String {
-    let prec = cfg.precision;
-    let (mt, kt, nt) = shape.tile.unwrap_or_else(|| prec.tile());
-    if !prec.is_int8() {
-        format!("{PAD_M}x{}x{}_{mt}x{kt}x{nt}_8c_modalsilu{}", shape.kaug(), shape.na, prec.nat_tag())
-    } else {
-        format!("{PAD_M}x{}x{}_{mt}x{kt}x{nt}_8c", shape.ka, shape.na)
-    }
+    shape.stream_stem(cfg, shape.na, 1)
 }
 
 impl SharedCtxA {
@@ -323,6 +387,8 @@ impl SharedCtxA {
 
     pub fn with_shape(dev: &Rc<Device>, root: &Path, cfg: &crate::tuning::TuningConfig,
                       shape: CtxAShape) -> Rc<Self> {
+        shape.validate(cfg).expect("ctxA shape");
+        let rows = shape.rows;
         let prec = cfg.precision;
         let wa = crate::kernel_registry::resolve_kernel_dir(root, WA_SUBDIR);
         // The tile is the precision's unless this shape's kernels were built at another one.
@@ -368,9 +434,7 @@ impl SharedCtxA {
             for &n in shape.streams.iter() {
                 // mode: 1=silu, 0=identity (every N). All modes run on the loaded xclbin.
                 for (mode, tag) in [(1u8, "modalsilu"), (0u8, "modalid")] {
-                    let nat = prec.nat_tag();
-                    let kaug = shape.kaug();
-                    let insts = crate::kernel_registry::insts_path(&wa, &format!("{PAD_M}x{kaug}x{n}_{mt}x{kt}x{nt}_8c_{tag}{nat}"));
+                    let insts = crate::kernel_registry::insts_path(&wa, &shape.stream_stem(cfg, n, mode));
                     // A mode with no built stream is skipped, not fatal: a model uses a subset of
                     // {identity, silu, gelu} and the set that exists differs per shape (whisper's
                     // encoder never asks for silu; only its fc1 asks for gelu, at N=ffn). Asking for
@@ -388,8 +452,7 @@ impl SharedCtxA {
             }
         } else {
             for &n in shape.streams.iter() {
-                let ka = shape.ka;
-                let insts = crate::kernel_registry::insts_path(&wa, &format!("{PAD_M}x{ka}x{n}_{mt}x{kt}x{nt}_8c"));
+                let insts = crate::kernel_registry::insts_path(&wa, &shape.stream_stem(cfg, n, 0));
                 let (bo, n_instr) = load_stream(&insts);
                 streams.push((n, bo, n_instr));
             }
@@ -397,8 +460,8 @@ impl SharedCtxA {
 
         // activation BO: in_bytes/elem (bf16=2, int8=1), K = ka_dev (768 / 800 modal). Output BO is
         // 4B/elem (f32 / i32).
-        let bo_a = dev.alloc_bo(&kern, PAD_M * ka_dev * prec.in_bytes(), FLAG_HOST_ONLY, g_a).unwrap();
-        let bo_c = dev.alloc_bo(&kern, PAD_M * shape.na * 4, FLAG_HOST_ONLY, g_c).unwrap();
+        let bo_a = dev.alloc_bo(&kern, shape.activation_bytes(cfg).unwrap(), FLAG_HOST_ONLY, g_a).unwrap();
+        let bo_c = dev.alloc_bo(&kern, shape.output_bytes().unwrap(), FLAG_HOST_ONLY, g_c).unwrap();
         let bo_tmp = dev.alloc_bo(&kern, 1, FLAG_HOST_ONLY, g_tmp).unwrap();
         let bo_tr = dev.alloc_bo(&kern, 4, FLAG_HOST_ONLY, g_tr).unwrap();
 
@@ -414,21 +477,21 @@ impl SharedCtxA {
             for _ in 0..2 {
                 // modal: K-aug pipe activation (ones-column at KA) so the mm2 partials' identity stream
                 // adds their (zero) bias correctly; sized ka_dev.
-                let mut a_buf = vec![0u16; PAD_M * ka_dev];
+                let mut a_buf = vec![0u16; rows * ka_dev];
                 if modal {
                     let one = f32_to_bf16_bits(1.0);
-                    for r in 0..PAD_M {
+                    for r in 0..rows {
                         a_buf[r * ka_dev + shape.ka] = one;
                     }
                 }
                 pipe.push(PipeSlot {
-                    bo_a: dev.alloc_bo(&kern, PAD_M * ka_dev * prec.in_bytes(), FLAG_HOST_ONLY, g_a).unwrap(),
-                    bo_c: dev.alloc_bo(&kern, PAD_M * shape.na * 4, FLAG_HOST_ONLY, g_c).unwrap(),
+                    bo_a: dev.alloc_bo(&kern, shape.activation_bytes(cfg).unwrap(), FLAG_HOST_ONLY, g_a).unwrap(),
+                    bo_c: dev.alloc_bo(&kern, shape.output_bytes().unwrap(), FLAG_HOST_ONLY, g_c).unwrap(),
                     bo_tmp: dev.alloc_bo(&kern, 1, FLAG_HOST_ONLY, g_tmp).unwrap(),
                     bo_tr: dev.alloc_bo(&kern, 4, FLAG_HOST_ONLY, g_tr).unwrap(),
-                    cbuf: RefCell::new(vec![0f32; PAD_M * shape.na]),
+                    cbuf: RefCell::new(vec![0f32; rows * shape.na]),
                     a_buf: RefCell::new(if prec.is_int8() { Vec::new() } else { a_buf }),
-                    a_buf_i8: RefCell::new(if prec.is_int8() { vec![0i8; PAD_M * shape.ka] } else { Vec::new() }),
+                    a_buf_i8: RefCell::new(if prec.is_int8() { vec![0i8; rows * shape.ka] } else { Vec::new() }),
                     a_inited: std::cell::Cell::new(false),
                 });
             }
@@ -448,19 +511,19 @@ impl SharedCtxA {
             a_buf: RefCell::new(if prec.is_int8() {
                 Vec::new()
             } else {
-                // modal: K-aug activation [PAD_M, 800] with the ones-column at index KA (so the K-aug
+                // modal: K-aug activation [rows, 800] with the ones-column at index KA (so the K-aug
                 // matmul adds bias); the conversion loop writes only cols 0..KA, leaving this intact.
-                let mut v = vec![0u16; PAD_M * ka_dev];
+                let mut v = vec![0u16; rows * ka_dev];
                 if modal {
                     let one = f32_to_bf16_bits(1.0);
-                    for r in 0..PAD_M {
+                    for r in 0..rows {
                         v[r * ka_dev + shape.ka] = one;
                     }
                 }
                 v
             }),
-            a_buf_i8: RefCell::new(if prec.is_int8() { vec![0i8; PAD_M * shape.ka] } else { Vec::new() }),
-            cbuf: RefCell::new(vec![0f32; PAD_M * shape.na]),
+            a_buf_i8: RefCell::new(if prec.is_int8() { vec![0i8; rows * shape.ka] } else { Vec::new() }),
+            cbuf: RefCell::new(vec![0f32; rows * shape.na]),
             a_inited: std::cell::Cell::new(false),
             pipeline,
             pipe,
@@ -489,7 +552,7 @@ impl SharedCtxA {
             .unwrap_or_else(|| panic!(
                 "ctxA modal: no stream N={n} mode={mode} (0=identity, 1=silu, 2=gelu); build \
                  insts_{}x{}x{n}_*_8c_modal{} for this shape",
-                PAD_M, self.shape.kaug(),
+                self.shape.rows, self.shape.kaug(),
                 match mode { 0 => "id", 1 => "silu", _ => "gelu" }))
     }
 
@@ -499,7 +562,8 @@ impl SharedCtxA {
     /// activation scale to dequant with in [`pipe_read`]. bf16 and int8 both supported.
     fn pipe_start(&self, s: usize, a_real: ArrayView2<f32>, bo_b: &Bo, n: usize) -> (Run, f32) {
         let (mp, kk) = a_real.dim();
-        debug_assert_eq!(kk, self.shape.ka);
+        assert_eq!(kk, self.shape.ka);
+        self.shape.check_rows(mp).expect("ctxA pipelined dispatch rows");
         let slot = &self.pipe[s];
         let tc = Instant::now();
         let scale_a = if self.prec.is_int8() {
@@ -723,7 +787,7 @@ impl CtxAOp {
         })
     }
 
-    /// `a_real` is `[Mp, KA]` (Mp <= PAD_M). Returns `[Mp, n]` f32 with the host epilogue applied.
+    /// `a_real` is `[Mp, KA]` (Mp <= shape.rows). Returns `[Mp, n]` f32 with the host epilogue applied.
     pub fn forward(&self, a_real: &Array2<f32>) -> Array2<f32> {
         self.forward_view(a_real.view())
     }
@@ -738,7 +802,7 @@ impl CtxAOp {
         }
         let (mp, kk) = a_real.dim();
         assert_eq!(kk, self.shared.shape.ka);
-        assert!(mp <= PAD_M);
+        self.shared.shape.check_rows(mp).expect("ctxA dispatch rows");
         let sh = &self.shared;
 
         // --- write/convert activation into the shared bf16 buffer (rows beyond mp stay zero) ---
@@ -788,7 +852,7 @@ impl CtxAOp {
         let tf = Instant::now();
         sh.bo_c.sync_from_device().unwrap();
         marsh::add(marsh::SYNC_FROM, tf.elapsed());
-        // an N=n stream writes [PAD_M, n] contiguous f32; the first mp rows are [mp, n] contiguous.
+        // an N=n stream writes [rows, n] contiguous f32; the first mp rows are [mp, n] contiguous.
         // Read straight into the aligned f32 buffer (device f32 LE == native x86 f32 layout).
         let tr = Instant::now();
         {
@@ -832,7 +896,7 @@ impl CtxAOp {
     fn forward_view_int8(&self, a_real: ArrayView2<f32>) -> Array2<f32> {
         let (mp, kk) = a_real.dim();
         assert_eq!(kk, self.shared.shape.ka);
-        assert!(mp <= PAD_M);
+        self.shared.shape.check_rows(mp).expect("ctxA dispatch rows");
         let sh = &self.shared;
         let n = self.n;
 
@@ -900,7 +964,7 @@ impl CtxAOp {
         assert!(!self.shared.prec.is_int8(), "forward_activated_bf16 is bf16-only");
         let (mp, kk) = a_real.dim();
         assert_eq!(kk, self.shared.shape.ka);
-        assert!(mp <= PAD_M);
+        self.shared.shape.check_rows(mp).expect("ctxA dispatch rows");
         let sh = &self.shared;
         let kd = sh.ka_dev;
         let n = self.n;
@@ -999,7 +1063,7 @@ impl CtxAOp {
         col_off: usize,
     ) -> Array2<f32> {
         assert!(!self.shared.prec.is_int8(), "forward_bf16_rows is bf16-only");
-        assert!(mp <= PAD_M);
+        self.shared.shape.check_rows(mp).expect("ctxA dispatch rows");
         let sh = &self.shared;
         let kd = sh.ka_dev;
         let n = self.n;
@@ -1118,7 +1182,7 @@ pub struct FfnMm2 {
     bias2: Vec<f32>,    // length self.shape.mm2_out, added on host once after the partial sum
     /// Resident-FFN draft (`forward_resident`): the reused `[mp, NA]` bf16 buffer that holds the
     /// fc1->fc2 intermediate across the seam (no f32 materialize, no per-partial re-conversion). Empty
-    /// until the resident path is first used; lazily grown to `PAD_M*NA`.
+    /// until the resident path is first used; lazily grown to `rows*NA`.
     inter: RefCell<Vec<u16>>,
 }
 
@@ -1543,6 +1607,78 @@ mod tests {
         assert_eq!(t.mm2_ksplit(), 4, "ffn/d_model is 4 for both sizes, so mm2 splits the same way");
         assert_eq!(t.tile, Some((32, 32, 32)),
             "turbo is uniform m=32: N=5120 at m=64 overruns the 20-bit ShimNOC BD stride field");
+    }
+
+    #[test]
+    fn larger_m_owns_allocation_stream_and_dispatch_bounds() {
+        let cfg = TuningConfig::baked_default(Precision::NativeBf16);
+        let mut shape = CtxAShape::whisper_small();
+        shape.rows = 1024;
+        shape.tile = Some((32, 32, 32));
+        shape.validate(&cfg).unwrap();
+        assert_eq!(shape.activation_bytes(&cfg).unwrap(), 1024 * 800 * 2);
+        assert_eq!(shape.output_bytes().unwrap(), 1024 * 3072 * 4);
+        assert_eq!(xclbin_stem(&shape, &cfg), "1024x800x3072_32x32x32_8c_modalsilunat");
+        assert_eq!(shape.stream_stem(&cfg, 768, 0), "1024x800x768_32x32x32_8c_modalidnat");
+        assert!(shape.check_rows(603).is_ok());
+        assert!(CtxAShape::default().check_rows(603).is_err());
+        assert!(shape.check_rows(1025).is_err());
+        shape.rows = 1025;
+        assert!(shape.validate(&cfg).is_err());
+        shape.rows = 0;
+        assert!(shape.validate(&cfg).is_err());
+    }
+
+    #[test]
+    fn native_preflight_rejects_missing_wrong_m_and_replaced_streams_without_device() {
+        use sha2::{Digest, Sha256};
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("kernels/whole_array");
+        std::fs::create_dir_all(&dir).unwrap();
+        let shape = CtxAShape { rows: 1024, tile: Some((32,32,32)), streams: vec![768,3072], ..CtxAShape::default() };
+        let cfg = TuningConfig::baked_default(Precision::NativeBf16);
+        assert!(shape.preflight_native(root.path(), &cfg).unwrap_err().contains("contract_1024"));
+        let hash = format!("{:x}", Sha256::digest(b"fixture"));
+        let mut paths = vec![];
+        for (stem, n) in [(xclbin_stem(&shape, &cfg), 3072), (shape.stream_stem(&cfg, 768, 0), 768), (shape.stream_stem(&cfg, 3072, 0), 3072)] {
+            let contract = serde_json::json!({"rows":1024,"k":800,"n":n,"tile":[32,32,32],"precision":"native", "xclbin_sha256":hash,"insts_sha256":hash});
+            let path = dir.join(format!("contract_{stem}.json"));
+            std::fs::write(&path, contract.to_string()).unwrap();
+            paths.push(path);
+            std::fs::write(crate::kernel_registry::xclbin_path(&dir, &stem), b"fixture").unwrap();
+            std::fs::write(crate::kernel_registry::insts_path(&dir, &stem), b"fixture").unwrap();
+        }
+        shape.preflight_native(root.path(), &cfg).unwrap();
+        let good = std::fs::read_to_string(&paths[1]).unwrap();
+        let mut wrong: serde_json::Value = serde_json::from_str(&good).unwrap();
+        wrong["rows"] = 512.into();
+        std::fs::write(&paths[1], wrong.to_string()).unwrap();
+        assert!(shape.preflight_native(root.path(), &cfg).unwrap_err().contains("extent/precision mismatch"));
+        for (field, value) in [("k", serde_json::json!(768)), ("n", serde_json::json!(3072)),
+            ("tile", serde_json::json!([64,32,32])), ("precision", serde_json::json!("bf16"))] {
+            let mut wrong: serde_json::Value = serde_json::from_str(&good).unwrap();
+            wrong[field] = value;
+            std::fs::write(&paths[1], wrong.to_string()).unwrap();
+            assert!(shape.preflight_native(root.path(), &cfg).is_err());
+        }
+        std::fs::write(&paths[1], "malformed").unwrap();
+        assert!(shape.preflight_native(root.path(), &cfg).unwrap_err().contains("parse"));
+        std::fs::write(&paths[1], good).unwrap();
+        let stem = shape.stream_stem(&cfg, 768, 0);
+        let txt = crate::kernel_registry::insts_path(&dir, &stem);
+        let bin = dir.join(format!("insts_{stem}.bin"));
+        std::fs::rename(&txt, &bin).unwrap();
+        shape.preflight_native(root.path(), &cfg).unwrap();
+        std::fs::write(&txt, b"stale preferred txt").unwrap();
+        assert!(shape.preflight_native(root.path(), &cfg).unwrap_err().contains("hash mismatch"));
+        std::fs::remove_file(txt).unwrap();
+        let stream = crate::kernel_registry::insts_path(&dir, &shape.stream_stem(&cfg, 768, 0));
+        std::fs::write(&stream, b"old-512-instructions").unwrap();
+        assert!(shape.preflight_native(root.path(), &cfg).unwrap_err().contains("hash mismatch"));
+        for precision in [Precision::FastBf16, Precision::Int8] {
+            let wrong = TuningConfig::baked_default(precision);
+            assert!(shape.preflight_native(root.path(), &wrong).is_err());
+        }
     }
 
     /// An unbuilt size must be an error here, not a filename that fails to open on the device.

@@ -4,7 +4,9 @@ use std::path::Path;
 use std::rc::Rc;
 
 use ndarray::{s, Array2};
-use npu_asr::ctx2::{CtxAOp, Epi, FfnMm2, SharedCtxA};
+use npu_asr::ctx2::{CtxAOp, CtxAShape, Epi, FfnMm2, SharedCtxA};
+use npu_asr::tuning::TuningConfig;
+use npu_asr_host::batch::{segmented_mha, PassageSpans};
 use npu_asr_host::{gelu, layer_norm, mha};
 use npu_parakeet::npu::{Act, NpuMatmul};
 use npu_xrt::Device;
@@ -56,12 +58,17 @@ impl BertBlock {
         }
     }
 
-    fn forward(&self, x: &Array2<f32>, valid_len: usize) -> Array2<f32> {
+    fn forward(&self, x: &Array2<f32>, valid_len: usize, spans: Option<&PassageSpans>) -> Array2<f32> {
         // --- self-attention (post-norm) ---
         let q = self.q.forward(x);
         let k = self.k.forward(x);
         let v = self.v.forward(x);
-        let ctx = mha(&q, &k, &v, self.n_heads, self.head_dim, false, valid_len);
+        // Only attention partitions passages; projections, FFNs and row-wise host stages share M.
+        let ctx = match spans {
+            Some(spans) => segmented_mha(&q, &k, &v, self.n_heads, self.head_dim, spans)
+                .expect("validated BERT packed attention"),
+            None => mha(&q, &k, &v, self.n_heads, self.head_dim, false, valid_len),
+        };
         let attn = self.o.forward(&ctx);
         let x = add(x, &attn);
         let x = layer_norm(&x, &self.attn_ln_w, &self.attn_ln_b, LN_EPS);
@@ -120,16 +127,34 @@ fn add(a: &Array2<f32>, b: &Array2<f32>) -> Array2<f32> {
 
 pub struct BertEncoder {
     blocks: Vec<BertBlock>,
+    row_capacity: usize,
 }
 
 impl BertEncoder {
     pub fn new(dev: Rc<Device>, root: &Path, weights: &BertWeights, n_heads: usize, head_dim: usize) -> Self {
         let cfg = crate::tuning_profile::resolve(root, npu_asr::ctx2::Precision::from_env());
-        let shared = SharedCtxA::with_tuning(&dev, root, &cfg);
+        Self::with_shape(dev, root, weights, n_heads, head_dim, &cfg, CtxAShape::default())
+    }
+
+    pub fn with_shape(dev: Rc<Device>, root: &Path, weights: &BertWeights, n_heads: usize, head_dim: usize,
+                      cfg: &TuningConfig, shape: CtxAShape) -> Self {
+        let row_capacity = shape.rows;
+        let shared = SharedCtxA::with_shape(&dev, root, cfg, shape);
         let blocks = (0..weights.n_layers())
             .map(|i| BertBlock::new(shared.clone(), &weights.layers[i], n_heads, head_dim))
             .collect();
-        BertEncoder { blocks }
+        BertEncoder { blocks, row_capacity }
+    }
+
+    pub fn forward_packed(&self, x: &Array2<f32>, spans: &PassageSpans) -> Result<Array2<f32>, String> {
+        if x.nrows() != spans.rows() || x.nrows() > self.row_capacity || x.ncols() != 768 {
+            return Err("BERT packed rows do not match passage spans, capacity or hidden width".into());
+        }
+        let mut x = x.clone();
+        for block in &self.blocks {
+            x = block.forward(&x, spans.rows(), Some(spans));
+        }
+        Ok(x)
     }
 }
 
@@ -137,7 +162,7 @@ impl Encoder for BertEncoder {
     fn forward_last(&self, x: &Array2<f32>, valid_len: usize) -> Array2<f32> {
         let mut x = x.clone();
         for b in &self.blocks {
-            x = b.forward(&x, valid_len);
+            x = b.forward(&x, valid_len, None);
         }
         let _ = s![..]; // keep ndarray::s import used if slicing added later
         x

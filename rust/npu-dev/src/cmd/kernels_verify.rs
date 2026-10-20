@@ -7,10 +7,7 @@
 //! not appear in it. Scenario declarations are the other half -- the model-owned list of what
 //! MUST be there, independent of what currently is.
 //!
-//! Deliberately observability-only: this prints a report and its exit code reflects whether
-//! everything declared was found, but nothing upstream (npu.rs, install.sh) reads that exit code
-//! yet. Wiring this into a hard gate is a separate, later decision -- see declared-kernel-set,
-//! spec section 5 question 4.
+//! Installation gate: a nonzero exit rejects missing, unverified, stale or invalid artifacts.
 //!
 //!   cargo run -p npu-asr --bin verify_declared_kernels -- [<repo-root>] [<kernels-root>]
 //!
@@ -83,6 +80,10 @@ pub fn run(argv: Vec<String>) {
             DeclaredStatus::PresentUnverified => {
                 unverified += 1;
                 ("UNVERIFIED", " (file exists, no kernel_manifest.json to check it against)".to_string())
+            }
+            DeclaredStatus::InvalidContract(e) => {
+                mismatched += 1;
+                ("INVALID-CONTRACT", format!(" ({e})"))
             }
             DeclaredStatus::HashMismatch(e) => {
                 mismatched += 1;
