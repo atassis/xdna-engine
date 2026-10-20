@@ -20,6 +20,7 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from check_iron_artifact_provenance import validate as validate_iron_provenance
 from lib.data_root import XDNA_DATA
 from pyannote_local_inputs import PipelineComponent, pipeline_components, validate_local_pipeline_inputs
 
@@ -827,14 +828,15 @@ def _publish_recipe(recipe: Recipe, staged: Recipe, key: str, rollback: Path) ->
         shutil.rmtree(backup_root)
 
 
-def verified_existing_gemma4(recipe: Recipe, key: str) -> bool:
+def verified_existing_gemma4(recipe: Recipe, key: str, repo: Path) -> bool:
     if recipe.model != "gemma4-12b":
         return False
     try:
         validate_recipe_outputs(recipe)
-        meta = json.loads((Path(recipe.outputs[0]) / "meta.json").read_text())
-        iron = meta.get("iron")
-        if not isinstance(iron, dict) or not all(iron.get(name) is not None for name in ("commit", "dirty", "identity")):
+        expected = next((line.split("=", 1)[1].split("#", 1)[0].strip()
+                         for line in (repo / "toolchain.lock").read_text().splitlines()
+                         if line.startswith("IRON_SOURCE_COMMIT=")), None)
+        if not expected or validate_iron_provenance(Path(recipe.outputs[0]) / "meta.json", expected):
             return False
         for raw in recipe.outputs[3:]:
             if not (Path(raw) / ".recipe-manifest.json").is_file():
@@ -901,7 +903,7 @@ def _build_recipe(recipe: Recipe, repo: Path, artifacts: Path, build: Path, key:
     if cache_hit(recipe, key):
         expire_published_stage(recipe, key, stage_root)
         return "HIT"
-    if verified_existing_gemma4(recipe, key):
+    if verified_existing_gemma4(recipe, key, repo):
         return "VERIFIED"
     ensure_outputs_ready(recipe, key)
     if stage_root.exists():

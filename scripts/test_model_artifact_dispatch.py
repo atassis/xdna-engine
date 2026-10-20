@@ -1362,6 +1362,42 @@ class ModelArtifactDispatchPlanTests(unittest.TestCase):
             self.assertEqual(recovery.read_text(), "recovery")
             self.assertFalse((root / "rollback/key").exists())
 
+    def test_gemma4_reuse_rejects_unqualified_iron_without_changing_live_outputs(self) -> None:
+        cases = (
+            (None, {"commit": "a", "dirty": False, "identity": "pinned:a"}),
+            ("IRON_SOURCE_COMMIT=a\n", {"commit": "old", "dirty": False, "identity": "pinned:old"}),
+            ("IRON_SOURCE_COMMIT=a\n", {"commit": "a", "dirty": True, "identity": "pinned:a"}),
+            ("IRON_SOURCE_COMMIT=a\n", {"commit": "a", "dirty": False, "identity": "development:a"}),
+            ("IRON_SOURCE_COMMIT=a\n", {"commit": "a", "identity": "pinned:a"}),
+            ("IRON_SOURCE_COMMIT=a\n", {"commit": "a", "dirty": False}),
+            ("IRON_SOURCE_COMMIT=a\n", {"dirty": False, "identity": "pinned:a"}),
+            ("IRON_SOURCE_COMMIT=a\n", None),
+            ("OTHER_PIN=a\n", {"commit": "a", "dirty": False, "identity": "pinned:a"}),
+            ("IRON_SOURCE_COMMIT=\n", {"commit": "a", "dirty": False, "identity": "pinned:a"}),
+        )
+        for lock, iron in cases:
+            with self.subTest(lock=lock, iron=iron), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                if lock is not None:
+                    (root / "toolchain.lock").write_text(lock)
+                (root / "scenario.toml").write_text("[scenario]\n")
+                config = root / "engine.toml"
+                config.write_text("[server]\n")
+                outputs = tuple(str(root / name) for name in ("resident", "tokenizer", "checkpoint", "data"))
+                for raw in outputs:
+                    Path(raw).mkdir()
+                (Path(outputs[0]) / "meta.json").write_text(json.dumps({"iron": iron}))
+                (Path(outputs[0]) / ".model-recipe.json").write_text('{"sentinel":"keep"}\n')
+                (Path(outputs[3]) / ".recipe-manifest.json").write_text("{}")
+                recipe = Recipe("gemma4-12b", "scenario.toml", (), outputs, ())
+                before = {p: p.read_bytes() for raw in outputs for p in Path(raw).rglob("*") if p.is_file()}
+                with patch("model_artifact_dispatch.LOCK_ROOT", root / "locks"), \
+                        patch("model_artifact_dispatch.run_commands", side_effect=RuntimeError("fixture build required")):
+                    with self.assertRaisesRegex(RuntimeError, "fixture build required"):
+                        build_recipe(recipe, root, config, root / "artifacts", root / "build")
+                after = {p: p.read_bytes() for raw in outputs for p in Path(raw).rglob("*") if p.is_file()}
+                self.assertEqual(before, after)
+
     def test_fresh_gemma4_provenance_is_verified_without_rebuilding(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1380,7 +1416,8 @@ class ModelArtifactDispatchPlanTests(unittest.TestCase):
             for output in outputs[3:]:
                 (Path(output) / ".recipe-manifest.json").write_text("{}")
             recipe = Recipe("gemma4-12b", "scenarios/generate-gemma4-12b-resident-256k.toml", (), outputs, ())
-            self.assertTrue(verified_existing_gemma4(recipe, "key"))
+            (root / "toolchain.lock").write_text("IRON_SOURCE_COMMIT=a # pinned source\n")
+            self.assertTrue(verified_existing_gemma4(recipe, "key", root))
             self.assertTrue((Path(outputs[0]) / ".model-recipe.json").is_file())
 
     def test_failed_staged_command_never_replaces_an_unmanaged_live_output(self) -> None:
