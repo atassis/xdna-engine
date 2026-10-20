@@ -1,4 +1,6 @@
+import hashlib
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -7,6 +9,100 @@ import unittest
 
 REPO = Path(__file__).resolve().parents[1]
 HELPER = REPO / "scripts" / "lib" / "init_source_aiebu.sh"
+
+
+class ReadOnlyToolchainTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.repo = self.root / "repo"
+        (self.repo / "scripts/lib").mkdir(parents=True)
+        shutil.copy2(REPO / "scripts/toolchain_up.sh", self.repo / "scripts/toolchain_up.sh")
+        shutil.copy2(REPO / "scripts/lib/data_root.sh", self.repo / "scripts/lib/data_root.sh")
+        self.trace = self.root / "unexpected-setup"
+        for helper in ("lib/init_source_aiebu.sh", "lib/fork_python_binding.sh",
+                       "fast_build_env.sh", "toolchain_gc.sh"):
+            (self.repo / "scripts" / helper).write_text(f'echo setup >> "{self.trace}"\nexit 99\n')
+        self.lock = "MLIR_AIE_FORK_COMMIT=abc # fixture\nMLIR_DISTRO_DIR=distro\nIRON_SOURCE_COMMIT=one\n"
+        (self.repo / "toolchain.lock").write_text(self.lock)
+        distro = self.repo / "distro/bin"
+        distro.mkdir(parents=True)
+        (distro / "mlir-tblgen").touch()
+        semantic = "MLIR_AIE_FORK_COMMIT=abc\nMLIR_DISTRO_DIR=distro\n"
+        self.key = hashlib.sha256(semantic.encode()).hexdigest()[:12]
+        self.home = self.root / "instances"
+        self.instance = self.home / self.key
+        (self.instance / "python/aie/iron").mkdir(parents=True)
+        (self.instance / "python/aie/iron/program.py").write_text("def resolve_program(self, device_name): pass\n")
+        self.tools = ("aiecc", "aie-opt", "aie-translate", "aiebu-asm", "bootgen")
+        (self.instance / "bin").mkdir()
+        for tool in self.tools:
+            p = self.instance / "bin" / tool
+            p.write_text(f'#!/bin/sh\necho tool >> "{self.trace}"\nexit 99\n')
+            p.chmod(0o755)
+        include = self.instance / "build/include/aie_api"
+        include.mkdir(parents=True)
+        (include / "aie.hpp").touch()
+        self.env = dict(os.environ, TOOLCHAIN_RESOLVE_ONLY="1", TOOLCHAIN_HOME=str(self.home),
+                        XDNA_DATA=str(self.root / "data"), XDNA_CACHE=str(self.root / "cache"))
+
+    def snapshot(self):
+        return {str(p.relative_to(self.root)): (
+                    hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else None,
+                    p.stat().st_mtime_ns)
+                for p in self.root.rglob("*")}
+
+    def resolve(self):
+        before = self.snapshot()
+        result = subprocess.run(["bash", str(self.repo / "scripts/toolchain_up.sh")],
+                                env=self.env, text=True, capture_output=True)
+        self.assertEqual(before, self.snapshot(), result.stderr)
+        self.assertFalse(self.trace.exists())
+        self.assertFalse((self.root / "cache").exists())
+        return result
+
+    def test_ready_instance_resolves_without_setup_or_writes(self):
+        result = self.resolve()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), str(self.instance))
+
+    def test_missing_tool_is_not_backfilled(self):
+        for tool in self.tools:
+            with self.subTest(tool=tool):
+                p = self.instance / "bin" / tool
+                saved = p.read_bytes()
+                p.unlink()
+                result = self.resolve()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("read-only", result.stderr)
+                p.write_bytes(saved)
+                p.chmod(0o755)
+
+    def test_missing_python_or_headers_are_not_backfilled(self):
+        for name in ("python/aie/iron/program.py", "build/include/aie_api/aie.hpp"):
+            with self.subTest(name=name):
+                p = self.instance / name
+                saved = p.read_bytes()
+                p.unlink()
+                result = self.resolve()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("read-only", result.stderr)
+                p.write_bytes(saved)
+
+    def test_legacy_instance_is_not_adopted(self):
+        legacy = self.home / hashlib.sha256(self.lock.encode()).hexdigest()[:12]
+        self.instance.rename(legacy)
+        result = self.resolve()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.instance.exists())
+        self.assertIn("read-only", result.stderr)
+
+    def test_iron_only_change_reuses_the_same_compiler_instance(self):
+        (self.repo / "toolchain.lock").write_text(self.lock.replace("IRON_SOURCE_COMMIT=one", "IRON_SOURCE_COMMIT=two"))
+        result = self.resolve()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), str(self.instance))
 
 
 class AiebuBootstrapTests(unittest.TestCase):

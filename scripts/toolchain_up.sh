@@ -2,13 +2,11 @@
 # Build (or locate, if already built) the mlir-aie-with-bindings toolchain INSTANCE for the current
 # toolchain.lock, into a content-addressed dir keyed by the lock hash. Prints the instance dir on stdout.
 # Self-consistent: fork IRON (place-tiles) + fork aiecc + the kernel aie_api headers, one version.
+# TOOLCHAIN_RESOLVE_ONLY=1 returns an existing instance without setup or shared writes.
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-source "$REPO/scripts/lib/init_source_aiebu.sh"
-source "$REPO/scripts/lib/fork_python_binding.sh"
 set -a; . "$REPO/toolchain.lock"; set +a
-source "$REPO/scripts/fast_build_env.sh"   # ccache + lld (no-ops if absent)
-source "$REPO/scripts/toolchain_gc.sh"
+source "$REPO/scripts/lib/data_root.sh"
 
 # Resolve the MLIR core distro (the LLVM/MLIR framework aiecc is built ON -- NOT Peano). It is a
 # prebuilt dependency provisioned SEPARATELY by scripts/fetch_mlir_distro.sh (network); this script
@@ -40,6 +38,26 @@ _lock_semantic() {
 LOCKHASH="$(_lock_semantic | sha256sum | cut -c1-12)"
 INSTROOT="${TOOLCHAIN_HOME:-$XDNA_CACHE/instances}"
 INST="$INSTROOT/$LOCKHASH"
+
+if [ "${TOOLCHAIN_RESOLVE_ONLY:-0}" = "1" ]; then
+  # Do not adopt, backfill, patch, bind Python, touch the store, or create caches here.
+  for tool in aiecc aie-opt aie-translate aiebu-asm bootgen; do
+    [ -x "$INST/bin/$tool" ] || {
+      echo "[toolchain_up] read-only resolution: missing $INST/bin/$tool" >&2; exit 1;
+    }
+  done
+  [ -f "$INST/python/aie/iron/program.py" ] \
+    && grep -q "def resolve_program(self, device_name" "$INST/python/aie/iron/program.py" \
+    && [ -f "$INST/build/include/aie_api/aie.hpp" ] || {
+      echo "[toolchain_up] read-only resolution: incomplete fork Python/headers at $INST" >&2; exit 1;
+    }
+  echo "$INST"; exit 0
+fi
+
+source "$REPO/scripts/lib/init_source_aiebu.sh"
+source "$REPO/scripts/lib/fork_python_binding.sh"
+source "$REPO/scripts/fast_build_env.sh"   # ccache + lld (no-ops if absent)
+source "$REPO/scripts/toolchain_gc.sh"
 
 # Adopt an instance built under the legacy whole-file key instead of rebuilding an identical
 # toolchain. SYMLINK, never rename: build/CMakeCache.txt bakes this absolute path (14 references)
