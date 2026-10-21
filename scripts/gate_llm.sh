@@ -170,8 +170,8 @@ EOP
   # a hardcoded $REPO/rust/target silently misses -- and the DEVICE STEP then does nothing while
   # the judge below replays whatever dumps already existed, reporting stale PASSes.
   local tgt
-  tgt="$(cd "$REPO/rust" && cargo metadata --format-version 1 --no-deps 2>/dev/null \
-         | "$PY" -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])' 2>/dev/null)"
+  tgt="$(cd "$REPO/rust" && cargo metadata --format-version 1 --no-deps \
+         | "$PY" -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
   [ -n "$tgt" ] || tgt="$REPO/rust/target"
   local bin="$tgt/release/npu-dev"
   local rc=0 refs=() r arm name
