@@ -20,7 +20,8 @@ all tensors fp32 on disk (bf16 happens at runtime). Run in ~/npuvox-asr-bench/.v
 
 Usage: ~/npuvox-asr-bench/.venv/bin/python scripts/extract_parakeet_encoder.py
 """
-import os, json, re, shutil
+import os, json, re, shutil, tempfile
+from pathlib import Path
 import numpy as np
 import onnx
 from onnx import numpy_helper, helper
@@ -119,9 +120,8 @@ def main():
 
     # ---------- reference activations (seeded forward) ----------
     # The model is >2GB so SerializeToString() overflows protobuf's 2GB cap. Instead,
-    # reload the graph WITHOUT pulling external data inline, splice in the extra outputs,
-    # and write a small temp .onnx beside encoder-model.onnx.data so its initializers stay
-    # EXTERNAL (the temp graph is ~41MB); ORT then resolves weights from the .data file.
+    # Keep reference initializers external. ONNX rejects symlinked external data, so the
+    # temporary graph and copied data live under OUT, not in the checkpoint directory.
     mref = onnx.load(ONNX, load_external_data=False)
     gref = mref.graph
     bn = {n.name: n for n in gref.node}
@@ -139,9 +139,6 @@ def main():
         if t not in have:
             gref.output.append(helper.make_empty_tensor_value_info(t))
 
-    tmp = os.path.join(os.path.dirname(ONNX), "_ref_graph.onnx")
-    onnx.save(mref, tmp)  # initializers stay external -> small file referencing encoder-model.onnx.data
-
     rng = np.random.RandomState(SEED)
     feed = {}
     for inp in gref.input:
@@ -154,15 +151,33 @@ def main():
             feed[inp.name] = np.array([T_MEL], dtype=np.int64)
             save(f"{OUT}/refs/length.npy", feed[inp.name])
 
-    sess = ort.InferenceSession(tmp, providers=["CPUExecutionProvider"])
-    outs = sess.run(list(refs.values()), feed)
-    os.remove(tmp)
+    with tempfile.TemporaryDirectory(prefix="parakeet-ref-", dir=OUT) as work:
+        locations = {entry.value for tensor in gref.initializer for entry in tensor.external_data
+                     if entry.key == "location"}
+        for location in locations:
+            relative = Path(location)
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ValueError(f"external data location must stay relative to the graph: {location}")
+            source = (Path(ONNX).parent / relative).resolve()
+            if not source.is_file():
+                raise FileNotFoundError(source)
+            target = Path(work) / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+        tmp = str(Path(work) / "_ref_graph.onnx")
+        onnx.save(mref, tmp)
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = 2
+        options.inter_op_num_threads = 1
+        sess = ort.InferenceSession(tmp, sess_options=options, providers=["CPUExecutionProvider"])
+        outs = sess.run(list(refs.values()), feed)
     for k, arr in zip(refs.keys(), outs):
         a = np.asarray(arr)
         save(f"{OUT}/refs/{k}.npy", a)
         man["refs"][k] = list(a.shape)
 
-    json.dump(man, open(f"{OUT}/manifest.json", "w"), indent=2)
+    with open(f"{OUT}/manifest.json", "w") as manifest:
+        json.dump(man, manifest, indent=2)
     print(f"OK  blocks={NB}  weights/block={len(man['blocks'][0])}  pre_encode={len(man['pre_encode'])}")
     print("block-0 keys:", man["blocks"][0])
     print("pre_encode  :", sorted(set(man["pre_encode"])))

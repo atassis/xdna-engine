@@ -43,6 +43,13 @@ CPU round trip between layers.
 
     RF_BUILD=/path/to/build/dir designs/resident_forward/recipes/rf48C.sh
 
+Run the recipe inside a resource-limited caller scope: all parts and packing inherit that
+scope's aggregate memory, swap and CPU limits. The ladder creates no separate systemd scopes.
+Parts are serial (`RF_LADDER_JOBS=1` only); `AIECC_JOBS` defaults to the smaller of two or half
+of `nproc`, with a floor of one. Larger job requests are rejected. OpenMP, OpenBLAS and MKL
+thread pools use the same bound. The caller also owns the wall deadline and whole-cgroup
+termination; the ladder's available-memory admission check is not a hard memory limit.
+
 Writes `$RF_BUILD/rf48C/design.elf.zst` (the repo's `<name>.elf.zst`-only convention, see
 `designs/decode_fused/elf_zst.py`) plus `pack.json` (control-code sizes, the ELF's uncompressed
 `sha256`, and IRON/toolchain-instance provenance) and `gen_args.txt`.

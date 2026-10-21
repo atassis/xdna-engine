@@ -156,7 +156,8 @@ print("host preparation does not require pyxrt")
         env = os.environ.copy()
         env["PATH"] = f"{bins}:{env['PATH']}"
         env["RF_BUILD"] = str(build)
-        env["RF_LADDER_JOBS"] = "2"
+        env["RF_LADDER_JOBS"] = "1"
+        env["AIECC_JOBS"] = "1"
         return root, build, env
 
     def run_ladder(self, failed_part: str | None = None, slow_part: str | None = None) -> tuple[subprocess.CompletedProcess[str], Path]:

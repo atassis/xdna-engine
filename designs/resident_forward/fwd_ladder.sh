@@ -4,20 +4,29 @@
 # them into <name> (fwd_pack.py). A forward ladder lowered as one design needs more than the 6G
 # build cap (223 MB of MLIR swapped past 12 GB); a part of one or two forward sequences stays near 5 GB.
 #
-# Parts are admitted by MEMORY, not by whether some other session's aiecc/cargo happens to be
-# running (that pgrep loop blocked on unrelated work on a shared box). RF_LADDER_JOBS caps
-# concurrency (default 3; =1 reproduces the old fully-serial behaviour). RF_PEAK_KB below is an
-# initial table of measured per-part peak RSS keyed by the part's own emit list
-# (g4-resident-rf48c-repro-build-wall, 2026-09-30); an emit list not in the table assumes 5.5 GB.
-# A part is admitted only once MemAvailable minus a 4 GB desktop reserve covers its expected peak;
-# each part still carries its own systemd-run MemoryMax=6G cap as the hard backstop.
+# Parts run serially inside the caller's cgroup so its aggregate memory/swap/CPU limits
+# also cover compilation and packing. The caller must provide the approved resource scope;
+# this script does not create one. RF_PEAK_KB records per-part RSS from
+# g4-resident-rf48c-repro-build-wall (2026-09-30), not aggregate cgroup memory.
+# Admission also reserves 4 GB for the desktop; unknown emit lists assume 5.5 GB.
 HERE=$(dirname "$(readlink -f "$0")")
 REPO=$(cd "$HERE/../.." && pwd)
+set -euo pipefail
+max_jobs=$(nproc)
+max_jobs=$((max_jobs / 2))
+(( max_jobs >= 1 )) || max_jobs=1
+(( max_jobs <= 2 )) || max_jobs=2
+if [[ ${RF_LADDER_JOBS:-1} != 1 ]] ||
+   [[ ! ${AIECC_JOBS:-$max_jobs} =~ ^[12]$ ]] ||
+   (( ${AIECC_JOBS:-$max_jobs} > max_jobs )); then
+  echo "RF resource policy requires RF_LADDER_JOBS=1 and AIECC_JOBS=1..$max_jobs" >&2
+  exit 2
+fi
+export AIECC_JOBS=${AIECC_JOBS:-$max_jobs}
+export OMP_NUM_THREADS=$AIECC_JOBS OPENBLAS_NUM_THREADS=$AIECC_JOBS MKL_NUM_THREADS=$AIECC_JOBS
 source "$HERE/env.sh"
 export RF_BUILD=${RF_BUILD:-${XDNA_DATA:-$REPO}/build/resident_forward}
 name=$1; flags=$2; shift 2
-
-RF_LADDER_JOBS=${RF_LADDER_JOBS:-3}
 export RF_KOBJ_RUN="run-$(date +%s%N)-$$"
 trap 'rm -rf "$RF_BUILD/kobj/$RF_KOBJ_RUN"' EXIT
 RESERVE_KB=$((4 * 1024 * 1024))
@@ -43,64 +52,23 @@ total=${#parts[@]}
 
 mem_available_kb() { awk '/^MemAvailable:/{print $2}' /proc/meminfo; }
 
-declare -A PID_PART PID_EMIT
-running=0
-next=0
-fail_rc=0
-fail_msg=""
-
-launch() {
-  local part=$1 emit=$2
-  mkdir -p $RF_BUILD/$part
-  ( cd $RF_BUILD/$part &&
-    RF_BUILD=$RF_BUILD RF_ATTN_H=1 RF_FAST=1 RF_TEXT_MARGIN=128 AIECC_JOBS=8 systemd-run --user --scope -q -p CPUWeight=20 \
-      -p MemoryMax=6G -p MemorySwapMax=1G nice -n 10 /usr/bin/time -v $PY $HERE/rf_build.py $part rlayer_design \
-      emit=$emit $flags > build.log 2>&1 ) &
-  PID_PART[$!]=$part
-  PID_EMIT[$!]=$emit
-  running=$((running + 1))
-}
-
-# Non-blocking: reports every tracked pid that has already exited (wait on a dead pid returns
-# immediately) and updates $fail_rc/$fail_msg on the first failure seen.
-reap() {
-  local pid dead=()
-  for pid in "${!PID_PART[@]}"; do
-    kill -0 "$pid" 2>/dev/null || dead+=("$pid")
+for ((i=0; i<total; i++)); do
+  part=${parts[$i]}
+  emit=${emits[$i]}
+  expected=${RF_PEAK_KB[$emit]:-$DEFAULT_PEAK_KB}
+  while [ $(( $(mem_available_kb) - RESERVE_KB )) -lt "$expected" ]; do
+    sleep 5
   done
-  for pid in "${dead[@]}"; do
-    if wait "$pid"; then rc=0; else rc=$?; fi
-    local part=${PID_PART[$pid]} emit=${PID_EMIT[$pid]}
-    local log=$RF_BUILD/$part/build.log
-    local peak=$(grep "Maximum resident" "$log" | awk '{print $NF}')
-    local wall=$(grep "Elapsed" "$log" | awk '{print $NF}')
-    echo "$part emit=$emit rc=$rc peak_kB=$peak wall=$wall"
-    unset "PID_PART[$pid]" "PID_EMIT[$pid]"
-    running=$((running - 1))
-    if [ $rc -ne 0 ] && [ $fail_rc -eq 0 ]; then
-      fail_rc=$rc; fail_msg="$part failed (rc=$rc), log: $log"
-    fi
-  done
-}
-
-while [ $next -lt $total ] || [ $running -gt 0 ]; do
-  reap
-  if [ $fail_rc -ne 0 ]; then
-    while [ $running -gt 0 ]; do sleep 5; reap; done
-    echo "$fail_msg" >&2
-    exit $fail_rc
+  mkdir -p "$RF_BUILD/$part"
+  if ( cd "$RF_BUILD/$part" &&
+    RF_ATTN_H=1 RF_FAST=1 RF_TEXT_MARGIN=128 nice -n 10 /usr/bin/time -v \
+      "$PY" "$HERE/rf_build.py" "$part" rlayer_design "emit=$emit" $flags > build.log 2>&1 ); then
+    echo "$part emit=$emit rc=0 log=$RF_BUILD/$part/build.log"
+  else
+    rc=$?
+    echo "$part failed (rc=$rc), log: $RF_BUILD/$part/build.log" >&2
+    exit "$rc"
   fi
-  if [ $next -lt $total ] && [ $running -lt $RF_LADDER_JOBS ]; then
-    emit=${emits[$next]}
-    expected=${RF_PEAK_KB[$emit]:-$DEFAULT_PEAK_KB}
-    avail=$(mem_available_kb)
-    if [ $((avail - RESERVE_KB)) -ge "$expected" ]; then
-      launch "${parts[$next]}" "$emit"
-      next=$((next + 1))
-      continue
-    fi
-  fi
-  sleep 5
 done
 
-$PY $HERE/fwd_pack.py $name "${parts[@]}"
+"$PY" "$HERE/fwd_pack.py" "$name" "${parts[@]}"

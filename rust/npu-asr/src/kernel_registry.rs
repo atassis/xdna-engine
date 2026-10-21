@@ -337,7 +337,7 @@ pub fn source_digest(repo_root: &Path, paths: &[String]) -> std::io::Result<Opti
     }
     let mut files: Vec<PathBuf> = Vec::new();
     for rel in paths {
-        collect_sources(&repo_root.join(rel), &mut files)?;
+        collect_sources(repo_root, &repo_root.join(rel), &mut files)?;
     }
     // Sort by path so the digest is independent of readdir order, which is not stable across
     // filesystems and would otherwise make the same tree hash differently on two boxes.
@@ -355,7 +355,11 @@ pub fn source_digest(repo_root: &Path, paths: &[String]) -> std::io::Result<Opti
     Ok(Some(digest.iter().map(|b| format!("{b:02x}")).collect()))
 }
 
-fn collect_sources(path: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+fn collect_sources(repo_root: &Path, path: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    // Generated simulator shims must not make the same canonical sources differ across checkouts.
+    if path == repo_root.join("aie_kernels/_test/gen") {
+        return Ok(());
+    }
     if path.is_file() {
         out.push(path.to_path_buf());
         return Ok(());
@@ -369,7 +373,7 @@ fn collect_sources(path: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     for entry in std::fs::read_dir(path)? {
         let p = entry?.path();
         if p.is_dir() {
-            collect_sources(&p, out)?;
+            collect_sources(repo_root, &p, out)?;
         } else if p.extension().and_then(|e| e.to_str()).is_some_and(|e| SOURCE_EXTS.contains(&e))
             || p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("Makefile"))
         {
@@ -1647,6 +1651,61 @@ mod tests {
         // this is what every caller that cannot reach the sources still sees.
         let blind = verify_declared_kernel_set_from(&declared, kernels.path(), None);
         assert!(matches!(blind[0].status, DeclaredStatus::Present));
+    }
+
+    #[test]
+    fn generated_test_outputs_do_not_make_canonical_kernels_stale() {
+        let repo = tempfile::tempdir().unwrap();
+        let kernels = tempfile::tempdir().unwrap();
+        let src_dir = repo.path().join("aie_kernels");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("k.cc"), b"// canonical").unwrap();
+        let mut declared = declare(&[("layernorm", &["ctxln_512x1024"])]);
+        declared.get_mut("layernorm").unwrap().sources = vec!["aie_kernels".to_string()];
+        let fam = kernels.path().join("layernorm");
+        std::fs::create_dir_all(&fam).unwrap();
+        write_fake_kernel(&fam, "ctxln_512x1024", b"xclbin bytes", Some(b"insts"));
+        let digest = source_digest(repo.path(), &declared["layernorm"].sources).unwrap();
+        let manifest = generate_manifest_with_source(&fam, digest.as_deref()).unwrap();
+        write_manifest(&fam, &manifest).unwrap();
+
+        let generated = src_dir.join("_test/gen/nested");
+        std::fs::create_dir_all(&generated).unwrap();
+        for contents in [b"// generated v1".as_slice(), b"// generated v2".as_slice()] {
+            std::fs::write(generated.join("shim.cc"), contents).unwrap();
+            let report = verify_declared_kernel_set_from(&declared, kernels.path(), Some(repo.path()));
+            assert!(matches!(report[0].status, DeclaredStatus::Present), "{:?}", report[0].status);
+        }
+        std::fs::remove_dir_all(src_dir.join("_test/gen")).unwrap();
+        assert_eq!(source_digest(repo.path(), &declared["layernorm"].sources).unwrap(), digest);
+        std::fs::write(src_dir.join("k.cc"), b"// changed canonical").unwrap();
+        let report = verify_declared_kernel_set_from(&declared, kernels.path(), Some(repo.path()));
+        assert!(matches!(report[0].status, DeclaredStatus::StaleSource { .. }));
+    }
+
+    #[test]
+    fn source_digest_is_checkout_independent_and_keeps_other_source_inputs() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let paths = vec!["aie_kernels".to_string(), "recipe.sh".to_string()];
+        let inputs = ["aie_kernels/k.cc", "aie_kernels/_test/generate.py", "aie_kernels/production/gen/k.cc", "recipe.sh"];
+        for root in [first.path(), second.path()] {
+            for rel in inputs {
+                let path = root.join(rel);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, b"original").unwrap();
+            }
+        }
+        let baseline = source_digest(first.path(), &paths).unwrap();
+        let generated = second.path().join("aie_kernels/_test/gen");
+        std::fs::create_dir_all(&generated).unwrap();
+        std::fs::write(generated.join("shim.cc"), b"generated").unwrap();
+        assert_eq!(source_digest(second.path(), &paths).unwrap(), baseline);
+        for rel in inputs {
+            std::fs::write(second.path().join(rel), b"changed").unwrap();
+            assert_ne!(source_digest(second.path(), &paths).unwrap(), baseline, "{rel}");
+            std::fs::write(second.path().join(rel), b"original").unwrap();
+        }
     }
 
     /// A family that declares no sources must be unaffected, or adding the field would flip every
