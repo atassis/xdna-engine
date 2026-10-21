@@ -1,6 +1,7 @@
 """Package a self-contained resident-forward artifact from existing build outputs."""
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -8,7 +9,8 @@ from pathlib import Path
 
 
 BUILD_FILES = ("pack.json", "fwd_layout.json", "params.txt", "gen_args.txt")
-OPTIONAL_BUILD_FILES = ("full_elf_config.json", "gen_env.txt")
+# full_elf_config.json names build-only PDI/TXN inputs, not packaged companions.
+OPTIONAL_BUILD_FILES = ("gen_env.txt",)
 RESIDENT_KINDS = {
     "resident_forward_raw",
     "resident_forward_onecmd",
@@ -36,6 +38,56 @@ def copy_file(source: str, destination: str) -> str:
 
 def copy_tree(source: Path, destination: Path) -> None:
     shutil.copytree(source, destination, copy_function=copy_file, symlinks=False)
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open('rb') as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def derive_store(source: Path, out: Path) -> None:
+    """Derive portable metadata, preserving verified blobs and original provenance by hash."""
+    if out.exists() or out.is_symlink():
+        raise ValueError(f'derived store output already exists: {out}')
+    manifest_path = source / 'manifest.json'
+    receipt_path = source / '.recipe-manifest.json'
+    manifest = json.loads(manifest_path.read_text())
+    receipt = json.loads(receipt_path.read_text())
+    files = receipt['files']
+    actual = {str(p.relative_to(source)) for p in source.rglob('*')
+              if p.is_file() and p.name != '.recipe-manifest.json'}
+    if set(files) != actual or 'manifest.json' not in files:
+        raise ValueError('store receipt file inventory mismatch')
+    for rel, digest in files.items():
+        if Path(rel).is_absolute() or '..' in Path(rel).parts or sha256_file(source / rel) != digest:
+            raise ValueError(f'store receipt digest mismatch: {rel}')
+    if 'source_dir' not in manifest:
+        # Already portable: still validate the entire receipt before copying it.
+        copy_tree(source, out)
+        return
+    source_dir = manifest.pop('source_dir')
+    if not isinstance(source_dir, str):
+        raise ValueError('store source_dir must be a string')
+    copy_tree(source, out)
+    # copy_tree may hardlink: replace metadata inodes, never write through them.
+    (out / 'manifest.json').unlink()
+    (out / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+    (out / '.recipe-manifest.json').unlink()
+    derived = {
+        'command': 'package_artifact.py --derive-store (portable-store-v1)',
+        'derivation': {
+            'version': 1,
+            'source_manifest_sha256': sha256_file(manifest_path),
+            'source_receipt_sha256': sha256_file(receipt_path),
+            'removed_fields': ['source_dir'],
+            'source_dir_sha256': hashlib.sha256(source_dir.encode()).hexdigest(),
+        },
+        'files': files | {'manifest.json': sha256_file(out / 'manifest.json')},
+    }
+    (out / '.recipe-manifest.json').write_text(json.dumps(derived, indent=2, sort_keys=True) + '\n')
 
 
 def relative_build_path(value: str) -> Path:
@@ -147,10 +199,28 @@ def package(out: Path, build: Path, meta_path: Path, weights: Path, store: Path)
         for name in BUILD_FILES + OPTIONAL_BUILD_FILES:
             source = build / name
             if source.is_file():
-                copy_file(str(source), str(staging / name))
+                if name == 'gen_env.txt':
+                    # Keep RF_INST and runtime flags; these two describe build-only locations.
+                    lines = source.read_text().splitlines(keepends=True)
+                    removed = [line for line in lines if line.startswith(('RF_BUILD=', 'RF_STORE='))]
+                    (staging / name).write_text(''.join(line for line in lines if line not in removed))
+                    if removed:
+                        (staging / 'packaging-derivation.json').write_text(json.dumps({
+                            'command': 'package_artifact.py (portable-gen-env-v1)',
+                            'source_gen_env_sha256': sha256_file(source),
+                            'gen_env_sha256': sha256_file(staging / name),
+                            'removed_fields': [line.split('=', 1)[0] for line in removed],
+                            'removed_values_sha256': [hashlib.sha256(line.split('=', 1)[1].rstrip('\n').encode()).hexdigest()
+                                                      for line in removed],
+                        }, indent=2) + '\n')
+                else:
+                    copy_file(str(source), str(staging / name))
         copy_file(str(weights / "w_head.npy"), str(staging / "w_head.npy"))
         copy_tree(weights, staging / "weights")
-        copy_tree(store, staging / "store")
+        if (store / '.recipe-manifest.json').is_file() or 'source_dir' in json.loads((store / 'manifest.json').read_text()):
+            derive_store(store, staging / 'store')
+        else:
+            copy_tree(store, staging / "store")
         os.replace(staging, out)
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
@@ -160,11 +230,17 @@ def package(out: Path, build: Path, meta_path: Path, weights: Path, store: Path)
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--build", type=Path, required=True)
-    parser.add_argument("--meta", type=Path, required=True)
-    parser.add_argument("--weights", type=Path, required=True)
+    parser.add_argument("--derive-store", action="store_true")
+    parser.add_argument("--build", type=Path)
+    parser.add_argument("--meta", type=Path)
+    parser.add_argument("--weights", type=Path)
     parser.add_argument("--store", type=Path, required=True)
     args = parser.parse_args()
+    if args.derive_store:
+        derive_store(args.store, args.out)
+        return 0
+    if any(value is None for value in (args.build, args.meta, args.weights)):
+        parser.error('packaging needs --build --meta --weights')
     package(args.out, args.build, args.meta, args.weights, args.store)
     return 0
 

@@ -111,6 +111,9 @@ def configured_pyannote_sdks(config: Path) -> tuple[str, ...]:
 
 
 def recipe_for(model: str, scenario: str, repo: Path, artifacts: Path, inputs: Path, build: Path) -> Recipe:
+    # CLS changes pooling/scheduling, not BGE's exported model data or its receipt.
+    if model == "bge-base-cls" and scenario == "scenarios/bge-base-cls.toml":
+        return recipe_for("bge-base", "scenarios/bge-base.toml", repo, artifacts, inputs, build)
     py = sys.executable
     export_py = os.environ.get("MODEL_EXPORT_PY", sys.executable)
     iron_py = os.environ.get("MODEL_IRON_PY", str(repo / ".venv-iron/bin/python"))
@@ -164,6 +167,9 @@ def recipe_for(model: str, scenario: str, repo: Path, artifacts: Path, inputs: P
                 command("decode", ["bash", str(scripts / "build_whisper_rail.sh"), "whisper-turbo", f"{whisper}/decode_rail"],
                         WEIGHTS=f"{whisper}/weights", VENV_IRON=str(Path(iron_py).parent.parent),
                         WHISPER_CHECKPOINT_DIR=src("whisper-turbo")),
+                command("serving-companions", [export_py, str(scripts / "whisper_serving_companions.py"),
+                        "export", "--checkpoint", src("whisper-turbo"), "--out", whisper],
+                        HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1"),
             ),
         )
     if model == "gemma3-270m" and scenario == "scenarios/generate-gemma3-270m.toml":
@@ -235,7 +241,7 @@ def recipe_for(model: str, scenario: str, repo: Path, artifacts: Path, inputs: P
 def plan(config: Path, repo: Path, artifacts: Path, inputs: Path, build: Path) -> list[Recipe]:
     recipes = [recipe_for(row["name"], row["scenario"], repo, artifacts, inputs, build)
                for row in configured_models(config)]
-    return recipes
+    return list({recipe.model: recipe for recipe in recipes}.values())
 
 
 def source_digest(paths: tuple[str, ...]) -> str:
@@ -277,7 +283,9 @@ def required_members(recipe: Recipe, output: bool) -> tuple[tuple[str, ...], ...
             "bge-base": (("model.onnx",), ("tokenizer.json",)),
             "pyannote-community-1": (("segmentation.onnx",), ("embedding.onnx",), ("diarize.json",)),
             "pyannote-3.1": (("segmentation.onnx",), ("embedding.onnx",), ("diarize.json",)),
-            "whisper-turbo": (("decode_rail/meta.json",),),
+            "whisper-turbo": (("decode_rail/meta.json",), ("config.json",), ("preprocessor.onnx",),
+                              ("onnx/decoder_model.onnx",), ("onnx/decoder_with_past_model.onnx",),
+                              ("tokenizer.json",), ("serving-companions.json",)),
             "gemma3-270m": (("meta.json",),),
             "qwen3-0.6b": (("meta.json",),),
             "qwen3.5-4b": (("meta.json",),),
@@ -325,6 +333,9 @@ def validate_recipe_outputs(recipe: Recipe, *, references: Recipe | None = None)
     require_members(recipe, Path(recipe.outputs[0]), True)
     if recipe.model == "qwen3.5-4b":
         validate_qwen35_closure(recipe, references or recipe)
+    if recipe.model == "whisper-turbo":
+        from whisper_serving_companions import validate
+        validate(Path(recipe.outputs[0]))
 
 
 def validate_qwen35_closure(recipe: Recipe, references: Recipe) -> None:

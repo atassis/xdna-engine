@@ -7,7 +7,8 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from package_artifact import package
+from package_artifact import package, derive_store
+import hashlib
 
 
 def write_build(build: Path) -> None:
@@ -36,6 +37,33 @@ def write_store(store: Path) -> None:
 
 
 class PackageArtifactTests(unittest.TestCase):
+    def test_derive_store_preserves_original_and_checks_every_receipted_byte(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'protected-stage' / 'store'
+            write_store(source)
+            manifest = source / 'manifest.json'
+            data = json.loads(manifest.read_text())
+            data['source_dir'] = str(root / 'protected-stage' / 'weights')
+            manifest.write_text(json.dumps(data))
+            files = {str(p.relative_to(source)): hashlib.sha256(p.read_bytes()).hexdigest()
+                     for p in source.rglob('*') if p.is_file()}
+            receipt = source / '.recipe-manifest.json'
+            receipt.write_text(json.dumps({'command': 'original export', 'files': files}))
+            original = {str(p.relative_to(source)): p.read_bytes() for p in source.rglob('*') if p.is_file()}
+            out = root / 'derived'
+            derive_store(source, out)
+            self.assertNotIn('source_dir', json.loads((out / 'manifest.json').read_text()))
+            derived = json.loads((out / '.recipe-manifest.json').read_text())
+            self.assertEqual(derived['derivation']['source_receipt_sha256'], hashlib.sha256(receipt.read_bytes()).hexdigest())
+            self.assertEqual(derived['files']['blobs/embed.bin'], files['blobs/embed.bin'])
+            self.assertNotIn(str(root / 'protected-stage'), (out / '.recipe-manifest.json').read_text())
+            self.assertEqual(original, {str(p.relative_to(source)): p.read_bytes() for p in source.rglob('*') if p.is_file()})
+            (source / 'blobs/embed.bin').write_bytes(b'corrupt')
+            with self.assertRaisesRegex(ValueError, 'digest'):
+                derive_store(source, root / 'bad')
+            self.assertFalse((root / 'bad').exists())
+
     def test_package_is_relocatable_after_sources_are_removed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -54,7 +82,12 @@ class PackageArtifactTests(unittest.TestCase):
             (weights / "w_head.npy").write_bytes(b"head-stream")
             write_store(store)
 
+            # Build-debug PDI/TXN paths are not part of the runnable ELF package.
+            (build / "full_elf_config.json").write_text(json.dumps({"pdi": str(build / "stage.pdi")}))
+            (build / "gen_env.txt").write_text(f"RF_KEEP=1\nRF_INST=/cache/pin\nRF_BUILD={build}\nRF_STORE={store}\n")
             package(out, build, source_meta, weights, store)
+            self.assertFalse((out / "full_elf_config.json").exists())
+            self.assertEqual((out / "gen_env.txt").read_text(), "RF_KEEP=1\nRF_INST=/cache/pin\n")
             shutil.rmtree(build)
             shutil.rmtree(weights)
             shutil.rmtree(store)

@@ -39,6 +39,20 @@ set -euo pipefail
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 REPO="$(dirname "$SCRIPT_PATH")"
 
+# Prepared mode is explicit and fail-closed before migration or any live writes.
+# This verifier runs no SDK, Cargo, model export, or kernel builder.
+INSTALL_MODE="${INSTALL_MODE:-build}"
+case "$INSTALL_MODE" in
+  build) ;;
+  prepared)
+    [ "${ENGINE_ARTIFACTS_LINK:-0}" != 1 ] || { echo 'prepared mode requires served artifact manifests' >&2; exit 1; }
+    [ -n "${PREPARED_MANIFEST:-}" ] || { echo 'PREPARED_MANIFEST is required' >&2; exit 1; }
+    prepared_assignments="$(python3 "$REPO/scripts/prepared_install.py" --repo "$REPO" --manifest "$PREPARED_MANIFEST")"
+    eval "$prepared_assignments"
+    ;;
+  *) echo "unknown INSTALL_MODE=$INSTALL_MODE (build|prepared)" >&2; exit 1 ;;
+esac
+
 export ONNX_ASR_VENV="${ONNX_ASR_VENV:-$REPO/.venv-export}"
 
 # Repo export venv (has onnx + onnxruntime). Used to (re)generate the
@@ -82,10 +96,12 @@ ENGINE_BIN_ARCHIVE="${ENGINE_BIN_ARCHIVE:-${XDG_DATA_HOME:-$HOME/.local/share}/n
 # step exists to be.
 #
 # grep rather than jq: jq is not a dependency of this script and need not become one.
+if [ "$INSTALL_MODE" = build ]; then
 CARGO_TARGET_DIR_RESOLVED="$(cd "$REPO/rust" && cargo metadata --format-version 1 --no-deps 2>/dev/null \
   | grep -o '"target_directory":"[^"]*"' | head -1 | cut -d'"' -f4)"
 [ -n "$CARGO_TARGET_DIR_RESOLVED" ] || CARGO_TARGET_DIR_RESOLVED="$REPO/rust/target"
 BUILT_BIN="$CARGO_TARGET_DIR_RESOLVED/release/npu"
+fi
 ENGINE_CONFIG="${ENGINE_CONFIG:-$HOME/.config/npu/engine.toml}"
 PYANNOTE_VENV="${PYANNOTE_VENV:-$REPO/.venv-pyannote}"
 PYANNOTE_COMMUNITY_VENV="${PYANNOTE_COMMUNITY_VENV:-$REPO/.venv-pyannote-community}"
@@ -179,6 +195,7 @@ ok "Repo layout looks correct."
 info "Preflight checks..."
 
 # 2a. cargo
+if [ "$INSTALL_MODE" = build ]; then
 command -v cargo >/dev/null 2>&1 || die "cargo not found on PATH. Install Rust (https://rustup.rs)."
 ok "cargo: $(command -v cargo)"
 
@@ -235,6 +252,10 @@ info "Building Rust workspace (cargo build --release)..."
 )
 [ -x "$BUILT_BIN" ] || die "Build finished but $BUILT_BIN is missing/not executable."
 ok "Built engine binary: $BUILT_BIN"
+else
+  ONNX_ASR_PY="$(command -v python3)"
+  ok "Verified prepared inputs: $PREPARED_MANIFEST"
+fi
 
 # ---------------------------------------------------------------------------
 # 3a. INSTALL the engine binary
@@ -303,8 +324,10 @@ fi
 # the binary uses DT_RUNPATH (searched AFTER LD_LIBRARY_PATH), the stable dir wins -> the
 # service survives `cargo clean` and any build-tree churn.
 info "Hardening onnxruntime .so -> $STABLE_LIB_DIR"
+if [ "$INSTALL_MODE" = build ]; then
 ORT_REAL_SO="$(find "$ONNX_ASR_VENV" -path '*/onnxruntime/capi/libonnxruntime.so.*' 2>/dev/null \
                  | grep -E 'libonnxruntime\.so\.[0-9]' | head -n1 || true)"
+fi
 [ -n "$ORT_REAL_SO" ] || die "no libonnxruntime.so.* under $ONNX_ASR_VENV (onnx-asr venv layout changed?)."
 mkdir -p "$STABLE_LIB_DIR"
 cp -f "$ORT_REAL_SO" "$STABLE_LIB_DIR/"
@@ -336,7 +359,8 @@ fi
 
 # Bounded: keep the newest 10 (~170 MB worst case, and far less while hardlinks share storage with
 # the live binary). Unbounded would trade one silent failure for another.
-if [ -d "$ENGINE_BIN_ARCHIVE" ]; then
+# Prepared rollout preserves existing rollback history; it does not authorize cleanup.
+if [ "$INSTALL_MODE" = build ] && [ -d "$ENGINE_BIN_ARCHIVE" ]; then
   # shellcheck disable=SC2012  # names are npu-<hex>, so ls -t is safe here
   ls -t "$ENGINE_BIN_ARCHIVE"/npu-* 2>/dev/null | tail -n +11 | while read -r old; do
     rm -f "$old" && info "  pruned archived binary $(basename "$old")"
@@ -348,6 +372,7 @@ fi
 # ---------------------------------------------------------------------------
 MODEL_INPUT_ROOT="${MODEL_INPUT_ROOT:-$XDNA_DATA/model-inputs}"
 MODEL_INSTALL_REPORT="${MODEL_INSTALL_REPORT:-$XDNA_LOGS/model-install-report.json}"
+if [ "$INSTALL_MODE" = build ]; then
 info "Building configured model artifacts from $MODEL_INPUT_ROOT"
 MODEL_EXPORT_PY="$ONNX_ASR_PY" MODEL_IRON_PY="$MODEL_IRON_PY" \
 MODEL_PYANNOTE_PY="$MODEL_PYANNOTE_PY" MODEL_PYANNOTE_COMMUNITY_PY="$MODEL_PYANNOTE_COMMUNITY_PY" NPU_BIN="$BUILT_BIN" \
@@ -356,6 +381,7 @@ MODEL_PYANNOTE_PY="$MODEL_PYANNOTE_PY" MODEL_PYANNOTE_COMMUNITY_PY="$MODEL_PYANN
   --model-input-root "$MODEL_INPUT_ROOT" --report "$MODEL_INSTALL_REPORT" \
   || die "configured model artifact build failed; see the command above and $MODEL_INSTALL_REPORT"
 ok "Configured model artifact recipes completed: $MODEL_INSTALL_REPORT"
+fi
 
 # A directory "exists with content" check (non-empty).
 dir_has_content() { [ -d "$1" ] && [ -n "$(ls -A "$1" 2>/dev/null)" ]; }
@@ -377,6 +403,7 @@ cp -r "$REPO/scenarios" "$ENGINE_ROOT/scenarios"
 
 # The staged engine config owns the required common-kernel closure. Missing declarations,
 # adapters, manifests, or artifacts are install failures rather than warnings.
+if [ "$INSTALL_MODE" = build ]; then
 DECLARED_KERNELS_BIN="$CARGO_TARGET_DIR_RESOLVED/release/npu-dev"
 [ -x "$DECLARED_KERNELS_BIN" ] || die "npu-dev not found at $DECLARED_KERNELS_BIN"
 "$DECLARED_KERNELS_BIN" kernels-build --engine-root "$ENGINE_ROOT" --config "$ENGINE_CONFIG" "$REPO" "$ENGINE_KERNELS" "$ENGINE_MLIR_AIE" \
@@ -385,6 +412,16 @@ DECLARED_KERNELS_BIN="$CARGO_TARGET_DIR_RESOLVED/release/npu-dev"
 bash "$REPO/scripts/publish_kernels.sh" "$ENGINE_KERNELS" "$ENGINE_MLIR_AIE" "$ENGINE_CONFIG" "$ENGINE_ROOT" \
   || die "kernel publish refused -- see the message above. The usual cause is a build dir that was
   never rebuilt after a re-pin; scripts/check_kernel_artifact_freshness.sh names every stale one."
+else
+  # Consume the already manifest/native-contract-verified bundle; never regenerate it.
+  prepared_kernel_stage="$ENGINE_ROOT/kernels.prepared-$$"
+  [ ! -e "$prepared_kernel_stage" ] || die "prepared kernel stage exists"
+  cp -a --reflink=auto "$PREPARED_KERNELS" "$prepared_kernel_stage"
+  if [ -e "$ENGINE_KERNELS" ]; then
+    mv "$ENGINE_KERNELS" "$ENGINE_KERNELS.prev-$(date +%Y%m%dT%H%M%S)"
+  fi
+  mv "$prepared_kernel_stage" "$ENGINE_KERNELS"
+fi
 "$DECLARED_KERNELS_BIN" kernels-verify --engine-root "$ENGINE_ROOT" --config "$ENGINE_CONFIG" "$REPO" "$ENGINE_KERNELS" \
   || die "published kernels do not satisfy the required closure for $ENGINE_CONFIG"
 ok "Kernels published (pin $(cat "$ENGINE_KERNELS/.toolchain-stamp" 2>/dev/null || echo unknown))"
@@ -450,6 +487,7 @@ fi
 if dir_has_content "$ASR_DIR"; then
   ok "ASR artifacts present: $ASR_DIR (skipping asr_oracle.py)"
 else
+  [ "$INSTALL_MODE" = build ] || die "prepared ASR artifacts missing"
   info "ASR artifacts missing — generating via scripts/asr_oracle.py (onnx-asr venv)..."
   (
     cd "$REPO"
@@ -515,6 +553,7 @@ ok "  config/profiles -> $ENGINE_ROOT/config/profiles"
 # whichever install actually ran most recently. Names sort lexically the same as chronologically
 # (`%Y%m%dT%H%M%S`), so a plain `sort -r` is exact.
 prune_prev() {  # name
+  [ "$INSTALL_MODE" = prepared ] && return 0
   ls -1d "$ENGINE_ROOT/$1.prev-"* 2>/dev/null | sort -r | tail -n +2 | while IFS= read -r old; do
     rm -rf -- "$old" && echo "  pruned superseded $(basename "$old")"
   done || true
