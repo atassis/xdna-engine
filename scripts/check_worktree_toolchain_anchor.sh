@@ -17,8 +17,8 @@
 #     instances-root defaults to XDNA_CACHE/instances (see cache_env.sh), or <workspace-root>/.cache/instances.
 #
 # Exit 0  = safe to remove (no instance anchored here).
-# Exit 1  = REFUSED -- an instance's src/.git resolves inside this worktree's admin dir; naming the
-#           instance(s), so `git worktree remove <path>` is not the next command to run blind.
+# Exit 1  = REFUSED -- instance source links or Git administration depend on this worktree.
+# Exit 2  = invalid arguments or an incomplete source/administration scan.
 set -euo pipefail
 
 usage() { echo "usage: check_worktree_toolchain_anchor.sh <repo-path> <worktree-path> [instances-root]" >&2; exit 2; }
@@ -41,30 +41,66 @@ WT_ABS="$(cd "$WT_PATH" && pwd -P)"
 
 [ -d "$INSTROOT" ] || { echo "[check_worktree_toolchain_anchor] no instances root at $INSTROOT -- nothing to check, safe"; exit 0; }
 
-hits=()
-for gitfile in "$INSTROOT"/*/src/.git; do
-  [ -f "$gitfile" ] || continue   # only the gitdir-pointer form; a real .git dir here is not a worktree
-  target="$(sed -n 's/^gitdir: //p' "$gitfile")"
-  case "$target" in
-    "$WT_GITDIR"/*|"$WT_GITDIR"|"$WT_ABS"/*)
-      hits+=("$(basename "$(dirname "$(dirname "$gitfile")")")  ->  $target") ;;
-  esac
-done
-# toolchain_up.sh symlinks the instance's nested submodules (aie_api, aie-rt, bootgen, cmake modules)
-# to whichever checkout built it, so the worktree can be load-bearing without owning the gitdir.
-for link in "$INSTROOT"/*/src/third_party/* "$INSTROOT"/*/src/cmake/*; do
-  [ -L "$link" ] || continue
-  case "$(readlink "$link")" in
-    "$WT_ABS"/*) hits+=("${link#"$INSTROOT"/}  ->  $(readlink "$link")") ;;
-  esac
-done
+python3 - "$WT_GITDIR" "$WT_ABS" "$INSTROOT" <<'PY'
+import os
+from pathlib import Path
+import sys
 
-if [ "${#hits[@]}" -gt 0 ]; then
-  echo "[check_worktree_toolchain_anchor] REFUSED: $WT_PATH anchors ${#hits[@]} toolchain instance(s):" >&2
-  for h in "${hits[@]}"; do echo "  $h" >&2; done
-  echo "[check_worktree_toolchain_anchor] removing this worktree orphans them silently (self-healing on next toolchain_up.sh, but the running instance breaks with no attribution)." >&2
-  echo "[check_worktree_toolchain_anchor] rebuild those instances from the submodule's primary checkout first, or accept the rebuild cost, before removing." >&2
-  exit 1
-fi
+admin, worktree, instances = (Path(arg).resolve() for arg in sys.argv[1:])
+hits = []
+errors = []
 
-echo "[check_worktree_toolchain_anchor] safe: no toolchain instance anchored to $WT_PATH"
+
+def anchored(path):
+    target = path.resolve()
+    return target.is_relative_to(admin) or target.is_relative_to(worktree)
+
+
+def inspect(path):
+    try:
+        # Do not traverse linked source trees; resolve their dependency directly.
+        if path.is_symlink():
+            try:
+                path.resolve(strict=True)
+            except FileNotFoundError:
+                pass  # A missing target can still point inside the carrier.
+            if anchored(path):
+                hits.append(f"{path.relative_to(instances)} -> {path.resolve()}")
+        if path.name == ".git" and path.is_file():
+            pointer = path.read_text().strip()
+            if not pointer.startswith("gitdir: ") or not pointer[8:]:
+                raise ValueError(f"malformed gitdir pointer: {path}")
+            target = (path.parent / pointer[8:]).resolve()
+            if anchored(target):
+                hits.append(f"{path.relative_to(instances)} -> {target}")
+    except (OSError, RuntimeError, ValueError) as error:
+        errors.append(str(error))
+
+
+try:
+    for instance in sorted(instances.iterdir()):
+        source = instance / "src"
+        inspect(source)
+        if not source.is_dir():
+            continue
+        # Nested submodules can own administration under the carrier even after
+        # src/.git has been rehomed. Never descend into Git object databases.
+        for root, directories, files in os.walk(source, onerror=lambda e: errors.append(str(e))):
+            for name in sorted(directories + files):
+                inspect(Path(root) / name)
+            directories[:] = [name for name in directories if name != ".git"]
+except (OSError, RuntimeError) as error:
+    errors.append(str(error))
+
+if hits or errors:
+    print(f"[check_worktree_toolchain_anchor] REFUSED: {worktree}", file=sys.stderr)
+    for hit in hits:
+        print(f"  {hit}", file=sys.stderr)
+    for error in errors:
+        print(f"  incomplete scan: {error}", file=sys.stderr)
+    print("[check_worktree_toolchain_anchor] preserve/rehome these dependencies and verify consumers "
+          "before requesting removal; this check does not authorize a rebuild.", file=sys.stderr)
+    sys.exit(2 if errors else 1)
+
+print(f"[check_worktree_toolchain_anchor] safe: no toolchain instance anchored to {worktree}")
+PY
