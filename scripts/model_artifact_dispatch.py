@@ -17,12 +17,13 @@ import sys
 import tempfile
 import tomllib
 from contextlib import ExitStack, contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from check_iron_artifact_provenance import validate as validate_iron_provenance
 from lib.data_root import XDNA_DATA
 from pyannote_local_inputs import PipelineComponent, pipeline_components, validate_local_pipeline_inputs
+from model_artifact_stages import Stage, StageRunner, View, digest as stage_digest, rebase_stage, source_identity
 
 
 LOCK_ROOT = XDNA_DATA / "locks/model-artifacts"
@@ -59,6 +60,7 @@ class Command:
     step: str
     argv: tuple[str, ...]
     env: dict[str, str]
+    stage: Stage | None = None
 
 
 @dataclass(frozen=True)
@@ -111,9 +113,13 @@ def configured_pyannote_sdks(config: Path) -> tuple[str, ...]:
 
 
 def recipe_for(model: str, scenario: str, repo: Path, artifacts: Path, inputs: Path, build: Path) -> Recipe:
+    return declare_stages(_recipe_for(model, scenario, repo, artifacts, inputs, build), repo, build)
+
+
+def _recipe_for(model: str, scenario: str, repo: Path, artifacts: Path, inputs: Path, build: Path) -> Recipe:
     # CLS changes pooling/scheduling, not BGE's exported model data or its receipt.
     if model == "bge-base-cls" and scenario == "scenarios/bge-base-cls.toml":
-        return recipe_for("bge-base", "scenarios/bge-base.toml", repo, artifacts, inputs, build)
+        return _recipe_for("bge-base", "scenarios/bge-base.toml", repo, artifacts, inputs, build)
     py = sys.executable
     export_py = os.environ.get("MODEL_EXPORT_PY", sys.executable)
     iron_py = os.environ.get("MODEL_IRON_PY", str(repo / ".venv-iron/bin/python"))
@@ -238,6 +244,147 @@ def recipe_for(model: str, scenario: str, repo: Path, artifacts: Path, inputs: P
     raise ValueError(f"no model artifact recipe for configured model {model!r} scenario {scenario!r}")
 
 
+def declare_stages(recipe: Recipe, repo: Path, build: Path) -> Recipe:
+    checkpoint = recipe.inputs[0]
+    export_py = os.environ.get("MODEL_EXPORT_PY", sys.executable)
+    iron_py = os.environ.get("MODEL_IRON_PY", str(repo / ".venv-iron/bin/python"))
+    compiler_runtime = {"IRON": str(repo / "third_party/iron"), "IRON_DIR": str(repo / "third_party/iron"),
+                        "VENV_IRON": str(Path(iron_py).parent.parent),
+                        "PYTHONPATH": str(repo / "third_party/iron"), "TOOLCHAIN_RESOLVE_ONLY": "1"}
+    compiler_env = ("IRON*", "VENV_IRON", "PEANO_INSTALL_DIR", "AIE*", "MODEL_AIECC",
+                    "RF_*", "PREFILL_*", "DECODE_*", "GEN_EXTRA", "ACT_POLY", "PRECISION",
+                    "WINDOW_RUNGS", "KV_BLOCK_T", "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS")
+    compiler_sources = ("toolchain.lock", "scripts/amd_paths.sh", "scripts/toolchain_up.sh",
+                        "scripts/toolchain_gc.sh", "scripts/fast_build_env.sh", "scripts/cache_env.sh",
+                        "scripts/require_disk_backed.sh", "scripts/lib", "aie_kernels", "third_party/iron",
+                        "third_party/iron/iron/common/test_utils.py")
+    weight_sources = ("scripts/dump_llm_weights.py", "designs/decode_fused/llm_decode_spec.py",
+                      "third_party/iron/iron/common/quant.py")
+    weight_input = View(checkpoint, ("*.safetensors", "*.bin", "config.json", "*.index.json"))
+    tokenizer_input = View(checkpoint, ("*.json", "*.jinja", "*.model"))
+    rf = "designs/resident_forward/"
+    rf_shared = tuple(rf + name + ".py" for name in (
+        "bfp16_model", "chain_ref", "head_ref", "kvring", "m1_design", "m2_design", "mlp_ref",
+        "o_ref", "rattn2_design", "rattnh", "rf_model", "rf_paths", "rforward", "rglobal", "rhead",
+        "rlayer_design", "rmlp_design", "rmlp_ref", "rseg_design", "rsplitl"))
+    commands = recipe.commands
+    if recipe.model == "gemma4-12b":
+        data = commands[0]
+        commands = tuple(replace(data, step="data-" + name.replace("_", "-"),
+                                 argv=(*data.argv, "--stages", name))
+                         for name in ("hf_config", "weights", "towers", "store", "rf_stack")) + commands[1:]
+    result = []
+    for item in commands:
+        step, model = item.step, recipe.model
+        if model == "gemma4-12b":
+            item = replace(item, env=item.env | {"RF_MODEL": model})
+        if model in {"parakeet", "bge-base"}:
+            packages = ("numpy", "onnx", "onnxruntime") if model == "parakeet" else ("numpy", "torch", "transformers", "onnx", "tokenizers", "safetensors")
+            stage = Stage(inputs=(View(checkpoint),), outputs=(View(recipe.outputs[0]),),
+                          sources=(str(Path(item.argv[1]).relative_to(repo)),),
+                          sdk_python=export_py, sdk_packages=packages)
+        elif model in PYANNOTE_SDKS:
+            stage = Stage(inputs=(View(checkpoint),),
+                          outputs=() if step == "validate" else (View(recipe.outputs[0]),),
+                          dependencies=() if step == "validate" else ("validate",),
+                          sources=(str(Path(item.argv[1]).relative_to(repo)), "scripts/pyannote_local_inputs.py"),
+                          sdk_python=item.argv[0], sdk_packages=PYANNOTE_SDKS[model][1] +
+                          (("numpy",) if model == "pyannote-3.1" and step == "export" else ()) +
+                          (("scipy",) if model == "pyannote-community-1" and step == "export" else ()))
+        elif model == "whisper-turbo":
+            root = recipe.outputs[0]
+            if step == "encoder":
+                stage = Stage(inputs=(View(checkpoint),),
+                              outputs=(View(root, ("config.json", "conv", "refs", "L[0-9]*"), True),),
+                              sources=("scripts/extract_whisper_encoder.py", "tests/data/wer_clips/en_01.wav"),
+                              sdk_python=export_py, sdk_packages=("numpy", "torch", "transformers", "soundfile", "safetensors"))
+            elif step == "decode":
+                stage = Stage(inputs=(weight_input,), outputs=(View(root + "/decode_rail"), View(root + "/weights")),
+                              sources=(*compiler_sources, *weight_sources, "scripts/build_whisper_rail.sh",
+                                       "scripts/build_llm_decode.sh", "designs/decode_fused"),
+                              environment=(*compiler_env, "MAX_SEQ"), sdk_python=iron_py, sdk_packages=("numpy", "safetensors"))
+                work = str(build / model / "decode-work")
+                item = replace(item, env=item.env | compiler_runtime | {"KEEP_WORK": work})
+                stage = replace(stage, scratch=(work,), toolchain=True)
+            else:
+                stage = Stage(inputs=(View(checkpoint),), dependencies=("encoder",),
+                              outputs=(View(root, ("preprocessor.onnx*", "onnx", "tokenizer.json", "serving-companions.json"), True),),
+                              sources=("scripts/whisper_serving_companions.py", recipe.scenario),
+                              sdk_python=export_py, sdk_packages=("numpy", "torch", "transformers", "onnx", "onnxruntime", "optimum", "optimum-onnx", "tokenizers", "safetensors"))
+        elif model in {"gemma3-270m", "qwen3-0.6b", "qwen3.5-4b"}:
+            if step == "weights":
+                target = item.argv[item.argv.index("--out") + 1]
+                stage = Stage(inputs=(weight_input,), outputs=(View(target),), sources=weight_sources,
+                              sdk_python=iron_py, sdk_packages=("numpy", "safetensors"))
+            elif step == "tokenizer":
+                stage = Stage(inputs=(tokenizer_input,), outputs=(View(item.argv[-1]),),
+                              symbols=("copy_tokenizer", "main"))
+            else:
+                target = item.argv[-1]
+                stage = Stage(dependencies=("weights",) if step == "decode" else ("weights", "decode"),
+                              outputs=(View(target),),
+                              sources=(*compiler_sources, "scripts/build_llm_decode.sh" if step == "decode" else "scripts/build_prefill.sh",
+                                       "designs/decode_fused", "scripts/gate_numeric.py", "scripts/rope_int_phase.py"),
+                              environment=compiler_env, sdk_python=iron_py, sdk_packages=("numpy",))
+                work = str(build / model / (step + "-work"))
+                item = replace(item, env=item.env | compiler_runtime | {"VENV_IRON": str(Path(iron_py).parent.parent), "KEEP_WORK": work})
+                stage = replace(stage, scratch=(work,), toolchain=True)
+        elif model == "gemma4-12b":
+            if step.startswith("data-"):
+                root_for = {"hf-config": recipe.outputs[6], "weights": recipe.outputs[5],
+                            "towers": recipe.outputs[7], "store": recipe.outputs[4], "rf-stack": recipe.outputs[3]}
+                part = step.removeprefix("data-")
+                dependencies = {"hf-config": (), "weights": (), "towers": (),
+                                "store": ("data-weights", "data-towers"),
+                                "rf-stack": ("data-weights", "data-store")}[part]
+                producer_sources = {"hf-config": (), "weights": weight_sources,
+                                    "towers": ("scripts/dump_gemma4_towers.py",),
+                                    "store": (*rf_shared, rf + "qkv_ref.py", rf + "weight_store.py"),
+                                    "rf-stack": (*rf_shared, rf + "attn_layout.py", rf + "grun.py", rf + "qkv_ref.py", rf + "stack_prep.py", rf + "weight_store.py")}[part]
+                # The served hf_config also owns tokenizer sidecars; geometry reads only config.json.
+                if part == "hf-config":
+                    inputs = (View(checkpoint, ("*.json",)),)
+                elif part in {"weights", "towers"}:
+                    inputs = (weight_input,)
+                else:
+                    inputs = (View(checkpoint, ("config.json",)),)
+                stage = Stage(inputs=inputs, dependencies=dependencies, outputs=(View(root_for[part]),),
+                              sources=(rf + "recipes/gemma4_data.sh", *producer_sources),
+                              environment=("IRON_DIR", "VENV_IRON", "RF_*"), sdk_python=iron_py,
+                              sdk_packages=("numpy", "safetensors") if part in {"weights", "towers"} else ("numpy",))
+                item = replace(item, env=item.env | {"VENV_IRON": str(Path(iron_py).parent.parent),
+                                                     "RF_HF_CONFIG": checkpoint + "/config.json"})
+            elif step == "build":
+                packed = item.env["RF_BUILD"] + "/rf48C"
+                stage = Stage(inputs=(View(checkpoint, ("config.json",)),), dependencies=("data-store",),
+                              outputs=(View(packed, ("design.elf.zst", "full_elf_config.json", "fwd_layout.json", "pack.json",
+                                                    "gen_args.txt", "gen_env.txt", "params.txt"), True),),
+                              sources=(*compiler_sources, *rf_shared, "designs/decode_fused/elf_zst.py",
+                                       *(rf + name for name in ("recipes/rf48C.sh", "fwd_ladder.sh", "env.sh", "rf_build.py", "rf_input.py", "fwd_pack.py", "kobj_cache.py"))),
+                              environment=compiler_env, sdk_python=iron_py, sdk_packages=("numpy",),
+                              retain=True, scratch=(item.env["RF_BUILD"],), toolchain=True)
+                item = replace(item, env=item.env | compiler_runtime | {"VENV_IRON": str(Path(iron_py).parent.parent),
+                                                                        "RF_HF_CONFIG": checkpoint + "/config.json"})
+            else:
+                stage = Stage(inputs=(tokenizer_input,), dependencies=("data-rf-stack", "data-store", "build"),
+                              outputs=tuple(View(raw) for raw in recipe.outputs[:3]),
+                              sources=(*rf_shared, "third_party/iron/iron/common/quant.py", rf + "artifact_meta.py", rf + "package_artifact.py"),
+                              symbols=("package_gemma4", "copy_tokenizer", "main"), environment=("RF_*",),
+                              sdk_python=sys.executable, sdk_packages=("numpy", "safetensors"))
+                item = replace(item, env=item.env | {"RF_HF_CONFIG": checkpoint + "/config.json",
+                                                     "RF_STORE": recipe.outputs[4]})
+        elif model == "espcn":
+            stage = Stage(inputs=(View(checkpoint),),
+                          outputs=(View(recipe.outputs[0], ("conv*_*.npy", "gate_*.npy"), True),) if step == "export" else (View(recipe.outputs[0] + "/espcn.safetensors"),),
+                          sources=("scripts/export_espcn.py",) if step == "export" else (),
+                          sdk_python=export_py if step == "export" else '',
+                          sdk_packages=("numpy", "onnx", "onnxruntime") if step == "export" else ())
+        else:
+            raise ValueError(f"no stage contract for {model}: {step}")
+        result.append(replace(item, stage=stage))
+    return replace(recipe, commands=tuple(result))
+
+
 def plan(config: Path, repo: Path, artifacts: Path, inputs: Path, build: Path) -> list[Recipe]:
     recipes = [recipe_for(row["name"], row["scenario"], repo, artifacts, inputs, build)
                for row in configured_models(config)]
@@ -338,7 +485,7 @@ def validate_recipe_outputs(recipe: Recipe, *, references: Recipe | None = None)
         validate(Path(recipe.outputs[0]))
 
 
-def validate_qwen35_closure(recipe: Recipe, references: Recipe) -> None:
+def validate_qwen35_closure(recipe: Recipe, references: Recipe, *, step: str | None = None) -> None:
     decode, prefill, tokenizer = map(Path, recipe.outputs)
     reference_decode = Path(references.outputs[0])
 
@@ -348,8 +495,13 @@ def validate_qwen35_closure(recipe: Recipe, references: Recipe) -> None:
         if not any(target.resolve().is_relative_to(Path(raw).resolve()) for raw in recipe.outputs):
             raise ValueError(f"{recipe.model}: artifact dependency escapes published outputs: {target}")
 
+    if step == "tokenizer":
+        for name in ("tokenizer.json", "tokenizer_config.json", "config.json"):
+            require_file(tokenizer / name)
+        return
     decode_meta = json.loads((decode / "meta.json").read_text())
-    for root in (decode, prefill):
+    roots = (decode,) if step == "decode" else (prefill,) if step == "prefill" else (decode, prefill)
+    for root in roots:
         require_file(root / "meta.json")
         meta = json.loads((root / "meta.json").read_text())
         elf = root / meta["elf"]
@@ -373,11 +525,31 @@ def validate_qwen35_closure(recipe: Recipe, references: Recipe) -> None:
             host_blobs += [protocol[key] for key in ("pos_blob", "logit_bias_blob") if protocol.get(key)]
             for name in host_blobs:
                 require_file(decode / "buffers" / f"{name}.bin")
-    for name in ("tokenizer.json", "tokenizer_config.json", "config.json"):
-        require_file(tokenizer / name)
+    if step is None:
+        for name in ("tokenizer.json", "tokenizer_config.json", "config.json"):
+            require_file(tokenizer / name)
+
+
+def validate_stage_outputs(recipe: Recipe, step: str) -> None:
+    if recipe.model == "qwen3.5-4b" and step in {"decode", "prefill", "tokenizer"}:
+        validate_qwen35_closure(recipe, recipe, step=step)
+        if step in {"decode", "prefill"}:
+            dump = next(item.argv[item.argv.index("--out") + 1] for item in recipe.commands if item.step == "weights")
+            metadata = Path(recipe.outputs[0 if step == "decode" else 1]) / "meta.json"
+            if dump.encode() in metadata.read_bytes():
+                raise RuntimeError(f"{recipe.model}: staged path leaked into published metadata: {metadata}")
+    elif step == "export" and recipe.model in {"parakeet", "bge-base", *PYANNOTE_SDKS}:
+        validate_recipe_outputs(recipe)
+    elif recipe.model == "whisper-turbo" and step == "serving-companions":
+        from whisper_serving_companions import validate
+        validate(Path(recipe.outputs[0]))
+    elif recipe.model == "gemma4-12b" and step == "package":
+        validate_recipe_outputs(recipe)
 
 
 def authority_digest(recipe: Recipe, repo: Path) -> str:
+    if recipe.commands and all(item.stage is not None for item in recipe.commands):
+        return stage_digest({item.step: source_identity(item, repo, symbols=globals()) for item in recipe.commands})
     digest = hashlib.sha256()
     root = repo.resolve()
     candidates = (
@@ -432,8 +604,9 @@ def pyannote_sdk_identity(recipe: Recipe) -> str:
 
 def recipe_key(recipe: Recipe, repo: Path, config: Path, *, authority: str | None = None,
                inputs: str | None = None) -> str:
+    # Selection is already represented by this recipe; deployment-only defaults are not build inputs.
+    del config
     h = hashlib.sha256()
-    h.update(config.read_bytes())
     h.update((repo / recipe.scenario).read_bytes())
     h.update(json.dumps(asdict(recipe), sort_keys=True).encode())
     h.update((authority or authority_digest(recipe, repo)).encode())
@@ -530,21 +703,23 @@ def package_gemma4(repo: Path, artifacts: Path, build: Path, out: Path, tokenize
                                    count=entry["length"] // dtype.itemsize,
                                    offset=entry["offset"]).reshape(entry["shape"])
     save_file(towers, checkpoint / "model.safetensors")
-    subprocess.run([
-        sys.executable, str(repo / "designs/resident_forward/artifact_meta.py"),
-        "--build", str(build / "rf48C"), "--store", str(store),
-        "--config", str(checkpoint / "config.json"),
-    ], check=True, cwd=repo)
-    cmd = [
-        sys.executable,
-        str(repo / "designs/resident_forward/package_artifact.py"),
-        "--out", str(out),
-        "--build", str(build / "rf48C"),
-        "--meta", str(build / "rf48C" / "meta.json"),
-        "--weights", str(artifacts / "gemma4-12b/rf_stack"),
-        "--store", str(artifacts / "gemma4-12b/store"),
-    ]
-    subprocess.run(cmd, check=True, cwd=repo)
+    with tempfile.TemporaryDirectory(prefix=".gemma4-package-", dir=build.parent) as temporary:
+        metadata = Path(temporary) / "meta.json"
+        subprocess.run([
+            sys.executable, str(repo / "designs/resident_forward/artifact_meta.py"),
+            "--build", str(build / "rf48C"), "--store", str(store),
+            "--config", str(checkpoint / "config.json"), "--out", str(metadata),
+        ], check=True, cwd=repo)
+        cmd = [
+            sys.executable,
+            str(repo / "designs/resident_forward/package_artifact.py"),
+            "--out", str(out),
+            "--build", str(build / "rf48C"),
+            "--meta", str(metadata),
+            "--weights", str(artifacts / "gemma4-12b/rf_stack"),
+            "--store", str(artifacts / "gemma4-12b/store"),
+        ]
+        subprocess.run(cmd, check=True, cwd=repo)
     copy_tokenizer(tokenizer_source, tokenizer_out)
 
 
@@ -759,14 +934,18 @@ def rebase_recipe(recipe: Recipe, live_artifacts: Path, staged_artifacts: Path,
     return Recipe(recipe.model, recipe.scenario, recipe.inputs,
                   tuple(replace(value) for value in recipe.outputs),
                   tuple(Command(item.step, tuple(replace(value) for value in item.argv),
-                                {key: replace(value) for key, value in item.env.items()})
+                                {key: replace(value) for key, value in item.env.items()},
+                                rebase_stage(item.stage, replace))
                         for item in recipe.commands))
 
 
-def write_receipt(recipe: Recipe, key: str, *, commands: tuple[Command, ...] | None = None) -> None:
+def write_receipt(recipe: Recipe, key: str, *, commands: tuple[Command, ...] | None = None,
+                  stages: dict | None = None) -> None:
     record = {"model": recipe.model, "scenario": recipe.scenario, "recipe_key": key,
               "output_digest": output_digest(recipe.outputs),
               "commands": [asdict(c) for c in (recipe.commands if commands is None else commands)]}
+    if stages is not None:
+        record["stages"] = stages
     target = manifest_path(recipe)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
@@ -809,11 +988,11 @@ def publish_recipe(recipe: Recipe, staged: Recipe, key: str, rollback: Path) -> 
         _publish_recipe(recipe, staged, key, rollback)
 
 
-def _publish_recipe(recipe: Recipe, staged: Recipe, key: str, rollback: Path) -> None:
+def _publish_recipe(recipe: Recipe, staged: Recipe, key: str, rollback: Path, *, stages: dict | None = None) -> None:
     require_no_recovery(rollback, key)
     reference_args = {"references": recipe} if recipe.model == "qwen3.5-4b" else {}
     validate_recipe_outputs(staged, **reference_args)
-    write_receipt(staged, key, commands=recipe.commands)
+    write_receipt(staged, key, commands=recipe.commands, stages=stages)
     if not cache_hit(staged, key, **reference_args):
         raise RuntimeError(f"recipe manifest did not verify in staging: {recipe.model}")
     moved: list[tuple[Path, Path]] = []
@@ -862,6 +1041,21 @@ def stage_witness_path(stage_root: Path) -> Path:
     return stage_root.parent / f".{stage_root.name}.published.json"
 
 
+def write_stage_witness(recipe: Recipe, staged: Recipe, key: str, stage_root: Path) -> None:
+    # Prepared intent is cleanup authority only after the matching final payload verifies.
+    info = stage_root.lstat()
+    if not stat.S_ISDIR(info.st_mode):
+        raise ValueError("transaction stage is not a directory")
+    expected = {"recipe_key": key, "output_digest": output_digest(staged.outputs),
+                "outputs": list(recipe.outputs), "stage": str(stage_root.parent.resolve() / stage_root.name),
+                "stage_identity": [info.st_dev, info.st_ino]}
+    with stage_witness_path(stage_root).open("x") as handle:
+        json.dump(expected, handle, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
 def expire_published_stage(recipe: Recipe, key: str, stage_root: Path, *, record: bool = False) -> None:
     witness = stage_witness_path(stage_root)
     try:
@@ -874,14 +1068,7 @@ def expire_published_stage(recipe: Recipe, key: str, stage_root: Path, *, record
                     "outputs": list(recipe.outputs),
                     "stage": str(stage_root.parent.resolve() / stage_root.name)}
         if record:
-            info = stage_root.lstat()
-            if not stat.S_ISDIR(info.st_mode):
-                raise ValueError("transaction stage is not a directory")
-            expected["stage_identity"] = [info.st_dev, info.st_ino]
-            # Outside the stage: partial rmtree must not erase retry authority.
-            with witness.open("x") as handle:
-                json.dump(expected, handle, sort_keys=True)
-                handle.write("\n")
+            write_stage_witness(recipe, recipe, key, stage_root)
         if not stat.S_ISREG(witness.lstat().st_mode):
             raise ValueError("publication witness is not a regular file")
         saved = json.loads(witness.read_text())
@@ -897,31 +1084,62 @@ def expire_published_stage(recipe: Recipe, key: str, stage_root: Path, *, record
         print(f"WARNING {recipe.model}: cleanup pending at {stage_root}: {error}", file=sys.stderr)
 
 
+def stage_locations(recipe: Recipe, artifacts: Path, build: Path) -> tuple[Path, Path]:
+    layout = stage_digest({"model": recipe.model, "outputs": recipe.outputs,
+                           "artifacts": str(artifacts), "build": str(build)})[:16]
+    return (build / "model-artifact-staging" / f"{recipe.model}-active-{layout}",
+            build / "model-artifact-state" / f"{recipe.model}-{layout}")
+
+
 def build_recipe(recipe: Recipe, repo: Path, config: Path, artifacts: Path, build: Path) -> str:
     authority_before = authority_digest(recipe, repo)
     inputs_before = source_digest(recipe.inputs)
     key = recipe_key(recipe, repo, config, authority=authority_before, inputs=inputs_before)
-    stage_root = build / "model-artifact-staging" / f"{recipe.model}-{key[:16]}"
+    runner = None
+    resources = list(recipe.outputs)
+    if recipe.commands and all(item.stage is not None for item in recipe.commands):
+        stage_root, state = stage_locations(recipe, artifacts, build)
+        staged = rebase_recipe(recipe, artifacts, stage_root / "artifacts", build, stage_root / "build")
+        runner = StageRunner(recipe, staged, repo, stage_root, state, artifacts, build, run_commands,
+                             symbols=globals(), validate=validate_stage_outputs)
+        resources.append(state)
+    else:
+        stage_root = build / "model-artifact-staging" / f"{recipe.model}-{key[:16]}"
     rollback = artifacts / ".model-artifact-rollback"
-    with resource_locks((*recipe.outputs, stage_root, stage_witness_path(stage_root), rollback / key)):
+    with resource_locks((*resources, stage_root, stage_witness_path(stage_root), rollback / key)):
         return _build_recipe(recipe, repo, artifacts, build, key, stage_root,
-                             rollback, authority_before, inputs_before)
+                             rollback, authority_before, inputs_before, runner=runner)
 
 
 def _build_recipe(recipe: Recipe, repo: Path, artifacts: Path, build: Path, key: str,
-                  stage_root: Path, rollback: Path, authority_before: str, inputs_before: str) -> str:
+                  stage_root: Path, rollback: Path, authority_before: str, inputs_before: str,
+                  *, runner: StageRunner | None = None) -> str:
     require_no_recovery(rollback, key)
     if cache_hit(recipe, key):
+        if runner is not None:
+            runner.resume_settlement(key)
         expire_published_stage(recipe, key, stage_root)
         return "HIT"
-    if verified_existing_gemma4(recipe, key, repo):
+    witness = stage_witness_path(stage_root)
+    if witness.exists() or witness.is_symlink():
+        raise RuntimeError(f"publication recovery requires inspection before retry: {witness}")
+    if runner is not None and manifest_path(recipe).exists() and (
+            not (runner.state / "owner.json").exists() or
+            not json.loads(manifest_path(recipe).read_text()).get("stages")):
+        raise RuntimeError(f"{recipe.model}: historical receipt has no qualified stage witnesses; "
+                           "preserve it and qualify frontier adoption, or use prepared installation; "
+                           "a new cache protocol does not authorize rebuilding or restamping accepted artifacts")
+    if runner is None and verified_existing_gemma4(recipe, key, repo):
         return "VERIFIED"
     ensure_outputs_ready(recipe, key)
-    if stage_root.exists():
-        shutil.rmtree(stage_root)
+    if runner is None and (stage_root.exists() or stage_root.is_symlink()):
+        raise RuntimeError(f"unowned recipe staging requires inspection before retry: {stage_root}")
     staged_artifacts, staged_build = stage_root / "artifacts", stage_root / "build"
     staged = rebase_recipe(recipe, artifacts, staged_artifacts, build, staged_build)
-    run_commands(staged, repo)
+    if runner is not None:
+        runner.run()
+    else:
+        run_commands(staged, repo)
     if recipe.model == "qwen3.5-4b":
         validate_recipe_outputs(staged)
     relocate_recipe_metadata(recipe, staged)
@@ -929,10 +1147,20 @@ def _build_recipe(recipe: Recipe, repo: Path, artifacts: Path, build: Path, key:
     no_staging_references(staged, stage_root)
     if authority_before != authority_digest(recipe, repo) or inputs_before != source_digest(recipe.inputs):
         raise RuntimeError(f"{recipe.model}: source authority changed while the staged build ran")
-    _publish_recipe(recipe, staged, key, rollback)
+    if runner is not None:
+        runner.prepare_settlement(key)
+    write_stage_witness(recipe, staged, key, stage_root)
+    _publish_recipe(recipe, staged, key, rollback,
+                    stages=runner.publication_record() if runner is not None else None)
     if not cache_hit(recipe, key):
         raise RuntimeError(f"recipe manifest did not verify after publish: {recipe.model}")
-    expire_published_stage(recipe, key, stage_root, record=True)
+    if runner is not None:
+        try:
+            runner.settle()
+        except (OSError, ValueError, RuntimeError) as error:
+            print(f"WARNING {recipe.model}: verified publication; frontier settlement pending at {runner.state}: {error}", file=sys.stderr)
+            return "BUILT"
+    expire_published_stage(recipe, key, stage_root)
     return "BUILT"
 
 

@@ -442,6 +442,20 @@ class Qwen35StoragePilotTests(unittest.TestCase):
         self.artifacts, self.build = self.root / "artifacts", self.root / "build"
         self.recipe = recipe_for("qwen3.5-4b", self.scenario, self.repo,
                                  self.artifacts, self.root / "inputs", self.build)
+        for item in self.recipe.commands:
+            for raw in item.stage.sources:
+                producer = self.repo / raw
+                if producer.suffix in {".py", ".sh", ".lock"}:
+                    producer.parent.mkdir(parents=True, exist_ok=True)
+                    producer.write_text("fixture producer")
+                else:
+                    producer.mkdir(parents=True, exist_ok=True)
+        sdk_patch = patch("model_artifact_stages.sdk_identity", return_value="fixture SDK")
+        sdk_patch.start()
+        self.addCleanup(sdk_patch.stop)
+        toolchain_patch = patch("model_artifact_stages.toolchain_identity", return_value={"pin": "fixture toolchain"})
+        toolchain_patch.start()
+        self.addCleanup(toolchain_patch.stop)
         source = Path(self.recipe.inputs[0])
         source.mkdir(parents=True)
         for name in ("config.json", "tokenizer.json", "tokenizer_config.json", "model.safetensors"):
@@ -629,20 +643,23 @@ class Qwen35StoragePilotTests(unittest.TestCase):
         first_calls = len(self.calls)
         Path(self.recipe.inputs[0], "model.safetensors").write_bytes(b"changed")
         self.assertEqual(self.run_build(), "BUILT")
-        self.assertEqual(len(self.calls), first_calls * 2)
-        quant = self.repo / "designs/decode_fused/quant.py"
-        quant.parent.mkdir(parents=True)
+        affected = ["dump_llm_weights.py", "build_llm_decode.sh", "build_prefill.sh"]
+        self.assertEqual([Path(argv[1]).name for argv in self.calls[first_calls:]], affected)
+        quant = self.repo / "third_party/iron/iron/common/quant.py"
+        quant.parent.mkdir(parents=True, exist_ok=True)
         quant.write_text("quant = 2\n")
         self.assertEqual(self.run_build(), "BUILT")
-        self.assertEqual(len(self.calls), first_calls * 3)
+        self.assertEqual([Path(argv[1]).name for argv in self.calls[first_calls:]], affected * 2)
+        calls_after_rebuild = len(self.calls)
         self.assertEqual(self.run_build(), "HIT")
-        self.assertEqual(len(self.calls), first_calls * 3)
+        self.assertEqual(len(self.calls), calls_after_rebuild)
 
     def test_missing_published_blob_invalidates_receipt(self):
         self.assertEqual(self.run_build(), "BUILT")
         Path(self.recipe.outputs[0], "buffers/W.bin").unlink()
         self.assertEqual(self.run_build(), "BUILT")
-        self.assertEqual(len(self.calls), 8)
+        self.assertEqual([Path(argv[1]).name for argv in self.calls[4:]],
+                         ["dump_llm_weights.py", "build_llm_decode.sh"])
 
     def test_different_data_roots_build_only_in_their_own_stage(self):
         self.assertEqual(self.run_build(), "BUILT")
@@ -786,8 +803,16 @@ class ModelArtifactDispatchPlanTests(unittest.TestCase):
                 "model.embed_audio.embedding_projection.weight": {
                     "blob": "tower", "offset": 0, "length": array.nbytes,
                     "shape": list(array.shape), "dtype": "float32", "layout": "raw_native"}}}))
-            with patch("model_artifact_dispatch.subprocess.run"):
+            compiler = root / "build/rf48C"
+            compiler.mkdir(parents=True)
+            (compiler / "meta.json").write_text("preserve compiler metadata")
+            with patch("model_artifact_dispatch.subprocess.run") as run:
                 package_gemma4(REPO, artifacts, root / "build", root / "out", source, root / "tokenizer")
+            metadata_command = run.call_args_list[0].args[0]
+            self.assertIn("--out", metadata_command)
+            metadata_out = Path(metadata_command[metadata_command.index("--out") + 1])
+            self.assertFalse(metadata_out.is_relative_to(compiler))
+            self.assertEqual((compiler / "meta.json").read_text(), "preserve compiler metadata")
             checkpoint = artifacts / "gemma4-12b-qat/checkpoint"
             saved = load_file(checkpoint / "model.safetensors")
             self.assertEqual(list(saved), ["model.embed_audio.embedding_projection.weight"])
@@ -801,6 +826,10 @@ class ModelArtifactDispatchPlanTests(unittest.TestCase):
         staged = rebase_recipe(recipe, artifacts, stage / "artifacts", build, stage / "build")
         command = next(item for item in staged.commands if item.step == "build")
         self.assertEqual(command.env.get("RF_STORE"), str(stage / "artifacts/gemma4-12b/store"))
+        expected = str(Path(recipe.inputs[0]) / "config.json")
+        self.assertEqual(command.env.get("RF_HF_CONFIG"), expected)
+        data = next(item for item in staged.commands if item.step == "data-rf-stack")
+        self.assertEqual(data.env.get("RF_HF_CONFIG"), expected)
 
     def test_published_prefill_metadata_resolves_its_published_decode(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -866,7 +895,7 @@ class ModelArtifactDispatchPlanTests(unittest.TestCase):
             ("gemma3-270m", "scenarios/generate-gemma3-270m.toml", "weights"),
             ("qwen3-0.6b", "scenarios/generate-qwen3-0.6b.toml", "weights"),
             ("qwen3.5-4b", "scenarios/generate-qwen3.5-4b.toml", "weights"),
-            ("gemma4-12b", "scenarios/generate-gemma4-12b-resident-256k.toml", "data"),
+            ("gemma4-12b", "scenarios/generate-gemma4-12b-resident-256k.toml", "data-weights"),
         ):
             with self.subTest(model=model):
                 recipe = recipe_for(model, scenario, REPO, REPO / "data/artifacts",
@@ -1066,7 +1095,8 @@ class ModelArtifactDispatchPlanTests(unittest.TestCase):
 
     def test_resident_recipe_packages_the_declared_artifact(self) -> None:
         gemma4 = next(entry for entry in self.plan() if entry["model"] == "gemma4-12b")
-        self.assertEqual([command["step"] for command in gemma4["commands"]], ["data", "build", "package"])
+        self.assertEqual([command["step"] for command in gemma4["commands"]],
+                         ["data-hf-config", "data-weights", "data-towers", "data-store", "data-rf-stack", "build", "package"])
         outputs = set(gemma4["outputs"])
         self.assertTrue({
             "/model-artifacts/gemma4-12b/resident_rf48C_p7148a7",

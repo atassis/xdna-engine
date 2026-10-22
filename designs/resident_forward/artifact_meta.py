@@ -70,5 +70,6 @@ if __name__ == "__main__":
     parser.add_argument("--build", type=Path, required=True)
     parser.add_argument("--store", type=Path, required=True)
     parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--out", type=Path, help="write derived metadata outside the reusable compiler frontier")
     args = parser.parse_args()
-    (args.build / "meta.json").write_text(json.dumps(metadata(args.build, args.store, args.config), indent=2) + "\n")
+    (args.out or args.build / "meta.json").write_text(json.dumps(metadata(args.build, args.store, args.config), indent=2) + "\n")
