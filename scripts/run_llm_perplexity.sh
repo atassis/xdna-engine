@@ -24,11 +24,15 @@ CORPUS="${2:?corpus}"
 OUTP="${3:?out-prefix}"
 MAXTOK="${4:-2000}"
 VENV_IRON="${VENV_IRON:-$REPO/.venv-iron}"
+[ -r "$CORPUS" ] || { echo "ERROR: cannot read corpus $CORPUS"; exit 1; }
+if [ "$SPEC" = "qwen3.5-4b" ] && [ -z "${WEIGHTS:-}" ]; then
+    exec "$VENV_IRON/bin/python" "$REPO/scripts/with_llm_weights.py" --spec "$SPEC" \
+        -- bash "${BASH_SOURCE[0]}" "$@"
+fi
 . "$REPO/scripts/amd_paths.sh"
 IRON="${IRON:-$IRON_DIR}"
 WEIGHTS="${WEIGHTS:-$REPO/artifacts/$SPEC/weights}"
 [ -d "$WEIGHTS" ] || { echo "ERROR: no weights at $WEIGHTS"; exit 1; }
-[ -r "$CORPUS" ] || { echo "ERROR: cannot read corpus $CORPUS"; exit 1; }
 
 INST="$("$REPO/scripts/toolchain_up.sh")"
 export PYTHONPATH="$INST/python:$IRON${PYTHONPATH:+:$PYTHONPATH}"

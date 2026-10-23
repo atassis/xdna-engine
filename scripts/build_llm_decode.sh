@@ -20,12 +20,16 @@ OUT="$(realpath -m "$OUT")"
 . "$REPO/scripts/require_disk_backed.sh"
 require_disk_backed "$OUT" "OUT (the built artifact)" || exit 1
 VENV_IRON="${VENV_IRON:-$REPO/.venv-iron}"
+[ -x "$VENV_IRON/bin/python" ] || { echo "ERROR: no iron venv at $VENV_IRON"; exit 1; }
+if [ "$SPEC" = "qwen3.5-4b" ] && [ -z "${WEIGHTS:-}" ]; then
+    exec "$VENV_IRON/bin/python" "$REPO/scripts/with_llm_weights.py" --spec "$SPEC" \
+        -- bash "${BASH_SOURCE[0]}" "$@"
+fi
 . "$REPO/scripts/amd_paths.sh"        # -> IRON_DIR, AIEBU_ASM_DIR (relocatable; env-overridable)
 IRON="${IRON:-$IRON_DIR}"
 WEIGHTS="${WEIGHTS:-$REPO/artifacts/$SPEC/weights}"
 GEN="$REPO/designs/decode_fused/gen_llm_decode.py"
 
-[ -x "$VENV_IRON/bin/python" ] || { echo "ERROR: no iron venv at $VENV_IRON"; exit 1; }
 # Gate on the API SURFACE gen_llm_decode.py imports, not a branch name or a worktree path. This
 # used to default IRON to a wt-iron-qwen3 worktree and require the DELETED iron/common/fusion.py,
 # which tethered the whole LLM decode build to one side branch; the generator is now on

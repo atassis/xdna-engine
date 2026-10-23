@@ -4,14 +4,16 @@ kind = "generate"
 # weights (which keep 69 of 72 JevBench decisions against bf16's 70 on the CPU reference) with a bf16
 # head, and ACT_POLY=1 activations (the tanh-LUT ones put logits at 6x the bf16 floor):
 #
-#   decode     IRON=<wt-iron-qwen35> WEIGHTS=<the f32 dump> GEN_EXTRA="--max-seq 4096" ACT_POLY=1 \
+#   decode     IRON=<wt-iron-qwen35> GEN_EXTRA="--max-seq 4096" ACT_POLY=1 \
 #              DECODE_GDR_LIMBS=1 \
 #              PRECISION='{"mlp": "int4/g32/clip", "attn_o": "int4/g32/clip", "qkv": "int4/g32/clip"}' \
 #              scripts/build_llm_decode.sh qwen3.5-4b "" artifacts/qwen3.5-4b/decode_s4096_gdrl
 #   tokenizer  the HF snapshot of Qwen/Qwen3.5-4B (tokenizer.json, tokenizer_config.json)
 #
-# The build reads the f32 dump (scripts/dump_llm_weights.py --spec qwen3.5-4b), 16 GB; the decode
-# path never reads `weights` at runtime, only the memory-ceiling estimate does. So it names the
+# Without explicit WEIGHTS, the build exports f32 weights from
+# $XDNA_DATA/model-inputs/qwen3.5-4b/checkpoint into a command-scoped XDNA_BUILD directory.
+# Explicit WEIGHTS stays caller-owned. The decode path never reads the dump at runtime,
+# only the memory-ceiling estimate does. So it names the
 # arena bytes the device actually receives, 3.3 GB, not the dump. S=4096 because JevBench's hard set
 # has decide prompts up to 4033 tokens; on prompts that fit S=2048 the pair's answers are
 # bit-identical to the S=2048 pair's. The delta rule runs on bf16 limbs, as the prefill's does: the

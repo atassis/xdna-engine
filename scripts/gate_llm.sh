@@ -45,6 +45,8 @@ PY="$VENV_IRON/bin/python"
 
 SCRATCH="${GATE_DUMP_ROOT:-$XDNA_SCRATCH/prefill/gate}"
 SPEC="${GATE_SPEC:-qwen3-0.6b}"   # defined here: WEIGHTS/DECODE_ART below derive from it
+TRANSIENT_WEIGHTS=0
+if [ "$SPEC" = "qwen3.5-4b" ] && [ -z "${WEIGHTS:-}" ]; then TRANSIENT_WEIGHTS=1; fi
 WEIGHTS="${WEIGHTS:-$REPO/artifacts/$SPEC/weights}"
 REF="${GATE_REF:-$REPO/tests/refs/qwen3-0.6b/gate_ref_n32.json}"
 NPU_JSON="${GATE_NPU:-$SCRATCH/npu_tokens.json}"
@@ -57,6 +59,7 @@ DECODE_ART="${DECODE_ART:-$REPO/artifacts/$SPEC/decode}"
 DEFAULT_ARTIFACTS="$XDNA_SCRATCH/prefill/mlp_m256 $XDNA_SCRATCH/prefill/attn_m256_s2048"
 read -r -a ARTIFACTS <<<"${GATE_ARTIFACTS:-$DEFAULT_ARTIFACTS}"
 
+ORIGINAL_ARGS=("$@")
 MODE=""; JUDGE_ONLY=0; EXTRA=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -68,6 +71,17 @@ while [ $# -gt 0 ]; do
   shift
 done
 [ -n "$MODE" ] || { echo "usage: gate_llm.sh --tier1|--tier2|--tier2-prefill|--all|--refresh-goldens <dir>|--make-ref"; exit 2; }
+
+NEEDS_WEIGHTS=0
+case "$MODE" in
+  --refresh-goldens|--make-ref|--make-prefill-refs) NEEDS_WEIGHTS=1 ;;
+  --tier2|--all)
+    if [ "$JUDGE_ONLY" = "0" ] || [ ! -f "$REF" ]; then NEEDS_WEIGHTS=1; fi ;;
+esac
+if [ "$TRANSIENT_WEIGHTS" = "1" ] && [ "$NEEDS_WEIGHTS" = "1" ]; then
+  exec env -u WEIGHTS "$PY" "$REPO/scripts/with_llm_weights.py" --spec "$SPEC" \
+      -- bash "${BASH_SOURCE[0]}" "${ORIGINAL_ARGS[@]}"
+fi
 
 device_step() {
   echo
