@@ -48,7 +48,7 @@ SPEC="${GATE_SPEC:-qwen3-0.6b}"   # defined here: WEIGHTS/DECODE_ART below deriv
 TRANSIENT_WEIGHTS=0
 if [ "$SPEC" = "qwen3.5-4b" ] && [ -z "${WEIGHTS:-}" ]; then TRANSIENT_WEIGHTS=1; fi
 WEIGHTS="${WEIGHTS:-$REPO/artifacts/$SPEC/weights}"
-REF="${GATE_REF:-$REPO/tests/refs/qwen3-0.6b/gate_ref_n32.json}"
+REF="${GATE_REF:-$REPO/tests/refs/$SPEC/gate_ref_n32.json}"
 NPU_JSON="${GATE_NPU:-$SCRATCH/npu_tokens.json}"
 TOKENS="${GATE_TOKENS:-32}"
 K="${GATE_K:-5}"

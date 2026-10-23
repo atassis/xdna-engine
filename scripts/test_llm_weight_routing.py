@@ -90,6 +90,17 @@ raise SystemExit(37 if Path(sys.argv[1]).name == 'with_llm_weights.py' else 0)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(any(Path(call[0]).name == 'with_llm_weights.py' for call in self.calls()))
 
+    def test_default_reference_belongs_to_selected_model(self):
+        self.env.pop('GATE_REF')
+        for model in ['qwen3.5-4b', 'qwen3-0.6b']:
+            with self.subTest(model=model):
+                self.log.unlink(missing_ok=True)
+                result = self.run_shell('gate_llm.sh', '--make-ref', GATE_SPEC=model, WEIGHTS=str(self.root))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                call = self.calls()[0]
+                self.assertEqual(call[call.index('--out') + 1],
+                                 str(self.root / 'tests/refs' / model / 'gate_ref_n32.json'))
+
     def test_explicit_weights_and_other_models_do_not_route(self):
         for env in [{'WEIGHTS': str(self.root)}, {'GATE_SPEC': 'qwen3-0.6b'}]:
             with self.subTest(env=env):
