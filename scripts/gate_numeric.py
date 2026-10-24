@@ -109,7 +109,8 @@ def mean_rel_l1(got, ref):
     g = np.asarray(got, np.float64).ravel()
     r = np.asarray(ref, np.float64).ravel()
     den = float(np.abs(r).mean())
-    return float(np.abs(g - r).mean() / den) if den > 0 else float(np.abs(g - r).mean())
+    with np.errstate(invalid="ignore"):               # non-finite data is the gate's to report
+        return float(np.abs(g - r).mean() / den) if den > 0 else float(np.abs(g - r).mean())
 
 
 def check(got, ref, atol, rtol=RTOL):
@@ -118,20 +119,37 @@ def check(got, ref, atol, rtol=RTOL):
     Full output, not a sample and not a summary statistic: a single structurally wrong element --
     a transposed tile, a stale row, an off-by-one in a slab offset -- moves no aggregate metric
     far enough to fail, and is exactly the defect class this rail keeps hitting.
+
+    A NON-FINITE VALUE IS A VIOLATION, NEVER A COMPARISON. `err > tol` is False whenever err is
+    NaN, so a NaN device element escapes the count outright; an infinite REFERENCE inflates tol to
+    inf and escapes the same way. Both sides are finite-masked before the element-wise check, and
+    a non-finite element on either side counts in n_bad and fails the gate.
     """
     g = np.asarray(got, np.float64).ravel()
     r = np.asarray(ref, np.float64).ravel()
     if g.shape != r.shape:
         raise ValueError(f"shape mismatch: device {g.shape} vs reference {r.shape}")
-    err = np.abs(g - r)
-    tol = atol + rtol * np.abs(r)
-    bad = err > tol
+    if not (np.isfinite(atol) and np.isfinite(rtol)):
+        raise ValueError(f"non-finite tolerance: atol={atol}, rtol={rtol} -- a gate cannot "
+                         f"compare against NaN/inf; a golden or floor that produced one is corrupt")
+    nonfinite_g = ~np.isfinite(g)
+    nonfinite_r = ~np.isfinite(r)
+    with np.errstate(invalid="ignore"):
+        err = np.abs(g - r)
+        tol = atol + rtol * np.abs(r)
+        bad = (err > tol) | nonfinite_g | nonfinite_r
+        # Worst element by margin; a non-finite element has no margin, so it must not be able to
+        # win argmax as a NaN would (argmax returns the first NaN) without being counted -- it is
+        # already counted above, and worst reporting points at the worst FINITE miss.
+        margin = np.where(nonfinite_g | nonfinite_r, -np.inf, err - tol)
     n_bad = int(bad.sum())
-    worst = int(np.argmax(err - tol)) if g.size else 0
+    worst = int(np.argmax(margin)) if g.size else 0
     return {
         "n": int(g.size),
         "n_bad": n_bad,
         "frac_bad": n_bad / g.size if g.size else 0.0,
+        "n_nonfinite_got": int(nonfinite_g.sum()),
+        "n_nonfinite_ref": int(nonfinite_r.sum()),
         "mean_rel_L1": mean_rel_l1(g, r),
         "rtol": rtol,
         "atol": float(atol),
@@ -208,6 +226,10 @@ def gate_artifact(art_dir, dump_dir, tensors=None, atol_override=None):
         ref = _read(os.path.join(art_dir, spec["ref"]), ref_dt, n)
         got = _read(os.path.join(dump_dir, f"{name}.bin"), dev_dt, n)
         atol = float(spec["atol"]) if atol_override is None else float(atol_override)
+        if not np.isfinite(atol):
+            raise SystemExit(f"ERROR: {art_dir}/meta.json declares a non-finite atol for '{name}' "
+                             f"({atol}); the golden or bf16 floor it was derived from is corrupt. "
+                             f"Regenerate the artifact, do not gate against it")
         r = check(got, ref, atol)
         # The device's error over the bf16 floor's. NOT gated on -- our own doctrine keeps error
         # metrics as notes -- but it is the sensitive number: a datapath 2.6x less accurate than
@@ -236,6 +258,9 @@ def report(art_dir, results, atol_override=None, margin=None):
         if not r["pass"]:
             print(f"[tier1]   worst element [{r['worst_index']}]: device {r['worst_got']:.6g} "
                   f"vs reference {r['worst_ref']:.6g}, |err| {r['max_abs_err']:.4e}")
+        if r["n_nonfinite_got"] or r["n_nonfinite_ref"]:
+            print(f"[tier1]   non-finite elements: device {r['n_nonfinite_got']}, reference "
+                  f"{r['n_nonfinite_ref']} -- a non-finite value is a violation, never a comparison")
     print("[tier1] 'x bf16 floor' is a NOTE, never the gate: how much worse than a faithful bf16 "
           "host\n[tier1] implementation of the same dataflow this datapath is. 1.0 is host "
           "quality.")
@@ -258,6 +283,9 @@ def main():
     if len(dumps) not in (1, len(a.artifact)):
         raise SystemExit(f"ERROR: {len(dumps)} --dump dirs for {len(a.artifact)} artifacts")
     tensors = a.tensors.split(",") if a.tensors else None
+    if a.atol is not None and not np.isfinite(a.atol):
+        raise SystemExit(f"ERROR: --atol {a.atol} is not finite -- an override cannot lift the "
+                         f"gate above NaN/inf any more than an artifact's own value can")
     ok, blob = True, {}
     for i, art in enumerate(a.artifact):
         dump = dumps[i] if len(dumps) > 1 else dumps[0]

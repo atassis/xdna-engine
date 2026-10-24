@@ -97,6 +97,57 @@ def test_shape_mismatch_is_an_error_not_a_verdict():
 
 
 # ------------------------------------------------------------------------------------------------
+# TIER 1: non-finite values. The recorded false PASS (2026-10-24): `bad = err > tol` is False when
+# err is NaN, so a NaN device element escaped the violation count through the full CLI (exit 0,
+# "PASS"); an infinite REFERENCE escaped the same way by inflating tol to inf. A non-finite value
+# on either side is now itself a violation, and non-finite tolerances are rejected outright.
+# ------------------------------------------------------------------------------------------------
+def test_a_single_nan_in_the_device_output_fails_instead_of_escaping():
+    ref = np.linspace(-3, 3, 1000).astype(np.float32)
+    got = ref.copy()
+    got[500] = np.nan
+    r = gn.check(got, ref, atol=0.0)
+    assert not r["pass"] and r["n_bad"] == 1
+    assert r["n_nonfinite_got"] == 1 and r["n_nonfinite_ref"] == 0
+
+
+def test_a_nan_among_finite_wrong_values_is_counted_with_them():
+    """Mixed array: the NaN must not zero out (or hide behind) the finite violations beside it."""
+    ref = np.linspace(-3, 3, 100).astype(np.float32)
+    got = ref.copy()
+    got[10] = 9.0
+    got[20] = np.nan
+    r = gn.check(got, ref, atol=0.0)
+    assert not r["pass"] and r["n_bad"] == 2
+    assert r["n_nonfinite_got"] == 1
+    # worst-element reporting points at the worst FINITE miss, not at the NaN
+    assert r["worst_index"] == 10
+
+
+def test_an_infinite_reference_fails_rather_than_inflating_the_tolerance():
+    """The second escape: tol = atol + rtol*|ref| is inf when ref is inf, and |got - inf| > inf is
+    False -- an infinite golden would have passed ANY device output at its own position."""
+    ref = np.linspace(-3, 3, 64).astype(np.float32)
+    ref[7] = np.inf
+    r = gn.check(ref.copy(), ref, atol=0.0)
+    assert not r["pass"] and r["n_bad"] == 1 and r["n_nonfinite_ref"] == 1
+
+
+def test_an_all_nonfinite_output_fails():
+    got = np.full(16, np.nan, np.float32)
+    r = gn.check(got, np.ones(16, np.float32), atol=1.0)
+    assert not r["pass"] and r["n_bad"] == 16 and r["n_nonfinite_got"] == 16
+
+
+def test_nonfinite_tolerances_are_rejected_not_compared():
+    ref = np.ones(8, np.float32)
+    with pytest.raises(ValueError):
+        gn.check(ref, ref, atol=float("nan"))
+    with pytest.raises(ValueError):
+        gn.check(ref, ref, atol=0.0, rtol=float("inf"))
+
+
+# ------------------------------------------------------------------------------------------------
 # TIER 1: the artifact plumbing. A missing reference must never read as a pass.
 # ------------------------------------------------------------------------------------------------
 def _artifact(tmp_path, refs, floors, name="out"):
@@ -167,6 +218,51 @@ def test_a_round_trip_through_a_real_artifact_passes_and_a_perturbed_one_fails(t
     bad[7] = bad[6]                                   # one stale row
     np.asarray(bad, BF16).tofile(os.path.join(dump, "out.bin"))
     assert not any(r["pass"] for _, r in gn.gate_artifact(art, dump))
+
+
+def test_an_artifact_declaring_a_nonfinite_atol_is_refused(tmp_path):
+    """atol is derived from the golden and its bf16 floor; a NaN there means the artifact itself
+    is corrupt, and the gate must say so rather than compare against a meaningless tolerance."""
+    rng = np.random.default_rng(7)
+    ref = rng.standard_normal(256).astype(np.float32)
+    art = _artifact(tmp_path, {"out": ref}, {"out": np.asarray(np.asarray(ref, BF16), np.float32)})
+    mp = os.path.join(art, "meta.json")
+    meta = json.load(open(mp))
+    meta["gate"]["tensors"]["out"]["atol"] = float("nan")
+    json.dump(meta, open(mp, "w"))
+    dump = os.path.join(art, "dump")
+    os.makedirs(dump, exist_ok=True)
+    np.asarray(ref, BF16).tofile(os.path.join(dump, "out.bin"))
+    with pytest.raises(SystemExit) as e:
+        gn.gate_artifact(art, dump)
+    assert "non-finite atol" in str(e.value)
+
+
+def test_the_cli_fails_loudly_on_a_nonfinite_dump(tmp_path):
+    """The recorded 2026-10-24 false PASS ran exactly this shape through the full CLI: a NaN in the
+    device dump printed PASS and exited 0. The same CLI must now exit nonzero and say why, while a
+    finite dump of the same artifact still passes, and a non-finite --atol override is refused."""
+    rng = np.random.default_rng(8)
+    ref = (rng.standard_normal((32, 64)).astype(np.float32) @
+           rng.standard_normal((64, 32)).astype(np.float32))
+    floor = np.asarray(np.asarray(ref, BF16), np.float32)
+    art = _artifact(tmp_path, {"out": ref}, {"out": floor})
+    dump = os.path.join(art, "dump")
+    os.makedirs(dump, exist_ok=True)
+
+    def run(dump_values, *extra):
+        np.asarray(dump_values, BF16).tofile(os.path.join(dump, "out.bin"))
+        return subprocess.run([sys.executable, os.path.join(_HERE, "gate_numeric.py"),
+                               art, "--dump", dump, *extra], capture_output=True, text=True)
+
+    r = run(floor)                                    # finite control: still passes
+    assert r.returncode == 0 and "*** PASS ***" in r.stdout
+    nan_dump = floor.copy()
+    nan_dump.flat[5] = np.nan                         # ONE element, not a whole row
+    r = run(nan_dump)
+    assert r.returncode != 0 and "FAIL" in r.stdout and "non-finite elements: device 1" in r.stdout
+    r = run(floor, "--atol", "nan")
+    assert r.returncode != 0 and "not finite" in r.stderr
 
 
 # ------------------------------------------------------------------------------------------------
