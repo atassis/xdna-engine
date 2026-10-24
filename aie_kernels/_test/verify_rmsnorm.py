@@ -21,6 +21,16 @@ from aie.iron.controlflow import range_
 from aie.iron.kernel import ExternalFunction
 from aie.helpers.taplib import TensorTiler2D
 
+# The JIT cache keys only what it is told about (source_files=), and this design's
+# kernel is an ExternalFunction(source_file=...) shim that #include's the brick .cc,
+# invisible to the key -- a cache hit can silently link a stale .o after rmsnorm.cc
+# changes. bricklib.py, the generalization of this rail, gates the identical shape
+# with this opt-in env switch; mirrored here rather than left unguarded. Set
+# BRICK_JIT_CACHE=1 only against a toolchain that records what a build actually
+# consumed, and never without re-running the perturb check (edit rmsnorm.cc, confirm
+# the gate moves).
+_JIT_CACHE = os.environ.get("BRICK_JIT_CACHE") == "1"
+
 HERE = Path(__file__).parent
 BRICK = HERE.parent / "rmsnorm"
 GEN = HERE / "gen"
@@ -54,7 +64,7 @@ golden = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(golden)
 
 
-@iron.jit
+@iron.jit(use_cache=_JIT_CACHE)
 def rmsnorm_design(
     inp: In,
     gb: In,
