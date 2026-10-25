@@ -134,9 +134,11 @@ def _recipe_for(model: str, scenario: str, repo: Path, artifacts: Path, inputs: 
 
     if model == "parakeet" and scenario == "scenarios/asr.toml":
         return Recipe(
-            model, scenario, (src("parakeet"),), (out("parakeet"),),
+            model, scenario, (src("parakeet"),), (out("parakeet"), out("relpos")),
             (command("export", [export_py, str(scripts / "extract_parakeet_encoder.py")],
-                     PARAKEET_SOURCE=src("parakeet"), PARAKEET_OUT=out("parakeet")),),
+                     PARAKEET_SOURCE=src("parakeet"), PARAKEET_OUT=out("parakeet")),
+             command("relpos", ["bash", str(scripts / "relpos_prebuild.sh")], OUT_ROOT=out("relpos"),
+                     BUCKETS="100:25:bucket_100 152:38:bucket_152 172:43:single", HEADS="8", ROWS="1", TSKIP="0")),
         )
     if model == "bge-base" and scenario == "scenarios/bge-base.toml":
         return Recipe(
@@ -278,7 +280,13 @@ def declare_stages(recipe: Recipe, repo: Path, build: Path) -> Recipe:
         step, model = item.step, recipe.model
         if model == "gemma4-12b":
             item = replace(item, env=item.env | {"RF_MODEL": model})
-        if model in {"parakeet", "bge-base"}:
+        if model == "parakeet" and step == "relpos":
+            stage = Stage(outputs=(View(recipe.outputs[1]),),
+                          sources=(*compiler_sources, "scripts/relpos_prebuild.sh", "designs/relpos_mha", "aie_kernels"),
+                          environment=(*compiler_env, "MLIR_AIE_ROOT"),
+                          sdk_python=iron_py, sdk_packages=("numpy",), toolchain=True)
+            item = replace(item, env=item.env | compiler_runtime)
+        elif model in {"parakeet", "bge-base"}:
             packages = ("numpy", "onnx", "onnxruntime") if model == "parakeet" else ("numpy", "torch", "transformers", "onnx", "tokenizers", "safetensors")
             stage = Stage(inputs=(View(checkpoint),), outputs=(View(recipe.outputs[0]),),
                           sources=(str(Path(item.argv[1]).relative_to(repo)),),
@@ -459,7 +467,12 @@ def require_members(recipe: Recipe, root: Path, output: bool) -> None:
     if not output and recipe.model.startswith("pyannote"):
         validate_local_pipeline_inputs(root)
         return
-    for choices in required_members(recipe, output):
+    if output and recipe.model == "parakeet" and len(recipe.outputs) > 1 and root == Path(recipe.outputs[1]):
+        members = tuple((f"{bucket}/{name}",) for bucket in ("bucket_100", "bucket_152", "single")
+                        for name in ("final.xclbin", "insts.bin", ".toolchain-stamp"))
+    else:
+        members = required_members(recipe, output)
+    for choices in members:
         if not any(candidate for choice in choices for candidate in root.glob(choice)):
             raise FileNotFoundError(f"{recipe.model}: required {kind} missing under {root}: {' or '.join(choices)}")
 
@@ -478,6 +491,8 @@ def validate_recipe_outputs(recipe: Recipe, *, references: Recipe | None = None)
         if not Path(raw).exists():
             raise FileNotFoundError(f"{recipe.model}: recipe output missing: {raw}")
     require_members(recipe, Path(recipe.outputs[0]), True)
+    if recipe.model == "parakeet" and len(recipe.outputs) > 1:
+        require_members(recipe, Path(recipe.outputs[1]), True)
     if recipe.model == "qwen3.5-4b":
         validate_qwen35_closure(recipe, references or recipe)
     if recipe.model == "whisper-turbo":
@@ -538,7 +553,11 @@ def validate_stage_outputs(recipe: Recipe, step: str) -> None:
             metadata = Path(recipe.outputs[0 if step == "decode" else 1]) / "meta.json"
             if dump.encode() in metadata.read_bytes():
                 raise RuntimeError(f"{recipe.model}: staged path leaked into published metadata: {metadata}")
-    elif step == "export" and recipe.model in {"parakeet", "bge-base", *PYANNOTE_SDKS}:
+    elif recipe.model == "parakeet" and step == "export":
+        validate_recipe_outputs(replace(recipe, outputs=recipe.outputs[:1]))
+    elif recipe.model == "parakeet" and step == "relpos":
+        require_members(recipe, Path(recipe.outputs[1]), True)
+    elif step == "export" and recipe.model in {"bge-base", *PYANNOTE_SDKS}:
         validate_recipe_outputs(recipe)
     elif recipe.model == "whisper-turbo" and step == "serving-companions":
         from whisper_serving_companions import validate

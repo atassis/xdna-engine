@@ -49,6 +49,10 @@ def scenario_artifact_paths(scen: dict) -> list[str]:
             v = block.get(field, "")
             if isinstance(v, str) and v.startswith("artifacts/"):
                 out.append(v)
+    # Parakeet's resident attention loader resolves this fixed path outside its weights bundle.
+    scenario = scen.get("scenario", {})
+    if scenario.get("kind") == "asr" and "parakeet" in scenario.get("name", "").lower():
+        out.append("artifacts/relpos")
     return out
 
 

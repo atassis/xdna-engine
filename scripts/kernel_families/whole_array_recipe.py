@@ -64,10 +64,10 @@ def resolve(stem):
     native = rest.endswith("nat")
     if native:
         rest = rest[: -len("nat")]
-    tail = re.match(r"^(bf16out)?(panel(\d+))?$", rest)
+    tail = re.match(r"^(bf16out)?(panel(\d+))?(apanel(\d+))?$", rest)
     if not tail or tail.group(0) != rest:
         raise ValueError(f"{stem!r}: unrecognized trailing tokens {rest!r} in variant {variant!r}")
-    bf16out, panel_width = bool(tail.group(1)), tail.group(3)
+    bf16out, panel_width, a_panel_width = bool(tail.group(1)), tail.group(3), tail.group(5)
     if native:
         fast = False
 
@@ -85,6 +85,8 @@ def resolve(stem):
         variables.append("dtype_out=bf16")
     if panel_width:
         variables.append(f"c_panel_width={panel_width}")
+    if a_panel_width:
+        variables.append(f"a_panel_width={a_panel_width}")
     return makefile, variables, f"build/final_{stem}.xclbin"
 
 

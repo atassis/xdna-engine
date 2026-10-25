@@ -13,7 +13,15 @@ precision = "bf16"
 weights = "artifacts/parakeet"
 
 [kernels.whole_array]
-required = ["512x1024x4096_32x32x128_8c_modalsilubf16outpanel1024"]
+# The resident program also needs the streams selected by NpuMatmul::stream_k_ex.
+required = [
+    "512x1024x4096_32x32x128_8c_modalsilubf16outpanel1024",
+    "512x1024x1024_64x32x128_8c_modalid",
+    "512x1024x2048_64x32x128_8c_modalid",
+    "512x1024x1024_64x32x128_8c_modalidkrtp",
+    "512x1024x2048_64x32x128_8c_modalidkrtp",
+    "512x4096x1024_64x32x128_8c_modalidkrtpapanel1024",
+]
 one_of = [["512x1024x4096_64x32x128_8c_modalsilukrtp", "512x1024x4096_64x32x128_8c_modalsilu"]]
 recipe = "scripts/kernel_families/whole_array.sh"
 sources = ["aie_kernels", "designs/whole_array_fused", "scripts/kernel_families/whole_array.sh", "scripts/kernel_families/whole_array_recipe.py"]

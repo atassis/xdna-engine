@@ -6,6 +6,7 @@ import pathlib
 import subprocess
 import sys
 import unittest
+import tomllib
 
 
 SCRIPT = pathlib.Path(__file__).with_name("kernel_families") / "whole_array_recipe.py"
@@ -35,6 +36,27 @@ class WholeArrayRecipeTest(unittest.TestCase):
         self.assertEqual(panel.returncode, 0, panel.stderr)
         self.assertIn("dtype_out=bf16", panel.stdout)
         self.assertIn("c_panel_width=1024", panel.stdout)
+
+    def test_parakeet_declares_dispatch_streams(self):
+        repo = SCRIPT.parents[2]
+        scenario = tomllib.loads((repo / "scenarios/asr.toml").read_text())
+        required = scenario["kernels"]["whole_array"]["required"]
+        for suffix in ("", "krtp"):
+            for n in (1024, 2048):
+                stem = f"512x1024x{n}_64x32x128_8c_modalid{suffix}"
+                self.assertIn(stem, required)
+                result = self.run_recipe(stem)
+                self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("512x4096x1024_64x32x128_8c_modalidkrtpapanel1024", required)
+
+    def test_resolves_parakeet_panel_input_stream(self):
+        stem = "512x4096x1024_64x32x128_8c_modalidkrtpapanel1024"
+        result = self.run_recipe(stem)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("k_loop_rtp=1", result.stdout)
+        self.assertIn("a_panel_width=1024", result.stdout)
+        self.assertIn("no_silu=1", result.stdout)
+        self.assertIn(f"build/final_{stem}.xclbin", result.stdout)
 
     def test_larger_m_native_and_invalid_row_grid(self):
         for mode in ("silu", "id"):

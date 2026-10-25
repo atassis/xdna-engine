@@ -34,12 +34,13 @@ TSKIP="${TSKIP:-0}"
 # carries its own t_active RTP, so the insts hold HEADS*ROWS t_active words, not HEADS.
 ROWS="${ROWS:-1}"
 OUT_ROOT="${OUT_ROOT:-artifacts/relpos}"
-EX=mlir-aie/programming_examples/ml/relpos_mha
+MLIR_AIE_ROOT="${MLIR_AIE_ROOT:-$REPO/mlir-aie}"
+EX="$MLIR_AIE_ROOT/programming_examples/ml/relpos_mha"
 
 setup_env() { source scripts/iron_env.sh; }
 setup_env
 python3 -c "import aie.iron" 2>/dev/null || { echo "[prebuild] iron env not green"; exit 2; }
-scripts/sync_kernels.sh >/dev/null 2>&1
+scripts/sync_kernels.sh "$MLIR_AIE_ROOT" >/dev/null 2>&1
 # shellcheck disable=SC1091
 source scripts/kernel_sandbox.sh   # current_toolchain_hash -- for the INSTALLED-copy stamp below
 
