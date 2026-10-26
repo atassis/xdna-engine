@@ -205,8 +205,11 @@ lnaffcast_scatter_c?=0
 # TAP's outer repeat dimension, and the shim BD has only four.
 a_panel_width?=0
 
+# Qualified same-core FC2: four K1024 partials plus local integer-SIMD RNE.
+fc2_fused_ieee_rne?=0
+
 # Two kernel objects: the matmul (mm.cc) and the fused epilogue.
-kernels=mm_${m}x${k}x${n} mm_silu_epilogue_${m}x${k}x${n}$(if $(filter 0,${mode_lnaffcast}),, mm_mode_lnaffcast_${m}x${k}x${n})$(if $(filter 0,${mode_resadd2a}),, mm_mode_resadd2a_${m}x${k}x${n})
+kernels=mm_${m}x${k}x${n} mm_silu_epilogue_${m}x${k}x${n}$(if $(filter 0,${mode_lnaffcast}),, mm_mode_lnaffcast_${m}x${k}x${n})$(if $(filter 0,${mode_resadd2a}),, mm_mode_resadd2a_${m}x${k}x${n})$(if $(filter 0,${fc2_fused_ieee_rne}),, acc_add_ieee_rne)
 
 aieargs+=-m $m -k $k -n $n --n-aie-cols ${n_aie_cols} --b-col-maj ${b_col_maj}
 ifeq (${no_silu}, 1)
@@ -223,6 +226,9 @@ aieargs+=--c-panel-width ${c_panel_width}
 endif
 ifeq (${k_loop_rtp}, 1)
 aieargs+=--k-loop-rtp
+endif
+ifeq (${fc2_fused_ieee_rne}, 1)
+aieargs+=--fc2-fused-ieee-rne
 endif
 ifeq (${mode_resadd}, 1)
 aieargs+=--mode-resadd
@@ -313,6 +319,7 @@ re_tag=$(if $(filter 1,${round_even}),re,)$(if $(filter 1,${silu_f32_tail}),ft,)
 panel_tag=$(if $(filter 0,${c_panel_width}),,panel${c_panel_width})
 out_tag=$(if $(filter bf16,${dtype_out}),bf16out,)
 krtp_tag=$(if $(filter 1,${k_loop_rtp}),krtp,)
+fc2_tag=$(if $(filter 1,${fc2_fused_ieee_rne}),fc2rne,)
 resadd_tag=$(if $(filter 1,${mode_resadd}),resadd,)
 # The rtp arm is a DIFFERENT INSTRUCTION STREAM on the SAME xclbin, so it needs its own artifact
 # name or it overwrites the GEMM stream -- the same rule panel_tag carries.
@@ -333,7 +340,7 @@ r2a_tag=$(if $(filter 0,${mode_resadd2a}),,r2a)$(if $(filter 0,${resadd2a_noop})
 # variation, and it is the scrtp tag above that keeps the two arms' xclbins apart.
 rtpr2a_tag=$(if $(filter 1,${rtp_mode_resadd2a}),rtp5,)$(if $(filter 1,${resadd2a_rev_rows}),revr,)$(if $(filter 0,${resadd2a_rows}),,r${resadd2a_rows})$(if $(filter 1.0,${resadd2a_scale}),,s$(subst .,,${resadd2a_scale}))
 rtplnaff_tag=$(if $(filter 1,${rtp_mode_lnaffcast}),rtp18,)$(if $(filter 0,${lnaffcast_rows}),,r${lnaffcast_rows})$(if $(filter 1,${lnaffcast_c_fanout}),fan,)$(if $(filter 1,${lnaffcast_group_rounds}),,g${lnaffcast_group_rounds})$(if ${lnaffcast_contig_taps},ctg${lnaffcast_contig_taps},)
-target_suffix=${M}x${K}x${N}_${m}x${k}x${n}_${n_aie_cols}c_${mode_tag}${out_tag}${panel_tag}${dep_tag}${abdep_tag}${l3dep_tag}${wrk_tag}${mt_tag}${re_tag}${nat_tag}${krtp_tag}${apanel_tag}${resadd_tag}${rtpresadd_tag}${raonly_tag}${bisect_tag}${mrl_tag}${krl_tag}${lnaff_tag}${rtplnaff_tag}${r2a_tag}${rtpr2a_tag}${stack_tag}${opt_tag}
+target_suffix=${M}x${K}x${N}_${m}x${k}x${n}_${n_aie_cols}c_${mode_tag}${out_tag}${panel_tag}${dep_tag}${abdep_tag}${l3dep_tag}${wrk_tag}${mt_tag}${re_tag}${nat_tag}${krtp_tag}${fc2_tag}${apanel_tag}${resadd_tag}${rtpresadd_tag}${raonly_tag}${bisect_tag}${mrl_tag}${krl_tag}${lnaff_tag}${rtplnaff_tag}${r2a_tag}${rtpr2a_tag}${stack_tag}${opt_tag}
 
 use_iron=1
 aie_py_src=whole_array_modal_iron.py
@@ -385,6 +392,10 @@ FORCE:
 build/mm_silu_epilogue_${m}x${k}x${n}.o: ${lib_kernels_dir}/mm-silu-epilogue/mm_silu_epilogue.cc build/.epi_defines.stamp
 	mkdir -p ${@D}
 	cd ${@D} && ${KERNEL_CC} ${KERNEL_CFLAGS} ${EPI_DEFINES} ${epi_opt} -c $< -o ${@F}
+
+build/acc_add_ieee_rne.o: ${srcdir}/../../../../../aie_kernels/acc-add/acc_add_ieee_rne.cc
+	mkdir -p ${@D}
+	cd ${@D} && ${KERNEL_CC} ${KERNEL_CFLAGS} -c $< -o ${@F}
 
 # lnaffcast mode object. Its own .cc rather than the epilogue's, because AIEAssignCoreLinkFiles
 # traces only direct func.call edges from the core -- an object this one CALLED would never reach

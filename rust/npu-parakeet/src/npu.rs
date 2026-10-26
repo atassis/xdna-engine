@@ -657,6 +657,7 @@ pub fn modal_site_report() -> String {
 
 const DFF: usize = 4096; // Parakeet FFN inner dim (fc1 N / fc2 K)
 const SHORT_FFN_ROWS: usize = 256;
+const SHORT_FC2_FUSED_TILE: &str = "16x32x128";
 
 fn ffn_gemm_rows(m: usize, short_available: bool) -> usize {
     assert!(m <= PAD_M, "FFN rows exceed normalization capacity");
@@ -667,14 +668,39 @@ fn ffn_chunk_bytes(rows: usize) -> usize {
     rows * KRES * 2
 }
 
-struct ShortFfn {
-    fc1: Fc1PanelBf16,
-    fc2: Rc<Kernel>,
+fn short_fc2_fused_stem() -> String {
+    format!("{SHORT_FFN_ROWS}x{KRES}x{KRES}_{SHORT_FC2_FUSED_TILE}_8c_modalidkrtpfc2rne")
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn short_fc2_fused_eligible(m: usize, default_short_route: bool, artifact_present: bool) -> bool {
+    default_short_route && artifact_present && (1..=SHORT_FFN_ROWS).contains(&m)
+}
+
+fn fc2_weight_layout(root_bytes: usize, part_bytes: usize) -> Option<[usize; DFF / KRES]> {
+    (root_bytes == part_bytes * (DFF / KRES)).then_some([
+        0,
+        part_bytes,
+        2 * part_bytes,
+        3 * part_bytes,
+    ])
+}
+
+struct ShortFc2 {
+    kern: Rc<Kernel>,
     instr: Bo,
     n: usize,
     bo_out: Bo,
     dummy_tmp: Bo,
     dummy_tr: Bo,
+}
+
+struct ShortFfn {
+    fc1: Fc1PanelBf16,
+    // The legacy K=1024 stream is retained only for an absent fused artifact or a pre-existing
+    // chunk-only cache. New weights always enter through the contiguous root used by fused FC2.
+    legacy_fc2: Option<ShortFc2>,
+    fused_fc2: Option<ShortFc2>,
 }
 // Tile of the bf16-out fc1 (Fc1PanelBf16). NOT `self.tile`: bf16 out needs a per-core f32 accumulator that
 // does not fit alongside the m=64 C tile (L1 overflows by ~11.6 KB), so this variant only exists at m=32.
@@ -2577,6 +2603,19 @@ impl NpuMatmul {
         &o.bo_out
     }
 
+    fn short_fc2_fused_available(&self) -> bool {
+        if !self.modal || !self.krtp || ln_mode() || std::env::var_os("NPU_RESIDENT_XCLBIN").is_some()
+            || !std::env::var("PARAKEET_MODAL_EPI_SUFFIX").unwrap_or_default().is_empty()
+        {
+            return false;
+        }
+        let panel = format!("{SHORT_FFN_ROWS}x{KRES}x{DFF}_{FC1_PANEL_BF16_TILE}_8c_modalsilubf16outpanel{KRES}");
+        let modal = format!("{SHORT_FFN_ROWS}x{KRES}x{DFF}_{}_8c_modalsilukrtp", self.tile);
+        kernel_registry::artifact_pair_present(&self.base, &panel)
+            && kernel_registry::artifact_pair_present(&self.base, &modal)
+            && kernel_registry::artifact_pair_present(&self.base, &short_fc2_fused_stem())
+    }
+
     fn short_ffn(&self, m: usize) -> Option<Rc<ShortFfn>> {
         // Manual precision/program variants retain their existing, paired 512-row streams.
         if ffn_gemm_rows(m, true) != SHORT_FFN_ROWS || !self.modal || !self.krtp
@@ -2590,10 +2629,13 @@ impl NpuMatmul {
         }
         let panel = format!("{SHORT_FFN_ROWS}x{KRES}x{DFF}_{FC1_PANEL_BF16_TILE}_8c_modalsilubf16outpanel{KRES}");
         let modal = format!("{SHORT_FFN_ROWS}x{KRES}x{DFF}_{}_8c_modalsilukrtp", self.tile);
-        let stream = format!("{SHORT_FFN_ROWS}x{KRES}x{KRES}_{}_8c_modalidkrtp", self.tile);
+        let legacy_stream = format!("{SHORT_FFN_ROWS}x{KRES}x{KRES}_{}_8c_modalidkrtp", self.tile);
+        let fused_stream = short_fc2_fused_stem();
+        let fused_present = self.short_fc2_fused_available();
+        let legacy_present = kernel_registry::insts_path(&self.base, &legacy_stream).is_file();
         if !kernel_registry::artifact_pair_present(&self.base, &panel)
             || !kernel_registry::artifact_pair_present(&self.base, &modal)
-            || !kernel_registry::insts_path(&self.base, &stream).is_file()
+            || (!fused_present && !legacy_present)
         {
             *self.short_ffn.borrow_mut() = Some(None);
             return None;
@@ -2608,8 +2650,16 @@ impl NpuMatmul {
             instr.sync_to_device().unwrap();
             (kern, instr, bytes.len() / 4)
         };
+        let short_fc2 = |stem: &str, insts_stem: &str| {
+            let (kern, instr, n) = load(stem, insts_stem);
+            let alloc = |bytes, arg| self.dev.alloc_bo(&kern, bytes, FLAG_HOST_ONLY, kern.group_id(arg).unwrap()).unwrap();
+            ShortFc2 {
+                bo_out: alloc(SHORT_FFN_ROWS * KRES * 4, 5),
+                dummy_tmp: alloc(1, 6), dummy_tr: alloc(4, 7),
+                kern, instr, n,
+            }
+        };
         let (fc1, fc1_instr, fc1_n) = load(&panel, &panel);
-        let (fc2, instr, n) = load(&modal, &stream);
         let alloc = |k: &Kernel, bytes, arg| self.dev.alloc_bo(k, bytes, FLAG_HOST_ONLY, k.group_id(arg).unwrap()).unwrap();
         let short = Rc::new(ShortFfn {
             fc1: Fc1PanelBf16 {
@@ -2617,12 +2667,12 @@ impl NpuMatmul {
                 dummy_tmp: alloc(&fc1, 1, 6), dummy_tr: alloc(&fc1, 4, 7),
                 kern: fc1, instr: fc1_instr, n: fc1_n,
             },
-            bo_out: alloc(&fc2, SHORT_FFN_ROWS * KRES * 4, 5),
-            dummy_tmp: alloc(&fc2, 1, 6), dummy_tr: alloc(&fc2, 4, 7),
-            fc2, instr, n,
+            legacy_fc2: legacy_present.then(|| short_fc2(&modal, &legacy_stream)),
+            fused_fc2: fused_present.then(|| short_fc2(&fused_stream, &fused_stream)),
         });
         if !npu_xrt::quiet() {
-            eprintln!("[npu] FFN GEMMs: {SHORT_FFN_ROWS} rows, shared weights, four host f32 partials");
+            eprintln!("[npu] FFN GEMMs: {SHORT_FFN_ROWS} rows, fused FC2={} legacy FC2={}",
+                short.fused_fc2.is_some(), short.legacy_fc2.is_some());
         }
         *self.short_ffn.borrow_mut() = Some(Some(short.clone()));
         Some(short)
@@ -2633,8 +2683,10 @@ impl NpuMatmul {
         let bank = |k: &Kernel, arg| k.group_id(arg).unwrap() & 0xffff;
         assert_eq!(bank(&short.fc1.kern, 3), bank(&rl.ac_kern, 5), "LN prefix bank");
         assert_eq!(bank(&short.fc1.kern, 4), bank(&self.kern, 4), "shared W1 bank");
-        assert_eq!(bank(&short.fc1.kern, 5), bank(&short.fc2, 3), "FC1 panel bank");
-        assert_eq!(bank(&short.fc2, 4), bank(&self.kern, 4), "shared W2 bank");
+        for fc2 in [short.legacy_fc2.as_ref(), short.fused_fc2.as_ref()].into_iter().flatten() {
+            assert_eq!(bank(&short.fc1.kern, 5), bank(&fc2.kern, 3), "FC1 panel bank");
+            assert_eq!(bank(&fc2.kern, 4), bank(&self.kern, 4), "shared W2 bank");
+        }
         let prefix = rl.bo_bf16.sub(0, ffn_chunk_bytes(SHORT_FFN_ROWS)).unwrap();
         let o = &short.fc1;
         let started = Instant::now();
@@ -2645,15 +2697,45 @@ impl NpuMatmul {
         stats.ffn_fc1_s += started.elapsed().as_secs_f64();
     }
 
-    fn short_fc2(&self, short: &ShortFfn, a: &Bo, w: &Bo, m: usize) -> Array2<f32> {
+    fn short_fc2(&self, fc2: &ShortFc2, a: &Bo, w: &Bo, m: usize) -> Array2<f32> {
         assert!((1..=SHORT_FFN_ROWS).contains(&m));
-        { let _dt = self.dtimer(); short.fc2.run_matmul8(3, &short.instr, short.n, a, w, &short.bo_out, &short.dummy_tmp, &short.dummy_tr).unwrap(); }
+        { let _dt = self.dtimer(); fc2.kern.run_matmul8(3, &fc2.instr, fc2.n, a, w, &fc2.bo_out, &fc2.dummy_tmp, &fc2.dummy_tr).unwrap(); }
         self.stats.borrow_mut().dispatches += 1;
-        short.bo_out.sync_from_device().unwrap();
+        fc2.bo_out.sync_from_device().unwrap();
         let mut bytes = vec![0u8; m * KRES * 4];
-        short.bo_out.read_bytes(&mut bytes).unwrap();
+        fc2.bo_out.read_bytes(&mut bytes).unwrap();
         Array2::from_shape_vec((m, KRES), bytes.chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()).unwrap()
+    }
+
+    fn short_fc2_fused(&self, short: &ShortFfn, a: &Bo, w: &Bo, m: usize) -> Array2<f32> {
+        self.short_fc2(short.fused_fc2.as_ref().expect("fused FC2 selected without artifact"), a, w, m)
+    }
+
+    fn fc2_has_legacy_chunks(&self, id: &str) -> bool {
+        (0..DFF / KRES).any(|c| self.wcache.borrow().contains_key(&format!("{id}.{c}")))
+    }
+
+    fn short_fc2_can_fuse(&self, short: &ShortFfn, id: &str) -> bool {
+        short.fused_fc2.is_some()
+            && (self.wcache.borrow().contains_key(id) || !self.fc2_has_legacy_chunks(id))
+    }
+
+    fn fc2_weight_chunks_from_root(&self, id: &str, root: &Rc<Bo>) -> Vec<Rc<Bo>> {
+        let part_bytes = KRES * KRES * 2;
+        let offsets = fc2_weight_layout(root.nbytes(), part_bytes)
+            .expect("FC2 root must be contiguous [DFF,KRES] bf16");
+        offsets.into_iter().enumerate().map(|(c, offset)| {
+            let sid = format!("{id}.{c}");
+            let cached = self.wcache.borrow().get(&sid).cloned();
+            if let Some(chunk) = cached {
+                chunk
+            } else {
+                let chunk = Rc::new(root.sub(offset, part_bytes).unwrap());
+                self.wcache.borrow_mut().insert(sid, chunk.clone());
+                chunk
+            }
+        }).collect()
     }
 
     pub fn resident_ffn<F1: FnOnce() -> Array2<f32>, F2: FnOnce() -> Array2<f32>>(
@@ -2686,23 +2768,53 @@ impl NpuMatmul {
         } else {
             self.fc1_pack_in_drain(&rl, &w1)
         };
+        // The optional short candidate consumes all four K panels in one dispatch. It owns one
+        // contiguous W2 root; the legacy K-split route later binds shared sub-BO views of it.
+        if short.as_ref().is_some_and(|s| self.short_fc2_can_fuse(s, id2)) {
+            let cached = self.wcache.borrow().get(id2).cloned();
+            let w2 = cached.unwrap_or_else(|| {
+                let w = make_w2();
+                assert_eq!(w.dim(), (DFF, KRES), "fc2 W2 dim");
+                self.weight_bo(id2, w.view())
+            });
+            let t_fc2 = Instant::now();
+            let out = self.short_fc2_fused(short.as_ref().unwrap(), a_chunks, &w2, m);
+            self.stats.borrow_mut().ffn_fc2_s += t_fc2.elapsed().as_secs_f64();
+            return out;
+        }
+
         // Four separately rounded partials, accumulated on the host in the existing order.
         let parts = DFF / KRES;
         let chunk_bytes = ffn_chunk_bytes(ffn_gemm_rows(m, short.is_some()));
-        let need_w2 = (0..parts).any(|c| !self.wcache.borrow().contains_key(&format!("{id2}.{c}")));
-        let w2 = if need_w2 {
+        let cached_root = self.wcache.borrow().get(id2).cloned();
+        // A long-first call must establish the same root as a later short fused call. Otherwise a
+        // 257->32 transition would either allocate a second full W2 or silently miss fusion.
+        let (root, w2) = if let Some(root) = cached_root {
+            (Some(root), None)
+        } else if self.short_fc2_fused_available() && !self.fc2_has_legacy_chunks(id2) {
             let w = make_w2();
             assert_eq!(w.dim(), (DFF, KRES), "fc2 W2 dim");
-            Some(w)
+            (Some(self.weight_bo(id2, w.view())), None)
         } else {
-            None
+            let need_w2 = (0..parts).any(|c| !self.wcache.borrow().contains_key(&format!("{id2}.{c}")));
+            let w2 = if need_w2 {
+                let w = make_w2();
+                assert_eq!(w.dim(), (DFF, KRES), "fc2 W2 dim");
+                Some(w)
+            } else {
+                None
+            };
+            (None, w2)
         };
+        let root_chunks = root.as_ref().map(|w| self.fc2_weight_chunks_from_root(id2, w));
         let mut acc = Array2::<f32>::zeros((m, KRES));
         let t_fc2 = Instant::now();
         for c in 0..parts {
             let chunk = a_chunks.sub(c * chunk_bytes, chunk_bytes).unwrap();
             let sid = format!("{id2}.{c}");
-            let w2c = {
+            let w2c = if let Some(ref chunks) = root_chunks {
+                chunks[c].clone()
+            } else {
                 let cc = self.wcache.borrow().get(&sid).cloned();
                 cc.unwrap_or_else(|| {
                     let w = w2.as_ref().expect("w2 present on cache miss");
@@ -2710,7 +2822,7 @@ impl NpuMatmul {
                 })
             };
             let partial = if let Some(s) = short.as_ref() {
-                self.short_fc2(s, &chunk, &w2c, m)
+                self.short_fc2(s.legacy_fc2.as_ref().expect("legacy FC2 unavailable for chunk-only cache"), &chunk, &w2c, m)
             } else {
                 self.dispatch_with_a(&chunk, m, &w2c, KRES, false)
             };
@@ -2746,13 +2858,27 @@ impl NpuMatmul {
         } else {
             self.fc1_pack_in_drain(&rl, &w1)
         };
+        if short.as_ref().is_some_and(|s| self.short_fc2_can_fuse(s, id2)) {
+            let cached = self.wcache.borrow().get(id2).cloned();
+            let w2 = cached.unwrap_or_else(|| self.weight_bo_bf16(id2, DFF, KRES, bits2));
+            return self.short_fc2_fused(short.as_ref().unwrap(), a_chunks, &w2, m);
+        }
+
         let parts = DFF / KRES;
         let chunk_bytes = ffn_chunk_bytes(ffn_gemm_rows(m, short.is_some()));
+        let cached_root = self.wcache.borrow().get(id2).cloned();
+        let root = cached_root.or_else(|| {
+            (self.short_fc2_fused_available() && !self.fc2_has_legacy_chunks(id2))
+                .then(|| self.weight_bo_bf16(id2, DFF, KRES, bits2))
+        });
+        let root_chunks = root.as_ref().map(|w| self.fc2_weight_chunks_from_root(id2, w));
         let mut acc = Array2::<f32>::zeros((m, KRES));
         for c in 0..parts {
             let chunk = a_chunks.sub(c * chunk_bytes, chunk_bytes).unwrap();
             let sid = format!("{id2}.{c}");
-            let w2c = {
+            let w2c = if let Some(ref chunks) = root_chunks {
+                chunks[c].clone()
+            } else {
                 let cc = self.wcache.borrow().get(&sid).cloned();
                 cc.unwrap_or_else(|| {
                     // bits2 is row-major [DFF, KRES]; a KRES-row chunk is a contiguous slice.
@@ -2761,7 +2887,7 @@ impl NpuMatmul {
                 })
             };
             let partial = if let Some(s) = short.as_ref() {
-                self.short_fc2(s, &chunk, &w2c, m)
+                self.short_fc2(s.legacy_fc2.as_ref().expect("legacy FC2 unavailable for chunk-only cache"), &chunk, &w2c, m)
             } else {
                 self.dispatch_with_a(&chunk, m, &w2c, KRES, false)
             };
@@ -3671,16 +3797,40 @@ mod short_ffn_tests {
         let gamma = gb.row(0).to_vec();
         let beta = gb.row(1).to_vec();
         let npu = NpuMatmul::open(Path::new(&root)).unwrap();
+        let fused = npu.short_ffn(32).expect("short route artifacts").fused_fc2.is_some();
+        let bf16_first = std::env::var_os("ASR_FFN_BF16_FIRST").is_some();
+        let rows = if std::env::var_os("ASR_FFN_LONG_FIRST").is_some() {
+            [257, 256, 32, 400, 32]
+        } else {
+            [32, 256, 257, 400, 32]
+        };
         let mut first = None;
-        for (i, rows) in [32, 256, 257, 400, 32].into_iter().enumerate() {
+        let mut dispatches = Vec::new();
+        for (i, rows) in rows.into_iter().enumerate() {
             let input = Array2::from_shape_fn((rows, KRES), |(r, c)| x[[r % 32, c]]);
-            let result = npu.resident_ffn_bf16(&input, &gamma, &beta,
+            let before = npu.stats.borrow().dispatches;
+            let bf16_result = bf16_first.then(|| npu.resident_ffn_bf16(&input, &gamma, &beta,
                 "mixed.w1", KRES, DFF, w1.as_slice().unwrap(),
-                "mixed.w2", DFF, KRES, w2.as_slice().unwrap());
+                "mixed.w2", DFF, KRES, w2.as_slice().unwrap()));
+            let before_f32 = npu.stats.borrow().dispatches;
+            let f32_result = if i == 0 && !bf16_first {
+                npu.resident_ffn(&input, &gamma, &beta,
+                    || w1.mapv(|v| f32::from_bits((v as u32) << 16)), "mixed.w1",
+                    || w2.mapv(|v| f32::from_bits((v as u32) << 16)), "mixed.w2")
+            } else {
+                npu.resident_ffn(&input, &gamma, &beta,
+                    || panic!("warm f32 W1 maker ran"), "mixed.w1",
+                    || panic!("warm f32 W2 maker ran"), "mixed.w2")
+            };
+            let after_f32 = npu.stats.borrow().dispatches;
+            dispatches.push(after_f32 - before_f32);
+            let result = bf16_result.unwrap_or_else(|| npu.resident_ffn_bf16(&input, &gamma, &beta,
+                "mixed.w1", KRES, DFF, w1.as_slice().unwrap(),
+                "mixed.w2", DFF, KRES, w2.as_slice().unwrap()));
+            let bf16_dispatches = if bf16_first { before_f32 - before }
+                else { npu.stats.borrow().dispatches - after_f32 };
+            assert_eq!(bf16_dispatches, after_f32 - before_f32, "weight API dispatch parity");
             assert!(result.iter().all(|v| v.is_finite()));
-            let f32_result = npu.resident_ffn(&input, &gamma, &beta,
-                || w1.mapv(|v| f32::from_bits((v as u32) << 16)), "mixed.w1",
-                || w2.mapv(|v| f32::from_bits((v as u32) << 16)), "mixed.w2");
             assert_eq!(result.mapv(f32::to_bits), f32_result.mapv(f32::to_bits));
             if rows == 32 {
                 let bits: Vec<u32> = result.iter().map(|v| v.to_bits()).collect();
@@ -3688,6 +3838,37 @@ mod short_ffn_tests {
             }
             ndarray_npy::write_npy(out.join(format!("{i}-{rows}.npy")), &result).unwrap();
         }
+        // The shared LN/fc1 prefix is identical; only fused FC2 removes three partial dispatches.
+        let expected_extra = if fused { 3 } else { 0 };
+        let short_count = dispatches[rows.iter().position(|&m| m <= SHORT_FFN_ROWS).unwrap()];
+        for (&m, &count) in rows.iter().zip(&dispatches) {
+            assert_eq!(count, short_count + if m > SHORT_FFN_ROWS { expected_extra } else { 0 },
+                "dispatch witness at rows={m}");
+        }
+
+        let cache = npu.wcache.borrow();
+        let root_w2 = cache.get("mixed.w2");
+        if fused {
+            let root_w2 = root_w2.expect("fused FC2 must cache contiguous W2 root");
+            assert_eq!(root_w2.nbytes(), DFF * KRES * 2);
+        } else {
+            assert!(root_w2.is_none(), "legacy-only arm must not allocate a second full W2");
+        }
+        let chunk_bytes = KRES * KRES * 2;
+        for c in 0..DFF / KRES {
+            let chunk = cache.get(&format!("mixed.w2.{c}")).unwrap();
+            assert_eq!(chunk.nbytes(), chunk_bytes);
+            if let Some(root) = root_w2 {
+                assert_eq!(chunk.map().unwrap() as usize,
+                    root.map().unwrap() as usize + c * chunk_bytes,
+                    "legacy chunk must alias contiguous W2 storage");
+            }
+        }
+        let offsets = fc2_weight_layout(DFF * KRES * 2, chunk_bytes).unwrap();
+        std::fs::write(out.join("mixed-row-witness.txt"), format!(
+            "fused={fused}\nbf16_first={bf16_first}\nrows={rows:?}\ndispatches={dispatches:?}\nroot_bytes={}\nchunk_bytes={chunk_bytes}\nchunk_offsets={offsets:?}\n",
+            root_w2.map_or(0, |bo| bo.nbytes()),
+        )).unwrap();
     }
 
     #[test]
@@ -3709,6 +3890,28 @@ mod short_ffn_tests {
             assert_eq!(4 * bytes, rows * DFF * 2);
             assert_eq!(bytes % 4096, 0);
         }
+    }
+
+    #[test]
+    fn fused_fc2_contract_is_limited_to_default_short_rows() {
+        assert_eq!(short_fc2_fused_stem(), "256x1024x1024_16x32x128_8c_modalidkrtpfc2rne");
+        for rows in [1, 32, 256] {
+            assert!(short_fc2_fused_eligible(rows, true, true));
+        }
+        for rows in [0, 257, 400, PAD_M] {
+            assert!(!short_fc2_fused_eligible(rows, true, true));
+        }
+        assert!(!short_fc2_fused_eligible(32, false, true));
+        assert!(!short_fc2_fused_eligible(32, true, false));
+    }
+
+    #[test]
+    fn fused_fc2_uses_one_contiguous_weight_and_legacy_views() {
+        let root = DFF * KRES * 2;
+        let part = KRES * KRES * 2;
+        assert_eq!(fc2_weight_layout(root, part), Some([0, part, 2 * part, 3 * part]));
+        assert_eq!(fc2_weight_layout(root - 2, part), None);
+        assert_eq!(fc2_weight_layout(root, part - 2), None);
     }
 }
 

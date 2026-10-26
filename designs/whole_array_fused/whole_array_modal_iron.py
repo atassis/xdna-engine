@@ -362,6 +362,7 @@ def my_matmul(
     resadd2a_rev_rows=False,
     resadd2a_fused=False,
     resadd2a_scale_rtp=False,
+    fc2_fused_ieee_rne=False,
 ):
     n_aie_rows = 4
     n_aie_cores = n_aie_rows * n_aie_cols
@@ -405,6 +406,43 @@ def my_matmul(
     assert k % s == 0
     assert n % t == 0
     assert (m * n) % 16 == 0, "epilogue walks the tile in 16-wide chunks"
+    if fc2_fused_ieee_rne:
+        if (M, K, N, m, k, n, n_aie_cols, dtype_out_str, do_silu, do_gelu, do_glu) != (
+                256, 1024, 1024, 16, 32, 128, 8, "f32", False, False, False):
+            raise ValueError("fc2 fused IEEE-RNE is qualified only for 256x4096x1024, 16x32x128/8c identity")
+        if not emulate_bf16_mmul_with_bfp16:
+            raise ValueError("fc2 fused IEEE-RNE requires the accepted bf16 emulation path")
+        # FC2 has one physical stream ABI: row-major W2, row-major C, ordinary
+        # A, and the GEMM body selected for every tile. Modal bodies/RTP arms
+        # either consume a different stream or change the partial boundaries.
+        incompatible = {
+            "b_col_maj": b_col_maj,
+            "c_panel_width": c_panel_width,
+            "a_panel_width": a_panel_width,
+            "mode_resadd": mode_resadd,
+            "rtp_mode_resadd": rtp_mode_resadd,
+            "resadd_only": resadd_only,
+            "mode_read_late": mode_read_late,
+            "k_read_late": k_read_late,
+            "mode_lnaffcast": mode_lnaffcast,
+            "rtp_mode_lnaffcast": rtp_mode_lnaffcast,
+            "lnaffcast_rows": lnaffcast_rows,
+            "lnaffcast_c_fanout": lnaffcast_c_fanout,
+            "lnaffcast_group_rounds": lnaffcast_group_rounds != 1,
+            "lnaffcast_contig_taps": lnaffcast_contig_taps,
+            "lnaffcast_1x": lnaffcast_1x,
+            "mode_resadd2a": mode_resadd2a,
+            "rtp_mode_resadd2a": rtp_mode_resadd2a,
+            "resadd2a_rows": resadd2a_rows,
+            "resadd2a_scale": resadd2a_scale != 1.0,
+            "resadd2a_rev_rows": resadd2a_rev_rows,
+            "resadd2a_fused": resadd2a_fused,
+            "resadd2a_scale_rtp": resadd2a_scale_rtp,
+        }
+        selected = [name for name, value in incompatible.items() if value]
+        if selected:
+            raise ValueError("fc2 fused IEEE-RNE rejects incompatible stream/layout options: "
+                             + ", ".join(selected))
 
     fifo_depth = 2
     # Single-buffer the C path on wide-N fast tiles (WA_C_DEPTH=1): the f32 acc_buf + a double-buffered
@@ -449,8 +487,10 @@ def my_matmul(
     C_taps = []
 
     # Define tensor types. NOTE: C / C_l2 / C_l1 are now OUTPUT dtype (bf16).
-    A_ty = np.ndarray[(M * K,), np.dtype[dtype_in]]
-    B_ty = np.ndarray[(K * N,), np.dtype[dtype_in]]
+    # FC2 fused consumes all four physical K1024 panels in one submission. The
+    # local worker still zeroes/materializes each K1024 partial independently.
+    A_ty = np.ndarray[((4 if fc2_fused_ieee_rne else 1) * M * K,), np.dtype[dtype_in]]
+    B_ty = np.ndarray[((4 if fc2_fused_ieee_rne else 1) * K * N,), np.dtype[dtype_in]]
     C_ty = np.ndarray[(M * N,), np.dtype[dtype_out]]
     A_l2_ty = np.ndarray[(m * k * n_A_tiles_per_shim,), np.dtype[dtype_in]]
     B_l2_ty = np.ndarray[(k * n,), np.dtype[dtype_in]]
@@ -476,6 +516,11 @@ def my_matmul(
         f"mm_modal_epilogue_f32_{dtype_out_str}",
         f"mm_silu_epilogue_{m}x{k}x{n}.o",
         [cacc_ty, C_l1_ty, rtp_ty],
+    )
+    exact_add_kernel = (
+        Kernel("acc_add_row_ieee_rne", "acc_add_ieee_rne.o",
+               [cacc_ty, cacc_ty, cacc_ty, np.int32])
+        if fc2_fused_ieee_rne else None
     )
 
     # MODE 4: resadd, carried as a MODE of this xclbin rather than a sibling one. It reuses the
@@ -1067,6 +1112,35 @@ def my_matmul(
                         in_b.release(1)
             out_c.release(1)
 
+    def core_fn_fc2_fused_ieee_rne(in_a, in_b, out_c, partial, alternate,
+                                    rtp_buff, barrier, zero, matmul, epilogue, exact_add):
+        """Four independently drained K1024 GEMMs and ordered local IEEE-RNE adds.
+
+        `out_c`, `partial`, and `alternate` are distinct f32 tiles. Holding them in
+        L1 is what avoids a third input FIFO while preserving the baseline's four
+        rounding boundaries; do not turn the four zero/matmul groups into K4096.
+        """
+        barrier.wait_for_value(1)
+        loop = range(1) if n_tiles_per_core == 1 else range_(n_tiles_per_core)
+        for _ in loop:
+            elem_out = out_c.acquire(1)
+            zero(elem_out)  # explicit +0 seed, never an assignment shortcut
+            for panel in range(4):
+                zero(partial)
+                for _ in range_(K // k):
+                    elem_in_a = in_a.acquire(1)
+                    elem_in_b = in_b.acquire(1)
+                    matmul(elem_in_a, elem_in_b, partial)
+                    in_a.release(1)
+                    in_b.release(1)
+                # Materialize the f32 partial before its exact RNE addition.
+                epilogue(partial, partial, rtp_buff)
+                if panel % 2:
+                    exact_add(alternate, partial, elem_out, m * n)
+                else:
+                    exact_add(elem_out, partial, alternate, m * n)
+            out_c.release(1)
+
     def core_fn_resadd_only(in_a, in_b, out_c, rtp_buff, barrier, resadd):
         # Discriminator arm for the mode-4 hang: the SAME resadd body, the same stream contract
         # and the same shapes, in a core ELF that does NOT carry the matmul. Completing here
@@ -1238,6 +1312,18 @@ def my_matmul(
             ]
             if split_acc:
                 args.append(Buffer(cacc_ty, name=f"cacc_{row}_{col}"))
+            if fc2_fused_ieee_rne:
+                # Two local f32 buffers plus the C fifo hold partial/current/next.
+                # No third DMA object is declared: A and B remain the only consumers.
+                args += [
+                    Buffer(cacc_ty, name=f"fc2_partial_{row}_{col}"),
+                    Buffer(cacc_ty, name=f"fc2_alternate_{row}_{col}"),
+                    rtp_bufs[row][col], rtp_barrier, zero_kernel, matmul_kernel,
+                    epilogue_kernel, exact_add_kernel,
+                ]
+                workers.append(Worker(core_fn_fc2_fused_ieee_rne, args,
+                                      stack_size=_stack_size()))
+                continue
             if resadd_only:
                 # zero/matmul/epilogue are deliberately NOT referenced: an unreferenced Kernel
                 # is never declared, so the matmul stays out of the core ELF entirely. That
@@ -1358,6 +1444,29 @@ def my_matmul(
             C_tiles, M, N, m, n, n_aie_rows, n_aie_cols, c_panel_width
         )
     c_index = 0
+    if fc2_fused_ieee_rne:
+        # Wrap each accepted K1024 walk in a panel-repeat dimension. One shim
+        # task then streams p0..p3 (each p has its 32 k=32 tiles) and stays
+        # below the shim's active-BD budget; four separately issued tasks did
+        # not. The core remains responsible for the four reset/materialize/add
+        # boundaries.
+        def four_panel_tap(tap, panel_stride, shape, expected_sizes, expected_strides):
+            # The accepted tap already consumes all four shim BD dimensions;
+            # its outer dimension must be exactly the singleton being replaced.
+            # A panel/layout option must fail rather than silently changing the
+            # 32 K tiles per independently rounded partial.
+            if (list(tap.sizes) != expected_sizes or list(tap.strides) != expected_strides):
+                raise ValueError("fc2 fused IEEE-RNE received an incompatible base DMA tap")
+            return TensorAccessPattern(
+                shape, tap.offset, [4, *expected_sizes[1:]],
+                [panel_stride, *expected_strides[1:]]
+            )
+        A_panel_taps = [four_panel_tap(t, M * K, (4 * M, K),
+                                       [1, 32, m, k], [0, k, K, 1])
+                        for t in A_tiles]
+        B_panel_taps = [four_panel_tap(t, K * N, (4 * K, N),
+                                       [1, 32, k, n], [0, k * N, N, 1])
+                        for t in B_tiles]
 
     def lnaffcast_fills(A, B, C, A_prods, B_prods, C_conses):
         """The lnaffcast mode's own fill contract: 8 A + 1 B + 1 C drain per C tile.
@@ -1599,6 +1708,37 @@ def my_matmul(
 
         if rtp_mode_resadd2a:
             resadd2a_fills(A, B, C, A_prods, B_prods, C_conses)
+            return
+
+        if fc2_fused_ieee_rne:
+            # Keep the original C grouping/producer routing, but each worker's
+            # one C hold receives all four panel groups before this single drain.
+            tg = TaskGroup()
+            for tb in range(ceildiv(M // m // n_aie_rows, tb_max_n_rows)):
+                for pingpong in [0, 1]:
+                    if c_index >= len(C_tiles):
+                        break
+                    row_base = tb * tb_max_n_rows + pingpong * tb_max_n_rows // 2
+                    current_tb_n_rows = min(
+                        [tb_max_n_rows // 2, M // m // n_aie_rows - row_base]
+                    )
+                    for col in range(n_aie_cols):
+                        C_taps.append(C_tiles[c_index])
+                        C_conses[col].drain(C, tap=C_tiles[c_index], wait=True, group=tg)
+                        c_index += 1
+                        for tile_row in range(current_tb_n_rows):
+                            tile_offset = ((row_base + tile_row) * n_shim_mem_A + col) % len(A_tiles)
+                            if col < n_aie_rows:
+                                tap_a = A_panel_taps[tile_offset]
+                                A_prods[col].fill(A, tap=tap_a, group=tg)
+                                A_taps.append(tap_a)
+                            tap_b = B_panel_taps[col]
+                            B_prods[col].fill(B, tap=tap_b, group=tg)
+                            B_taps.append(tap_b)
+                    if tb > 0 or (tb == 0 and pingpong > 0):
+                        tg.finish()
+                        tg = TaskGroup()
+            tg.finish()
             return
 
         tg = TaskGroup()
@@ -1971,6 +2111,11 @@ def main():
         "core ELF. rtp is written by sequence(), so scale becomes insts-only and the encoder's "
         "1.0 and 0.5 resadds share ONE xclbin -- program count is what a mode costs.",
     )
+    argparser.add_argument(
+        "--fc2-fused-ieee-rne",
+        action="store_true",
+        help="qualified M256 four-K1024 same-core FC2 schedule with local integer-SIMD IEEE-RNE adds",
+    )
     args = argparser.parse_args()
     maybe_module = my_matmul(
         args.dev,
@@ -2015,6 +2160,7 @@ def main():
         args.resadd2a_rev_rows,
         args.resadd2a_fused,
         args.resadd2a_scale_rtp,
+        args.fc2_fused_ieee_rne,
     )
     if args.generate_taps:
         return maybe_module
