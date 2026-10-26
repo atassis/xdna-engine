@@ -174,6 +174,14 @@ fn resident_companion_artifacts_present(
         && kernel_registry::resolve_artifact_dir(dwconv, legacy, "dwconv_silu_t_1024x400").is_some()
 }
 
+fn assert_resident_ln_inputs(x: &Array2<f32>, gamma: &[f32], beta: &[f32]) {
+    let (t, d) = x.dim();
+    assert_eq!(d, KRES, "resident LN needs D=KRES={KRES}");
+    assert!(t <= PAD_M, "T={t} exceeds PAD_M={PAD_M}");
+    assert_eq!(gamma.len(), KRES);
+    assert_eq!(beta.len(), KRES);
+}
+
 /// BD-carriage precision for the conveyor query belt (open-item C / SPLITP). Default PLAIN per the
 /// Deliverable-1 gate (scripts/conveyor_bd_precision_check.py). Env PARAKEET_CONVEYOR_BD=split flips
 /// to two-bf16 (hi+lo, ~14 mantissa bits) if the device 17-clip WER ever regresses vs 8.5.
@@ -415,6 +423,7 @@ pub struct NpuMatmul {
     legacy_ln_dir: PathBuf,
     // Tri-state cache: None = untried; Some(Some) = co-resident on-chip LN + affine-cast chain loaded.
     resident_ln: RefCell<Option<Option<Rc<ResidentLn>>>>,
+    short_ffn: RefCell<Option<Option<Rc<ShortFfn>>>>,
     pub stats: RefCell<NpuStats>,
 }
 
@@ -440,7 +449,7 @@ struct ResidentLn {
     // this pair removes 48 dispatches AND the 48 ctxln->affcast transitions with them.
     //
     // NOT usable by `resident_mha_affine_ln_f32`, which reads the f32 `bo_ln` the fused kernel never
-    // materializes -- that caller goes through `ln_affine_cast_chained`. `PARAKEET_LN_FUSED=0`
+    // materializes -- that caller uses `ln_normalize_only`. `PARAKEET_LN_FUSED=0`
     // restores the chain everywhere.
     lnaffcast: Option<LnFused>,
     bo_x: Bo,    // [PAD_M, KRES] f32   (ctxLN input,  ln g3)
@@ -647,6 +656,26 @@ pub fn modal_site_report() -> String {
 }
 
 const DFF: usize = 4096; // Parakeet FFN inner dim (fc1 N / fc2 K)
+const SHORT_FFN_ROWS: usize = 256;
+
+fn ffn_gemm_rows(m: usize, short_available: bool) -> usize {
+    assert!(m <= PAD_M, "FFN rows exceed normalization capacity");
+    if short_available && (1..=SHORT_FFN_ROWS).contains(&m) { SHORT_FFN_ROWS } else { PAD_M }
+}
+
+fn ffn_chunk_bytes(rows: usize) -> usize {
+    rows * KRES * 2
+}
+
+struct ShortFfn {
+    fc1: Fc1PanelBf16,
+    fc2: Rc<Kernel>,
+    instr: Bo,
+    n: usize,
+    bo_out: Bo,
+    dummy_tmp: Bo,
+    dummy_tr: Bo,
+}
 // Tile of the bf16-out fc1 (Fc1PanelBf16). NOT `self.tile`: bf16 out needs a per-core f32 accumulator that
 // does not fit alongside the m=64 C tile (L1 overflows by ~11.6 KB), so this variant only exists at m=32.
 const FC1_PANEL_BF16_TILE: &str = "32x32x128";
@@ -915,6 +944,7 @@ impl NpuMatmul {
             dw_dir,
             legacy_ln_dir,
             resident_ln: RefCell::new(None),
+            short_ffn: RefCell::new(None),
             stats: RefCell::new(NpuStats::default()),
         })
     }
@@ -1176,9 +1206,9 @@ impl NpuMatmul {
     pub fn resident_mha_affine_ln_f32(&self, x: &Array2<f32>, gamma: &[f32], beta: &[f32]) -> Array2<f32> {
         self.stats.borrow_mut().calls += 1;
         let m = x.nrows();
-        // CHAINED on purpose: this path reads the f32 `bo_ln` back, and the fused ctxLN->affine_cast
-        // kernel never materializes it.
-        let rl = self.ln_affine_cast_chained(x, gamma, beta);
+        // This caller needs normalized f32 values, not the unused affine-cast bf16 output.
+        // Its f32 affine and hi/lo representation remain on the existing host path.
+        let rl = self.ln_normalize_only(x, gamma, beta);
         rl.bo_ln.sync_from_device().unwrap();
         let mut cb = vec![0u8; PAD_M * KRES * 4];
         rl.bo_ln.read_bytes(&mut cb).unwrap();
@@ -1736,26 +1766,19 @@ impl NpuMatmul {
         rl
     }
 
-    /// [`Self::ln_affine_cast`] forced onto the two-dispatch chain, so `bo_ln` (the f32 LN output)
-    /// IS materialized. Only for callers that read it back -- the fused kernel skips it.
-    fn ln_affine_cast_chained(&self, x: &Array2<f32>, gamma: &[f32], beta: &[f32]) -> Rc<ResidentLn> {
-        let rl = self.resident_ln().expect("ln_affine_cast_chained without resident_ff_available()");
+    /// Materialize only f32 ctxLN for split-A MHA; its affine-cast output is not consumed.
+    fn ln_normalize_only(&self, x: &Array2<f32>, gamma: &[f32], beta: &[f32]) -> Rc<ResidentLn> {
+        assert_resident_ln_inputs(x, gamma, beta);
+        let rl = self.resident_ln().expect("ln_normalize_only without resident_ff_available()");
         let x_std = x.as_standard_layout();
         let t = x.nrows();
         let mut buf = vec![0f32; PAD_M * KRES];
         buf[..t * KRES].copy_from_slice(&x_std.as_slice().unwrap()[..t * KRES]);
         rl.bo_x.write_bytes(f32_bytes(&buf)).unwrap();
         rl.bo_x.sync_to_device().unwrap();
-        let mut gb = vec![0f32; 2 * KRES];
-        gb[..KRES].copy_from_slice(gamma);
-        gb[KRES..].copy_from_slice(beta);
-        rl.bo_gb.write_bytes(f32_bytes(&gb)).unwrap();
-        rl.bo_gb.sync_to_device().unwrap();
         modal_site("rl.ln_kern#2");
         { let _dt = self.dtimer(); rl.ln_kern.run_matmul8(3, &rl.ln_instr, rl.ln_n, &rl.bo_x, &rl.bo_ln, &rl.ln_c, &rl.ln_tmp, &rl.ln_tr).unwrap(); }
-        modal_site("rl.ac_kern#2");
-        { let _dt = self.dtimer(); rl.ac_kern.run_matmul8(3, &rl.ac_instr, rl.ac_n, &rl.bo_ln, &rl.bo_gb, &rl.bo_bf16, &rl.ac_tmp, &rl.ac_tr).unwrap(); }
-        self.stats.borrow_mut().dispatches += 2;
+        self.stats.borrow_mut().dispatches += 1;
         rl
     }
 
@@ -2554,6 +2577,85 @@ impl NpuMatmul {
         &o.bo_out
     }
 
+    fn short_ffn(&self, m: usize) -> Option<Rc<ShortFfn>> {
+        // Manual precision/program variants retain their existing, paired 512-row streams.
+        if ffn_gemm_rows(m, true) != SHORT_FFN_ROWS || !self.modal || !self.krtp
+            || ln_mode() || std::env::var_os("NPU_RESIDENT_XCLBIN").is_some()
+            || !std::env::var("PARAKEET_MODAL_EPI_SUFFIX").unwrap_or_default().is_empty()
+        {
+            return None;
+        }
+        if let Some(cached) = self.short_ffn.borrow().as_ref() {
+            return cached.clone();
+        }
+        let panel = format!("{SHORT_FFN_ROWS}x{KRES}x{DFF}_{FC1_PANEL_BF16_TILE}_8c_modalsilubf16outpanel{KRES}");
+        let modal = format!("{SHORT_FFN_ROWS}x{KRES}x{DFF}_{}_8c_modalsilukrtp", self.tile);
+        let stream = format!("{SHORT_FFN_ROWS}x{KRES}x{KRES}_{}_8c_modalidkrtp", self.tile);
+        if !kernel_registry::artifact_pair_present(&self.base, &panel)
+            || !kernel_registry::artifact_pair_present(&self.base, &modal)
+            || !kernel_registry::insts_path(&self.base, &stream).is_file()
+        {
+            *self.short_ffn.borrow_mut() = Some(None);
+            return None;
+        }
+        let load = |stem: &str, insts_stem: &str| {
+            let path = resolve_verified(&self.base, stem).xclbin;
+            let kern = self.dev.load_kernel(path.to_str().unwrap(), None).unwrap();
+            let bytes = std::fs::read(kernel_registry::insts_path(&self.base, insts_stem)).unwrap();
+            assert!(!bytes.is_empty() && bytes.len() % 4 == 0, "invalid short FFN instructions");
+            let instr = self.dev.alloc_bo(&kern, bytes.len(), FLAG_CACHEABLE, kern.group_id(1).unwrap()).unwrap();
+            instr.write_bytes(&bytes).unwrap();
+            instr.sync_to_device().unwrap();
+            (kern, instr, bytes.len() / 4)
+        };
+        let (fc1, fc1_instr, fc1_n) = load(&panel, &panel);
+        let (fc2, instr, n) = load(&modal, &stream);
+        let alloc = |k: &Kernel, bytes, arg| self.dev.alloc_bo(k, bytes, FLAG_HOST_ONLY, k.group_id(arg).unwrap()).unwrap();
+        let short = Rc::new(ShortFfn {
+            fc1: Fc1PanelBf16 {
+                bo_out: alloc(&fc1, SHORT_FFN_ROWS * DFF * 2, 5),
+                dummy_tmp: alloc(&fc1, 1, 6), dummy_tr: alloc(&fc1, 4, 7),
+                kern: fc1, instr: fc1_instr, n: fc1_n,
+            },
+            bo_out: alloc(&fc2, SHORT_FFN_ROWS * KRES * 4, 5),
+            dummy_tmp: alloc(&fc2, 1, 6), dummy_tr: alloc(&fc2, 4, 7),
+            fc2, instr, n,
+        });
+        if !npu_xrt::quiet() {
+            eprintln!("[npu] FFN GEMMs: {SHORT_FFN_ROWS} rows, shared weights, four host f32 partials");
+        }
+        *self.short_ffn.borrow_mut() = Some(Some(short.clone()));
+        Some(short)
+    }
+
+    fn short_fc1(&self, short: &ShortFfn, rl: &ResidentLn, w1: &Bo) {
+        // XRT encodes a context slot above the low 16-bit memory bank. Slots need not match.
+        let bank = |k: &Kernel, arg| k.group_id(arg).unwrap() & 0xffff;
+        assert_eq!(bank(&short.fc1.kern, 3), bank(&rl.ac_kern, 5), "LN prefix bank");
+        assert_eq!(bank(&short.fc1.kern, 4), bank(&self.kern, 4), "shared W1 bank");
+        assert_eq!(bank(&short.fc1.kern, 5), bank(&short.fc2, 3), "FC1 panel bank");
+        assert_eq!(bank(&short.fc2, 4), bank(&self.kern, 4), "shared W2 bank");
+        let prefix = rl.bo_bf16.sub(0, ffn_chunk_bytes(SHORT_FFN_ROWS)).unwrap();
+        let o = &short.fc1;
+        let started = Instant::now();
+        { let _p = crate::prof::phase::PhaseScope::new("ffn_fc1", crate::prof::phase::Bucket::Npu);
+          let _dt = self.dtimer(); o.kern.run_matmul8(3, &o.instr, o.n, &prefix, w1, &o.bo_out, &o.dummy_tmp, &o.dummy_tr).unwrap(); }
+        let mut stats = self.stats.borrow_mut();
+        stats.dispatches += 1;
+        stats.ffn_fc1_s += started.elapsed().as_secs_f64();
+    }
+
+    fn short_fc2(&self, short: &ShortFfn, a: &Bo, w: &Bo, m: usize) -> Array2<f32> {
+        assert!((1..=SHORT_FFN_ROWS).contains(&m));
+        { let _dt = self.dtimer(); short.fc2.run_matmul8(3, &short.instr, short.n, a, w, &short.bo_out, &short.dummy_tmp, &short.dummy_tr).unwrap(); }
+        self.stats.borrow_mut().dispatches += 1;
+        short.bo_out.sync_from_device().unwrap();
+        let mut bytes = vec![0u8; m * KRES * 4];
+        short.bo_out.read_bytes(&mut bytes).unwrap();
+        Array2::from_shape_vec((m, KRES), bytes.chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()).unwrap()
+    }
+
     pub fn resident_ffn<F1: FnOnce() -> Array2<f32>, F2: FnOnce() -> Array2<f32>>(
         &self, x: &Array2<f32>, gamma: &[f32], beta: &[f32],
         make_w1: F1, id1: &str, make_w2: F2, id2: &str,
@@ -2577,11 +2679,16 @@ impl NpuMatmul {
         self.stats.borrow_mut().ffn_weight_prep_s += t_wp.elapsed().as_secs_f64();
         // fc1 -> chunk-major bf16 in ONE dispatch (the served fc1 path). `a_chunks` is the buffer
         // the fc2 K-split sub-slices.
-        let a_chunks: &Bo = self.fc1_pack_in_drain(&rl, &w1);
-        // fc2 K-split: each K=KRES chunk is a device SUB-BUFFER of a_chunks; K=KRES modal (identity),
-        // host-accumulate the `parts` partials in f32 -- bit-identical to the host K-split (WER-neutral).
+        let short = self.short_ffn(m);
+        let a_chunks: &Bo = if let Some(s) = short.as_ref() {
+            self.short_fc1(s, &rl, &w1);
+            &s.fc1.bo_out
+        } else {
+            self.fc1_pack_in_drain(&rl, &w1)
+        };
+        // Four separately rounded partials, accumulated on the host in the existing order.
         let parts = DFF / KRES;
-        let chunk_bytes = PAD_M * KRES * 2;
+        let chunk_bytes = ffn_chunk_bytes(ffn_gemm_rows(m, short.is_some()));
         let need_w2 = (0..parts).any(|c| !self.wcache.borrow().contains_key(&format!("{id2}.{c}")));
         let w2 = if need_w2 {
             let w = make_w2();
@@ -2602,7 +2709,12 @@ impl NpuMatmul {
                     self.weight_bo(&sid, w.slice(s![c * KRES..(c + 1) * KRES, ..]))
                 })
             };
-            acc += &self.dispatch_with_a(&chunk, m, &w2c, KRES, false);
+            let partial = if let Some(s) = short.as_ref() {
+                self.short_fc2(s, &chunk, &w2c, m)
+            } else {
+                self.dispatch_with_a(&chunk, m, &w2c, KRES, false)
+            };
+            acc += &partial;
         }
         self.stats.borrow_mut().ffn_fc2_s += t_fc2.elapsed().as_secs_f64();
         acc
@@ -2627,9 +2739,15 @@ impl NpuMatmul {
             let c = self.wcache.borrow().get(id1).cloned();
             c.unwrap_or_else(|| self.weight_bo_bf16(id1, k1, n1, bits1))
         };
-        let a_chunks: &Bo = self.fc1_pack_in_drain(&rl, &w1);
+        let short = self.short_ffn(m);
+        let a_chunks: &Bo = if let Some(s) = short.as_ref() {
+            self.short_fc1(s, &rl, &w1);
+            &s.fc1.bo_out
+        } else {
+            self.fc1_pack_in_drain(&rl, &w1)
+        };
         let parts = DFF / KRES;
-        let chunk_bytes = PAD_M * KRES * 2;
+        let chunk_bytes = ffn_chunk_bytes(ffn_gemm_rows(m, short.is_some()));
         let mut acc = Array2::<f32>::zeros((m, KRES));
         for c in 0..parts {
             let chunk = a_chunks.sub(c * chunk_bytes, chunk_bytes).unwrap();
@@ -2642,7 +2760,12 @@ impl NpuMatmul {
                     self.weight_bo_bf16(&sid, KRES, KRES, part_bits)
                 })
             };
-            acc += &self.dispatch_with_a(&chunk, m, &w2c, KRES, false);
+            let partial = if let Some(s) = short.as_ref() {
+                self.short_fc2(s, &chunk, &w2c, m)
+            } else {
+                self.dispatch_with_a(&chunk, m, &w2c, KRES, false)
+            };
+            acc += &partial;
         }
         acc
     }
@@ -3526,6 +3649,95 @@ mod conveyor_presence_tests {
         std::fs::write(dir.path().join("final.xclbin"), b"stub").unwrap();
         std::fs::write(dir.path().join("insts.bin"), b"stub").unwrap();
         assert!(conveyor_artifact_present(dir.path()));
+    }
+}
+
+#[cfg(test)]
+mod short_ffn_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires an exclusive NPU window and captured FFN fixture"]
+    fn mixed_row_device_control() {
+        let fixture = std::env::var("ASR_FFN_FIXTURE").expect("ASR_FFN_FIXTURE");
+        let root = std::env::var("ASR_FFN_ROOT").expect("ASR_FFN_ROOT");
+        let out = PathBuf::from(std::env::var("ASR_FFN_OUTPUT").expect("ASR_FFN_OUTPUT"));
+        std::fs::create_dir(&out).unwrap();
+        let fixture = Path::new(&fixture);
+        let x: Array2<f32> = ndarray_npy::read_npy(fixture.join("x_f32.npy")).unwrap();
+        let gb: Array2<f32> = ndarray_npy::read_npy(fixture.join("gamma_beta_f32.npy")).unwrap();
+        let w1: Array2<u16> = ndarray_npy::read_npy(fixture.join("w1_bf16.npy")).unwrap();
+        let w2: Array2<u16> = ndarray_npy::read_npy(fixture.join("w2_bf16.npy")).unwrap();
+        let gamma = gb.row(0).to_vec();
+        let beta = gb.row(1).to_vec();
+        let npu = NpuMatmul::open(Path::new(&root)).unwrap();
+        let mut first = None;
+        for (i, rows) in [32, 256, 257, 400, 32].into_iter().enumerate() {
+            let input = Array2::from_shape_fn((rows, KRES), |(r, c)| x[[r % 32, c]]);
+            let result = npu.resident_ffn_bf16(&input, &gamma, &beta,
+                "mixed.w1", KRES, DFF, w1.as_slice().unwrap(),
+                "mixed.w2", DFF, KRES, w2.as_slice().unwrap());
+            assert!(result.iter().all(|v| v.is_finite()));
+            let f32_result = npu.resident_ffn(&input, &gamma, &beta,
+                || w1.mapv(|v| f32::from_bits((v as u32) << 16)), "mixed.w1",
+                || w2.mapv(|v| f32::from_bits((v as u32) << 16)), "mixed.w2");
+            assert_eq!(result.mapv(f32::to_bits), f32_result.mapv(f32::to_bits));
+            if rows == 32 {
+                let bits: Vec<u32> = result.iter().map(|v| v.to_bits()).collect();
+                if let Some(ref prior) = first { assert_eq!(prior, &bits); } else { first = Some(bits); }
+            }
+            ndarray_npy::write_npy(out.join(format!("{i}-{rows}.npy")), &result).unwrap();
+        }
+    }
+
+    #[test]
+    fn row_selection_keeps_the_long_and_missing_artifact_routes() {
+        for m in [1, 32, 255, 256] {
+            assert_eq!(ffn_gemm_rows(m, true), 256);
+            assert_eq!(ffn_gemm_rows(m, false), PAD_M);
+        }
+        for m in [0, 257, PAD_M] {
+            assert_eq!(ffn_gemm_rows(m, true), PAD_M);
+        }
+    }
+
+    #[test]
+    fn panel_chunk_offsets_follow_the_selected_physical_rows() {
+        for rows in [256, PAD_M] {
+            let bytes = ffn_chunk_bytes(rows);
+            assert_eq!(bytes, rows * KRES * 2);
+            assert_eq!(4 * bytes, rows * DFF * 2);
+            assert_eq!(bytes % 4096, 0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod resident_ln_input_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_the_normalize_only_input_contract() {
+        let x = Array2::<f32>::zeros((PAD_M, KRES));
+        assert_resident_ln_inputs(&x, &vec![0.0; KRES], &vec![0.0; KRES]);
+    }
+
+    #[test]
+    fn rejects_invalid_normalize_only_shapes_or_affine_arguments() {
+        let gamma = vec![0.0; KRES];
+        let beta = vec![0.0; KRES];
+        assert!(std::panic::catch_unwind(|| {
+            assert_resident_ln_inputs(&Array2::<f32>::zeros((1, KRES - 1)), &gamma, &beta)
+        }).is_err());
+        assert!(std::panic::catch_unwind(|| {
+            assert_resident_ln_inputs(&Array2::<f32>::zeros((PAD_M + 1, KRES)), &gamma, &beta)
+        }).is_err());
+        assert!(std::panic::catch_unwind(|| {
+            assert_resident_ln_inputs(&Array2::<f32>::zeros((1, KRES)), &gamma[..KRES - 1], &beta)
+        }).is_err());
+        assert!(std::panic::catch_unwind(|| {
+            assert_resident_ln_inputs(&Array2::<f32>::zeros((1, KRES)), &gamma, &beta[..KRES - 1])
+        }).is_err());
     }
 }
 
