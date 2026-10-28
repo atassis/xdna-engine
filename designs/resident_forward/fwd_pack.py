@@ -12,12 +12,14 @@ import os
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import rf_paths
 sys.path.insert(0, str(rf_paths.REPO / "designs" / "decode_fused"))  # elf_zst.write_elf: the repo's
                                                                       # <name>.elf.zst convention
 from elf_zst import write_elf
+from scratchpad_params import merge_params, read_params, write_params
 
 BUILD = os.environ.get("RF_BUILD", str(rf_paths.BUILD_ROOT))
 
@@ -78,14 +80,24 @@ def main():
                 continue
             inst[i["id"]] = txn
             src[i["id"]] = b
-        for f in ("params.txt",):
-            assert filecmp.cmp(f"{BUILD}/{b}/{f}", f"{BUILD}/{base}/{f}", shallow=False), (b, f)
+    parameter_parts = []
+    for b in builds:
+        params = read_params(Path(BUILD) / b / "params.txt")
+        config = json.load(open(f"{BUILD}/{b}/full_elf_config.json"))["xrt-kernels"][0]
+        # aiecc injects this reserved empty sequence after emitting params.txt.
+        commands = {f"{config['name']}:{entry['id']}" for entry in config["instance"]
+                    if entry["id"] != "aiecc_empty"}
+        if set(params.commands) != commands:
+            raise ValueError(f"{b}: parameter command bindings differ from ELF instances")
+        parameter_parts.append(params)
+    params = merge_params(parameter_parts)
     od = f"{BUILD}/{out}"
     os.makedirs(od, exist_ok=True)
     kern["instance"] = [{"TXN_ctrl_code_file": v, "id": k} for k, v in inst.items()]
     json.dump(cfg, open(f"{od}/full_elf_config.json", "w"), indent=2)
     subprocess.run(["aiebu-asm", "-t", "aie2_config", "-j", f"{od}/full_elf_config.json", "-o", f"{od}/design.elf"], check=True)
-    for f in ("params.txt", "fwd_layout.json", "gen_env.txt"):
+    write_params(Path(od) / "params.txt", params)
+    for f in ("fwd_layout.json", "gen_env.txt"):
         if os.path.exists(f"{BUILD}/{base}/{f}"):
             shutil.copy(f"{BUILD}/{base}/{f}", f"{od}/{f}")
     open(f"{od}/gen_args.txt", "w").write(" ".join(args0) + "\n")

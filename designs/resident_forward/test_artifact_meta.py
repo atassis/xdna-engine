@@ -52,8 +52,8 @@ class ArtifactMetaTests(unittest.TestCase):
             (root / "gen_env.txt").write_text("RF_FAST=1\nRF_ATTN_H=1\n")
             (root / "fwd_layout.json").write_text(json.dumps(layout))
             slots = list(reversed(range(len(layout["params"]))))
-            rows = [f"{name} {slot} i32 addr" for name, slot in zip(layout["params"], slots)]
-            (root / "params.txt").write_text(str(len(rows)) + "\n" + "\n".join(rows) + "\n")
+            rows = [f"{name} {slot} i32 addr - -" for name, slot in zip(layout["params"], slots)]
+            (root / "params.txt").write_text(f"{len(rows)} {len(rows)}\n" + "\n".join(rows) + "\n0\n0\n")
             elf = b"compiled ELF fixture"
             (root / "design.elf").write_bytes(elf)
             result = metadata(root, store, config)

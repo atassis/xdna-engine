@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 
 from kvring import PARAMETER_ABI
+from scratchpad_params import read_params
 
 ARTIFACT_KIND = "resident_forward_ladder_v2"
 
@@ -56,11 +57,13 @@ def metadata(build: Path, store: Path, config: Path) -> dict:
         raise ValueError("layout must include the complete model and head")
     if layer.D != cfg["hidden_size"]:
         raise ValueError("layout hidden size differs from checkpoint")
-    rows = (build / "params.txt").read_text().splitlines()
-    slots = {name: int(slot) for name, slot, dtype, kind in (row.split() for row in rows[1:])}
-    if int(rows[0]) != len(slots) or set(slots) != set(layout["params"]):
+    params = read_params(build / "params.txt")
+    slots = {name: value[0] for name, value in params.parameters.items()}
+    if set(slots) != set(layout["params"]) or any(value[1:3] != ("i32", "addr")
+                                                 for value in params.parameters.values()):
         raise ValueError("compiled scratchpad parameters differ from layout")
-    if sorted(slots.values()) != list(range(len(slots))):
+    if (None in slots.values() or params.slot_count != len(slots)
+            or sorted(slots.values()) != list(range(len(slots)))):
         raise ValueError("compiled scratchpad slots must be unique and contiguous")
     plan = forward.Plan(layer, lo, hi, True)
     row_block = plan.XROWS // (layer.PCAP_T * layer.D * 2)
