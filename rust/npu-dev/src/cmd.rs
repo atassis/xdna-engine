@@ -9,6 +9,7 @@ pub mod parakeet_encode;
 pub mod prefill_golden;
 pub mod prefill_time;
 pub mod prefill_token_gate;
+pub mod resident_repeatability;
 pub mod s2_chain;
 pub mod s2_design;
 pub mod tcache_parity;

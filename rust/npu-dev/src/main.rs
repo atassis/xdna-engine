@@ -17,6 +17,7 @@ const SUBCOMMANDS: &[(&str, &str)] = &[
     ("whisper-e2e", "End-to-end Whisper-small ASR latency bench with per-stage breakdown."),
     ("parakeet-e2e", "End-to-end Parakeet-tdt ASR latency bench (mel+encoder+TDT decode) with per-stage breakdown."),
     ("fused-elf", "Generic on-device probe for a fused full ELF via the shim + FusedArena."),
+    ("resident-repeatability", "Capture matched resident-forward trials; recovery is not acceptance."),
     ("prefill-token-gate", "Tier 2 gate for the batched prefill path: greedy-decode from a primed prompt."),
     ("prefill-time", "Time priming a prompt, batched vs one token at a time."),
     ("prefill-golden", "Localise a batched-prefill divergence to a layer against the CPU golden."),
@@ -41,6 +42,7 @@ fn lookup(sub: &str) -> Option<fn(Vec<String>)> {
         "whisper-e2e" => cmd::whisper_e2e::run,
         "parakeet-e2e" => cmd::parakeet_e2e::run,
         "fused-elf" => cmd::fused_elf::run,
+        "resident-repeatability" => cmd::resident_repeatability::run,
         "prefill-token-gate" => cmd::prefill_token_gate::run,
         "prefill-time" => cmd::prefill_time::run,
         "prefill-golden" => cmd::prefill_golden::run,
@@ -95,6 +97,11 @@ mod tests {
         for (name, _) in SUBCOMMANDS {
             assert!(lookup(name).is_some(), "`{name}` is in SUBCOMMANDS but has no match arm in lookup()");
         }
+    }
+
+    #[test]
+    fn resident_repeatability_command_is_dispatched() {
+        assert!(lookup("resident-repeatability").is_some());
     }
 
     #[test]
