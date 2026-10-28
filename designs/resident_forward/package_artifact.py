@@ -7,6 +7,8 @@ import os
 import shutil
 from pathlib import Path
 
+from artifact_meta import ARTIFACT_KIND, PARAMETER_ABI, elf_sha256
+
 
 BUILD_FILES = ("pack.json", "fwd_layout.json", "params.txt", "gen_args.txt")
 # full_elf_config.json names build-only PDI/TXN inputs, not packaged companions.
@@ -15,6 +17,7 @@ RESIDENT_KINDS = {
     "resident_forward_raw",
     "resident_forward_onecmd",
     "resident_forward_ladder",
+    ARTIFACT_KIND,
 }
 
 
@@ -167,6 +170,11 @@ def package(out: Path, build: Path, meta_path: Path, weights: Path, store: Path)
     if not elf_source.is_file():
         elf_source = build / f"{elf_path}.zst"
     require_file(elf_source)
+    if kind == ARTIFACT_KIND:
+        if meta.get("kv_ring_parameter_abi") != PARAMETER_ABI:
+            raise ValueError("incompatible KV-ring parameter ABI")
+        if meta.get("elf_sha256") != elf_sha256(build / elf_path):
+            raise ValueError("ELF digest differs from total-count metadata")
     for name in required_weight_files(meta) + ("w_head.npy",):
         require_file(weights / name)
     for blob_path in manifest_blob_paths(store, kind):

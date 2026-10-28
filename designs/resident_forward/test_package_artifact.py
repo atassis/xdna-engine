@@ -37,6 +37,35 @@ def write_store(store: Path) -> None:
 
 
 class PackageArtifactTests(unittest.TestCase):
+    def test_total_count_package_binds_abi_to_exact_elf(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            build, weights, store = (root / name for name in ("build", "weights", "store"))
+            build.mkdir()
+            weights.mkdir()
+            write_build(build)
+            write_store(store)
+            for name in ("w0.npy", "w_head.npy"):
+                (weights / name).write_bytes(b"weight fixture")
+            elf = b"total-count ELF fixture"
+            (build / "design.elf").write_bytes(elf)
+            meta = {"kind": "resident_forward_ladder_v2", "elf": "design.elf", "nlayer": 1,
+                    "kv_ring_parameter_abi": "zero-base-total-v1", "elf_sha256": hashlib.sha256(elf).hexdigest()}
+            path = root / "meta.json"
+            path.write_text(json.dumps(meta))
+            package(root / "valid", build, path, weights, store)
+            for index, change in enumerate(({"elf_sha256": "0" * 64},
+                                             {"kv_ring_parameter_abi": "extra-counts"})):
+                path.write_text(json.dumps(meta | change))
+                out = root / f"bad-{index}"
+                with self.assertRaisesRegex(ValueError, "ELF digest|parameter ABI"):
+                    package(out, build, path, weights, store)
+                self.assertFalse(out.exists())
+            path.write_text(json.dumps(meta))
+            (build / "design.elf").write_bytes(b"different ELF")
+            with self.assertRaisesRegex(ValueError, "ELF digest"):
+                package(root / "stale", build, path, weights, store)
+
     def test_derive_store_preserves_original_and_checks_every_receipted_byte(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

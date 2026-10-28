@@ -110,24 +110,24 @@ def sequence(L, m):
             m(f"aiex.npu.rtp_write(@rtp_{t}, 2, %kev) : i32", I)
     for c in range(NCOL):
         for r in range(NROW):
-            m(f"aiex.set_lock(%wp_{c}_{r}, 2)", I)
-            m(f"aiex.set_lock(%wc_{c}_{r}, 0)", I)
+            m.set_lock(f"%wp_{c}_{r}", 2, I)
+            m.set_lock(f"%wc_{c}_{r}", 0, I)
         for nm, v in (("xf", 1), ("xp", 0), ("xw", 1), ("xr", 0), ("yf", 2), ("yr", 0)):
-            m(f"aiex.set_lock(%{nm}_{c}, {v})", I)
+            m.set_lock(f"%{nm}_{c}", v, I)
     for c in range(NCOL):
         for r in range(NROW):
             t = L.core_name(c, r)
             if L.own_xlocks(c, r):
-                m(f"aiex.set_lock(%cxp_{t}, 1)", I)
-                m(f"aiex.set_lock(%cxc_{t}, 0)", I)
+                m.set_lock(f"%cxp_{t}", 1, I)
+                m.set_lock(f"%cxc_{t}", 0, I)
     for r in range(NROW):
         t = L.core_name(NCOL - 1, r)
-        m(f"aiex.set_lock(%cyp_{t}, 2)", I)
+        m.set_lock(f"%cyp_{t}", 2, I)
         for j in range(2):
-            m(f"aiex.set_lock(%cyc{j}_{t}, 0)", I)
+            m.set_lock(f"%cyc{j}_{t}", 0, I)
     for c in range(NCOL):
         for r in range(NROW):
-            m(f"aiex.set_lock(%cgo_{L.core_name(c, r)}, 1)", I)
+            m.set_lock(f"%cgo_{L.core_name(c, r)}", 1, I)
 
     def task(name, tile, d, ch, body, attrs="", pkt=""):
         m(f"%{name} = aiex.dma_configure_task(%{tile}, {d}, {ch}{pkt}) {{", I)

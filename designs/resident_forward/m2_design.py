@@ -297,17 +297,17 @@ def sequence(m, nt):
             m(f"aiex.npu.rtp_write(@rtp_{core_name(c, r)}, 0, %ntv) : i32", I)
     for c in range(NC):
         for nm, v in (("xf", 1), ("xr", 0), ("hf", 1), ("hr", 0), ("yf", 1), ("yr", 0)):
-            m(f"aiex.set_lock(%{nm}_{c}, {v})", I)
+            m.set_lock(f"%{nm}_{c}", v, I)
     for r in range(NR):
         t = core_name(NC - 1, r)
         for j in range(2):
-            m(f"aiex.set_lock(%cop{j}_{t}, 2)", I)
-            m(f"aiex.set_lock(%coc{j}_{t}, 0)", I)
-            m(f"aiex.set_lock(%cyc{j}_{t}, 0)", I)
-        m(f"aiex.set_lock(%cyp_{t}, 1)", I)
+            m.set_lock(f"%cop{j}_{t}", 2, I)
+            m.set_lock(f"%coc{j}_{t}", 0, I)
+            m.set_lock(f"%cyc{j}_{t}", 0, I)
+        m.set_lock(f"%cyp_{t}", 1, I)
     for c in range(NC):
         for r in range(NR):
-            m(f"aiex.set_lock(%cgo_{core_name(c, r)}, 1)", I)
+            m.set_lock(f"%cgo_{core_name(c, r)}", 1, I)
 
     def task(name, tile, d, ch, body, attrs=""):
         m(f"%{name} = aiex.dma_configure_task(%{tile}, {d}, {ch}) {{", I)

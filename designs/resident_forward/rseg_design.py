@@ -199,9 +199,9 @@ def sequence(m, nb, nt):
     for c in range(A2.NC):
         for nm, v in (("qe", 1), ("we", 1), ("qf", 0), ("kf", 0), ("ke", 2), ("v0f", 0), ("v0e", 2), ("v1f", 0), ("v1e", 2),
                       ("sf", 0), ("se", 2), ("paf", 0), ("pae", 2), ("pbf", 0), ("pbe", 2), ("wf", 0), ("ctf", 0), ("cte", 2)):
-            m(f"aiex.set_lock(%{nm}_{c}, {v})", I)
+            m.set_lock(f"%{nm}_{c}", v, I)
         for role in A2.ROLE.values():
-            m(f"aiex.set_lock(%go_{role}_{c}, 1)", I)
+            m.set_lock(f"%go_{role}_{c}", 1, I)
 
     def emit_task(name, tile, d, ch, body, attrs="", pkt=""):
         m(f"%{name} = aiex.dma_configure_task(%{tile}, {d}, {ch}{pkt}) {{", I)

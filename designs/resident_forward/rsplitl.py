@@ -138,7 +138,7 @@ def export(a, bd):
         a[4] = ["%four = arith.constant 4 : i32", f"aie.use_lock(%ctf_{c}, AcquireGreaterEqual, %four)",
                 f"aie.dma_bd(%CT_{c} : memref<{CTB}xi8> offset = 0 len = {CTB} sizes = [16, {CTB // 16}] strides = [{CTB // 16}, 1]) {{bd_id = 41 : i32}}",
                 f"aie.use_lock(%cte_{c}, Release, %four)"]
-        a[5] = re.sub(r" \{repeat_count = \d+ : i32\}", "", a[5])
+        a[5] = " {issue_token = true}"
     return a
 
 
@@ -169,7 +169,7 @@ def attention(L, m, nt, I, task, locked, chain, issued, freed, nb):
         for nm, v in (("we", 1), ("qe", 1), ("qf", 0), ("kf", 0), ("ke", 2), ("v0f", 0), ("v0e", 2), ("v1f", 0), ("v1e", 2),
                       ("sf", 0), ("se", 2), ("paf", 0), ("pae", 2), ("pbf", 0), ("pbe", 2), ("wf", 0), ("ctf", 0), ("cte", 4),
                       ("oaf", 0)):
-            m(f"aiex.set_lock(%{nm}_{c}, {v})", I)
+            m.set_lock(f"%{nm}_{c}", v, I)
     # A: the split attention, each column over its nbc blocks in segments
     nbc = nb // 8
     base = lambda name: name.rsplit("_", 1)[0]
@@ -208,6 +208,8 @@ def attention(L, m, nt, I, task, locked, chain, issued, freed, nb):
     A2.NBW = L.NBW_S
     for c in range(NC):
         m(f"aiex.dma_await_task(%so_{c})", I)
+    for c in range(NC):
+        m(f"aiex.dma_await_task(%ctout_{c})", I)
     if UPTO == "a":
         return True
     for name, tile in issued:
@@ -220,9 +222,9 @@ def attention(L, m, nt, I, task, locked, chain, issued, freed, nb):
         CT_ = f"%CT_{h} : memref<{CTB}xi8>"
         t = L.core_name(h, 3)
         for nm, v in (("ke", 2), ("kf", 0), ("cte", 1), ("ctf", 0)):
-            m(f"aiex.set_lock(%{nm}_{h}, {v})", I)
-        m(f"aiex.set_lock(%mgp_{t}, 1)", I)
-        m(f"aiex.set_lock(%mgc_{t}, 0)", I)
+            m.set_lock(f"%{nm}_{h}", v, I)
+        m.set_lock(f"%mgp_{t}", 1, I)
+        m.set_lock(f"%mgc_{t}", 0, I)
         p0 = partials(nb, 0) + h * WREC // 2
         task(f"mgs{h}", f"shim_{h}", "MM2S", 0,
              chain([[f"aie.dma_bd({KV} offset = {p0} len = {8 * UNIT // 2} sizes = [8, {UNIT // 2}] strides = [{CTB // 2}, 1])"],
@@ -233,11 +235,15 @@ def attention(L, m, nt, I, task, locked, chain, issued, freed, nb):
                                                      for i in range(2)]), " {repeat_count = 43 : i32}")
         task(f"mge{h}", f"t_{t}", "MM2S", 0, locked(f"mgc_{t}", f"aie.dma_bd(%acc_{t} : memref<{AH.O_E}xf32> offset = 0 len = {AH.O_E}) {{bd_id = 8 : i32}}", f"mgp_{t}"),
              "", L.LAYER.pkt(h, "sm"))
-        task(f"mgl{h}", f"mem_{h}", "S2MM", 4, locked(f"cte_{h}", f"aie.dma_bd({CT_} offset = {2 * UNIT} len = {OB}) {{bd_id = 2 : i32}}", f"ctf_{h}"))
-        task(f"mgx{h}", f"mem_{h}", "MM2S", 5, locked(f"ctf_{h}", f"aie.dma_bd({CT_} offset = {2 * UNIT} len = {OB} sizes = [16, {OB // 16}] strides = [{OB // 16}, 1]) {{bd_id = 41 : i32}}", f"cte_{h}"))
+        task(f"mgl{h}", f"mem_{h}", "S2MM", 4, locked(f"cte_{h}", f"aie.dma_bd({CT_} offset = {2 * UNIT} len = {OB}) {{bd_id = 2 : i32}}", f"ctf_{h}"), " {issue_token = true}")
+        task(f"mgx{h}", f"mem_{h}", "MM2S", 5, locked(f"ctf_{h}", f"aie.dma_bd({CT_} offset = {2 * UNIT} len = {OB} sizes = [16, {OB // 16}] strides = [{OB // 16}, 1]) {{bd_id = 41 : i32}}", f"cte_{h}"), " {issue_token = true}")
         task(f"mgw{h}", f"shim_{h}", "S2MM", 0, [f"aie.dma_bd({KV} offset = {merged(nb) + h * OB // 2} len = {OB // 2})"], " {issue_token = true}")
     for h in range(2):
         m(f"aiex.dma_await_task(%mgw{h})", I)
+    for h in range(2):
+        m(f"aiex.dma_await_task(%mgx{h})", I)
+    for h in range(2):
+        m(f"aiex.dma_await_task(%mgl{h})", I)
     if UPTO == "m":
         return True
     for h in range(2):
@@ -247,7 +253,7 @@ def attention(L, m, nt, I, task, locked, chain, issued, freed, nb):
     # R: every column reloads its two heads' merged rows (row 2c + hh of the worker's tile layout)
     for c in range(NC):
         for nm, v in (("ke", 2), ("kf", 0), ("v0e", 2), ("v0f", 0)):
-            m(f"aiex.set_lock(%{nm}_{c}, {v})", I)
+            m.set_lock(f"%{nm}_{c}", v, I)
     for c in range(NC):
         CTc = f"%CT_{c} : memref<{CTB}xi8>"
         for h, (e, f, ids_in, ids_out, ch_out) in enumerate((("ke", "kf", (0, 1), (34, 35), 1), ("v0e", "v0f", (26, 27), (8, 9), 2))):
@@ -277,4 +283,6 @@ def attention(L, m, nt, I, task, locked, chain, issued, freed, nb):
     A2.NBW = L.NBW_S
     for c in range(NC):
         m(f"aiex.dma_await_task(%rso_{c})", I)
+    for c in range(NC):
+        m(f"aiex.dma_await_task(%rtk_{c})", I)
     return UPTO == "r"

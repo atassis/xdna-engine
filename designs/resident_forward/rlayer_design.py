@@ -1018,10 +1018,10 @@ def o_tasks(m, nt, I, task, locked, chain, issued, freed):
             freed.add(name)
     for c in range(NC):
         for nm, v in (("yf", NDBO // 2), ("yr", 0), ("ow", 1), ("od", 0)):
-            m(f"aiex.set_lock(%{nm}_{c}, {v})", I)
+            m.set_lock(f"%{nm}_{c}", v, I)
         for r in range(NR):
-            m(f"aiex.set_lock(%wp_{c}_{r}, 2)", I)
-            m(f"aiex.set_lock(%wc_{c}_{r}, 0)", I)
+            m.set_lock(f"%wp_{c}_{r}", 2, I)
+            m.set_lock(f"%wc_{c}_{r}", 0, I)
     for c in range(NC):
         task(f"osw{c}", f"shim_{c}", "MM2S", 0, [f"aie.dma_bd(%w : memref<{wbytes()}xi8> offset = {NC * wcol() + c * WCOL_O} len = {WCOL_O})"])
     n2 = f"%v{NSPO * nt}"
@@ -1044,7 +1044,7 @@ def o_tasks(m, nt, I, task, locked, chain, issued, freed):
         # per (N block, sub-pass): nt A blocks, each an 8640-B read of its 5184-B record
         ob = [locked(f"oaf_{c}", f"aie.dma_bd({OA_} offset = {sp * A2.ABO} len = {nt * AB_UNIT} sizes = [{nt}, 3, {AB_UNIT // 3}] strides = [{CT_O}, {AB_UNIT // 3}, 1]) {{bd_id = {14 + sp} : i32}}", f"oaf_{c}", n2, n2)
               for sp in range(NSPO)]
-        task(f"oob{c}", f"mem_{c}", "MM2S", 4, chain(ob), f" {{repeat_count = {NDBO - 1} : i32}}")
+        task(f"oob{c}", f"mem_{c}", "MM2S", 4, chain(ob), f" {{issue_token = true, repeat_count = {NDBO - 1} : i32}}")
         task(f"oly{c}", f"mem_{c}", "S2MM", 2, locked(f"yf_{c}",
              f"aie.dma_bd({XY_} offset = 0 len = {nt * 16 * 64} sizes = [{NDBO // 2}, {nt}, 16, 64] strides = [64, {XB}, {XROW}, 1]) {{bd_id = 21 : i32}}", f"yr_{c}"),
              f" {{repeat_count = {NDBO // 2 - 1} : i32}}")
@@ -1066,6 +1066,8 @@ def o_tasks(m, nt, I, task, locked, chain, issued, freed):
                  f" {{repeat_count = {NDBO // 2 * nt - 1} : i32}}", c7pkt(r, j))
     wo(core_name(NC - 1, NR - 1), 1, 15, c7pkt(NR - 1, 1))
     readout(m, nt, I, task, locked, "o", token=MPH)
+    for c in range(NC):
+        m(f"aiex.dma_await_task(%oob{c})", I)
 
 
 def readout(m, nt, I, task, locked, pfx, token):
@@ -1093,10 +1095,10 @@ def mlp_tasks(m, nt, I, task, locked, chain, issued, freed):
             freed.add(name)
     for c in range(NC):
         for nm, v in (("xw", 1), ("xr", 0), ("mhf", 1), ("mhr", 0), ("yf", NDBM // 2), ("yr", 0), ("ow", 1), ("od", 0)):
-            m(f"aiex.set_lock(%{nm}_{c}, {v})", I)
+            m.set_lock(f"%{nm}_{c}", v, I)
         for r in range(NR):
-            m(f"aiex.set_lock(%wp_{c}_{r}, 2)", I)
-            m(f"aiex.set_lock(%wc_{c}_{r}, 0)", I)
+            m.set_lock(f"%wp_{c}_{r}", 2, I)
+            m.set_lock(f"%wc_{c}_{r}", 0, I)
     for c in range(NC):     # the weights in mlp_grouped order
         task(f"msw{c}", f"shim_{c}", "MM2S", 0,
              [f"aie.dma_bd(%w : memref<{wbytes()}xi8> offset = {NC * (wcol() + WCOL_O) + c * WCOL_MP} len = {WCOL_MP})"])
@@ -1194,28 +1196,28 @@ def sequence(m, nt, nb=None, split=False):
                 m(f"aiex.npu.rtp_write(@rtp_{core_name(c, r)}, 3, %nbwv) : i32", I)
     for c in range(NC):
         for r in range(NR):
-            m(f"aiex.set_lock(%wp_{c}_{r}, 2)", I)
-            m(f"aiex.set_lock(%wc_{c}_{r}, 0)", I)
+            m.set_lock(f"%wp_{c}_{r}", 2, I)
+            m.set_lock(f"%wc_{c}_{r}", 0, I)
         for nm, v in (("xf", 1), ("xp", 0), ("xw", 1), ("xr", 0), ("qf", 3 if GEO_G else 4), ("qr", 0),
                       ("rf", 1), ("rr", 0), ("hw", nt if GEO_G else 1), ("hr", 0)):
-            m(f"aiex.set_lock(%{nm}_{c}, {v})", I)
+            m.set_lock(f"%{nm}_{c}", v, I)
     for c in range(NC):
         for r in range(NR):
             t = core_name(c, r)
             if own_xlocks(c, r):
-                m(f"aiex.set_lock(%cxp_{t}, 1)", I)
-                m(f"aiex.set_lock(%cxc_{t}, 0)", I)
+                m.set_lock(f"%cxp_{t}", 1, I)
+                m.set_lock(f"%cxc_{t}", 0, I)
     for r in range(NR):
         t = core_name(NC - 1, r)
-        m(f"aiex.set_lock(%cyp_{t}, {2 if QKV_DOWN else 1})", I)
+        m.set_lock(f"%cyp_{t}", 2 if QKV_DOWN else 1, I)
         for j in range(2):
-            m(f"aiex.set_lock(%cyc{j}_{t}, 0)", I)
+            m.set_lock(f"%cyc{j}_{t}", 0, I)
         if gelu_off():
             for nm, v in (("cgE", 2), ("cgF", 0), ("coE", 2), ("coF", 0)):
-                m(f"aiex.set_lock(%{nm}_{core_name(EPI, r)}, {v})", I)
+                m.set_lock(f"%{nm}_{core_name(EPI, r)}", v, I)
     for c in range(NC):
         for r in range(NR):
-            m(f"aiex.set_lock(%cgo_{core_name(c, r)}, 1)", I)
+            m.set_lock(f"%cgo_{core_name(c, r)}", 1, I)
 
     issued = []
 
@@ -1274,7 +1276,7 @@ def sequence(m, nt, nb=None, split=False):
         task(f"xin{c}", f"mem_{c}", "S2MM", 1, locked(f"xf_{c}", f"aie.dma_bd({XR_} offset = 0 len = {X}) {{bd_id = 28 : i32}}", f"xp_{c}"))
         RP_ = f"%RP_{c} : memref<{PCAP_T * ROPE_T + SLACK}xi8>"
         if HEAD:
-            task(f"rin{c}", f"mem_{c}", "S2MM", 1, locked(f"rf_{c}", f"aie.dma_bd({RP_} offset = 0 len = {nt * (4096 if GEO_G else ROPE_T)}) {{bd_id = 33 : i32}}", f"rr_{c}"))
+            task(f"rin{c}", f"mem_{c}", "S2MM", 1, locked(f"rf_{c}", f"aie.dma_bd({RP_} offset = 0 len = {nt * (4096 if GEO_G else ROPE_T)}) {{bd_id = 33 : i32}}", f"rr_{c}"), " {issue_token = true}" if ATTN else "")
         task(f"nb{c}", f"mem_{c}", "MM2S", 4, locked(f"xp_{c}",
              f"aie.dma_bd({XR_} offset = 0 len = {2 * nt * AB_UNIT} sizes = [{2 * nt}, 3, {AB_UNIT // 3}] "
              f"strides = [{UNITB}, {AB_UNIT // 3}, 1]) {{bd_id = 12 : i32}}", f"xp_{c}"))
@@ -1386,7 +1388,7 @@ class Layer:
             return [("tk", f"mem_{c}", "MM2S", 5,
                      [f"aie.use_lock(%oaf_{c}, AcquireGreaterEqual, {n2})",
                       f"aie.dma_bd({oab} offset = 0 len = 64) {{bd_id = 41 : i32}}",
-                      f"aie.use_lock(%oaf_{c}, Release, {n2})"], ""),
+                      f"aie.use_lock(%oaf_{c}, Release, {n2})"], " {issue_token = true}"),
                     ("so", f"shim_{c}", "S2MM", 0,
                      [f"aie.dma_bd(%o : memref<{obuf()}xi8> offset = {c * XROW} len = 64)"], " {issue_token = true}")]
         return [("oo", f"mem_{c}", "MM2S", 5,
@@ -1415,8 +1417,8 @@ class Layer:
         X, KV = f"%x : memref<{xbuf()}xi8>", f"%kvr : memref<{A2.NBW * 64 * KVROW}xbf16>"
         if SRING:        # the window as two spans of whole blocks, once per pass (kvring)
             import kvring
-            rd = lambda kv: [kvring.bd_text(KV, kvring.read_bd(c, kv, 0)), "aie.next_bd ^b1", "^b1:",
-                             kvring.bd_text(KV, kvring.read_bd(c, kv, 1))]
+            rd = lambda kv: [kvring.bd_text(KV, kvring.read_bd(c, kv, 0, SRING)), "aie.next_bd ^b1", "^b1:",
+                             kvring.bd_text(KV, kvring.read_bd(c, kv, 1, SRING))]
             rep = f" {{repeat_count = {nt - 1} : i32}}"
             return [("sk", 0, rd(0), rep), ("sw", 1, f"aie.dma_bd({X} offset = {xbuf() - A2.WB} len = {A2.WB})", ""),
                     ("sv", 1, rd(1), rep)]
@@ -1460,7 +1462,7 @@ def attention_tasks(m, nt, I, task, locked, chain, issued, freed):
     if os.environ.get("RF_GSTOP") == "kv":    # bisection: end the command after the new K/V rows land
         return True
     for name, tile in issued:
-        if name.startswith("hp"):
+        if name.startswith(("hp", "rin")):
             m(f"aiex.dma_await_task(%{name})", I)
     for name, tile in issued:
         if tile.startswith("mem_") and not name.startswith("kws"):
@@ -1469,9 +1471,9 @@ def attention_tasks(m, nt, I, task, locked, chain, issued, freed):
     for c in range(NC):
         for nm, v in (("we", 1), ("kf", 0), ("ke", 2), ("v0f", 0), ("v0e", 2), ("v1f", 0), ("v1e", 2), ("sf", 0), ("se", 2),
                       ("paf", 0), ("pae", 2), ("pbf", 0), ("pbe", 2), ("wf", 0), ("ctf", 0), ("cte", 2)):
-            m(f"aiex.set_lock(%{nm}_{c}, {v})", I)
+            m.set_lock(f"%{nm}_{c}", v, I)
     for c in range(NC):
-        m(f"aiex.set_lock(%oaf_{c}, 0)", I)
+        m.set_lock(f"%oaf_{c}", 0, I)
     if GEO_G and CUR_SPLIT:
         import rsplitl
         return rsplitl.attention(sys.modules[__name__], m, nt, I, task, locked, chain, issued, freed, CUR_NB)
@@ -1482,6 +1484,9 @@ def attention_tasks(m, nt, I, task, locked, chain, issued, freed):
             A2.attn_tasks(m, nt, c, task, locked, chain, RG().Layer(LAYER, sys.modules[__name__]) if GEO_G else LAYER)
     for c in range(NC):
         m(f"aiex.dma_await_task(%so_{c})", I)
+    if OPH:
+        for c in range(NC):
+            m(f"aiex.dma_await_task(%tk_{c})", I)
     return os.environ.get("RF_GSTOP") == "att"    # bisection: end the command after attention
 
 

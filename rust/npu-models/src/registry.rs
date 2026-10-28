@@ -76,7 +76,7 @@ pub fn try_build(cfg_path: &Path, root: &Path) -> Result<Scenario, EngineError> 
             // the fused-decode-ELF rail below); mutually exclusive with `decode`. Which driver
             // constructs it is read from the artifact's OWN `meta.json` (`kind`), not a second
             // config field -- `rf48s` (`resident_forward_onecmd`, one fixed sliding-cache window)
-            // and `rf48L` (`resident_forward_ladder`, the 256k rung ladder + mirrored ring) are
+            // and `rf48L` (`resident_forward_ladder_v2`, the 256k rung ladder + sliding ring) are
             // different meta.json shapes under the same `artifacts.resident` directory convention.
             let tower_checkpoint = cfg.multimodal.tower_checkpoint.as_ref().map(|p| root.join(p));
             if !cfg.artifacts.resident.is_empty() {
@@ -88,7 +88,7 @@ pub fn try_build(cfg_path: &Path, root: &Path) -> Result<Scenario, EngineError> 
                     .map_err(|e| EngineError::Load(format!("parse {}: {e}", meta_path.display())))?;
                 let kind = meta_v.get("kind").and_then(|x| x.as_str()).unwrap_or_default();
                 match kind {
-                    "resident_forward_ladder" => {
+                    crate::llm::resident_ladder::ARTIFACT_KIND => {
                         let decode = crate::llm::LadderResidentForward::open(&dev, &resident_dir)?;
                         Scenario::Generate(Box::new(crate::llm::LlmGenerator::new(model_cfg, decode)
                             .with_scenario_defaults(cfg.generation.to_defaults())

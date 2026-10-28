@@ -1,7 +1,29 @@
 """Resident loader metadata derived from a compiled forward layout."""
+import hashlib
 import json
 import os
+import subprocess
 from pathlib import Path
+
+from kvring import PARAMETER_ABI
+
+ARTIFACT_KIND = "resident_forward_ladder_v2"
+
+
+def elf_sha256(path: Path) -> str:
+    path = Path(path)
+    if path.is_file():
+        with path.open("rb") as source:
+            return hashlib.file_digest(source, "sha256").hexdigest()
+    compressed = Path(f"{path}.zst")
+    if not compressed.is_file():
+        raise FileNotFoundError(f"missing ELF: {path} or {compressed}")
+    with subprocess.Popen(["zstd", "--quiet", "--decompress", "--stdout", "--", str(compressed)],
+                          stdout=subprocess.PIPE) as decoder:
+        digest = hashlib.file_digest(decoder.stdout, "sha256").hexdigest()
+        if decoder.wait():
+            raise ValueError(f"cannot decompress ELF: {compressed}")
+    return digest
 
 
 def metadata(build: Path, store: Path, config: Path) -> dict:
@@ -25,6 +47,8 @@ def metadata(build: Path, store: Path, config: Path) -> dict:
     expected = json.loads(json.dumps(forward.layout(layer)))
     if layout != expected:
         raise ValueError("compiled layout does not match its recorded generator inputs")
+    if layout.get("kv_ring_parameter_abi") != PARAMETER_ABI:
+        raise ValueError("compiled layout does not use the total-count KV-ring parameter ABI")
     cfg = json.loads(config.read_text())
     cfg = cfg.get("text_config", cfg)
     lo, hi = layout["range"]
@@ -43,14 +67,15 @@ def metadata(build: Path, store: Path, config: Path) -> dict:
     layer.set_geo(False)
     kvrow_s = layer.KVROW
     return {
-        "kind": "resident_forward_ladder", "elf": "design.elf", "boot": "boot",
+        "kind": ARTIFACT_KIND, "elf": "design.elf", "boot": "boot",
+        "elf_sha256": elf_sha256(build / "design.elf"),
         "weight_dir": "weights", "embedding_store": "store",
         "d_model": cfg["hidden_size"], "nlayer": hi + 1,
         "full_attention_layers": layout["global_layers"],
         "row_block": row_block, "pcap_t": layer.PCAP_T,
         "pmax": row_block * max(rung["nt"] for rung in layout["rungs"]),
         "sliding_window": cfg["sliding_window"],
-        **{key: layout[key] for key in ("s_cap", "s_ring", "s_rows", "g_cap", "param_unit_bytes", "s_ring_layout", "rungs")},
+        **{key: layout[key] for key in ("s_cap", "s_ring", "s_rows", "g_cap", "param_unit_bytes", "s_ring_layout", "kv_ring_parameter_abi", "rungs")},
         "kvrow_s": kvrow_s, "kvrow_g": rglobal.KVROW,
         "xrows": plan.XROWS, "rope_s_off": plan.RS, "rope_g_off": plan.RG,
         "widths_s_off": plan.WS, "widths_g_off": plan.WG, "widths_bytes": attention.WB,

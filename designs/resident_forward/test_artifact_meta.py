@@ -1,6 +1,9 @@
+import hashlib
 import importlib
 import json
 import os
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +11,25 @@ from unittest.mock import patch
 
 
 class ArtifactMetaTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("zstd"), "zstd is required for compressed ELF metadata")
+    def test_elf_digest_uses_decompressed_bytes_and_rejects_corruption(self):
+        from artifact_meta import elf_sha256
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "design.elf"
+            data = b"compiled ELF fixture"
+            path.write_bytes(data)
+            expected = hashlib.sha256(data).hexdigest()
+            self.assertEqual(elf_sha256(path), expected)
+            subprocess.run(["zstd", "--quiet", str(path)], check=True)
+            path.unlink()
+            self.assertEqual(elf_sha256(path), expected)
+            Path(f"{path}.zst").write_bytes(b"not zstd")
+            with self.assertRaisesRegex(ValueError, "cannot decompress ELF"):
+                elf_sha256(path)
+            Path(f"{path}.zst").unlink()
+            with self.assertRaises(FileNotFoundError):
+                elf_sha256(path)
+
     def test_metadata_uses_compiled_layout_and_scratchpad_slots(self):
         from artifact_meta import metadata
         with tempfile.TemporaryDirectory() as directory:
@@ -32,7 +54,15 @@ class ArtifactMetaTests(unittest.TestCase):
             slots = list(reversed(range(len(layout["params"]))))
             rows = [f"{name} {slot} i32 addr" for name, slot in zip(layout["params"], slots)]
             (root / "params.txt").write_text(str(len(rows)) + "\n" + "\n".join(rows) + "\n")
+            elf = b"compiled ELF fixture"
+            (root / "design.elf").write_bytes(elf)
             result = metadata(root, store, config)
+            self.assertEqual(result["kind"], "resident_forward_ladder_v2")
+            self.assertEqual(result["kv_ring_parameter_abi"], "zero-base-total-v1")
+            self.assertEqual(layout["kv_ring_parameter_abi"], result["kv_ring_parameter_abi"])
+            self.assertEqual(result["elf_sha256"], hashlib.sha256(elf).hexdigest())
+            fixture = Path(__file__).resolve().parents[2] / "rust/npu-models/tests/fixtures/resident_ladder_v2_meta.json"
+            self.assertEqual(result, json.loads(fixture.read_text()))
             self.assertEqual(result["scratchpad_params"], dict(zip(layout["params"], slots)))
             self.assertEqual(result["scratch_bytes"], layout["SF"])
             self.assertEqual(result["cache_bytes"], layout["KF"])
@@ -44,6 +74,11 @@ class ArtifactMetaTests(unittest.TestCase):
             for offset in result["split_widths_x_off"]:
                 self.assertLessEqual(result["rope_g_off"] + offset - result["xrows"] + result["widths_bytes"], result["xbuf"])
             self.assertEqual(result["weight_dir"], "weights")
+            legacy = dict(layout)
+            legacy.pop("kv_ring_parameter_abi", None)
+            (root / "fwd_layout.json").write_text(json.dumps(legacy))
+            with self.assertRaisesRegex(ValueError, "layout"):
+                metadata(root, store, config)
             layout["SF"] += 8
             (root / "fwd_layout.json").write_text(json.dumps(layout))
             with self.assertRaisesRegex(ValueError, "layout"):

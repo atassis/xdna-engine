@@ -43,7 +43,7 @@ pub use tool_syntax::{PayloadFormat, ProbeReason, ToolProbe, ToolSyntax};
 pub fn resident_max_context(dir: &std::path::Path) -> Option<usize> {
     let v: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("meta.json")).ok()?).ok()?;
     match v.get("kind")?.as_str()? {
-        "resident_forward_ladder" => resident_ladder::LadderMeta::load(dir).ok().map(|m| m.largest_keys(1)),
+        resident_ladder::ARTIFACT_KIND => resident_ladder::LadderMeta::load(dir).ok().map(|m| m.largest_keys(1)),
         "resident_forward_onecmd" => resident_onecmd::OneCmdMeta::load(dir)
             .ok()
             .map(|m| resident_onecmd::max_context_bound(m.s_cap, m.pmax, m.nbw, m.sliding_window)),

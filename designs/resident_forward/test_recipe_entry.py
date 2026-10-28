@@ -34,6 +34,14 @@ def imports_name(path: Path, module: str, name: str) -> bool:
 
 
 class RecipeEntryTests(unittest.TestCase):
+    def graph_env(self) -> dict[str, str]:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        manifest = Path(directory.name) / "artifacts/gemma4-12b/store/manifest.json"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text(json.dumps({"full_attention_layers": list(range(5, 48, 6))}))
+        return os.environ | {"RF_FAST": "1", "XDNA_DATA": directory.name}
+
     def graphgen(self, flags: list[str]) -> subprocess.CompletedProcess[str]:
         probe = """
 import sys
@@ -42,12 +50,10 @@ sys.modules["pyxrt"] = None
 import rlayer_design
 print(len(rlayer_design.build_text(sys.argv[2:])))
 """
-        env = os.environ.copy()
-        env["RF_FAST"] = "1"
         return subprocess.run(
             [sys.executable, "-c", textwrap.dedent(probe), str(HERE), *flags],
             cwd=HERE,
-            env=env,
+            env=self.graph_env(),
             capture_output=True,
             text=True,
         )
@@ -77,7 +83,7 @@ print(json.dumps({"rungs": layer.f_rungs(),
         flags = rf48c_flags()
         flags.insert(flags.index("1"), "emit=f3,f3w256")
         result = subprocess.run([sys.executable, "-c", textwrap.dedent(probe), str(HERE), *flags],
-                                cwd=HERE, env=os.environ | {"RF_FAST": "1"},
+                                cwd=HERE, env=self.graph_env(),
                                 capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)
         graph = json.loads(result.stdout)

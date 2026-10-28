@@ -449,23 +449,23 @@ def sequence(m, nt, blocks=1, part=None, switches=0, attn=False, res=None):
     for c in range(NC):
         for nm, v in (("xf", 1), ("xp", 1 if part == "b2" or res in ("mid", "out") else 0), ("xw", 1), ("xr", 0), ("hf", 1), ("hr", 0),
                       ("yf", YNB), ("yr", 0), ("ow", 1), ("od", 0)):
-            m(f"aiex.set_lock(%{nm}_{c}, {v})", I)
+            m.set_lock(f"%{nm}_{c}", v, I)
     for c in range(NC):
         for r in range(NR):
             t = core_name(c, r)
             if scale_core(c, r):
-                m(f"aiex.set_lock(%cxp_{t}, 1)", I)
-                m(f"aiex.set_lock(%cxc_{t}, 0)", I)
+                m.set_lock(f"%cxp_{t}", 1, I)
+                m.set_lock(f"%cxc_{t}", 0, I)
     for r in range(NR):
         t = core_name(NC - 1, r)
         for j in range(2):
-            m(f"aiex.set_lock(%cop{j}_{t}, 2)", I)
-            m(f"aiex.set_lock(%coc{j}_{t}, 0)", I)
-            m(f"aiex.set_lock(%cyc{j}_{t}, 0)", I)
-        m(f"aiex.set_lock(%cyp_{t}, 2)", I)
+            m.set_lock(f"%cop{j}_{t}", 2, I)
+            m.set_lock(f"%coc{j}_{t}", 0, I)
+            m.set_lock(f"%cyc{j}_{t}", 0, I)
+        m.set_lock(f"%cyp_{t}", 2, I)
     for c in range(NC):
         for r in range(NR):
-            m(f"aiex.set_lock(%cgo_{core_name(c, r)}, {1 if ATT else blocks})", I)
+            m.set_lock(f"%cgo_{core_name(c, r)}", 1 if ATT else blocks, I)
 
     issued = []
 
@@ -562,8 +562,8 @@ def sequence(m, nt, blocks=1, part=None, switches=0, attn=False, res=None):
         # R6: the first thing each dispatch does to the MemTile is read the canary the previous
         # dispatch left; the last is to leave its own (host-chosen, from the tail of %x)
         for c in range(NC):
-            m(f"aiex.set_lock(%cq_{c}, 1)", I)
-            m(f"aiex.set_lock(%cf_{c}, {0 if res in ('mid', 'out') else 1})", I)
+            m.set_lock(f"%cq_{c}", 1, I)
+            m.set_lock(f"%cf_{c}", 0 if res in ('mid', 'out') else 1, I)
         if res in ("mid", "out"):
             for c in range(NC):
                 CN = f"%CAN_{c} : memref<{CAN}xi8>"
@@ -588,7 +588,7 @@ def sequence(m, nt, blocks=1, part=None, switches=0, attn=False, res=None):
                 for c in range(NC):
                     for r in range(NR):
                         m(f"aiex.npu.rtp_write(@rtp_{core_name(c, r)}, 0, %ntv) : i32", I)
-                        m(f"aiex.set_lock(%cgo_{core_name(c, r)}, 1)", I)
+                        m.set_lock(f"%cgo_{core_name(c, r)}", 1, I)
                 for c in range(NC):
                     task(f"sw{c}_{b}", f"shim_{c}", "MM2S", 0, [f"aie.dma_bd(%w : memref<{NC * WCOL}xi8> offset = {c * WCOL} len = {WCOL})"])
             if attn:
@@ -597,8 +597,8 @@ def sequence(m, nt, blocks=1, part=None, switches=0, attn=False, res=None):
                 ob = OB()
                 for c in range(NC):
                     A_ = f"%ATT_{c} : memref<{ATT_MT}xi8>"
-                    m(f"aiex.set_lock(%aw_{c}, 1)", I)
-                    m(f"aiex.set_lock(%af_{c}, 0)", I)
+                    m.set_lock(f"%aw_{c}", 1, I)
+                    m.set_lock(f"%af_{c}", 0, I)
                     task(f"ai{c}", f"mem_{c}", "S2MM", 1, locked(f"aw_{c}", f"aie.dma_bd({A_} offset = 0 len = {ATT_MT}) {{bd_id = 32 : i32}}", f"af_{c}"))
                     task(f"ao{c}", f"mem_{c}", "MM2S", 5, locked(f"af_{c}", f"aie.dma_bd({A_} offset = 0 len = {ATT_MT}) {{bd_id = 33 : i32}}", f"aw_{c}"))
                     task(f"sa{c}", f"shim_{c}", "MM2S", 1, [f"aie.dma_bd(%w : memref<{NC * WCOL}xi8> offset = {c * WCOL} len = {ATT_MT})"])
@@ -619,7 +619,7 @@ def sequence(m, nt, blocks=1, part=None, switches=0, attn=False, res=None):
             for c in range(NC):
                 for nm, v in (("xp", 1), ("xw", 1), ("xr", 0), ("hf", 1), ("hr", 0),
                               ("yf", YNB), ("yr", 0), ("ow", 1), ("od", 0)):
-                    m(f"aiex.set_lock(%{nm}_{c}, {v})", I)
+                    m.set_lock(f"%{nm}_{c}", v, I)
         block_tasks(b)
     if res in ("in", "mid"):
         for c in range(NC):

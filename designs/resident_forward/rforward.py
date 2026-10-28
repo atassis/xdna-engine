@@ -153,8 +153,8 @@ def retarget(line, plan, li, glob, kind):
             assert sz[-1] % u == 0 and all(v % u == 0 for v in st[:-1]) and st[-1] == 1, line
             sz[-1] //= u
             st = [v // u for v in st[:-1]] + [1]
-        gm = re.search(r"length_granule = (\d+) : i32", rest)
-        if gm:                          # a granule of source elements, in scratch elements
+        gm = re.search(r"length_unit = (\d+) : i32", rest)
+        if gm:                          # the source-element length unit, in scratch elements
             g_ = int(gm.group(1)) * scale
             assert g_ % u == 0, line
             rest = rest[:gm.start(1)] + str(g_ // u) + rest[gm.end(1):]
@@ -275,4 +275,5 @@ def layout(L):
     if L.SRING_FWD:
         import kvring
         out["s_ring_layout"] = kvring.describe(L.SRING_FWD, L.NBW_S, s_rows(L) * L.KVROW)
+        out["kv_ring_parameter_abi"] = kvring.PARAMETER_ABI
     return out

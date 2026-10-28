@@ -35,6 +35,11 @@ class M:
         self.n += 1
         return f"%{p}{self.n}"
 
+    def set_lock(self, lock, value, ind=4):
+        operand = self.tmp("lock_value")
+        self(f"{operand} = arith.constant {value} : i32", ind)
+        self(f"aiex.set_lock({lock}, {operand})", ind)
+
 
 def core_name(c, r):
     return f"{c}_{2 + r}"
@@ -239,13 +244,13 @@ def sequence(m, nt):
             t = core_name(c, r)
             m(f"aiex.npu.rtp_write(@rtp_{t}, 0, %ntv) : i32", I)
     for c in range(NC):
-        m(f"aiex.set_lock(%xf_{c}, 1)", I)
-        m(f"aiex.set_lock(%xr_{c}, 0)", I)
-        m(f"aiex.set_lock(%hf_{c}, 1)", I)
-        m(f"aiex.set_lock(%hr_{c}, 0)", I)
+        m.set_lock(f"%xf_{c}", 1, I)
+        m.set_lock(f"%xr_{c}", 0, I)
+        m.set_lock(f"%hf_{c}", 1, I)
+        m.set_lock(f"%hr_{c}", 0, I)
     for c in range(NC):
         for r in range(NR):
-            m(f"aiex.set_lock(%cgo_{core_name(c, r)}, 1)", I)
+            m.set_lock(f"%cgo_{core_name(c, r)}", 1, I)
     if PARTS == "min":
         m("}", 4)
         return

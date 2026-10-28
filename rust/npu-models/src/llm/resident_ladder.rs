@@ -14,7 +14,7 @@
 //! - **Two scratch BOs**: `%s` holds the weights (static BDs only), `%k` the caches (every BD whose
 //!   address moves with the position), so a runtime-offset transfer cannot reach a weight byte.
 //!
-//! Layout is read from `meta.json` (`kind: "resident_forward_ladder"`), itself generated from
+//! Layout is read from `meta.json` (`kind: "resident_forward_ladder_v2"`), itself generated from
 //! `fwd_layout.json` (the build's own authority) plus the architecture-constant `%x`/`%o` offsets
 //! `rforward.Plan` computes identically for every rung (confirmed: this build's `XF`/`OF` equal
 //! `rf48s`'s `xbuf`/`obuf_f1` bit for bit) -- see `scripts/gen_rf48L_meta.py`. Nothing here hand-
@@ -47,6 +47,10 @@ use crate::llm::resident::ring_read_first;
 use crate::telemetry::ArmProvenance;
 use crate::llm::multimodal::MediaEmbeds;
 use crate::llm::resident_raw::{artifact_relative_path, global_widths_record, piece_nt, rope_row_global, rope_row_sliding, sliding_widths_record, EmbedHeadPack};
+
+pub(crate) const ARTIFACT_KIND: &str = "resident_forward_ladder_v2";
+const PARAMETER_ABI: &str = "zero-base-total-v1";
+const RING_COUNTS: [&str; 4] = ["kvw_a_rows", "kvw_b_rows", "kvr_a_blocks", "kvr_b_blocks"];
 
 /// Pause before each re-run of a non-finite dispatch. A policy, measured 2026-09-30 on rf48C under
 /// desktop load: failures come in bursts, 63% clear on an immediate re-run, and 7 of 8 that failed
@@ -237,7 +241,7 @@ pub fn build_provenance(dir: &Path, elf: &[u8], max_seq: usize) -> ArmProvenance
 }
 
 /// One scratchpad parameter's value: a byte offset (written as `bytes / param_unit_bytes`) or a
-/// count of granules past the BD's static one (written raw).
+/// total row/block count for a zero-base-length BD (written raw).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RingParam {
     Bytes(usize),
@@ -253,13 +257,13 @@ pub fn ring_params(l: &RingLayout, s: usize, rows: usize, first: usize) -> Vec<(
     let [(ra, ma), (rb, mb)] = read_spans(first, l.window_blocks, c, l.block_rows);
     vec![
         ("kvw_a", RingParam::Bytes(slot(wa))),
-        ("kvw_an", RingParam::Count(na - 1)),
+        (RING_COUNTS[0], RingParam::Count(na)),
         ("kvw_b", RingParam::Bytes(slot(wb))),
-        ("kvw_bn", RingParam::Count(nb - 1)),
+        (RING_COUNTS[1], RingParam::Count(nb)),
         ("kvr_a", RingParam::Bytes(ra * l.block_bytes)),
-        ("kvr_an", RingParam::Count(ma - 1)),
+        (RING_COUNTS[2], RingParam::Count(ma)),
         ("kvr_b", RingParam::Bytes(rb * l.block_bytes)),
-        ("kvr_bn", RingParam::Count(mb - 1)),
+        (RING_COUNTS[3], RingParam::Count(mb)),
     ]
 }
 
@@ -269,29 +273,36 @@ pub fn ring_fits(l: &RingLayout, p: &[(&str, RingParam)]) -> Result<(), String> 
     let get = |k: &str| p.iter().find(|(n, _)| *n == k).map(|(_, v)| *v);
     for (bd, pre, write) in [(&l.write, "kvw", true), (&l.read, "kvr", false)] {
         for sp in ["a", "b"] {
-            let (Some(RingParam::Bytes(off)), Some(RingParam::Count(n))) = (get(&format!("{pre}_{sp}")), get(&format!("{pre}_{sp}n"))) else {
+            let unit = if write { "rows" } else { "blocks" };
+            let (Some(RingParam::Bytes(off)), Some(RingParam::Count(n))) = (get(&format!("{pre}_{sp}")), get(&format!("{pre}_{sp}_{unit}"))) else {
                 return Err(format!("{pre}_{sp}: missing or mistyped parameter"));
             };
-            let hi = bd.max_off + off + n * bd.granule_stride + bd.extent;
+            let extra = n.checked_sub(1).ok_or_else(|| format!("{pre}_{sp}: total count must be nonzero"))?;
+            let span = extra.checked_mul(bd.granule_stride).and_then(|v| v.checked_add(bd.extent))
+                .ok_or_else(|| format!("{pre}_{sp}: span arithmetic overflow"))?;
+            let lo = bd.min_off.checked_add(off).ok_or_else(|| format!("{pre}_{sp}: offset arithmetic overflow"))?;
+            let hi = bd.max_off.checked_add(off).and_then(|v| v.checked_add(span))
+                .ok_or_else(|| format!("{pre}_{sp}: extent arithmetic overflow"))?;
             if hi > l.region_bytes {
-                return Err(format!("{pre}_{sp}: [{}, {hi}) outside the {}-byte ring region", bd.min_off + off, l.region_bytes));
+                return Err(format!("{pre}_{sp}: [{lo}, {hi}) outside the {}-byte ring region", l.region_bytes));
             }
-            if write && off % l.slab_bytes + n * bd.granule_stride + bd.extent > l.slab_bytes {
-                return Err(format!("{pre}_{sp}: {} rows from byte {off} cross a slab", n + 1));
+            if write && (off % l.slab_bytes).checked_add(span).map_or(true, |hi| hi > l.slab_bytes) {
+                return Err(format!("{pre}_{sp}: {n} rows from byte {off} cross a slab"));
             }
-            if !write && (off % l.block_bytes != 0 || n + 1 > l.blocks) {
-                return Err(format!("{pre}_{sp}: {} blocks from byte {off} are not whole blocks of the ring", n + 1));
+            if !write && (off % l.block_bytes != 0 || n > l.blocks) {
+                return Err(format!("{pre}_{sp}: {n} blocks from byte {off} are not whole blocks of the ring"));
             }
         }
     }
     Ok(())
 }
 
-/// `rf48L/meta.json`'s schema (`kind: "resident_forward_ladder"`). See module doc for provenance.
+/// `rf48L/meta.json`'s schema (`kind: "resident_forward_ladder_v2"`). See module doc for provenance.
 #[derive(Debug, Clone)]
 pub struct LadderMeta {
     pub dir: PathBuf,
     pub elf_name: String,
+    pub elf_sha256: String,
     pub boot: String,
     pub rungs: Vec<Rung>,
     pub weight_dir: PathBuf,
@@ -340,12 +351,20 @@ impl LadderMeta {
         let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| EngineError::Load(format!("parse {}: {e}", meta_path.display())))?;
         let ctx = |msg: String| EngineError::Load(format!("{}: {msg}", meta_path.display()));
         let kind = v.get("kind").and_then(|x| x.as_str()).ok_or_else(|| ctx("missing `kind`".into()))?;
-        if kind != "resident_forward_ladder" {
-            return Err(ctx(format!("kind {kind:?}, expected \"resident_forward_ladder\"")));
+        if kind != ARTIFACT_KIND {
+            return Err(ctx(format!("kind {kind:?}, expected {ARTIFACT_KIND:?}")));
         }
         let s = |k: &str| -> Result<String, EngineError> {
             v.get(k).and_then(|x| x.as_str()).map(|s| s.to_string()).ok_or_else(|| ctx(format!("missing `{k}`")))
         };
+        let abi = s("kv_ring_parameter_abi")?;
+        if abi != PARAMETER_ABI {
+            return Err(ctx(format!("kv_ring_parameter_abi {abi:?}, expected {PARAMETER_ABI:?}")));
+        }
+        let elf_sha256 = s("elf_sha256")?;
+        if elf_sha256.len() != 64 || !elf_sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+            return Err(ctx("invalid elf_sha256: expected 64 lowercase hexadecimal digits".into()));
+        }
         let u = |k: &str| -> Result<usize, EngineError> {
             v.get(k).and_then(|x| x.as_u64()).map(|x| x as usize).ok_or_else(|| ctx(format!("missing/non-numeric `{k}`")))
         };
@@ -375,6 +394,11 @@ impl LadderMeta {
             .iter()
             .map(|(k, val)| (k.clone(), val.as_u64().unwrap() as usize))
             .collect();
+        for name in RING_COUNTS {
+            if !scratchpad_params.contains_key(name) {
+                return Err(ctx(format!("missing total-count scratchpad parameter `{name}`")));
+            }
+        }
         let split_widths_x_off: Vec<usize> = v
             .get("split_widths_x_off")
             .and_then(|x| x.as_array())
@@ -424,6 +448,7 @@ impl LadderMeta {
         Ok(LadderMeta {
             dir: dir.to_path_buf(),
             elf_name: s("elf")?,
+            elf_sha256,
             boot: s("boot")?,
             rungs,
             weight_dir: path("weight_dir")?,
@@ -476,6 +501,15 @@ impl LadderMeta {
     }
 }
 
+fn verify_elf_digest(expected: &str, elf: &[u8]) -> Result<(), EngineError> {
+    use sha2::{Digest, Sha256};
+    let actual = format!("{:x}", Sha256::digest(elf));
+    if actual != expected {
+        return Err(EngineError::Load(format!("ELF digest mismatch for {PARAMETER_ABI}: expected {expected}, got {actual}")));
+    }
+    Ok(())
+}
+
 fn u16s_to_le_bytes(v: &[u16]) -> Vec<u8> {
     let mut out = Vec::with_capacity(v.len() * 2);
     for &x in v {
@@ -519,6 +553,8 @@ pub struct LadderResidentForward {
 impl LadderResidentForward {
     pub fn open(dev: &Rc<Device>, dir: &Path) -> Result<LadderResidentForward, EngineError> {
         let meta = LadderMeta::load(dir)?;
+        let elf = crate::llm::artifact::read_elf_bytes(&meta.elf_path())?;
+        verify_elf_digest(&meta.elf_sha256, &elf)?;
         let embed = EmbedHeadPack::open(&meta.embedding_store)?;
 
         let xb = dev.alloc_bo_raw(meta.xbuf, FLAG_HOST_ONLY, 0).map_err(|e| EngineError::Load(format!("alloc xb: {e}")))?;
@@ -540,7 +576,6 @@ impl LadderResidentForward {
 
         sb.sync_to_device().map_err(|e| EngineError::Load(format!("sync scratch: {e}")))?;
 
-        let elf = crate::llm::artifact::read_elf_bytes(&meta.elf_path())?;
         let boot = dev.open_elf_resident(&elf, Some(&format!("main:{}", meta.boot))).map_err(|e| EngineError::Load(format!("open_elf_resident (boot): {e}")))?;
         boot.bind(&[&xb, &ob, &sb, &sb, &sb]).map_err(|e| EngineError::Load(format!("bind boot: {e}")))?;
 
@@ -1004,7 +1039,10 @@ mod tests {
         assert_eq!(read_spans(64 * 7, 20, 1280, 64), [(7, 13), (0, 7)]);
         let p = ring_params(&rf_ring(), 1279, 16, 0);
         assert_eq!(p[0], ("kvw_a", RingParam::Bytes(4984768 * 2)));
-        assert_eq!(p[3], ("kvw_bn", RingParam::Count(14)));
+        assert_eq!(p[1], ("kvw_a_rows", RingParam::Count(1)));
+        assert_eq!(p[3], ("kvw_b_rows", RingParam::Count(15)));
+        assert_eq!(p[5], ("kvr_a_blocks", RingParam::Count(19)));
+        assert_eq!(p[7], ("kvr_b_blocks", RingParam::Count(1)));
         assert_eq!(p[6], ("kvr_b", RingParam::Bytes(4980736 * 2)));
     }
 
@@ -1019,15 +1057,87 @@ mod tests {
         }
         // the unsplit 16-row write from slot 1279 (the mirrored ring's overrun) must not pass
         let mut p = ring_params(&l, 1279, 16, 0);
-        p[1] = ("kvw_an", RingParam::Count(15));
+        p[1] = ("kvw_a_rows", RingParam::Count(16));
         assert!(ring_fits(&l, &p).unwrap_err().contains("outside"));
         // nor may a span that stays in the region but runs into the next slab
         let mut p = ring_params(&l, 100, 16, 0);
-        p[1] = ("kvw_an", RingParam::Count(40));
+        p[1] = ("kvw_a_rows", RingParam::Count(40));
         assert!(ring_fits(&l, &p).unwrap_err().contains("cross a slab"));
         let mut p = ring_params(&l, 0, 16, 0);
         p[4] = ("kvr_a", RingParam::Bytes(2 * l.block_bytes));
         assert!(ring_fits(&l, &p).unwrap_err().contains("outside"));
+    }
+
+    #[test]
+    fn ring_metadata_matches_python_and_rejects_legacy_parameter_names() {
+        // Shared with Python derivation: a six-layer synthetic schema fixture,
+        // not a runnable model artifact.
+        let fixture = include_str!("../../tests/fixtures/resident_ladder_v2_meta.json");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("meta.json");
+        std::fs::write(&path, fixture).unwrap();
+        let meta = LadderMeta::load(dir.path()).unwrap();
+        verify_elf_digest(&meta.elf_sha256, b"compiled ELF fixture").unwrap();
+        assert_eq!(meta.nlayer, 6);
+        assert_eq!(meta.param_unit_bytes, 8);
+        for s in [0, 1, 63, 64, 1279, 1280, 2559] {
+            for rows in [2, 16, 32, 64] {
+                let params = ring_params(&meta.s_ring_layout, s, rows, s / 64 * 64);
+                ring_fits(&meta.s_ring_layout, &params).unwrap();
+            }
+        }
+        let original: serde_json::Value = serde_json::from_str(fixture).unwrap();
+        for (legacy, total) in ["kvw_an", "kvw_bn", "kvr_an", "kvr_bn"].into_iter().zip(RING_COUNTS) {
+            let mut bad = original.clone();
+            let slots = bad["scratchpad_params"].as_object_mut().unwrap();
+            let slot = slots.remove(total).unwrap();
+            slots.insert(legacy.into(), slot);
+            std::fs::write(&path, serde_json::to_vec(&bad).unwrap()).unwrap();
+            assert!(LadderMeta::load(dir.path()).unwrap_err().to_string().contains(total));
+        }
+    }
+
+    #[test]
+    fn ring_metadata_requires_total_count_abi_before_other_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        for (meta, expected) in [
+            (serde_json::json!({"kind": "resident_forward_ladder"}), "resident_forward_ladder_v2"),
+            (serde_json::json!({"kind": "resident_forward_ladder_v2"}), "kv_ring_parameter_abi"),
+            (serde_json::json!({"kind": "resident_forward_ladder_v2", "kv_ring_parameter_abi": "extra-counts"}), "zero-base-total-v1"),
+            (serde_json::json!({"kind": "resident_forward_ladder_v2", "kv_ring_parameter_abi": "zero-base-total-v1"}), "elf_sha256"),
+            (serde_json::json!({"kind": "resident_forward_ladder_v2", "kv_ring_parameter_abi": "zero-base-total-v1", "elf_sha256": "invalid"}), "invalid elf_sha256"),
+        ] {
+            std::fs::write(dir.path().join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+            let error = LadderMeta::load(dir.path()).unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}, expected {expected}");
+        }
+    }
+
+    #[test]
+    fn ring_elf_digest_rejects_mismatched_plain_and_compressed_artifacts() {
+        use sha2::{Digest, Sha256};
+        let elf = b"total-count ELF fixture";
+        let expected = format!("{:x}", Sha256::digest(elf));
+        verify_elf_digest(&expected, elf).unwrap();
+        assert!(verify_elf_digest(&expected, b"legacy ELF").unwrap_err().to_string().contains("ELF digest mismatch"));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("design.elf");
+        std::fs::write(path.with_extension("elf.zst"), zstd::stream::encode_all(&elf[..], 0).unwrap()).unwrap();
+        let decoded = crate::llm::artifact::read_elf_bytes(&path).unwrap();
+        verify_elf_digest(&expected, &decoded).unwrap();
+        assert!(verify_elf_digest(&"0".repeat(64), &decoded).is_err());
+    }
+
+    #[test]
+    fn ring_total_counts_reject_empty_and_overflowing_spans() {
+        let l = rf_ring();
+        for index in [1, 3, 5, 7] {
+            for count in [0, usize::MAX] {
+                let mut p = ring_params(&l, 0, 16, 0);
+                p[index].1 = RingParam::Count(count);
+                assert!(ring_fits(&l, &p).is_err(), "index {index}, count {count}");
+            }
+        }
     }
 
     #[test]
