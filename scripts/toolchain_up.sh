@@ -39,6 +39,26 @@ LOCKHASH="$(_lock_semantic | sha256sum | cut -c1-12)"
 INSTROOT="${TOOLCHAIN_HOME:-$XDNA_CACHE/instances}"
 INST="$INSTROOT/$LOCKHASH"
 
+_has_fork_program() {
+  "$REPO/.venv-iron/bin/python" - "$1" <<'PY'
+import ast
+from pathlib import Path
+import sys
+try:
+    tree = ast.parse(Path(sys.argv[1]).read_text())
+except (OSError, SyntaxError):
+    sys.exit(1)
+for node in tree.body:
+    if isinstance(node, ast.ClassDef) and node.name == "Program":
+        for method in node.body:
+            if isinstance(method, ast.FunctionDef) and method.name == "resolve_program":
+                args = method.args.posonlyargs + method.args.args + method.args.kwonlyargs
+                if any(arg.arg == "device_name" for arg in args):
+                    sys.exit(0)
+sys.exit(1)
+PY
+}
+
 if [ "${TOOLCHAIN_RESOLVE_ONLY:-0}" = "1" ]; then
   # Do not adopt, backfill, patch, bind Python, touch the store, or create caches here.
   for tool in aiecc aie-opt aie-translate aiebu-asm bootgen; do
@@ -47,7 +67,7 @@ if [ "${TOOLCHAIN_RESOLVE_ONLY:-0}" = "1" ]; then
     }
   done
   [ -f "$INST/python/aie/iron/program.py" ] \
-    && grep -q "def resolve_program(self, device_name" "$INST/python/aie/iron/program.py" \
+    && _has_fork_program "$INST/python/aie/iron/program.py" \
     && [ -f "$INST/build/include/aie_api/aie.hpp" ] || {
       echo "[toolchain_up] read-only resolution: incomplete fork Python/headers at $INST" >&2; exit 1;
     }
@@ -100,27 +120,15 @@ _link_vendored_tools() {
 # The wheel's copy (2025) sends aie2p load_unaligned_v down the aie2 path, 256-bit loads with a 32 B
 # shift, and returns wrong lanes on device; the pinned tree has the aie2p 512-bit path.
 # scripts/check_aie_api_pin.sh ratchets this link.
-# These point SHARED state (the instance is keyed by the lock, not by the caller) at a path, so the
-# path must outlive any one caller. $REPO is whatever tree toolchain_up.sh was run from, and a linked
-# worktree is ephemeral: running this from one repointed the instance at it, and DELETING that
-# worktree later left both symlinks dangling, breaking every other tree's kernel compiles with
-# `aie_api/aie.hpp file not found`. Observed three times on 2026-09-06, twice from a worktree that
-# lacked a .venv-iron (so it dangled immediately) and once from a worktree that was later removed.
-# Resolve to the PRIMARY worktree instead, which is the one that cannot be pruned.
-_shared_link_root() {
-  local main
-  main="$(git -C "$REPO" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2; exit}')"
-  [ -n "$main" ] && [ -d "$main" ] && { echo "$main"; return; }
-  echo "$REPO"
-}
+# Both links belong to the instance's pinned source. A shared checkout may be on a different
+# revision or contain another session's work; a caller worktree may later be removed.
 _link_include_dirs() {
-  local root; root="$(_shared_link_root)"
   ln -sfn "$INST/src/third_party/aie_api/include/aie_api" "$INST/build/include/aie_api"
-  ln -sfn "$root/mlir-aie/aie_kernels" "$INST/build/include/aie_kernels"   # aie.iron _default_source_path resolves kernel .cc here (aie2p/mm.cc etc.)
+  ln -sfn "$INST/src/aie_kernels" "$INST/build/include/aie_kernels"
   # A dangling shared symlink is worse than a missing one: it fails deep inside Peano naming a header,
   # not the wiring. Say it here, where the cause is still visible.
-  for want in "aie_api/aie.hpp" "aie_kernels/aie2p/mm.cc"; do
-    [ -e "$INST/build/include/$want" ] || echo "[toolchain_up] WARNING: $INST/build/include/$want does not resolve (root=$root)" >&2
+  for want in "aie_api/aie.hpp" "aie_kernels"; do
+    [ -e "$INST/build/include/$want" ] || echo "[toolchain_up] WARNING: $INST/build/include/$want does not resolve" >&2
   done
 }
 
@@ -173,8 +181,15 @@ _apply_kernel_compile_speedups() {
   local f="$INST/src/python/utils/compile/utils.py"
   local patch="$REPO/patches/mlir-aie-kernel-compile-speedups.patch"
   [ -f "$f" ] || return 0
-  # Already carried, by the patch or by a pin that absorbed it.
-  grep -q "_PCH_ENABLED" "$f" && return 0
+  # The current implementation keeps the same features without the legacy enable marker.
+  if grep -q "_PCH_ENABLED" "$f" || {
+    grep -q '^def _kernel_pch(' "$f" &&
+    grep -q '^_COMPILER_LAUNCHER =' "$f" &&
+    grep -q '^_AIECC_CACHE_ENABLED =' "$f" &&
+    grep -q 'concurrent.futures.ThreadPoolExecutor' "$f"
+  }; then
+    return 0
+  fi
   [ -f "$patch" ] || { echo "[toolchain_up] WARN: $patch missing; kernel compiles stay slow" >&2; return 0; }
   if git -C "$INST/src" apply --check "$patch" >/dev/null 2>&1; then
     git -C "$INST/src" apply "$patch" &&       echo "[toolchain_up] applied kernel-compile speedups (PCH + parallel kernel compiles)" >&2
@@ -222,7 +237,7 @@ _build_parameter_scratchpad() {
   }
   echo "[toolchain_up] backfilling _parameter_scratchpad into $LOCKHASH ..." >&2
   cmake -B "$INST/build" -S "$INST/src" -DAIE_ENABLE_XRT_PYTHON_BINDINGS=ON >&2 \
-    && ninja -C "$INST/build" _parameter_scratchpad >&2 \
+    && ninja -j "$FB_NPROC" -C "$INST/build" _parameter_scratchpad >&2 \
     || echo "[toolchain_up] WARN: scratchpad binding backfill failed; scratchpad tests will skip" >&2
 }
 
@@ -235,7 +250,7 @@ _build_parameter_scratchpad() {
 _build_aie_translate() {
   [ -e "$INST/build/bin/aie-translate" ] && [ ! -L "$INST/build/bin/aie-translate" ] && return 0
   rm -f "$INST/build/bin/aie-translate"
-  ninja -C "$INST/build" aie-translate >&2
+  ninja -j "$FB_NPROC" -C "$INST/build" aie-translate >&2
 }
 
 # Build the vendored aiebu-asm (third_party/aiebu submodule) instead of requiring AIEBU_ASM_DIR to
@@ -256,10 +271,10 @@ _build_vendored_aiebu_asm() {
   init_source_aiebu "$INST/src" || return 1
   ninja -C "$INST/build" -t targets 2>/dev/null | grep -q '^aiebu-asm:' || return 0
   _require_aiebu_spec_python
-  ninja -C "$INST/build" aiebu-asm >&2
+  ninja -j "$FB_NPROC" -C "$INST/build" aiebu-asm >&2
 }
 
-if [ -f "$PYPKG" ] && grep -q "def resolve_program(self, device_name" "$PYPKG"; then
+if [ -f "$PYPKG" ] && _has_fork_program "$PYPKG"; then
   _build_aie_translate  # backfill the fork-built aie-translate (else it stays the stale wheel symlink)
   _build_vendored_aiebu_asm  # backfill aiebu-asm on a pin that has since gained third_party/aiebu
   _link_vendored_tools   # backfill vendored tools into already-built instances
@@ -326,26 +341,24 @@ if [ ! -e "$SRC/tools/aiecc/aiecc.cpp" ]; then
   # fired on a FRESH instance, so it went unnoticed until the first fresh build after the guard
   # landed -- where it aborted the build outright under set -e.
 fi
-# AIE_ENABLE_XRT_PYTHON_BINDINGS=ON builds _parameter_scratchpad, the host side of runtime
-# scratchpad params. Despite the option name the module is XRT-free (TEST_UTILS_USE_XRT=0, raw
-# buffer), and DISABLE_FIND_PACKAGE_XRT below does not suppress it -- XRT_COREUTIL/UUID come from
-# find_library, so the cmake_dependent_option guarding it holds. OFF emitted params.txt with
-# nothing able to read it, so every scratchpad test skipped rather than failed.
+# Keep XRT detection enabled: XRT_COREUTIL and UUID are configure-time prerequisites even for
+# the raw-buffer scratchpad reader. Disabling detection silently disables that binding and tests;
+# building it does not open a device.
 init_source_aiebu "$SRC"
 cmake -G Ninja -B "$INST/build" -S "$SRC" \
   -DCMAKE_BUILD_TYPE=Release \
   -DPython3_EXECUTABLE="$REPO/.venv-iron/bin/python" \
   -DCMAKE_PREFIX_PATH="$MLIR_DISTRO_ABS" \
   -DMLIR_DIR="$MLIR_DISTRO_ABS/lib/cmake/mlir" \
-  -DCMAKE_MODULE_PATH="$REPO/mlir-aie/cmake/modulesXilinx" \
+  -DCMAKE_MODULE_PATH="$SRC/cmake/modulesXilinx" \
   -DAIE_ENABLE_BINDINGS_PYTHON=ON -DLLVM_ENABLE_RTTI=ON \
   -DLLVM_INCLUDE_TESTS=OFF -DLLVM_USE_LINKER=lld \
-  -DCMAKE_DISABLE_FIND_PACKAGE_XRT=ON -DCMAKE_DISABLE_FIND_PACKAGE_hsa-runtime64=ON \
+  -DCMAKE_DISABLE_FIND_PACKAGE_hsa-runtime64=ON \
   -DCMAKE_DISABLE_FIND_PACKAGE_aiebu=ON \
   -DAIE_ENABLE_XRT_PYTHON_BINDINGS=ON \
   -DPEANO_INSTALL_DIR="$REPO/.venv-iron/lib/python3.14/site-packages/llvm-aie" \
   -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache >&2
-ninja -C "$INST/build" AIEPythonModules aiecc aie-opt >&2
+ninja -j "$FB_NPROC" -C "$INST/build" AIEPythonModules aiecc aie-opt >&2
 ln -sfn "$INST/build/python" "$INST/python"
 _link_include_dirs
 _wire_peano_lit
