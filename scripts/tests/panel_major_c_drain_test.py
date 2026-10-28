@@ -15,6 +15,7 @@ strides. It is CPU-only (no NPU, no build): it inspects the generator's TAPs dir
 
 Needs the IRON toolchain on PYTHONPATH -- run it under `source scripts/iron_env.sh`.
 """
+from itertools import product
 import os
 import sys
 
@@ -45,6 +46,11 @@ def check(cond, msg):
     else:
         print(f"  FAIL {msg}")
         failures.append(msg)
+
+
+def addresses(tap):
+    for coordinates in product(*(range(size) for size in tap.sizes)):
+        yield tap.offset + sum(i * stride for i, stride in zip(coordinates, tap.strides))
 
 
 def taps(c_panel_width, m):
@@ -84,7 +90,7 @@ for m in TILE_MS:
     n_panels = N // CHUNK_W
     bad = 0
     for d, (a, b) in enumerate(zip(row_major, panel_major)):
-        for src, dst in zip(a.access_generator(), b.access_generator()):
+        for src, dst in zip(addresses(a), addresses(b)):
             i, j_full = divmod(int(src), N)
             want = (j_full // CHUNK_W) * M * CHUNK_W + i * CHUNK_W + (j_full % CHUNK_W)
             if int(dst) != want:
@@ -96,7 +102,7 @@ for m in TILE_MS:
     # 3. The drains must still tile the destination exactly once -- no gap, no double write.
     cover = np.zeros(n_panels * M * CHUNK_W, dtype=np.int32)
     for b in panel_major:
-        for idx in b.access_generator():
+        for idx in addresses(b):
             cover[idx] += 1
     check(
         cover.min() == 1 and cover.max() == 1,
@@ -110,7 +116,7 @@ for m in TILE_MS:
     flat = c_ref.reshape(-1)
     out = np.zeros(n_panels * M * CHUNK_W, dtype=np.float32)
     for a, b in zip(row_major, panel_major):
-        for src, dst in zip(a.access_generator(), b.access_generator()):
+        for src, dst in zip(addresses(a), addresses(b)):
             out[dst] = flat[src]
     want = np.stack(
         [c_ref[:, c * CHUNK_W:(c + 1) * CHUNK_W] for c in range(n_panels)]

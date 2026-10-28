@@ -41,11 +41,10 @@ KERNEL_CC=${PEANO_INSTALL_DIR}/bin/clang++
 ifeq ($(MLIR_AIE_INSTANCE),)
 $(error MLIR_AIE_INSTANCE is unset -- source scripts/iron_env.sh before building)
 endif
+kernels_dir=${MLIR_AIE_INSTANCE}/src/aie_kernels/linalg
 ifeq ($(devicename),npu2)
-kernels_dir=${MLIR_AIE_INSTANCE}/src/aie_kernels/aie2p
 KERNEL_CFLAGS=${PEANOWRAP2P_FLAGS}
 else
-kernels_dir=${MLIR_AIE_INSTANCE}/src/aie_kernels/aie2
 KERNEL_CFLAGS=${PEANOWRAP2_FLAGS}
 endif
 

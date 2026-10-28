@@ -6,10 +6,10 @@
 
 // The vendor mm.cc plus the zero_<type> / zero_scalar_<type> entry points it
 // exported until mlir-aie #3732, which our generators still bind from the mm
-// object. Compile with the vendor aie2p kernel dir on -I.
+// object. Compile with the vendor linalg kernel dir on -I.
 
 #include "mm.cc"
-#include "../generic/zero.cc"
+#include "../common/zero.h"
 
 #define zero_vectorized_c_func(ctype_in, mlir_type_in, ctype_out,              \
                                mlir_type_out, r, s, t)                         \

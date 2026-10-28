@@ -56,11 +56,38 @@ from aie.iron.controlflow import range_
 from aie.helpers.dialects.scf import if_ as scf_if_, else_ as scf_else_
 from aie.dialects import arith as _arith
 from aie.extras import types as _T
-from aie.helpers.taplib import (
-    TensorAccessPattern,
-    TensorAccessSequence,
-    TensorTiler2D,
-)
+from aie.helpers.taplib import TensorAccessPattern
+
+
+def matrix_taps(M, K, N, m, k, n, n_aie_cols, b_col_maj):
+    """Ordered shim walks for the modal GEMM's four core rows."""
+    a_rows = m * (4 // n_aie_cols if n_aie_cols < 4 else 1)
+    groups = N // n // n_aie_cols
+    block_rows = m * 4
+    # Match the runtime's clamped row blocks without forcing short M to pad to two.
+    row_groups = min(2, M // block_rows)
+    A = [TensorAccessPattern((M, K), row * K,
+                             [groups, K // k, a_rows, k], [0, k, K, 1])
+         for row in range(0, M, a_rows)]
+    if b_col_maj:
+        B = [TensorAccessPattern((N, K), col * n * K,
+                                 [groups, K // k, n, k],
+                                 [n * n_aie_cols * K, k, K, 1])
+             for col in range(n_aie_cols)]
+    else:
+        B = [TensorAccessPattern((K, N), col * n,
+                                 [groups, K // k, k, n],
+                                 [n * n_aie_cols, k * N, N, 1])
+             for col in range(n_aie_cols)]
+    c_sizes = [row_groups, groups, block_rows, n]
+    c_strides = [block_rows * N, n * n_aie_cols, N, 1]
+    if groups == 1:
+        c_sizes = [1, row_groups, block_rows, n]
+        c_strides = [0, block_rows * N, N, 1]
+    C = [TensorAccessPattern((M, N), row * N + col * n, c_sizes, c_strides)
+         for row in range(0, M, block_rows * row_groups)
+         for col in range(n_aie_cols)]
+    return A, B, C
 
 def _str2bool(v):
     # Robustly parse 0/1/true/false. argparse type=bool is broken: bool("0")
@@ -835,7 +862,10 @@ def my_matmul(
                 of_offsets,
                 obj_types=[A_l1_ty] * (stop_row - start_row),
                 names=[f"A_L2L1_{row}" for row in range(start_row, stop_row)],
-                dims_to_stream=dims_to_stream,
+                to_stream=[TensorAccessPattern((m * k,), 0,
+                                                [size for size, _ in dims],
+                                                [stride for _, stride in dims])
+                           for dims in dims_to_stream],
                 depths=[ab_fifo_depth] * (stop_row - start_row),
             )
         )
@@ -856,7 +886,9 @@ def my_matmul(
             .forward(
                 obj_type=B_l1_ty,
                 name=f"B_L2L1_{col}",
-                dims_to_stream=dims_to_stream,
+                to_stream=TensorAccessPattern((k * n,), 0,
+                                               [size for size, _ in dims_to_stream],
+                                               [stride for _, stride in dims_to_stream]),
                 depth=ab_fifo_depth,
             )
         )
@@ -868,7 +900,9 @@ def my_matmul(
             C_l2_ty,
             name=f"C_L2L3_{col}",
             depth=c_fifo_depth,
-            dims_to_stream=[(m // r, r * n), (r, t), (n // t, r * t), (t, 1)],
+            to_stream=TensorAccessPattern((m * n,), 0,
+                                           [m // r, r, n // t, t],
+                                           [r * n, t, r * t, 1]),
         )
         of_offsets = [m * n * i for i in range(n_aie_rows)]
 
@@ -1391,21 +1425,7 @@ def my_matmul(
             workers.append(Worker(body, args, stack_size=_stack_size()))
 
     tb_max_n_rows = 4
-    # DERIVED, not `tb_max_n_rows // 2`: the C tiler below asks for exactly this many row-blocks, so a
-    # bare 2 forces M % (2 * m * n_aie_rows) == 0 -- i.e. M % 512 == 0 for the shipped 64x32x128 tile.
-    # That constraint is what makes PAD_M 512 and leaves 66-90% of every modal GEMM's rows as padding
-    # at the encoder's T=52..172. The RUNTIME loop already clamps the same quantity
-    # (`min(tb_max_n_rows // 2, M // m // n_aie_rows - row_base)`), so the tiler was the only place
-    # assuming two blocks exist.
-    tb_n_rows = min(tb_max_n_rows // 2, M // m // n_aie_rows)
-
-    A_tiles = TensorTiler2D.group_tiler(
-        (M, K),
-        (m * n_A_tiles_per_shim, k),
-        (1, K // k),
-        pattern_repeat=N // n // n_aie_cols,
-        prune_step=False,
-    )
+    A_tiles, B_tiles, C_tiles = matrix_taps(M, K, N, m, k, n, n_aie_cols, b_col_maj)
     if a_panel_width:
         # Read A straight out of the producer's [K//W, M, W] panel-major buffer (fc1's
         # default bf16 drain), so a wide-K GEMM needs no repack. Insts-only, same as the
@@ -1413,30 +1433,6 @@ def my_matmul(
         A_tiles = panel_major_a_taps(
             A_tiles, M, K, N, m * n_A_tiles_per_shim, k, n_aie_cols, n, a_panel_width
         )
-    if b_col_maj:
-        B_tiles = TensorTiler2D.step_tiler(
-            (N, K),
-            (n, k),
-            tile_group_repeats=(N // n // n_aie_cols, K // k),
-            tile_group_steps=(n_aie_cols, 1),
-            prune_step=False,
-        )
-    else:
-        B_tiles = TensorTiler2D.step_tiler(
-            (K, N),
-            (k, n),
-            tile_group_repeats=(K // k, N // n // n_aie_cols),
-            tile_group_steps=(1, n_aie_cols),
-            tile_group_col_major=True,
-            prune_step=False,
-        )
-    C_tiles = TensorTiler2D.step_tiler(
-        (M, N),
-        (m * n_aie_rows, n),
-        tile_group_repeats=(tb_n_rows, N // n // n_aie_cols),
-        tile_group_steps=(1, n_aie_cols),
-        prune_step=False,
-    )
     if c_panel_width:
         # Drain C straight into the [N//c_panel_width, M, c_panel_width] panel-major layout
         # the consumer wants. Insts-only: same rank/sizes/order, new strides.
@@ -1868,11 +1864,7 @@ def my_matmul(
     module = my_program.resolve_program()
 
     if generate_taps:
-        return (
-            TensorAccessSequence.from_taps(A_taps),
-            TensorAccessSequence.from_taps(B_taps),
-            TensorAccessSequence.from_taps(C_taps),
-        )
+        return A_taps, B_taps, C_taps
 
     return module
 

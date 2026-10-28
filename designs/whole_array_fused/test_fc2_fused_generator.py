@@ -179,15 +179,24 @@ class FC2FusedGeneratorTests(unittest.TestCase):
         outside_matmul = self.mlir.replace("func.call @matmul_bf16_f32", "func.call @missing_matmul", 1)
         outside_matmul = outside_matmul.replace(material, matmul_line + "\n          " + material, 1)
         early_release = "aie.objectfifo.release @C_L1L2_0_0(Produce, 1)"
+        first_worker = worker_bodies(self.mlir)[0]
+        k_loop = re.search(r"scf\.for %\w+ = (%\w+) to (%\w+) step (%\w+) \{",
+                           first_worker[first_worker.index(reset):])
+
+        def mutate_bound(index, old, new):
+            name = re.escape(k_loop.group(index))
+            return re.sub(rf"({name} = arith\.constant ){old}( : index)",
+                          rf"\g<1>{new}\g<2>", self.mlir, count=1)
+
         mutations = {
             "W2-stride": self.mlir.replace("[1048576, 32768, 1024, 1]", "[1048576, 32768, 1, 1024]", 1),
             "C-offset": self.mlir.replace("offset = 128 len = 16384", "offset = 0 len = 16384", 1),
             "native-add": self.mlir.replace("func.call @acc_add_row_ieee_rne", "func.call @native_float_add", 1),
             "retargeted-partial-reset": self.mlir.replace(reset, "func.call @zero_f32(%64)", 1),
             "moved-partial-reset": moved_reset,
-            "K31-bound": self.mlir.replace("%c32 = arith.constant 32 : index", "%c32 = arith.constant 31 : index", 1),
-            "K-lower-1": self.mlir.replace("%c0_71 = arith.constant 0 : index", "%c0_71 = arith.constant 1 : index", 1),
-            "K-step-2": self.mlir.replace("%c1_72 = arith.constant 1 : index", "%c1_72 = arith.constant 2 : index", 1),
+            "K31-bound": mutate_bound(2, 32, 31),
+            "K-lower-1": mutate_bound(1, 0, 1),
+            "K-step-2": mutate_bound(3, 1, 2),
             "delayed-C-seed": delayed_seed,
             "missing-matmul": self.mlir.replace("func.call @matmul_bf16_f32", "func.call @missing_matmul", 1),
             "matmul-outside-K-loop": outside_matmul,
