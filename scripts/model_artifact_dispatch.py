@@ -27,6 +27,7 @@ from model_artifact_stages import Stage, StageRunner, View, digest as stage_dige
 
 
 LOCK_ROOT = XDNA_DATA / "locks/model-artifacts"
+PAIRED_LLM_MODELS = {"qwen3.5-4b", "qwen3-embedding-4b"}
 
 
 @contextmanager
@@ -202,6 +203,25 @@ def _recipe_for(model: str, scenario: str, repo: Path, artifacts: Path, inputs: 
                 command("tokenizer", [py, str(scripts / "model_artifact_dispatch.py"), "--copy-tokenizer", src("qwen3-0.6b/checkpoint"), tokenizer]),
             ),
         )
+    if model == "qwen3-embedding-4b" and scenario == "scenarios/qwen3-embedding-4b.toml":
+        weights = path(build, model + "/weight-dump")
+        decode, prefill, tokenizer = (out(model + "/" + name) for name in (
+            "decode_s512_t64_bf16", "prefill_m256_s512_t64_bf16", "tokenizer"))
+        tiles = (repo / "designs/decode_fused/qwen3_embedding_4b_bf16_tiles.json").read_text()
+        return Recipe(
+            model, scenario, (src(model),), (decode, prefill, tokenizer),
+            (
+                command("weights", [export_py, str(scripts / "dump_llm_weights.py"), "--spec", model,
+                                    "--checkpoint-dir", src(model), "--out", weights, "--quant", "bf16"], **weight_env),
+                command("decode", ["bash", str(scripts / "build_llm_decode.sh"), model, "36", decode],
+                        WEIGHTS=weights, GEN_EXTRA="--max-seq 512", KV_BLOCK_T="64", PRECISION="bf16",
+                        FUSE_QKV_DP="1", FUSE_DECODE_LAYER="1", FUSE_MLP_DP="1"),
+                command("prefill", ["bash", str(scripts / "build_prefill.sh"), "36", "256", "512", prefill],
+                        WEIGHTS=weights, SPEC=model, DECODE_META=f"{decode}/meta.json", NO_GOLDEN="1",
+                        KV_BLOCK_T="64", PREFILL_BFP16="1", PREFILL_ACC="0", GEMM_TILES_OVERRIDE=tiles),
+                command("tokenizer", [py, str(scripts / "model_artifact_dispatch.py"), "--copy-tokenizer", src(model), tokenizer]),
+            ),
+        )
     if model == "gemma4-12b" and scenario == "scenarios/generate-gemma4-12b-resident-256k.toml":
         resident, tokenizer, checkpoint = out("gemma4-12b/resident_rf48C_p7148a7"), out("gemma4-12b/tokenizer"), out("gemma4-12b-qat/checkpoint")
         data_outputs = (
@@ -309,7 +329,8 @@ def declare_stages(recipe: Recipe, repo: Path, build: Path) -> Recipe:
             elif step == "decode":
                 stage = Stage(inputs=(weight_input,), outputs=(View(root + "/decode_rail"), View(root + "/weights")),
                               sources=(*compiler_sources, *weight_sources, "scripts/build_whisper_rail.sh",
-                                       "scripts/build_llm_decode.sh", "designs/decode_fused"),
+                                       "scripts/build_llm_decode.sh", "designs/decode_fused",
+                                       "designs/resident_forward/scratchpad_params.py"),
                               environment=(*compiler_env, "MAX_SEQ"), sdk_python=iron_py, sdk_packages=("numpy", "safetensors"))
                 work = str(build / model / "decode-work")
                 item = replace(item, env=item.env | compiler_runtime | {"KEEP_WORK": work})
@@ -319,11 +340,17 @@ def declare_stages(recipe: Recipe, repo: Path, build: Path) -> Recipe:
                               outputs=(View(root, ("preprocessor.onnx*", "onnx", "tokenizer.json", "serving-companions.json"), True),),
                               sources=("scripts/whisper_serving_companions.py", recipe.scenario),
                               sdk_python=export_py, sdk_packages=("numpy", "torch", "transformers", "onnx", "onnxruntime", "optimum", "optimum-onnx", "tokenizers", "safetensors"))
-        elif model in {"gemma3-270m", "qwen3-0.6b", "qwen3.5-4b"}:
+        elif model in {"gemma3-270m", "qwen3-0.6b", "qwen3.5-4b", "qwen3-embedding-4b"}:
             if step == "weights":
                 target = item.argv[item.argv.index("--out") + 1]
-                stage = Stage(inputs=(weight_input,), outputs=(View(target),), sources=weight_sources,
-                              sdk_python=iron_py, sdk_packages=("numpy", "safetensors"))
+                if model == "qwen3-embedding-4b":
+                    # Verification reads every pinned sidecar, not only the projection shards.
+                    stage = Stage(inputs=(View(checkpoint),), outputs=(View(target),),
+                                  sources=(*weight_sources, "scripts/qwen_embedding.py", "scripts/qwen_embedding_pins.json"),
+                                  sdk_python=export_py, sdk_packages=("numpy", "safetensors", "torch"))
+                else:
+                    stage = Stage(inputs=(weight_input,), outputs=(View(target),), sources=weight_sources,
+                                  sdk_python=iron_py, sdk_packages=("numpy", "safetensors"))
             elif step == "tokenizer":
                 stage = Stage(inputs=(tokenizer_input,), outputs=(View(item.argv[-1]),),
                               symbols=("copy_tokenizer", "main"))
@@ -332,7 +359,8 @@ def declare_stages(recipe: Recipe, repo: Path, build: Path) -> Recipe:
                 stage = Stage(dependencies=("weights",) if step == "decode" else ("weights", "decode"),
                               outputs=(View(target),),
                               sources=(*compiler_sources, "scripts/build_llm_decode.sh" if step == "decode" else "scripts/build_prefill.sh",
-                                       "designs/decode_fused", "scripts/gate_numeric.py", "scripts/rope_int_phase.py"),
+                                       "designs/decode_fused", "scripts/gate_numeric.py", "scripts/rope_int_phase.py",
+                                       "designs/resident_forward/scratchpad_params.py"),
                               environment=compiler_env, sdk_python=iron_py, sdk_packages=("numpy",))
                 work = str(build / model / (step + "-work"))
                 item = replace(item, env=item.env | compiler_runtime | {"VENV_IRON": str(Path(iron_py).parent.parent), "KEEP_WORK": work})
@@ -432,6 +460,9 @@ def tree_digest(root: Path, *, source: bool = False) -> str:
 
 
 def required_members(recipe: Recipe, output: bool) -> tuple[tuple[str, ...], ...]:
+    if recipe.model == "qwen3-embedding-4b":
+        from qwen_embedding import model_pin
+        return (("meta.json",),) if output else tuple((name,) for name in model_pin(recipe.model)["files"])
     if output:
         required = {
             "parakeet": (("preprocessor.onnx",), ("decoder_joint.onnx",), ("vocab.txt",), ("encoder/manifest.json",)),
@@ -464,6 +495,10 @@ def required_members(recipe: Recipe, output: bool) -> tuple[tuple[str, ...], ...
 
 def require_members(recipe: Recipe, root: Path, output: bool) -> None:
     kind = "artifact output" if output else "model input"
+    if not output and recipe.model == "qwen3-embedding-4b":
+        from qwen_embedding import model_pin, verify_files
+        verify_files(root, model_pin(recipe.model))
+        return
     if not output and recipe.model.startswith("pyannote"):
         validate_local_pipeline_inputs(root)
         return
@@ -493,14 +528,16 @@ def validate_recipe_outputs(recipe: Recipe, *, references: Recipe | None = None)
     require_members(recipe, Path(recipe.outputs[0]), True)
     if recipe.model == "parakeet" and len(recipe.outputs) > 1:
         require_members(recipe, Path(recipe.outputs[1]), True)
-    if recipe.model == "qwen3.5-4b":
-        validate_qwen35_closure(recipe, references or recipe)
+    if recipe.model in PAIRED_LLM_MODELS:
+        validate_paired_llm_closure(recipe, references or recipe)
+    if recipe.model == "qwen3-embedding-4b":
+        validate_qwen_embedding_closure(recipe)
     if recipe.model == "whisper-turbo":
         from whisper_serving_companions import validate
         validate(Path(recipe.outputs[0]))
 
 
-def validate_qwen35_closure(recipe: Recipe, references: Recipe, *, step: str | None = None) -> None:
+def validate_paired_llm_closure(recipe: Recipe, references: Recipe, *, step: str | None = None) -> None:
     decode, prefill, tokenizer = map(Path, recipe.outputs)
     reference_decode = Path(references.outputs[0])
 
@@ -545,9 +582,61 @@ def validate_qwen35_closure(recipe: Recipe, references: Recipe, *, step: str | N
             require_file(tokenizer / name)
 
 
+def validate_qwen_embedding_closure(recipe: Recipe, *, step: str | None = None) -> None:
+    from qwen_embedding import MAX_TOKENS, model_pin, verify_files
+    pin = model_pin(recipe.model)
+    runtime_names = ("config.json", "tokenizer_config.json", "tokenizer.json")
+    runtime_pin = pin | {"files": {name: pin["files"][name] for name in runtime_names}}
+    decode, prefill, tokenizer = map(Path, recipe.outputs)
+    if step in {None, "tokenizer"}:
+        verify_files(tokenizer, runtime_pin)
+    if step == "tokenizer":
+        return
+    checkpoint = Path(recipe.inputs[0])
+    runtime_hashes = verify_files(checkpoint, runtime_pin)
+    config = json.loads((checkpoint / "config.json").read_text())
+    decode_meta = json.loads((decode / "meta.json").read_text())
+    source = decode_meta.get("embedding_source", {})
+    files = source.get("files", {})
+    if (source.get("model") != pin["repo"] or source.get("revision") != pin["revision"]
+            or set(files) != set(pin["files"])):
+        raise ValueError(f"{recipe.model}: artifact source does not match the pinned checkpoint")
+    for name, expected in pin["files"].items():
+        value = files[name]
+        if (not isinstance(value, str) or len(value) != 64
+                or any(char not in "0123456789abcdef" for char in value)
+                or expected.get("sha256", value) != value
+                or runtime_hashes.get(name, value) != value):
+            raise ValueError(f"{recipe.model}: invalid artifact source digest for {name}")
+    quant = decode_meta.get("weight_quant", {})
+    plan = quant.get("plan", {})
+    if (set(plan) != {"mlp", "attn_o", "qkv", "head", "kv"}
+            or any(value != "bf16" for value in plan.values())
+            or any(quant.get(field, "bf16") != "bf16" for field in
+                   ("mlp_dtype", "attn_dtype", "qkv_dtype", "head_dtype"))):
+        raise ValueError(f"{recipe.model}: BF16 recipe cannot publish a different precision plan")
+    dimensions = {key: config[field] for key, field in (
+        ("layers", "num_hidden_layers"), ("d_model", "hidden_size"), ("ffn", "intermediate_size"),
+        ("q_heads", "num_attention_heads"), ("kv_heads", "num_key_value_heads"), ("head_dim", "head_dim"))}
+    dimensions.update(S=MAX_TOKENS, kv_block=int(next(item.env["KV_BLOCK_T"] for item in recipe.commands if item.step == "decode")))
+    roots = (decode,) if step == "decode" else (decode, prefill)
+    for root in roots:
+        meta = json.loads((root / "meta.json").read_text())
+        if meta.get("spec") != recipe.model or meta.get("embedding_source") != source:
+            raise ValueError(f"{recipe.model}: paired embedding source mismatch")
+        expected_dims = dimensions | ({"vocab": config["vocab_size"]} if root == decode else {"M": 256})
+        if any(meta.get("dims", {}).get(key) != value for key, value in expected_dims.items()):
+            raise ValueError(f"{recipe.model}: artifact geometry differs from the pinned BF16 schedule")
+        if root == prefill and (meta.get("causal") is not True or meta.get("causal_mode") != "rows"
+                                or meta.get("arena_shared") is not True):
+            raise ValueError(f"{recipe.model}: prefill requires causal rows and the shared decode arena")
+
+
 def validate_stage_outputs(recipe: Recipe, step: str) -> None:
-    if recipe.model == "qwen3.5-4b" and step in {"decode", "prefill", "tokenizer"}:
-        validate_qwen35_closure(recipe, recipe, step=step)
+    if recipe.model in PAIRED_LLM_MODELS and step in {"decode", "prefill", "tokenizer"}:
+        validate_paired_llm_closure(recipe, recipe, step=step)
+        if recipe.model == "qwen3-embedding-4b":
+            validate_qwen_embedding_closure(recipe, step=step)
         if step in {"decode", "prefill"}:
             dump = next(item.argv[item.argv.index("--out") + 1] for item in recipe.commands if item.step == "weights")
             metadata = Path(recipe.outputs[0 if step == "decode" else 1]) / "meta.json"
@@ -666,7 +755,7 @@ def cache_hit(recipe: Recipe, key: str, *, references: Recipe | None = None) -> 
     except (OSError, KeyError, json.JSONDecodeError, FileNotFoundError):
         return False
     except (ValueError, TypeError):
-        if recipe.model == "qwen3.5-4b":
+        if recipe.model in PAIRED_LLM_MODELS:
             return False
         raise
 
@@ -903,7 +992,7 @@ def provision_inputs(recipes: list[Recipe], allow_download: bool) -> None:
         target = Path(recipe.inputs[0])
         try:
             require_members(recipe, target if target.is_dir() else target.parent, False)
-            if source_manifest_path(recipe).is_file():
+            if source_manifest_path(recipe).is_file() or recipe.model == "qwen3-embedding-4b":
                 continue
             raise RuntimeError(f"{recipe.model}: unmanaged local input {target}; use an HF cache source or provide a source manifest")
         except FileNotFoundError:
@@ -1009,7 +1098,7 @@ def publish_recipe(recipe: Recipe, staged: Recipe, key: str, rollback: Path) -> 
 
 def _publish_recipe(recipe: Recipe, staged: Recipe, key: str, rollback: Path, *, stages: dict | None = None) -> None:
     require_no_recovery(rollback, key)
-    reference_args = {"references": recipe} if recipe.model == "qwen3.5-4b" else {}
+    reference_args = {"references": recipe} if recipe.model in PAIRED_LLM_MODELS else {}
     validate_recipe_outputs(staged, **reference_args)
     write_receipt(staged, key, commands=recipe.commands, stages=stages)
     if not cache_hit(staged, key, **reference_args):
@@ -1159,10 +1248,10 @@ def _build_recipe(recipe: Recipe, repo: Path, artifacts: Path, build: Path, key:
         runner.run()
     else:
         run_commands(staged, repo)
-    if recipe.model == "qwen3.5-4b":
+    if recipe.model in PAIRED_LLM_MODELS:
         validate_recipe_outputs(staged)
     relocate_recipe_metadata(recipe, staged)
-    validate_recipe_outputs(staged, references=recipe if recipe.model == "qwen3.5-4b" else None)
+    validate_recipe_outputs(staged, references=recipe if recipe.model in PAIRED_LLM_MODELS else None)
     no_staging_references(staged, stage_root)
     if authority_before != authority_digest(recipe, repo) or inputs_before != source_digest(recipe.inputs):
         raise RuntimeError(f"{recipe.model}: source authority changed while the staged build ran")

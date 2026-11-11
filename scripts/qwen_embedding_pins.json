@@ -1,0 +1,32 @@
+{
+  "qwen3-embedding-0.6b": {
+    "repo": "Qwen/Qwen3-Embedding-0.6B",
+    "revision": "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3",
+    "dimension": 1024,
+    "files": {
+      "config.json": {"size": 727, "git_sha1": "cef2749ee93607b8f9a58ec72f4f6bfaf874e71d", "sha256": "b5bf1f51fc45be473a54718cef92448d90a1be001bf9b9a44b8c7f10a19feaa9"},
+      "tokenizer.json": {"size": 11423705, "sha256": "def76fb086971c7867b829c23a26261e38d9d74e02139253b38aeb9df8b4b50a"},
+      "tokenizer_config.json": {"size": 9706, "git_sha1": "7345216a0785dc7086e8c245b2a9d3896ce2b756", "sha256": "253153d0738ceb4c668d2eff957714dd2bea0b56de772a9fdccd96cbf517e6a0"},
+      "config_sentence_transformers.json": {"size": 215, "git_sha1": "76aef3ade63553ebb698fe3c2a3264040ed093f8"},
+      "modules.json": {"size": 349, "git_sha1": "952a9b81c0bfd99800fabf352f69c7ccd46c5e43"},
+      "1_Pooling/config.json": {"size": 313, "git_sha1": "b6291baabbc39f9792d6759883a47d7d5bd0fbcf"},
+      "model.safetensors": {"size": 1191586416, "sha256": "0437e45c94563b09e13cb7a64478fc406947a93cb34a7e05870fc8dcd48e23fd"}
+    }
+  },
+  "qwen3-embedding-4b": {
+    "repo": "Qwen/Qwen3-Embedding-4B",
+    "revision": "5cf2132abc99cad020ac570b19d031efec650f2b",
+    "dimension": 2560,
+    "files": {
+      "config.json": {"size": 727, "git_sha1": "8b4b87fc69023e7a224eb6563753aaf3223d8b98", "sha256": "78d2861cbbfd80eee05839200c5a3b7ed64c789f6c1cab4fbb84cc4eae33eaf5"},
+      "tokenizer.json": {"size": 11422947, "sha256": "83cdf8c3a34f68862319cb1810ee7b1e2c0a44e0864ae930194ddb76bb7feb8d"},
+      "tokenizer_config.json": {"size": 7256, "git_sha1": "df3a9d96759529ca1006eb6db024bbb099a97578", "sha256": "2f58f4bbd7bbce15d683f525954ef3a92cd82f5e06415a9c513859bf8ab72436"},
+      "config_sentence_transformers.json": {"size": 215, "git_sha1": "76aef3ade63553ebb698fe3c2a3264040ed093f8"},
+      "modules.json": {"size": 349, "git_sha1": "952a9b81c0bfd99800fabf352f69c7ccd46c5e43"},
+      "1_Pooling/config.json": {"size": 313, "git_sha1": "81de5602eacbce382009c5af7a23085871801d8f"},
+      "model.safetensors.index.json": {"size": 30431, "git_sha1": "3d736ef26714eee0abde3e05104ee1b3ec26c974"},
+      "model-00001-of-00002.safetensors": {"size": 4965826464, "sha256": "e70bfe3c970523fb7ef4eddffed2254ce3f1e7150c3de2af4342de129dd756f8"},
+      "model-00002-of-00002.safetensors": {"size": 3077765624, "sha256": "ed1b87c8e9eb7e535a1a155e4fd00d9f4dba80e58a6db48a4c9f82cede7079c1"}
+    }
+  }
+}

@@ -30,6 +30,11 @@ use npu_models::{Engine, Model, ModelKind, EngineError};
 - `Model::embed(&self, text: &str) -> Result<Vec<f32>, EngineError>`
 - `Model::embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EngineError>` -- calls
   `embed` per element; not a batched device dispatch.
+- `Model::embed_batch_with_options(&self, texts: &[&str], options: &EmbeddingOptions)
+  -> Result<Vec<Vec<f32>>, EngineError>` -- explicit document/query preparation and optional full
+  dimension; unsupported options reject rather than being silently ignored.
+- `Model::embedding_metadata(&self) -> Option<EmbeddingMetadata>` -- the loaded Qwen embedding
+  profile/runtime identity, not a numerical or index-compatibility qualification.
 - `Model::diarize(&self, pcm: &[i16], sample_rate: u32) -> Result<Vec<Segment>, EngineError>`
   -- speaker-attributed spans (`Segment { start_s, end_s, speaker }`, `speaker` a cluster
   index, not a label).
@@ -139,8 +144,13 @@ Bodies are capped at 16 MiB. Streaming responses use Server-Sent Events with no
   with 400), sampling fields, `stream`. Response shape mirrors chat completions with
   `text_completion` objects and a `text` field instead of `message.content`/`delta.content`.
 - `POST /v1/embeddings` -- serves `Capability::EMBED`. Body: `model` (optional), `input` (a
-  string, or an array of strings). Response: `{"object":"list","data":[{"object":"embedding",
-  "index","embedding":[...]}],"model":"<served model name>"}`.
+  string, or an array of strings), optional `input_type` (`document` by default, or `query`) and
+  `dimensions`. Qwen accepts only its full dimension and rejects empty or over-limit inputs before
+  dispatch; query instructions count toward the limit. Existing BGE/ESM document requests keep their
+  behavior, while unsupported query/dimension options reject. Response:
+  `{"object":"list","data":[{"object":"embedding","index","embedding":[...]}],"model":"<served model name>"}`.
+  See [Qwen embedding qualification](qwen3_embedding.md) for pinned models, the 512-token policy and
+  the distinction between locally qualified source artifacts and supported installation.
 - `POST /v1/audio/speech` -- serves `Capability::TTS`. Body: `model`, `input` (text). Response
   is a `audio/wav` byte body (44-byte canonical header + 16-bit PCM), not JSON. `voice` is
   accepted and currently ignored -- no configured model reads it.

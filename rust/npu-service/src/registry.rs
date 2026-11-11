@@ -108,6 +108,8 @@ pub struct ModelStatus {
     /// !pin_honored` is a real, reportable state: "declared pinned, currently not protected, here's
     /// why" (`detail` carries the reason). Meaningless when `pinned` is false.
     pub pin_honored: bool,
+    /// Identity of the last successful loaded instance, never re-derived from mutable paths.
+    pub embedding: Option<npu_models::api::EmbeddingMetadata>,
 }
 
 /// Why a model stopped being resident. Distinct from `deferred_capacity`/`try_load`'s admission
@@ -249,7 +251,7 @@ impl Registry {
     pub fn try_load(&mut self, cfg: &ModelCfg, loader: &dyn ModelLoader, srv: &ServerCfg, now: Instant) {
         let ceiling = srv.memory_ceiling_mb * 1024 * 1024;
         let estimate = self.estimated_bytes(cfg, loader);
-        if self.resident_bytes() + estimate > ceiling {
+        if estimate > ceiling || self.resident_bytes() > ceiling - estimate {
             // Record what the model IS even though it is not loaded. Without this a deferred model
             // reports capability None, which `/v1/models` renders as kind "unknown". The lazy path
             // already asks the loader here (`actor::run`); the eager reconcile did not, so the two
@@ -266,11 +268,9 @@ impl Registry {
         match crate::actor::guard(|| loader.load(cfg)).unwrap_or_else(|msg| Err(EngineError::Load(msg))) {
             Ok(m) => {
                 let bo = m.footprint();
-                // Real bytes can exceed the pre-load ESTIMATE even when the estimate fit -- the
-                // estimate is a host file size, not device BO bytes. This is the safety net that
-                // catches an underestimate; the check above is the fast path that avoids loading
-                // something the estimate already ruled out.
-                if self.resident_bytes() + bo > ceiling {
+                // Host file sizes or declared arenas can omit auxiliary BOs. Keep the live
+                // check even when the pre-load estimate fit, without overflowing either sum.
+                if bo > ceiling || self.resident_bytes() > ceiling - bo {
                     self.set_failed(cfg, "over memory_ceiling".into(), None);
                     return;
                 }
@@ -286,6 +286,7 @@ impl Registry {
                     busy: false,
                     pinned: cfg.resident,
                     pin_honored: cfg.resident,
+                    embedding: m.embedding_metadata(),
                 };
                 self.upsert(Entry { cfg: cfg.clone(), model: Some(m), status, last_used: now,
                                     deferred_capacity: None, pin_honored: cfg.resident,
@@ -306,7 +307,7 @@ impl Registry {
         if self.get_loaded(&cfg.name).is_some() { return Ok(()); }
         let ceiling = srv.memory_ceiling_mb * 1024 * 1024;
         let estimate = self.estimated_bytes(cfg, loader);
-        while self.resident_bytes() + estimate > ceiling {
+        while estimate > ceiling || self.resident_bytes() > ceiling - estimate {
             if srv.evict_policy == EvictPolicy::None {
                 return Err(EngineError::Unsupported(format!(
                     "{} is not resident and evict_policy = \"none\" at memory_ceiling_mb ({} MB)",
@@ -359,7 +360,7 @@ impl Registry {
         if self.get_loaded(&cfg.name).is_some() { return Ok(()); }
         let ceiling = srv.memory_ceiling_mb * 1024 * 1024;
         let estimate = self.estimated_bytes(cfg, loader);
-        if self.resident_bytes() + estimate > ceiling {
+        if estimate > ceiling || self.resident_bytes() > ceiling - estimate {
             let held: Vec<&str> = self.entries.iter().filter(|e| e.model.is_some())
                 .map(|e| e.cfg.name.as_str()).collect();
             return Err(EngineError::Unsupported(format!(
@@ -404,6 +405,7 @@ impl Registry {
                 name: cfg.name.clone(), state: LoadState::Unloaded, detail, capability, bo_bytes: 0,
                 idle_s: None, served: 0, busy_us: 0, busy: false, pinned: cfg.resident,
                 pin_honored: cfg.resident,
+                embedding: None,
             },
             last_used: Instant::now(),
             deferred_capacity: None,
@@ -529,6 +531,7 @@ impl Registry {
             busy: false,
             pinned: cfg.resident,
             pin_honored: false,
+            embedding: None,
         };
         self.upsert(Entry { cfg: cfg.clone(), model: None, status, last_used: Instant::now(),
                             deferred_capacity: ceiling_bytes, pin_honored: false,
@@ -549,6 +552,98 @@ mod tests {
     fn cfg(name: &str) -> ModelCfg { ModelCfg { name: name.into(), scenario: "x".into(), resident: false } }
     fn pinned(name: &str) -> ModelCfg { ModelCfg { name: name.into(), scenario: "x".into(), resident: true } }
     fn ceiling_mb(mb: u64) -> ServerCfg { ServerCfg { memory_ceiling_mb: mb, ..Default::default() } }
+    fn check_overflowing_estimate(mode: &str) {
+        let loader = MockLoader { table: BTreeMap::from([
+            ("held".into(), Ok((Capability::EMBED, 64))),
+            ("huge".into(), Ok((Capability::EMBED, u64::MAX))),
+        ]) };
+        let srv = ServerCfg { memory_ceiling_mb: 1, evict_policy: EvictPolicy::None, ..Default::default() };
+        let mut r = Registry::default();
+        let now = Instant::now();
+        r.load_explicit(&cfg("held"), &loader, &srv, now).unwrap();
+        match mode {
+            "explicit" => assert!(matches!(r.load_explicit(&cfg("huge"), &loader, &srv, now), Err(EngineError::Unsupported(_)))),
+            "request" => assert!(matches!(r.ensure_resident(&cfg("huge"), &loader, &srv, now), Err(EngineError::Unsupported(_)))),
+            "reconcile" => r.try_load(&cfg("huge"), &loader, &srv, now),
+            _ => unreachable!(),
+        }
+        assert!(r.get_loaded("huge").is_none());
+        assert!(r.get_loaded("held").is_some());
+        assert_eq!(r.resident_bytes(), 64);
+    }
+
+    #[test]
+    fn explicit_load_refuses_an_overflowing_estimate_with_a_live_resident() { check_overflowing_estimate("explicit"); }
+    #[test]
+    fn request_refuses_an_overflowing_estimate_with_a_live_resident() { check_overflowing_estimate("request"); }
+    #[test]
+    fn reconcile_refuses_an_overflowing_estimate_with_a_live_resident() { check_overflowing_estimate("reconcile"); }
+
+    #[test]
+    fn post_load_budget_refuses_overflow_even_when_the_estimate_is_unknown() {
+        struct UnknownEstimate(MockLoader);
+        impl ModelLoader for UnknownEstimate {
+            fn load(&self, cfg: &ModelCfg) -> Result<Box<dyn StreamServable>, EngineError> { self.0.load(cfg) }
+        }
+        let loader = UnknownEstimate(MockLoader { table: BTreeMap::from([
+            ("held".into(), Ok((Capability::EMBED, 64))),
+            ("huge".into(), Ok((Capability::EMBED, u64::MAX))),
+        ]) });
+        let mut r = Registry::default();
+        let srv = ceiling_mb(1);let now = Instant::now();
+        r.try_load(&cfg("held"), &loader, &srv, now);
+        r.try_load(&cfg("huge"), &loader, &srv, now);
+        assert!(r.get_loaded("huge").is_none());
+        assert_eq!(r.resident_bytes(), 64);
+    }
+
+    #[test]
+    fn embedding_discovery_retains_only_the_successfully_loaded_instance_identity() {
+        use crate::loader::Servable;
+        use npu_models::api::EmbeddingMetadata;
+        use npu_models::capability::{Request, Response};
+        struct Model(u32);
+        impl Servable for Model {
+            fn capabilities(&self) -> Capability { Capability::EMBED }
+            fn footprint(&self) -> u64 { 1 }
+            fn run(&mut self, _: Request) -> Result<Response, EngineError> { unreachable!() }
+        }
+        impl StreamServable for Model {
+            fn embedding_metadata(&self) -> Option<EmbeddingMetadata> {
+                Some(EmbeddingMetadata { profile: serde_json::json!({"revision":self.0}),
+                    runtime: serde_json::json!({"qualification":"unqualified"}) })
+            }
+        }
+        struct Loader(std::cell::Cell<u32>);
+        impl ModelLoader for Loader {
+            fn load(&self, _: &ModelCfg) -> Result<Box<dyn StreamServable>, EngineError> {
+                if self.0.get() == 0 { Err(EngineError::Load("fixture load failure".into())) }
+                else { Ok(Box::new(Model(self.0.get()))) }
+            }
+            fn declared_capability(&self, _: &ModelCfg) -> Option<Capability> { Some(Capability::EMBED) }
+        }
+        let loader = Loader(std::cell::Cell::new(1));
+        let mut r = Registry::default();
+        let cfg = cfg("embedding");
+        let srv = ServerCfg::default();
+        r.declare(&cfg, Some(Capability::EMBED));
+        assert!(r.status()[0].embedding.is_none());
+        r.ensure_resident(&cfg, &loader, &srv, Instant::now()).unwrap();
+        assert_eq!(r.status()[0].embedding.as_ref().unwrap().profile["revision"], 1);
+        loader.0.set(2);
+        assert_eq!(r.status()[0].embedding.as_ref().unwrap().profile["revision"], 1);
+        r.release(&cfg.name, "fixture release", UnloadReason::Operator);
+        assert_eq!(r.status()[0].state, LoadState::Unloaded);
+        assert_eq!(r.status()[0].embedding.as_ref().unwrap().profile["revision"], 1);
+        r.ensure_resident(&cfg, &loader, &srv, Instant::now()).unwrap();
+        assert_eq!(r.status()[0].embedding.as_ref().unwrap().profile["revision"], 2);
+        r.release(&cfg.name, "fixture release", UnloadReason::Operator);
+        loader.0.set(0);
+        assert!(r.ensure_resident(&cfg, &loader, &srv, Instant::now()).is_err());
+        assert_eq!(r.status()[0].state, LoadState::Failed);
+        assert!(r.status()[0].embedding.is_none());
+    }
+
     /// The point of the operator path: it REFUSES at capacity where the request path evicts.
     #[test]
     fn load_explicit_refuses_at_capacity_instead_of_evicting() {

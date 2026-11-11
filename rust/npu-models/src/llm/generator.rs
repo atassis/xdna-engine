@@ -62,6 +62,14 @@ pub trait DecodeStep {
         Ok(CacheState::Retained)
     }
 
+    /// Start an unrelated document without trusting attention masking to hide previous state.
+    fn reset_independent(&mut self) -> Result<(), EngineError> {
+        match self.reset()? {
+            CacheState::Cleared => Ok(()),
+            CacheState::Retained => Err(EngineError::Unsupported("backend cannot clear independent-document state".into())),
+        }
+    }
+
     /// How much of a `reused`-token ledger prefix the cache can still be resumed from. A linear
     /// cache keeps every position it wrote, so the default keeps all of it; a ring overwrites the
     /// slots of old positions, and a backend with one answers `reused` or 0.

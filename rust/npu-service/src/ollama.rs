@@ -292,6 +292,7 @@ mod tests {
             busy: false,
             pinned: false,
             pin_honored: false,
+            embedding: None,
         }]
     }
 

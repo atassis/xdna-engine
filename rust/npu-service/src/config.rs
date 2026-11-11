@@ -165,7 +165,7 @@ impl Config {
     /// anything already loaded that no longer fits (see `Entry::pin_honored`).
     pub fn pin_overcommit(&self, footprint: impl Fn(&ModelCfg) -> u64) -> Option<String> {
         let pinned: Vec<&ModelCfg> = self.pinned().collect();
-        let total: u64 = pinned.iter().map(|m| footprint(m)).sum();
+        let total = pinned.iter().fold(0u64, |total, m| total.saturating_add(footprint(m)));
         let ceiling = self.server.memory_ceiling_mb * 1024 * 1024;
         (total > ceiling).then(|| format!(
             "{} model(s) pinned resident total ~{} MB, over memory_ceiling_mb = {} MB",
@@ -209,6 +209,17 @@ mod tests {
         let w = mk(6, 500).pin_overcommit(hundred_mb).expect("600 MB pinned over a 500 MB ceiling");
         assert!(w.contains("600 MB") && w.contains("memory_ceiling_mb = 500 MB"), "{w}");
     }
+    #[test]
+    fn pin_overcommit_refuses_a_sum_that_would_wrap_below_the_ceiling() {
+        let mut c = Config::default();
+        c.server.memory_ceiling_mb = 1;
+        c.models = ["huge", "small"].into_iter().map(|name| ModelCfg {
+            name: name.into(), scenario: "x".into(), resident: true,
+        }).collect();
+        let error = c.pin_overcommit(|m| if m.name == "huge" { u64::MAX } else { 64 });
+        assert!(error.is_some(), "a wrapped 63-byte total must not admit an oversized pin set");
+    }
+
     #[test]
     fn roundtrip_and_defaults() {
         let toml = r#"

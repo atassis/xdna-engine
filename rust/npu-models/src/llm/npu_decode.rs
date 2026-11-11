@@ -87,6 +87,22 @@ mod load_profile {
     }
 }
 
+fn read_final_hidden(
+    loc: BufLoc,
+    dimension: usize,
+    sync: impl FnOnce(npu_xrt::Arena) -> Result<(), EngineError>,
+    read: impl FnOnce(&mut [u8]) -> Result<(), EngineError>,
+) -> Result<Vec<f32>, EngineError> {
+    if loc.len != dimension * 2 {
+        return Err(EngineError::Load("xf is not a full BF16 hidden vector".into()));
+    }
+    // xf may be scratch, whereas step's normal readback synchronizes only the output BO.
+    sync(loc.arena)?;
+    let mut bytes = vec![0; loc.len];
+    read(&mut bytes)?;
+    Ok(unpack_bf16_bytes(&bytes))
+}
+
 pub(crate) fn pack_bf16_bytes(f: &[f32]) -> Vec<u8> {
     let mut bits = vec![0u16; f.len()];
     npu_xrt::pack_f32_to_bf16(f, &mut bits);
@@ -376,7 +392,7 @@ fn read_f32_blob(artifact: &LlmArtifact, name: &str, row: usize) -> Result<Vec<f
 /// scale-then-narrow is exactly the kind of difference that would show up there as a real
 /// divergence.
 pub(crate) struct EmbedTable {
-    /// The tied `W_head` blob, mmapped: `[vocab, d_model]` bf16 row-major, which IS the embedding
+    /// The tied `W_head` blob, mmapped: `[physical_rows, d_model]` bf16 row-major, which IS the embedding
     /// table -- `gen_llm_decode.py` builds `W_head` from `model.embed_tokens.weight`. Gathered one
     /// row per position, so a generation never materialises the table.
     ///
@@ -408,17 +424,64 @@ impl EmbedTable {
     }
 
     fn open(artifact: &LlmArtifact) -> Result<Self, EngineError> {
-        // Gate on the BYTE LENGTH the layout declares, not on the file merely existing: a W_head
-        // built for another vocab is the failure that would otherwise gather a wrong row quietly.
-        // `meta.json`'s `embed_blob` names the bf16 table the gather reads. It is "W_head" unless
-        // the lm-head was quantised, in which case W_head.bin is packed [scale|payload] rows and
-        // the generator emits a bf16 sidecar for this read. Defaults to "W_head" so every artifact
-        // built before that field keeps working.
-        let path = artifact.weight_blob_path(artifact.embed_blob());
+        // Only the device's raw BF16 W_head has physical vocabulary padding. Quantized or untied
+        // heads use a host-only sidecar, emitted at the logical vocabulary size, not head packing.
+        let blob = artifact.embed_blob();
+        let path = artifact.weight_blob_path(blob);
+        let invalid = |why: &str| EngineError::Load(format!("{}: {why}", path.display()));
         let vocab = artifact
             .vocab
-            .ok_or_else(|| EngineError::Load("decode artifact declares no dims.vocab".to_string()))?;
-        let want = vocab * artifact.d_model * 2;
+            .ok_or_else(|| invalid("decode artifact declares no dims.vocab"))?;
+        let table_bytes = |rows: usize| rows.checked_mul(artifact.d_model).and_then(|n| n.checked_mul(2))
+            .ok_or_else(|| invalid("BF16 embedding dimensions overflow byte length"));
+        if vocab == 0 || artifact.d_model == 0 {
+            return Err(invalid("BF16 embedding dimensions must be positive"));
+        }
+        let mut want = table_bytes(vocab)?;
+        if blob == "W_head" {
+            let loc = artifact.layout.get(blob).ok_or_else(|| invalid("W_head has no declared layout"))?;
+            let mut declared_bf16 = false;
+            if let Some(quant) = &artifact.weight_quant {
+                let quant = quant.as_object().ok_or_else(|| invalid("weight_quant must be an object"))?;
+                let mut check_dtype = |dtype: &serde_json::Value| {
+                    if dtype.as_str() != Some("bf16") {
+                        return Err(invalid("W_head embedding gather requires raw BF16 head precision"));
+                    }
+                    declared_bf16 = true;
+                    Ok(())
+                };
+                if let Some(dtype) = quant.get("head_dtype") {
+                    check_dtype(dtype)?;
+                }
+                if let Some(plan) = quant.get("plan") {
+                    let plan = plan.as_object().ok_or_else(|| invalid("weight_quant.plan must be an object"))?;
+                    if let Some(dtype) = plan.get("head") {
+                        check_dtype(dtype)?;
+                    }
+                }
+            }
+            // The generator owns the padding rule (LlmSpec.padded_vocab + pad_vocab_weight).
+            // Read its declaration, not a guessed tile multiple; LlmArtifact does not retain it.
+            let meta_path = artifact.decode_dir.join("meta.json");
+            let bytes = std::fs::read(&meta_path)
+                .map_err(|e| invalid(&format!("read {}: {e}", meta_path.display())))?;
+            let meta: serde_json::Value = serde_json::from_slice(&bytes)
+                .map_err(|e| invalid(&format!("parse {}: {e}", meta_path.display())))?;
+            let rows = match meta.get("host_protocol").and_then(|hp| hp.get("vocab_padded")) {
+                None => vocab, // Exact-sized artifacts predate the physical row declaration.
+                Some(value) => value.as_u64().and_then(|n| usize::try_from(n).ok())
+                    .filter(|&n| n >= vocab)
+                    .ok_or_else(|| invalid("host_protocol.vocab_padded must be an integer >= dims.vocab"))?,
+            };
+            if rows > vocab && !declared_bf16 {
+                return Err(invalid("padded W_head requires an explicit BF16 head precision declaration"));
+            }
+            want = table_bytes(rows)?;
+            if loc.len != want {
+                return Err(invalid(&format!("W_head layout declares {} bytes, BF16 physical rows={rows} d_model={} require {want}",
+                                           loc.len, artifact.d_model)));
+            }
+        }
         let f = std::fs::File::open(&path)
             .map_err(|e| EngineError::Load(format!("open {}: {e}", path.display())))?;
         // SAFETY: the artifact directory is owned by the engine and read-only for its lifetime; a
@@ -427,8 +490,8 @@ impl EmbedTable {
             .map_err(|e| EngineError::Load(format!("mmap {}: {e}", path.display())))?;
         if map.len() != want {
             return Err(EngineError::Load(format!(
-                "{} is {} bytes, artifact declares vocab={vocab} d_model={} (bf16 -> {} bytes)",
-                path.display(), map.len(), artifact.d_model, want
+                "{} is {} bytes, BF16 table requires {want} bytes (logical vocab={vocab} d_model={})",
+                path.display(), map.len(), artifact.d_model
             )));
         }
         let scale = match artifact.embed_scale {
@@ -837,6 +900,10 @@ impl NpuDecodeStep {
     /// (`new()` zero-fills every `cache_buffers` name explicitly, by length, once) and does not
     /// need this.
     pub fn reset(&mut self) -> Result<CacheState, EngineError> {
+        self.reset_cache(false)
+    }
+
+    fn reset_cache(&mut self, independent: bool) -> Result<CacheState, EngineError> {
         // The cache buffers are ALREADY zero when the model loads: `new()` writes zeros into
         // every one of them by name+length and syncs once, never by trusting a blob (a current
         // artifact ships none for them at all; see gen_llm_decode.py). This per-request pass
@@ -866,7 +933,7 @@ impl NpuDecodeStep {
         // it is zeroed every time and the ledger is invalidated: a prefix cannot be resumed
         // mid-way through a recurrence.
         let recurrent = !self.artifact.recurrent_buffers.is_empty();
-        let names = match std::env::var("NPU_LLM_REUSE_KV").ok().as_deref() != Some("0") {
+        let names = match !independent && std::env::var("NPU_LLM_REUSE_KV").ok().as_deref() != Some("0") {
             true if !recurrent => return Ok(CacheState::Retained),
             true => &self.artifact.recurrent_buffers,
             false => &self.artifact.cache_buffers,
@@ -901,11 +968,15 @@ impl DecodeStep for NpuDecodeStep {
 
     fn final_hidden(&mut self) -> Result<Option<Vec<f32>>, EngineError> {
         let Some(loc) = self.artifact.layout.get("xf").copied() else { return Ok(None) };
-        let mut bytes = vec![0u8; loc.len];
-        self.arena
-            .read_at(loc.arena, loc.off, &mut bytes)
-            .map_err(|e| EngineError::Device(format!("read xf: {e}")))?;
-        Ok(Some(unpack_bf16_bytes(&bytes)))
+        read_final_hidden(loc, self.artifact.d_model, |arena| {
+            match arena {
+                npu_xrt::Arena::Scratch => self.arena.sync_scratch_from_device(),
+                npu_xrt::Arena::Output => self.arena.sync_from_device(),
+                npu_xrt::Arena::Input => return Err(EngineError::Load("xf must be in scratch or output".into())),
+            }.map_err(|e| EngineError::Device(format!("sync xf: {e}")))
+        }, |bytes| self.arena.read_at(loc.arena, loc.off, bytes)
+            .map_err(|e| EngineError::Device(format!("read xf: {e}"))))
+            .map(Some)
     }
 
     /// The artifact's own `dims.S`. This is what makes the generator's bound real: without it the
@@ -927,6 +998,10 @@ impl DecodeStep for NpuDecodeStep {
             npu_xrt::dispatch_log::reset();
         }
         NpuDecodeStep::reset(self)
+    }
+
+    fn reset_independent(&mut self) -> Result<(), EngineError> {
+        self.reset_cache(true).map(|_| ())
     }
 
     fn has_recurrent_state(&self) -> bool {
@@ -1190,6 +1265,374 @@ impl DecodeStep for NpuDecodeStep {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires explicit artifacts, frozen tokens, fresh output and device lease"]
+    fn device_late_projection_dependency_control() {
+        use super::{pack_bf16_bytes, unpack_bf16_bytes, DecodeStep, Device, NpuDecodeStep, Rc};
+        use std::{io::Write, path::PathBuf, time::Instant};
+
+        fn render(step: &mut NpuDecodeStep, tokens: &[u32]) -> Result<Vec<f32>, String> {
+            step.reset_independent().map_err(|e| format!("reset: {e}"))?;
+            npu_xrt::dispatch_log::reset();
+            let prefix = step.prefill(&tokens[..tokens.len()-1], 0)
+                .map_err(|e| format!("prefill: {e}"))?;
+            for (position, &token) in tokens.iter().enumerate().skip(prefix) {
+                step.step(token, position).map_err(|e| format!("step: {e}"))?;
+            }
+            let hidden = step.final_hidden().map_err(|e| format!("hidden: {e}"))?
+                .ok_or_else(|| "missing hidden".to_string())?;
+            let norm = hidden.iter().map(|&v| (v as f64).powi(2)).sum::<f64>().sqrt();
+            if !norm.is_finite() || norm == 0.0 || hidden.iter().any(|v| !v.is_finite()) {
+                return Err("nonfinite or zero hidden".into());
+            }
+            Ok(hidden.iter().map(|&v| (v as f64 / norm) as f32).collect())
+        }
+
+        let decode = PathBuf::from(std::env::var("XDNA_LATE_DECODE").unwrap());
+        let prefill = PathBuf::from(std::env::var("XDNA_LATE_PREFILL").unwrap());
+        let output = PathBuf::from(std::env::var("XDNA_LATE_OUTPUT").unwrap());
+        assert!(output.symlink_metadata().is_err(), "fresh output required");
+        let tokens: Vec<u32> = serde_json::from_slice(&std::fs::read(
+            std::env::var("XDNA_LATE_TOKENS").unwrap()).unwrap()).unwrap();
+        assert!(!tokens.is_empty() && tokens.len() <= 512);
+        assert!(npu_xrt::dispatch_log::enabled(), "dispatch accounting required");
+        let started = Instant::now();
+        let dev = Rc::new(Device::open(0).unwrap());
+        let mut step = NpuDecodeStep::with_prefill(&dev, &decode, &prefill).unwrap();
+        assert_eq!(step.artifact.n_layers, 36);
+        assert_eq!(step.artifact.d_model, 2560);
+        let load_s = started.elapsed().as_secs_f64();
+        let name = format!("L{}_Wdk0", step.artifact.n_layers-1);
+        let loc = step.artifact.layout[&name];
+        assert_eq!(loc.arena, npu_xrt::Arena::Scratch);
+        assert!(loc.off >= (1usize << 32));
+        step.arena.sync_scratch_from_device().unwrap();
+        let mut original = vec![0u8; loc.len];
+        step.arena.read_at(loc.arena, loc.off, &mut original).unwrap();
+        assert_eq!(original, std::fs::read(decode.join("buffers").join(format!("{name}.bin"))).unwrap());
+        let mut timings = Vec::new();
+        let start = Instant::now();
+        let baseline = render(&mut step, &tokens).unwrap();
+        timings.push(serde_json::json!({"label":"baseline", "elapsed_s":start.elapsed().as_secs_f64(),
+            "counts":npu_xrt::dispatch_log::counts(), "dispatch_report":step.dispatch_report()}));
+        let start = Instant::now();
+        let warm = render(&mut step, &tokens).unwrap();
+        timings.push(serde_json::json!({"label":"warm", "elapsed_s":start.elapsed().as_secs_f64(),
+            "counts":npu_xrt::dispatch_log::counts(), "dispatch_report":step.dispatch_report()}));
+        // Modify only this fixture's owned BO. No checkpoint or packed-weight file is written.
+        let scaled = pack_bf16_bytes(&unpack_bf16_bytes(&original).into_iter()
+            .map(|v| -8.0 * v).collect::<Vec<_>>());
+        step.arena.write_at(loc.arena, loc.off, &scaled).unwrap();
+        step.arena.sync_to_device().unwrap();
+        let bad = render(&mut step, &tokens);
+        step.arena.write_at(loc.arena, loc.off, &original).unwrap();
+        step.arena.sync_to_device().unwrap();
+        let recovered = render(&mut step, &tokens).unwrap();
+        step.arena.sync_scratch_from_device().unwrap();
+        let mut restored = vec![0u8; loc.len];
+        step.arena.read_at(loc.arena, loc.off, &mut restored).unwrap();
+        assert_eq!(restored, original, "owned device weight restoration");
+        let report = serde_json::json!({"scope":"late-projection owned-BO negative and restoration, not throughput benchmark",
+            "layer":step.artifact.n_layers-1, "weight":name, "offset":loc.off, "length":loc.len,
+            "scale":-8, "load_s":load_s, "tokens":tokens, "baseline":baseline, "warm":warm,
+            "bad":bad, "recovered":recovered, "timings":timings, "device_bo_bytes":step.bo_bytes(),
+            "weight_restored":true});
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(output).unwrap();
+        serde_json::to_writer_pretty(&mut file, &report).unwrap();
+        file.write_all(b"\n").unwrap();
+        for other in [&warm, &recovered] {
+            let max = baseline.iter().zip(other).map(|(a,b)|(a-b).abs()).fold(0.0f32, f32::max);
+            assert!(max <= 1e-6, "repeat/recovery changed by {max}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires explicitly selected full artifact, output directory and device lease"]
+    fn device_selected_dense_attention_cache_trace() {
+        use super::{DecodeStep, Device, NpuDecodeStep, Rc};
+        use std::io::{Read, Seek, SeekFrom};
+        use std::path::PathBuf;
+        let decode = PathBuf::from(std::env::var("XDNA_TRACE_DECODE").unwrap());
+        let prefill = PathBuf::from(std::env::var("XDNA_TRACE_PREFILL").unwrap());
+        let output = PathBuf::from(std::env::var("XDNA_TRACE_OUTPUT").unwrap());
+        let tokens: Vec<u32> = match std::env::var("XDNA_TRACE_TOKENS") {
+            Ok(path) => serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap(),
+            Err(_) => vec![std::env::var("XDNA_TRACE_TOKEN").unwrap().parse().unwrap()],
+        };
+        assert!(!tokens.is_empty());
+        std::fs::create_dir(&output).unwrap();
+        let dev = Rc::new(Device::open(0).unwrap());
+        let mut step = NpuDecodeStep::with_prefill(&dev, &decode, &prefill).unwrap();
+        assert!(tokens.len() <= step.artifact.max_seq);
+        step.reset_independent().unwrap();
+        step.arena.sync_scratch_from_device().unwrap();
+        let xf = step.artifact.layout["xf"];
+        let mut initial_hidden = vec![0; xf.len];
+        step.arena.read_at(xf.arena, xf.off, &mut initial_hidden).unwrap();
+        std::fs::write(output.join("xf-before.bin"), &initial_hidden).unwrap();
+
+        // Sample immutable weight boundaries and the low-word aliases of high scratch buffers.
+        let mut regions = Vec::new();
+        for name in &step.artifact.weights {
+            let loc = step.artifact.layout[name];
+            let width = loc.len.min(128);
+            for start in [0, loc.len - width] {
+                regions.push((format!("{name}@{start}"), name.clone(), start, width));
+            }
+        }
+        for (name, loc) in &step.artifact.layout {
+            if loc.arena != npu_xrt::Arena::Scratch || loc.off < (1usize << 32) { continue; }
+            let low = loc.off % (1usize << 32);
+            for weight in &step.artifact.weights {
+                let owner = step.artifact.layout[weight];
+                if owner.arena == npu_xrt::Arena::Scratch && owner.off <= low && low < owner.off + owner.len {
+                    let width = (owner.off + owner.len - low).min(128);
+                    regions.push((format!("low32:{name}"), weight.clone(), low - owner.off, width));
+                    break;
+                }
+            }
+        }
+        let mut samples = Vec::new();
+        for (tag, name, start, width) in regions {
+            let loc = step.artifact.layout[&name];
+            let mut source = std::fs::File::open(decode.join("buffers").join(format!("{name}.bin"))).unwrap();
+            source.seek(SeekFrom::Start(start as u64)).unwrap();
+            let mut expected = vec![0; width]; source.read_exact(&mut expected).unwrap();
+            let mut actual = vec![0; width];
+            step.arena.read_at(loc.arena, loc.off + start, &mut actual).unwrap();
+            assert_eq!(actual, expected, "host upload/readback {tag}");
+            samples.push((tag, loc.arena, loc.off + start, expected));
+        }
+        let mut positions: Vec<usize> = [0, 1, 16, 31, 32, 63, 64, 127, 255, 511]
+            .into_iter().filter(|&pos| pos < tokens.len()).collect();
+        if positions.last() != Some(&(tokens.len() - 1)) { positions.push(tokens.len() - 1); }
+        let ranges: Vec<(String, String, usize, usize, bool)> = match std::env::var("XDNA_TRACE_RANGES") {
+            Ok(path) => serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap(),
+            Err(_) => Vec::new(),
+        };
+        let mut range_captures = 0;
+        for (pos, &token) in tokens.iter().enumerate() {
+            step.step(token, pos).unwrap();
+            if !ranges.is_empty() && positions.contains(&pos) {
+                step.arena.sync_scratch_from_device().unwrap();
+                for (name, arena, offset, length, every_selected) in &ranges {
+                    if !every_selected && pos + 1 != tokens.len() { continue; }
+                    assert!(name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+                    assert!(*length > 0 && *length <= 2 * 1024 * 1024);
+                    let arena = match arena.as_str() {
+                        "input" => npu_xrt::Arena::Input,
+                        "output" => npu_xrt::Arena::Output,
+                        "scratch" => npu_xrt::Arena::Scratch,
+                        _ => panic!("unknown diagnostic arena"),
+                    };
+                    let mut bytes = vec![0; *length];
+                    step.arena.read_at(arena, *offset, &mut bytes).unwrap();
+                    std::fs::write(output.join(format!("p{pos:03}-{name}.bin")), bytes).unwrap();
+                    range_captures += 1;
+                }
+            }
+        }
+        let hidden = step.final_hidden().unwrap().unwrap();
+        let mut changed = Vec::new();
+        for (tag, arena, offset, expected) in &samples {
+            let mut actual = vec![0; expected.len()];
+            step.arena.read_at(*arena, *offset, &mut actual).unwrap();
+            if actual != *expected { changed.push(tag.clone()); }
+        }
+        let hd = step.artifact.head_dim;
+        let heads = step.artifact.kv_heads;
+        let block = step.artifact.kv_block;
+        for layer in 0..step.artifact.n_layers {
+            for suffix in ["kc", "vc"] {
+                let name = format!("L{layer}_{suffix}");
+                let loc = step.artifact.layout[&name];
+                let mut dense = vec![0; heads * positions.len() * hd * 2];
+                for head in 0..heads {
+                    for (column, &pos) in positions.iter().enumerate() {
+                        let offset = (crate::llm::kv_layout::kv_off(pos, block, hd, heads)
+                            + crate::llm::kv_layout::head_base(head, block, hd)) * 2;
+                        assert!(offset + hd * 2 <= loc.len);
+                        let start = (head * positions.len() + column) * hd * 2;
+                        step.arena.read_at(loc.arena, loc.off + offset,
+                            &mut dense[start..start + hd * 2]).unwrap();
+                    }
+                }
+                std::fs::write(output.join(format!("{name}.bin")), dense).unwrap();
+            }
+        }
+        let report = serde_json::json!({"token":tokens[0],"tokens":tokens,"positions":positions,"range_captures":range_captures,
+            "layers":step.artifact.n_layers,
+            "d_model":step.artifact.d_model,"kv_heads":heads,"head_dim":hd,"kv_block":block,
+            "host_roundtrip_regions":samples.len(),
+            "above4gib_host_regions":samples.iter().filter(|(_,_,offset,_)| *offset >= (1usize << 32)).count(),
+            "weights_changed_by_dispatch":changed,"final_hidden":hidden});
+        std::fs::write(output.join("trace.json"), serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+    }
+
+    fn embed_table_meta() -> serde_json::Value {
+        serde_json::json!({
+            "elf": "decode.elf", "kernel_name": "main:sequence",
+            "input_size": 8, "output_size": 8, "scratch_size": 16,
+            "layout": {
+                "x": {"type": "input", "offset": 0, "len": 4},
+                "rope_global": {"type": "input", "offset": 4, "len": 4},
+                "logits": {"type": "output", "offset": 0, "len": 8},
+                "W_head": {"type": "scratch", "offset": 0, "len": 16}
+            },
+            "inputs": ["x", "rope_global"], "weights": ["W_head"], "output": "logits",
+            "scratchpad": {
+                "params": {"kv_off": {"byte_offset": 0, "kind": "addr"},
+                           "sm_mask": {"byte_offset": 4, "kind": "core"}},
+                "kv_param": "kv_off", "mask_param": "sm_mask"
+            },
+            "dims": {"layers": 1, "d_model": 2, "vocab": 3, "head_dim": 2, "S": 8},
+            "host_protocol": {"embed_scale": "none", "rope_theta_global": 10000.0,
+                              "vocab_padded": 4},
+            "weight_quant": {"head_dtype": "bf16", "plan": {"head": "bf16"}}
+        })
+    }
+
+    fn open_embed_table(
+        meta: &serde_json::Value, bytes: &[u8],
+    ) -> (tempfile::TempDir, Result<super::EmbedTable, crate::api::EngineError>) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("meta.json"), meta.to_string()).unwrap();
+        std::fs::create_dir(dir.path().join("buffers")).unwrap();
+        let artifact = crate::llm::artifact::LlmArtifact::load(dir.path()).expect("valid test artifact");
+        std::fs::write(artifact.weight_blob_path(artifact.embed_blob()), bytes).unwrap();
+        let table = super::EmbedTable::open(&artifact);
+        (dir, table)
+    }
+
+    #[test]
+    fn embed_table_opens_declared_padded_bf16_head_without_admitting_padding_tokens() {
+        let bytes = super::pack_bf16_bytes(&[1., 2., 3., 4., 5., 6., 0., 0.]);
+        let (_dir, table) = open_embed_table(&embed_table_meta(), &bytes);
+        let table = table.unwrap_or_else(|e| panic!("declared padded BF16 head must open: {e}"));
+        assert_eq!(table.d_model(), 2);
+        assert_eq!(table.vocab(), 3);
+        assert_eq!(&*table.row(2).unwrap(), &bytes[8..12]);
+        assert_eq!(table.head_row(2).unwrap(), vec![5., 6.]);
+        assert!(table.row(3).unwrap_err().to_string().contains("token 3 >= vocab 3"));
+        assert!(table.head_row(3).unwrap_err().to_string().contains("token 3 >= vocab 3"));
+    }
+
+    fn assert_embed_table_rejected(meta: &serde_json::Value, bytes: &[u8], case: &str) {
+        let (_dir, table) = open_embed_table(meta, bytes);
+        assert!(matches!(table, Err(crate::api::EngineError::Load(_))), "accepted {case}");
+    }
+
+    #[test]
+    fn embed_table_rejects_actual_or_declared_head_length_mismatch() {
+        let meta = embed_table_meta();
+        for len in [8, 12, 14, 18, 20] {
+            assert_embed_table_rejected(&meta, &vec![0; len], &format!("actual length {len}"));
+        }
+        for len in [8, 12, 14, 18, 20] {
+            let mut meta = embed_table_meta();
+            meta["layout"]["W_head"]["len"] = len.into();
+            meta["scratch_size"] = 24.into();
+            assert_embed_table_rejected(&meta, &[0; 16], &format!("declared length {len}"));
+        }
+    }
+
+    #[test]
+    fn embed_table_rejects_missing_malformed_or_unowned_padding() {
+        use serde_json::{json, Value};
+        for value in [Value::Null, json!("4"), json!(4.5), json!(-1), json!(0), json!(2), json!(5), json!(u64::MAX)] {
+            let mut meta = embed_table_meta();
+            meta["host_protocol"]["vocab_padded"] = value;
+            assert_embed_table_rejected(&meta, &[0; 16], "invalid vocab_padded");
+        }
+        let mut meta = embed_table_meta();
+        meta["host_protocol"].as_object_mut().unwrap().remove("vocab_padded");
+        assert_embed_table_rejected(&meta, &[0; 16], "undeclared padding");
+        let mut meta = embed_table_meta();
+        meta.as_object_mut().unwrap().remove("weight_quant");
+        assert_embed_table_rejected(&meta, &[0; 16], "padding without BF16 head declaration");
+        let mut meta = embed_table_meta();
+        meta["layout"].as_object_mut().unwrap().remove("W_head");
+        meta["weights"] = json!([]);
+        assert_embed_table_rejected(&meta, &[0; 16], "head without layout owner");
+    }
+
+    #[test]
+    fn embed_table_rejects_quantized_or_malformed_head_representation() {
+        use serde_json::json;
+        for quant in [json!({"head_dtype": "int8"}), json!({"plan": {"head": "int4:g128"}}),
+                      json!({"head_dtype": "bf16", "plan": {"head": "int8:g128"}}),
+                      json!({"head_dtype": 16}), json!({"plan": "bf16"}), json!("bf16")] {
+            let mut meta = embed_table_meta();
+            meta["weight_quant"] = quant;
+            meta["host_protocol"]["vocab_padded"] = 3.into();
+            meta["layout"]["W_head"]["len"] = 12.into();
+            assert_embed_table_rejected(&meta, &[0; 12], "non-BF16 head masquerading as exact-sized table");
+        }
+    }
+
+    #[test]
+    fn embed_table_opens_legacy_exact_head_and_logical_sidecar() {
+        use serde_json::json;
+        let bytes = super::pack_bf16_bytes(&[1., 2., 3., 4., 5., 6.]);
+        let mut meta = embed_table_meta();
+        meta["layout"]["W_head"]["len"] = 12.into();
+        meta["host_protocol"].as_object_mut().unwrap().remove("vocab_padded");
+        meta.as_object_mut().unwrap().remove("weight_quant");
+        let (_dir, table) = open_embed_table(&meta, &bytes);
+        assert_eq!(table.unwrap().head_row(2).unwrap(), vec![5., 6.]);
+
+        let mut meta = embed_table_meta();
+        meta["embed_blob"] = "W_embed".into();
+        meta["weight_quant"] = json!({"head_dtype": "int4", "plan": {"head": "int4:g128"}});
+        meta["host_protocol"]["embed_scale"] = "sqrt_d_model".into();
+        let (_dir, table) = open_embed_table(&meta, &bytes);
+        let table = table.unwrap();
+        assert_eq!(table.head_row(2).unwrap(), vec![5., 6.]);
+        assert_eq!(&*table.row(2).unwrap(), super::pack_bf16_bytes(&[5. * 2f32.sqrt(), 6. * 2f32.sqrt()]));
+        assert!(table.row(3).is_err());
+        assert!(table.head_row(3).is_err());
+        // The head's physical row declaration does not own the host-only embedding sidecar.
+        assert_embed_table_rejected(&meta, &[0; 16], "padded sidecar");
+        meta["layout"]["W_embed"] = json!({"type": "scratch", "offset": 16, "len": 16});
+        meta["scratch_size"] = 32.into();
+        assert_embed_table_rejected(&meta, &[0; 16], "sidecar with an unrelated layout declaration");
+    }
+
+    #[test]
+    fn embed_table_rejects_wrong_or_overflowing_dimensions() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("meta.json"), embed_table_meta().to_string()).unwrap();
+        std::fs::create_dir(dir.path().join("buffers")).unwrap();
+        let mut artifact = crate::llm::artifact::LlmArtifact::load(dir.path()).unwrap();
+        std::fs::write(artifact.weight_blob_path("W_head"), [0; 16]).unwrap();
+        for (vocab, d_model) in [(Some(3), 3), (Some(0), 2), (Some(3), 0),
+                                  (None, 2), (Some(usize::MAX), 2), (Some(3), usize::MAX)] {
+            artifact.vocab = vocab;
+            artifact.d_model = d_model;
+            assert!(matches!(super::EmbedTable::open(&artifact), Err(crate::api::EngineError::Load(_))),
+                    "accepted vocab={vocab:?}, d_model={d_model}");
+        }
+    }
+
+    #[test]
+    fn final_hidden_syncs_before_read_and_propagates_sync_failure() {
+        use super::{read_final_hidden, pack_bf16_bytes, BufLoc, EngineError};
+        use std::cell::Cell;
+        let synchronized = Cell::new(false);
+        let loc = BufLoc { arena: npu_xrt::Arena::Scratch, off: 0, len: 4 };
+        let hidden = read_final_hidden(loc, 2, |_| { synchronized.set(true); Ok(()) }, |bytes| {
+            assert!(synchronized.get(), "scratch host view is stale until sync");
+            bytes.copy_from_slice(&pack_bf16_bytes(&[3., 4.]));
+            Ok(())
+        }).unwrap();
+        assert_eq!(hidden, vec![3., 4.]);
+        let result = read_final_hidden(loc, 2,
+            |_| Err(EngineError::Device("sync failed".into())),
+            |_| panic!("must not read after sync failure"));
+        assert!(result.is_err());
+        assert!(read_final_hidden(loc, 3, |_| panic!("invalid width"), |_| panic!("invalid width")).is_err());
+    }
+
     use super::bucket_index;
     use super::flash_blocks_per_column;
     use super::flash_writes;

@@ -9,7 +9,8 @@ MLIR_DISTRO_WHEEL=mlir-24.0.0.2026100106+bdf04ebb
 PEANO_DIST=llvm_aie-22.0.0.2026102001+4f5df13d
 PEANO_DIST_SHA256=63c988f06bd7359737f881443b5166ade847efd1e5d27d57d8481ee406e62d41
 PEANO_FORK_COMMIT=d71ba4b99b4468f4c3df49e8f2bfe0d9a7289ae2
-IRON_SOURCE_COMMIT=2f7df42ca571d557514fcf233da460f655234af4
+# BF16 SiLU/QKV and current-SDK GEMM named-repeat/TAP carry.
+IRON_SOURCE_COMMIT=bdec61ceacdd171a5a16d983532ba0181c9b39c4
 NANOBIND=2.12.0
 
 # Previous control inputs retained for rollback; these comments are not active pins:

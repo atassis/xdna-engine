@@ -45,8 +45,24 @@ pub trait Head {
 pub trait Embedder {
     fn embed_one(&self, text: String) -> Result<Vec<f32>, EngineError>;
 
+    fn embedding_metadata(&self) -> Option<crate::api::EmbeddingMetadata> { None }
+
     /// Ordered array operation. Each implementation declares native batching or serial compatibility.
     fn embed_many(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EngineError>;
+
+    fn embed_with_options(&self, texts: &[&str], options: &crate::api::EmbeddingOptions)
+        -> Result<Vec<Vec<f32>>, EngineError> {
+        if options.input_type != crate::api::EmbeddingInputType::Document || options.dimensions.is_some() {
+            return Err(EngineError::Unsupported("this embedder does not support query preparation or dimensions".into()));
+        }
+        self.embed_many(texts)
+    }
+
+    /// Qualification capture is deliberately opt-in: legacy embedders must not execute on it.
+    fn embed_with_capture(&self, _: &[&str], _: &crate::api::EmbeddingOptions)
+        -> Result<crate::api::EmbeddingCapture, EngineError> {
+        Err(EngineError::Unsupported("this embedder does not support diagnostic capture".into()))
+    }
 
     /// See `AsrModel::bo_bytes`.
     fn bo_bytes(&self) -> u64 { 0 }

@@ -89,6 +89,35 @@ impl Engine {
     }
 }
 
+/// Explicit preparation role for embedding requests. Omission means document, never inferred.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EmbeddingInputType { Query, #[default] Document }
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+pub struct EmbeddingOptions {
+    #[serde(default)]
+    pub input_type: EmbeddingInputType,
+    pub dimensions: Option<usize>,
+}
+
+/// Embedding semantics and execution identity captured at a successful model load.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct EmbeddingMetadata {
+    pub profile: serde_json::Value,
+    pub runtime: serde_json::Value,
+}
+
+/// Diagnostic evidence from one embedding execution. Token IDs and masks are the exact serial,
+/// unpadded inputs submitted to the decoder; `metadata` is retained from the successful load.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct EmbeddingCapture {
+    pub vectors: Vec<Vec<f32>>,
+    pub input_ids: Vec<Vec<u32>>,
+    pub attention_mask: Vec<Vec<u32>>,
+    pub metadata: EmbeddingMetadata,
+}
+
 /// A loaded model. Wraps an internal pipeline; holds device resources, so it is NOT Send/Sync and a
 /// single instance must not be driven concurrently (the service serializes; the NPU is single-tenant).
 pub struct Model {
@@ -139,6 +168,10 @@ impl Model {
         match self.scen { Scenario::Embed(_) => self.hidden, _ => None }
     }
 
+    pub fn embedding_metadata(&self) -> Option<EmbeddingMetadata> {
+        match &self.scen { Scenario::Embed(m) => m.embedding_metadata(), _ => None }
+    }
+
     /// ASR: 16 kHz mono i16 PCM -> text.
     pub fn transcribe(&self, pcm: &[i16], sample_rate: u32) -> Result<String, EngineError> {
         if sample_rate != 16_000 {
@@ -166,6 +199,25 @@ impl Model {
     pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EngineError> {
         match &self.scen {
             Scenario::Embed(m) => m.embed_many(texts),
+            other => Err(EngineError::WrongKind {
+                wanted: ModelKind::Embed.capability(), got: kind_of(other).capability() }),
+        }
+    }
+
+    pub fn embed_batch_with_options(&self, texts: &[&str], options: &EmbeddingOptions)
+        -> Result<Vec<Vec<f32>>, EngineError> {
+        match &self.scen {
+            Scenario::Embed(m) => m.embed_with_options(texts, options),
+            other => Err(EngineError::WrongKind {
+                wanted: ModelKind::Embed.capability(), got: kind_of(other).capability() }),
+        }
+    }
+
+    /// Execute an embedding request and retain its actual decoder inputs for qualification.
+    pub fn embed_batch_with_capture(&self, texts: &[&str], options: &EmbeddingOptions)
+        -> Result<EmbeddingCapture, EngineError> {
+        match &self.scen {
+            Scenario::Embed(m) => m.embed_with_capture(texts, options),
             other => Err(EngineError::WrongKind {
                 wanted: ModelKind::Embed.capability(), got: kind_of(other).capability() }),
         }
@@ -321,5 +373,20 @@ mod embedding_batch_tests {
         assert_eq!(calls.get(), 1);
         assert!(model.embed_batch(&[]).unwrap().is_empty());
         assert_eq!(calls.get(), 2);
+        assert!(matches!(model.embed_batch_with_capture(&["a"], &EmbeddingOptions::default()),
+            Err(EngineError::Unsupported(_))));
+        assert_eq!(calls.get(), 2, "legacy capture must not forward");
+    }
+
+    struct AsrSpy;
+    impl crate::pipeline::AsrModel for AsrSpy {
+        fn transcribe(&self, _: &[i16]) -> Result<String, EngineError> { Ok(String::new()) }
+    }
+
+    #[test]
+    fn capture_on_a_non_embedding_model_is_wrong_kind() {
+        let model = Model { scen: Scenario::Asr(Box::new(AsrSpy)), hidden: None };
+        assert!(matches!(model.embed_batch_with_capture(&["a"], &EmbeddingOptions::default()),
+            Err(EngineError::WrongKind { .. })));
     }
 }

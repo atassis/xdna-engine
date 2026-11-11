@@ -19,6 +19,8 @@ pub use npu_models::capability::Servable;
 /// Every `Servable` this crate constructs implements this too (the registry stores
 /// `Box<dyn StreamServable>`); the default answers `Unsupported` for a model that cannot generate.
 pub trait StreamServable: Servable {
+    fn embedding_metadata(&self) -> Option<npu_models::api::EmbeddingMetadata> { None }
+
     fn generate_stream(
         &mut self,
         _prompt: &npu_models::Prompt,
@@ -98,6 +100,10 @@ impl Servable for EngineModel {
                 let refs: Vec<_> = texts.iter().map(String::as_str).collect();
                 self.model.embed_batch(&refs).map(Response::Vectors)
             }
+            Request::Embeddings { texts, options } => {
+                let refs: Vec<_> = texts.iter().map(String::as_str).collect();
+                self.model.embed_batch_with_options(&refs, &options).map(Response::Vectors)
+            }
             // Neither engine scenario takes an image, so this is a routing bug rather than a user
             // error -- but still a Result, because the actor must not be panicked by one.
             Request::Image { .. } => Err(EngineError::WrongKind {
@@ -109,6 +115,8 @@ impl Servable for EngineModel {
 }
 
 impl StreamServable for EngineModel {
+    fn embedding_metadata(&self) -> Option<npu_models::api::EmbeddingMetadata> { self.model.embedding_metadata() }
+
     /// `Model::generate` already returns `WrongKind` for a non-Generate scenario, so this is a plain
     /// delegation -- no capability check duplicated here.
     fn generate_stream(&mut self, prompt: &npu_models::Prompt, params: &npu_models::GenerateParams,
@@ -231,6 +239,23 @@ impl ModelLoader for EngineLoader {
             let scratch = field("scratch_bytes")?;
             return Some(xbuf + obuf + scratch);
         }
+        // Fused decode/prefill stores weights in one shared arena, not `artifacts.weights`.
+        // Match NpuDecodeStep::build/FusedArena::new: the maximum of each arena's two sizes,
+        // rounded up to the minimum BO size. Only metadata is read, never the weight blobs.
+        if !sc.artifacts.decode.is_empty() {
+            let mut sizes = [2u64; 3];
+            for part in [&sc.artifacts.decode, &sc.artifacts.prefill] {
+                if part.is_empty() { continue; }
+                let meta: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(self.root.join(part).join("meta.json")).ok()?
+                ).ok()?;
+                for (size, field) in sizes.iter_mut().zip(["input_size", "output_size", "scratch_size"]) {
+                    *size = (*size).max(meta.get(field)?.as_u64()?);
+                }
+            }
+            return sizes.into_iter().try_fold(0u64, |total, size| total.checked_add(size));
+        }
+        if sc.artifacts.weights.is_empty() { return None; }
         // `checkpoint` is an ADDITIONAL artifact next to `weights`, not an alternative to it (see
         // image-sr's scenario, whose `weights` is a tiny schedule JSON and whose `checkpoint` is
         // the actual baked net) -- so this sums both when a scenario sets one, rather than picking.
@@ -377,6 +402,86 @@ mod tests {
     }
     fn cfg() -> ModelCfg {
         ModelCfg { name: "m".into(), scenario: "scenario.toml".into(), resident: false }
+    }
+
+    fn write_fused_scenario(root: &std::path::Path, prefill: &str) {
+        std::fs::write(root.join("scenario.toml"), format!(
+            "[scenario]\nkind = \"embeddings\"\nname = \"m\"\n[artifacts]\ndecode = \"decode\"\nprefill = \"{prefill}\"\n"
+        )).unwrap();
+        std::fs::create_dir(root.join("decode")).unwrap();
+    }
+
+    fn write_arena_meta(root: &std::path::Path, name: &str, sizes: [u64; 3]) {
+        std::fs::write(root.join(name).join("meta.json"), serde_json::json!({
+            "input_size": sizes[0], "output_size": sizes[1], "scratch_size": sizes[2],
+        }).to_string()).unwrap();
+    }
+
+    #[test]
+    fn declared_footprint_uses_shared_decode_prefill_arena_sizes_not_root_files() {
+        let dir = tempfile::tempdir().unwrap();
+        write_fused_scenario(dir.path(), "prefill");
+        std::fs::create_dir(dir.path().join("prefill")).unwrap();
+        write_arena_meta(dir.path(), "decode", [10, 8, 100]);
+        write_arena_meta(dir.path(), "prefill", [40, 40, 50]);
+        std::fs::write(dir.path().join("unrelated.bin"), vec![0u8; 10_000]).unwrap();
+        let l = EngineLoader { root: dir.path().to_path_buf() };
+        assert_eq!(l.declared_footprint(&cfg()), Some(180));
+    }
+
+    #[test]
+    fn declared_footprint_decode_only_matches_the_minimum_arena_allocation() {
+        let dir = tempfile::tempdir().unwrap();
+        write_fused_scenario(dir.path(), "");
+        write_arena_meta(dir.path(), "decode", [0, 0, 13]);
+        let l = EngineLoader { root: dir.path().to_path_buf() };
+        assert_eq!(l.declared_footprint(&cfg()), Some(17));
+    }
+
+    #[test]
+    fn declared_fused_footprint_does_not_wrap_large_metadata_sizes() {
+        let dir = tempfile::tempdir().unwrap();
+        write_fused_scenario(dir.path(), "");
+        let l = EngineLoader { root: dir.path().to_path_buf() };
+        write_arena_meta(dir.path(), "decode", [0, 0, u64::MAX - 4]);
+        assert_eq!(l.declared_footprint(&cfg()), Some(u64::MAX));
+        write_arena_meta(dir.path(), "decode", [0, 0, u64::MAX]);
+        assert_eq!(l.declared_footprint(&cfg()), None, "an unrepresentable sum is unknown, not wrapped small");
+    }
+
+    #[test]
+    fn declared_footprint_does_not_guess_when_fused_metadata_is_incomplete() {
+        let dir = tempfile::tempdir().unwrap();
+        write_fused_scenario(dir.path(), "prefill");
+        write_arena_meta(dir.path(), "decode", [10, 8, 100]);
+        let l = EngineLoader { root: dir.path().to_path_buf() };
+        assert_eq!(l.declared_footprint(&cfg()), None, "missing prefill metadata");
+        std::fs::create_dir(dir.path().join("prefill")).unwrap();
+        std::fs::write(dir.path().join("prefill/meta.json"), r#"{"input_size":40,"scratch_size":50}"#).unwrap();
+        assert_eq!(l.declared_footprint(&cfg()), None, "missing arena size");
+    }
+
+    #[test]
+    fn declared_footprint_never_sums_the_root_for_an_empty_weights_field() {
+        let dir = tempfile::tempdir().unwrap();
+        write_scenario(dir.path(), "");
+        std::fs::write(dir.path().join("unrelated.bin"), vec![0u8; 10_000]).unwrap();
+        let l = EngineLoader { root: dir.path().to_path_buf() };
+        assert_eq!(l.declared_footprint(&cfg()), None);
+    }
+
+    #[test]
+    fn explicit_load_still_refuses_an_oversized_declared_fused_arena() {
+        let dir = tempfile::tempdir().unwrap();
+        write_fused_scenario(dir.path(), "");
+        write_arena_meta(dir.path(), "decode", [0, 0, 2 * 1024 * 1024]);
+        let l = EngineLoader { root: dir.path().to_path_buf() };
+        let mut registry = crate::registry::Registry::default();
+        let server = crate::config::ServerCfg { memory_ceiling_mb: 1, ..Default::default() };
+        let error = registry.load_explicit(&cfg(), &l, &server, std::time::Instant::now()).unwrap_err();
+        assert!(matches!(error, EngineError::Unsupported(_)), "{error}");
+        assert!(error.to_string().contains("cannot be made resident"));
+        assert!(registry.get_loaded("m").is_none());
     }
 
     /// The pre-load size estimate this needs to exist for at all: a pin-time budget check on a model

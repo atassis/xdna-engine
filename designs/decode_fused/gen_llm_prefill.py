@@ -103,12 +103,10 @@ merged with prefill/rowwise-softmax). AIE_DEVICE=npu2 keeps the build off the de
 the comment in gen_llm_decode.py.
 """
 import argparse
-import glob
 import hashlib
 import json
 import os
 import re
-import shutil
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -119,6 +117,7 @@ import ml_dtypes
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from llm_decode_spec import SPECS, BD_STRIDE_MAX  # noqa: E402
 from gemm_tile_registry import registry  # noqa: E402
+from scratchpad_metadata import sequence_scratchpad_metadata  # noqa: E402
 import pack_cache  # noqa: E402
 import precision  # noqa: E402 -- decode's own declarative per-site format plan; see dq_group
 from prefill_ref import (f32, gate_block, layer_stack, npy_weights,  # noqa: E402
@@ -2282,10 +2281,17 @@ def check_shared_weights(dec_meta_path, weights_dir, sp, dims):
             bad.append(f"{nm}: {t} is in {weights_dir} neither whole nor as kchunks")
             return
         if len(parts) != len(files):
-            bad.append(f"{nm} is {len(parts)} arena part(s) against {len(files)} dump file(s)")
-            return
-        for i, (part, fn) in enumerate(zip(parts, files)):
-            ref = np.load(os.path.join(weights_dir, fn))
+            # Decode can split a plain F32 dump along K before converting each slice to BF16.
+            # Packed chunks carry their own headers/scales and cannot be split this way.
+            ref = np.load(os.path.join(weights_dir, files[0]), mmap_mode="r") if len(files) == 1 else None
+            if (ref is None or ref.dtype != np.float32 or ref.ndim != 2
+                    or ref.shape[1] % len(parts)):
+                bad.append(f"{nm} is {len(parts)} arena part(s) against {len(files)} dump file(s)")
+                return
+            references = np.split(ref, len(parts), axis=1)
+        else:
+            references = (np.load(os.path.join(weights_dir, fn), mmap_mode="r") for fn in files)
+        for i, (part, ref) in enumerate(zip(parts, references)):
             tag = f"{nm}{'' if len(parts) == 1 else f'k{i}'}"
             a = rawb(part)
             if a.nbytes >= ref.nbytes:
@@ -2393,11 +2399,15 @@ def main():
     a = ap.parse_args()
 
     sp = SPECS[a.spec]
+    from llm_decode_spec import embedding_source_metadata
+    embedding_source = embedding_source_metadata(a.weights, a.spec, a.layers)
     dec_meta_path = None if a.no_arena_share else a.decode_meta
     if dec_meta_path and not os.path.isfile(dec_meta_path):
         raise SystemExit(f"ERROR: --decode-meta {dec_meta_path} does not exist")
     if dec_meta_path:
         dm = json.load(open(dec_meta_path))
+        if embedding_source is not None and dm.get("embedding_source") != embedding_source:
+            raise ValueError("prefill/decode pinned embedding source mismatch")
         # kv_block is checked because its ABSENCE from this list is what let a blocked decode and
         # a flat prefill share an arena, agree on every offset, and disagree about what the bytes
         # in it mean -- caught only on device, as one token repeated.
@@ -2552,14 +2562,7 @@ def main():
     elf_prov = write_elf(os.path.join(a.out, "prefill.elf"), elf)
     in_sz, out_sz, scr = fused.buffer_sizes
 
-    scratchpad_params = {}
-    pp = sorted(glob.glob("**/params.txt", recursive=True), key=os.path.getmtime)
-    if pp:
-        shutil.copy(pp[-1], os.path.join(a.out, "params.txt"))
-        for line in open(pp[-1]).read().splitlines()[1:]:
-            if line.strip():
-                n_, idx, ty, kind = line.split()
-                scratchpad_params[n_] = {"byte_offset": int(idx) * 4, "kind": kind, "dtype": ty}
+    scratchpad_params = sequence_scratchpad_metadata(fused, a.out)
     # `geom_slots` names the slots the META will advertise; `params.txt` is what the ELF actually
     # declares. They are produced by different halves of the build and nothing else compares them,
     # so a geometry whose `output_offset_parameter` was never threaded through ships an artifact
@@ -2767,6 +2770,8 @@ def main():
     import hashlib as _hl
     meta["elf_md5"] = _hl.md5(elf).hexdigest()
     meta.update(elf_prov)
+    if embedding_source is not None:
+        meta["embedding_source"] = embedding_source
     json.dump(meta, open(os.path.join(a.out, "meta.json"), "w"), indent=2)
     print(f"[ok] elf md5 {meta['elf_md5']} -- compare arms on THIS, never on the name")
     print(f"[ok] {NL}-layer {sp.name} prefill ELF ({len(elf)}B), M={M} S={S} "

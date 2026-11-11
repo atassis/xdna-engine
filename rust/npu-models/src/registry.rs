@@ -23,6 +23,23 @@ pub fn try_build(cfg_path: &Path, root: &Path) -> Result<Scenario, EngineError> 
     // Dispatch on the SAME answer `ModelKind::from_scenario_kind` gives the control plane before any
     // load, so a declared capability and the built one cannot disagree.
     let scen = match crate::ModelKind::from_scenario_kind(&cfg.scenario.kind) {
+        Some(crate::ModelKind::Embed) if cfg.embeddings.backbone.is_some() => {
+            let (tokenizer, dimension, source) = crate::llm::embedding::preflight(&cfg, root)?;
+            let dev = open_dev()?;
+            let decode_dir = root.join(&cfg.artifacts.decode);
+            let decode = if cfg.artifacts.prefill.is_empty() {
+                crate::llm::NpuDecodeStep::new(&dev, &decode_dir)?
+            } else {
+                crate::llm::NpuDecodeStep::with_prefill(&dev, &decode_dir, &root.join(&cfg.artifacts.prefill))?
+            };
+            if decode.artifact().embedding_source.as_ref() != Some(&source) {
+                return Err(EngineError::Load("loaded embedding source differs from preflight".into()));
+            }
+            let metadata = crate::llm::embedding::loaded_metadata(&source, dimension,
+                crate::llm::DecodeStep::max_context(&decode).unwrap_or(crate::llm::embedding::MAX_TOKENS),
+                &crate::llm::DecodeStep::provenance(&decode), decode.artifact().weight_quant.as_ref());
+            Scenario::Embed(Box::new(crate::llm::embedding::QwenEmbedder::new(tokenizer, decode, dimension)?.with_metadata(metadata)))
+        }
         Some(crate::ModelKind::Embed) => {
             if cfg.scenario.name.to_lowercase().starts_with("esm") {
                 if cfg.embeddings.batch_rows.is_some() {

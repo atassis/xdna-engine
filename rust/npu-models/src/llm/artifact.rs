@@ -175,6 +175,9 @@ pub struct LlmArtifact {
     pub role: ArtifactRole,
     pub decode_dir: PathBuf,
     pub elf_name: String,
+    /// Source/precision declarations captured from the same metadata parse as the loaded layout.
+    pub embedding_source: Option<serde_json::Value>,
+    pub weight_quant: Option<serde_json::Value>,
     pub kernel_name: String,
     pub input_size: usize,
     pub output_size: usize,
@@ -1281,6 +1284,8 @@ impl LlmArtifact {
             role,
             decode_dir: decode_dir.to_path_buf(),
             elf_name,
+            embedding_source: meta.get("embedding_source").cloned(),
+            weight_quant: meta.get("weight_quant").cloned(),
             kernel_name,
             input_size,
             output_size,
@@ -1586,6 +1591,9 @@ impl LlmArtifact {
     /// these produces an error on the device -- a disagreeing RoPE base or `S` yields a plausible
     /// wrong token and nothing else.
     pub fn check_prefill_pairing(&self, prefill: &LlmArtifact) -> Result<(), EngineError> {
+        if self.embedding_source != prefill.embedding_source {
+            return Err(EngineError::Load("prefill/decode embedding source receipts disagree".into()));
+        }
         let mut checks: Vec<(&str, usize, usize)> = vec![
             ("dims.head_dim", self.head_dim, prefill.head_dim),
             ("dims.d_model", self.d_model, prefill.d_model),
@@ -1881,6 +1889,26 @@ mod tests {
     fn write_meta(dir: &Path, meta: &serde_json::Value) {
         let mut f = fs::File::create(dir.join("meta.json")).unwrap();
         f.write_all(serde_json::to_string(meta).unwrap().as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn embedding_source_and_precision_are_captured_not_reread_from_mutable_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = base_meta(8, 4, serde_json::json!({}));
+        meta["embedding_source"] = serde_json::json!({"model":"fixture","revision":"first"});
+        meta["weight_quant"] = serde_json::json!({"plan":{"qkv":"bf16"}});
+        write_meta(dir.path(), &meta);
+        let first = LlmArtifact::load(dir.path()).unwrap();
+        assert_eq!(first.embedding_source.as_ref(), Some(&meta["embedding_source"]));
+        assert_eq!(first.weight_quant.as_ref(), Some(&meta["weight_quant"]));
+        meta["embedding_source"]["revision"] = "second".into();
+        meta["weight_quant"]["plan"]["qkv"] = "int8".into();
+        write_meta(dir.path(), &meta);
+        assert_eq!(first.embedding_source.as_ref().unwrap()["revision"], "first");
+        assert_eq!(first.weight_quant.as_ref().unwrap()["plan"]["qkv"], "bf16");
+        let second = LlmArtifact::load(dir.path()).unwrap();
+        assert_eq!(second.embedding_source.as_ref().unwrap()["revision"], "second");
+        assert_eq!(second.weight_quant.as_ref().unwrap()["plan"]["qkv"], "int8");
     }
 
     #[test]
@@ -2605,6 +2633,19 @@ mod tests {
     }
 
     #[test]
+    fn loaded_embedding_pair_requires_the_same_source_receipt() {
+        let (dec, pre) = pair_metas(2);
+        let (_d, _p, mut da, mut pa) = load_pair(&dec, &pre);
+        assert!(da.check_prefill_pairing(&pa).is_ok());
+        da.embedding_source = Some(serde_json::json!({"revision":"first"}));
+        assert!(da.check_prefill_pairing(&pa).is_err());
+        pa.embedding_source = da.embedding_source.clone();
+        assert!(da.check_prefill_pairing(&pa).is_ok());
+        pa.embedding_source = Some(serde_json::json!({"revision":"second"}));
+        assert!(da.check_prefill_pairing(&pa).is_err());
+    }
+
+    #[test]
     fn a_prefill_artifact_carries_its_batch_and_needs_no_output() {
         let (dec, pre) = pair_metas(2);
         let (_d, _p, da, pa) = load_pair(&dec, &pre);
@@ -3268,12 +3309,16 @@ mod tests {
     #[test]
     fn toolchain_stamped_but_unresolvable_pin_loads_with_a_warning_not_an_error() {
         let dir = tempfile::tempdir().unwrap();
-        // Stamped, but no toolchain.lock anywhere above this dir -- the production-install shape
-        // the design constraint requires: a shipped consumer must not need toolchain.lock to exist.
+        // TMPDIR may live under a checkout's toolchain.lock. The descriptor path gives this
+        // fixture an unpinned lexical root without needing a writable directory outside TMPDIR.
+        use std::os::fd::AsRawFd;
+        let directory = std::fs::File::open(dir.path()).unwrap();
+        let unpinned = std::path::PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+        assert_eq!(LlmArtifact::resolve_current_pin_hash(&unpinned).unwrap(), None);
         let mut meta = base_meta(8, 4, serde_json::json!({"rope_global": {"type": "input", "offset": 8, "len": 8}}));
         meta["toolchain"] = serde_json::json!({"hash": "9da6356ac521"});
         write_meta(dir.path(), &meta);
-        let art = LlmArtifact::load(dir.path()).expect("an unresolvable pin must be a warning, not fatal");
+        let art = LlmArtifact::load(&unpinned).expect("an unresolvable pin must be a warning, not fatal");
         assert_eq!(art.toolchain_hash.as_deref(), Some("9da6356ac521"));
     }
 
