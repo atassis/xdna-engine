@@ -17,7 +17,7 @@ mod upscale;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser};
 
-use cli_def::{CheckpointCmd, Cli, Cmd, ConfigCmd, DecideType, ModelCmd, OutFormat, OutputFormat, SamplingArgs, SpeechFormat};
+use cli_def::{CheckpointCmd, Cli, Cmd, ConfigCmd, DecideType, EmbedInputType, ModelCmd, OutFormat, OutputFormat, SamplingArgs, SpeechFormat};
 use clap_complete::Shell;
 use std::io::IsTerminal;
 use npu_models::telemetry::wire;
@@ -115,7 +115,8 @@ fn run(cli: &Cli, path: &Path) -> Result<()> {
             generate(prompt, model.as_deref(), sampling, *no_stream, *raw, *stats, as_json, images, *hide_reasoning),
         Cmd::Chat { prompt, model, sampling, no_stream, images, hide_reasoning } =>
             chat(prompt.as_deref(), model.as_deref(), sampling, *no_stream, as_json, images, *hide_reasoning),
-        Cmd::Embed { text, model } => embed(text, model.as_deref(), as_json),
+        Cmd::Embed { text, model, input_type, dimensions } =>
+            embed(text, model.as_deref(), *input_type, *dimensions, as_json),
         Cmd::Decide { state, question, kind, options, questions, model, stats } =>
             decide(state, question.as_deref(), *kind, options, questions.as_deref(), model, *stats, as_json),
         Cmd::Top { interval, once } => top(*interval, *once),
@@ -1163,10 +1164,17 @@ fn render_segments_json(v: &serde_json::Value, json: bool) -> String {
 /// Sent over the control socket to `/v1/embeddings` -- the exact request an HTTP client would make,
 /// so `route()` is the only place "what does embed do" is decided. No service running is a refusal,
 /// not an in-process fallback.
-fn embed(text: &str, model: Option<&str>, as_json: bool) -> Result<()> {
-    quiet_one_shot();
+fn embedding_body(text: &str, model: Option<&str>, input_type: Option<EmbedInputType>, dimensions: Option<u32>) -> serde_json::Value {
     let mut body = serde_json::json!({ "input": text });
     if let Some(m) = model { body["model"] = serde_json::json!(m); }
+    if let Some(role) = input_type { body["input_type"] = role.as_str().into(); }
+    if let Some(d) = dimensions { body["dimensions"] = d.into(); }
+    body
+}
+
+fn embed(text: &str, model: Option<&str>, input_type: Option<EmbedInputType>, dimensions: Option<u32>, as_json: bool) -> Result<()> {
+    quiet_one_shot();
+    let body = embedding_body(text, model, input_type, dimensions);
     let v = socket_client::call_json("/v1/embeddings", &body)?;
     let served_model = v["model"].as_str().unwrap_or_default();
     let embedding = v["data"][0]["embedding"].as_array().cloned().unwrap_or_default();
@@ -2463,6 +2471,13 @@ mod tests {
             match req {
                 npu_models::capability::Request::Text(t) =>
                     Ok(npu_models::capability::Response::Vector(t.bytes().map(|b| b as f32).collect())),
+                npu_models::capability::Request::Texts(texts) =>
+                    Ok(npu_models::capability::Response::Vectors(texts.iter().map(|t| t.bytes().map(|b| b as f32).collect()).collect())),
+                npu_models::capability::Request::Embeddings { texts, options } => {
+                    assert_eq!(options.input_type, npu_models::api::EmbeddingInputType::Query);
+                    assert_eq!(options.dimensions, Some(1024));
+                    Ok(npu_models::capability::Response::Vectors(texts.iter().map(|t| vec![1., 1024., t.len() as f32]).collect()))
+                }
                 other => panic!("EchoEmbed cannot serve {other:?}"),
             }
         }
@@ -2525,7 +2540,8 @@ mod tests {
         const PORT: u16 = 19193;
         let (handle, join, dir) = embed_socket_harness(PORT);
 
-        let body = serde_json::json!({"input": "hello"});
+        let body = embedding_body("hello", None, None, None);
+        assert_eq!(body, serde_json::json!({"input":"hello"}));
         let via_socket = socket_client::call_json("/v1/embeddings", &body).unwrap();
 
         let cfg_path = dir.path().join("engine.toml");
@@ -2538,6 +2554,18 @@ mod tests {
         let via_http: serde_json::Value = serde_json::from_str(resp.text()).unwrap();
 
         assert_eq!(via_socket, via_http, "the CLI-over-socket and HTTP route must agree exactly");
+        let cli = Cli::try_parse_from(["npu", "embed", "hello", "--input-type", "query", "--dimensions", "1024", "--model", "bge"]).unwrap();
+        let Cmd::Embed { text, model, input_type, dimensions } = &cli.cmd else { unreachable!() };
+        let body = embedding_body(text, model.as_deref(), *input_type, *dimensions);
+        assert_eq!(body, serde_json::json!({"input":"hello","model":"bge","input_type":"query","dimensions":1024}));
+        let via_socket = socket_client::call_json("/v1/embeddings", &body).unwrap();
+        assert_eq!(via_socket["data"][0]["embedding"], serde_json::json!([1, 1024, 5]));
+        let req = npu_service::http::Request { method:"POST".into(), path:"/v1/embeddings".into(),
+            boundary:String::new(), body:body.to_string().into_bytes() };
+        let (code, resp) = npu_service::http::route(&req, &handle, &cfg_path);
+        assert_eq!(code, 200);
+        assert_eq!(via_socket, serde_json::from_str::<serde_json::Value>(resp.text()).unwrap());
+        run(&cli, &cfg_path).expect("the real CLI execution uses the same socket request");
 
         std::env::remove_var("XDG_RUNTIME_DIR");
         handle.shutdown();
@@ -2760,7 +2788,7 @@ mod tests {
         std::env::set_var("XDG_RUNTIME_DIR", dir.path());
         // No `control_socket::bind` call at all -- nothing is listening.
 
-        let err = embed("hi", None, false).unwrap_err();
+        let err = embed("hi", None, None, None, false).unwrap_err();
         let tagged = err.downcast_ref::<Tagged>().expect("refusal must be a Tagged error");
         assert_eq!(tagged.0, Code::NoService);
         assert!(tagged.1.contains("systemctl --user start xdna-engine"), "{}", tagged.1);
@@ -2779,10 +2807,14 @@ mod tests {
         struct SlowEmbed;
         impl npu_service::loader::Servable for SlowEmbed {
             fn capabilities(&self) -> Capability { Capability::EMBED }
-            fn run(&mut self, _req: npu_models::capability::Request)
+            fn run(&mut self, req: npu_models::capability::Request)
                 -> Result<npu_models::capability::Response, npu_models::EngineError> {
                 std::thread::sleep(std::time::Duration::from_secs(3));
-                Ok(npu_models::capability::Response::Vector(vec![1.0]))
+                match req {
+                    npu_models::capability::Request::Text(_) => Ok(npu_models::capability::Response::Vector(vec![1.0])),
+                    npu_models::capability::Request::Texts(texts) => Ok(npu_models::capability::Response::Vectors(vec![vec![1.0]; texts.len()])),
+                    other => panic!("SlowEmbed cannot serve {other:?}"),
+                }
             }
         }
         impl npu_service::loader::StreamServable for SlowEmbed {}
@@ -3683,6 +3715,17 @@ mod decide_cli {
 #[cfg(test)]
 mod embed_cli_http_fuzz {
     use super::*;
+
+    #[test]
+    fn embedding_role_and_dimensions_are_explicit_cli_options() {
+        assert!(Cli::try_parse_from(["npu", "embed", "hello", "--input-type", "query", "--dimensions", "1024"]).is_ok());
+        assert!(Cli::try_parse_from(["npu", "embed", "hello", "--input-type", "document"]).is_ok());
+        for args in [vec!["npu", "embed", "hello", "--input-type", "guess"],
+                     vec!["npu", "embed", "hello", "--dimensions", "0"],
+                     vec!["npu", "embed", "hello", "--dimensions", "1.5"]] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
 
     /// The text `npu embed` hands to `Handle::embed`, going through the real clap parser (not a
     /// reimplementation of it).

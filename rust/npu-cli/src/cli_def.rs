@@ -52,6 +52,15 @@ pub struct Cli {
     pub cmd: Cmd,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum EmbedInputType { Query, Document }
+
+impl EmbedInputType {
+    pub fn as_str(self) -> &'static str {
+        match self { Self::Query => "query", Self::Document => "document" }
+    }
+}
+
 #[derive(Subcommand)]
 pub enum Cmd {
     /// Run the HTTP service (single device owner).
@@ -143,6 +152,10 @@ pub enum Cmd {
         #[arg(allow_hyphen_values = true)] text: String,
         /// Embedding model name; omit to use the configured embed default.
         #[arg(long)] model: Option<String>,
+        /// Preparation role; omission preserves the model's document default.
+        #[arg(long, value_enum)] input_type: Option<EmbedInputType>,
+        /// Requested dimension; the model must explicitly support it (Qwen: full dimension only).
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))] dimensions: Option<u32>,
     },
     /// Typed decisions over a state (TypeSafe's `/v1/systemone`), read off a language model's
     /// next-token probabilities over the options -- nothing is generated.

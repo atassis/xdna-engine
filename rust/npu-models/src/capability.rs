@@ -79,6 +79,7 @@ pub enum Request {
     Text(String),
     /// Ordered independent passages, delivered to an embedder as one request.
     Texts(Vec<String>),
+    Embeddings { texts: Vec<String>, options: crate::api::EmbeddingOptions },
     /// `Model::transcribe`'s shape: mono PCM plus the rate it was sampled at. The rate travels with
     /// the samples rather than being assumed 16 kHz -- the models resample, and a silently wrong
     /// rate is a wrong transcript, not an error.
@@ -100,6 +101,7 @@ impl Request {
         match self {
             Request::Text(_) => "text",
             Request::Texts(_) => "texts",
+            Request::Embeddings { .. } => "embeddings",
             Request::Audio { .. } => "audio",
             Request::Image { .. } => "image",
             Request::Decide(_) => "decide",

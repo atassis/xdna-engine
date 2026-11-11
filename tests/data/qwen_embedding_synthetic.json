@@ -1,0 +1,49 @@
+{
+  "scope": "Synthetic development fixture, not qualification of any real documentation corpus. Labels express the statements below, not claims about a deployed engine.",
+  "candidate_groups": {
+    "en-en": ["inference", "training", "ddr", "onchip", "compile", "qualify", "deployed", "source", "bottleneck", "hypothesis", "identifier", "pooling", "current", "historical", "limit", "longmodel"],
+    "ru-en": ["inference", "training", "ddr", "onchip", "compile", "qualify", "deployed", "source", "bottleneck", "hypothesis", "identifier", "pooling", "current", "historical", "limit", "longmodel"],
+    "ru-ru": ["ru-inference", "ru-training", "ru-deployed", "ru-compile", "ru-limit", "ru-onchip"],
+    "en-ru": ["ru-inference", "ru-training", "ru-deployed", "ru-compile", "ru-limit", "ru-onchip"]
+  },
+  "documents": [
+    {"id": "inference", "text": "Parallel inference serves independent requests concurrently. It does not distribute gradient updates or train model replicas."},
+    {"id": "training", "text": "Distributed training synchronizes gradients between workers to update model weights. This procedure does not configure concurrent inference requests."},
+    {"id": "ddr", "text": "Host-free DDR residency keeps intermediate buffers in device-accessible external memory without returning them to the host. It still incurs DDR traffic and is not on-chip residency."},
+    {"id": "onchip", "text": "On-chip residency retains intermediate values in core or memory-tile storage between operators, avoiding their external-memory round trips."},
+    {"id": "compile", "text": "Successful compilation proves the compiler emitted an artifact. It does not prove that the artifact ran correctly on the device."},
+    {"id": "qualify", "text": "Device qualification runs a specific artifact against reference outputs on the intended hardware and records the runtime, inputs, errors and conditions."},
+    {"id": "deployed", "text": "To identify deployed code, inspect the running process executable, runtime root and resolved artifact hashes. Current source HEAD alone does not identify the deployed artifact."},
+    {"id": "source", "text": "The source checkout HEAD identifies a source revision. Editing source without rebuilding or deploying does not change the running executable."},
+    {"id": "bottleneck", "text": "A measured bottleneck requires timing the operation on the actual artifact under controlled conditions. The suspected cost of an operator is only a hypothesis until measured."},
+    {"id": "hypothesis", "text": "The next experiment will test whether memory transfer dominates. No timing data has been collected, so memory transfer is a hypothesis, not a measured bottleneck."},
+    {"id": "identifier", "text": "START_BD_ID chooses the starting buffer descriptor identifier. The error BAD_BUFFER_DESCRIPTOR means the descriptor is invalid; adjust the descriptor configuration rather than change query pooling."},
+    {"id": "pooling", "text": "The embedding pooling option selects how token hidden states become one vector. CLS and last-valid-token pooling select different positions and define different embedding spaces."},
+    {"id": "current", "text": "CURRENT PROCEDURE: validate the staged package, obtain approval, then activate it and retain rollback artifacts. This replaces the historical copy-and-restart procedure."},
+    {"id": "historical", "text": "SUPERSEDED EXPERIMENT: copy a new executable over the live binary and restart immediately without staging validation. Do not use this historical procedure for current deployments."},
+    {"id": "limit", "text": "The sample embedding API supports at most 512 tokens including the query instruction. It rejects longer inputs; it does not silently truncate and does not support 32K requests."},
+    {"id": "longmodel", "text": "The model card advertises a 32K context. This advertised model capability does not establish the smaller sample runtime's effective request limit."},
+    {"id": "ru-inference", "text": "Параллельный инференс обслуживает независимые запросы одновременно. Он не синхронизирует градиенты и не обучает распределённые копии модели."},
+    {"id": "ru-training", "text": "Распределённое обучение синхронизирует градиенты между рабочими процессами для обновления весов. Это не режим обслуживания независимых запросов."},
+    {"id": "ru-deployed", "text": "Чтобы установить, какой артефакт работает сейчас, проверьте исполняемый файл живого процесса и хеши реально загруженных артефактов. Текущий HEAD исходников этого не доказывает."},
+    {"id": "ru-compile", "text": "Успешная компиляция означает, что получен артефакт. Она не подтверждает корректное исполнение на устройстве и не заменяет сравнение с эталоном."},
+    {"id": "ru-limit", "text": "Образец API отклоняет запросы длиннее 512 токенов, включая инструкцию. Автоматическое усечение и режим 32K не поддерживаются."},
+    {"id": "ru-onchip", "text": "Резидентность на кристалле сохраняет промежуточные данные в локальной памяти вычислительных ядер или memory tile. В отличие от внешней DDR, это позволяет избежать обмена с внешней памятью."}
+  ],
+  "queries": [
+    {"id": "en-intent", "text": "How can independent prediction requests run at the same time without training replicas?", "group": "en-en", "category": "related-wrong-intent", "relevant": ["inference"], "hard_negatives": ["training"]},
+    {"id": "ru-intent", "text": "Как одновременно обслуживать независимые запросы без обновления весов?", "group": "ru-ru", "category": "paraphrase", "relevant": ["ru-inference"], "hard_negatives": ["ru-training"]},
+    {"id": "ru-to-en", "text": "Данные остаются во внешней памяти без возврата на хост. Это уже резидентность на кристалле?", "group": "ru-en", "category": "residency-distinction", "relevant": ["ddr"], "hard_negatives": ["onchip"]},
+    {"id": "en-to-ru", "text": "Does producing a compiled artifact prove correct device execution?", "group": "en-ru", "category": "qualification", "relevant": ["ru-compile"], "hard_negatives": ["ru-deployed"]},
+    {"id": "identifier", "text": "What does BAD_BUFFER_DESCRIPTOR mean and what does START_BD_ID select?", "group": "en-en", "category": "exact-identifier", "relevant": ["identifier"], "hard_negatives": ["pooling"]},
+    {"id": "deployed", "text": "Which bytes answer requests right now, rather than which revision I edited?", "group": "en-en", "category": "deployed-vs-source", "relevant": ["deployed"], "hard_negatives": ["source"]},
+    {"id": "ru-deployed", "text": "Как доказать, что сервис исполняет именно нужную сборку, а не просто показать исходники?", "group": "ru-ru", "category": "deployed-vs-source", "relevant": ["ru-deployed"], "hard_negatives": ["ru-compile"]},
+    {"id": "negation", "text": "Will the sample endpoint silently shorten my 1000-token query to fit?", "group": "en-en", "category": "negation-constraint", "relevant": ["limit"], "hard_negatives": ["longmodel"]},
+    {"id": "ru-limit", "text": "Можно ли отправить в образец API 32 тысячи токенов только потому, что это указано в карточке модели?", "group": "ru-ru", "category": "unsupported-mode", "relevant": ["ru-limit"], "hard_negatives": ["ru-compile"]},
+    {"id": "freshness", "text": "What is the current activation procedure, not the superseded experiment?", "group": "en-en", "category": "current-vs-historical", "relevant": ["current"], "hard_negatives": ["historical"]},
+    {"id": "measurement", "text": "What evidence distinguishes a suspected memory cost from an established limiting operation?", "group": "en-en", "category": "measurement-vs-hypothesis", "relevant": ["bottleneck"], "hard_negatives": ["hypothesis"]},
+    {"id": "multi-source", "text": "What checks identify the running artifact and establish its numerical correctness on the intended device?", "group": "en-en", "category": "multiple-sources", "relevant": ["deployed", "qualify"], "hard_negatives": ["source", "compile"]},
+    {"id": "ru-en-paraphrase", "text": "Как сохранять результаты между операторами, чтобы не передавать их во внешнюю память?", "group": "ru-en", "category": "paraphrase", "relevant": ["onchip"], "hard_negatives": ["ddr"]},
+    {"id": "en-ru-onchip", "text": "Where should intermediates stay to avoid trips through external RAM?", "group": "en-ru", "category": "paraphrase", "relevant": ["ru-onchip"], "hard_negatives": ["ru-inference"]}
+  ]
+}

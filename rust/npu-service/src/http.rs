@@ -367,8 +367,11 @@ fn models_doc(status: &[ModelStatus], age_s: Option<u64>, doing: Option<&str>) -
         let kind = s.capability.map(|c| c.0).unwrap_or("unknown");
         let state = match s.state { LoadState::Loaded => "loaded", LoadState::Failed => "failed", LoadState::Unloaded => "unloaded" };
         let idle = match s.idle_s { Some(n) => n.to_string(), None => "null".to_string() };
+        let embedding = s.embedding.as_ref().map(|m| format!(",\"embedding\":{}", serde_json::json!({
+            "identity_scope":"last-successful-load", "profile":m.profile, "runtime":m.runtime,
+        }))).unwrap_or_default();
         data.push_str(&format!(
-            "{{\"id\":\"{}\",\"object\":\"model\",\"kind\":\"{kind}\",\"state\":\"{state}\",\"detail\":\"{}\",\"bo_bytes\":{},\"idle_s\":{idle},\"pinned\":{},\"pin_honored\":{},\"busy\":{},\"served\":{},\"busy_us\":{}}}",
+            "{{\"id\":\"{}\",\"object\":\"model\",\"kind\":\"{kind}\",\"state\":\"{state}\",\"detail\":\"{}\",\"bo_bytes\":{},\"idle_s\":{idle},\"pinned\":{},\"pin_honored\":{},\"busy\":{},\"served\":{},\"busy_us\":{}{embedding}}}",
             s.name, parse::json_escape(&s.detail), s.bo_bytes, s.pinned, s.pin_honored, s.busy, s.served, s.busy_us));
     }
     let Some(age) = age_s else {
@@ -789,7 +792,11 @@ fn embeddings(req: &Request, handle: &Handle) -> Response {
         Ok(v) => v,
         Err(e) => return (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e)).into()),
     };
-    let served = match handle.embed_batch(model.as_deref(), &inputs) {
+    let options = match serde_json::from_str::<npu_models::api::EmbeddingOptions>(&body) {
+        Ok(v) if v.dimensions != Some(0) => v,
+        _ => return (400, "{\"error\":\"invalid embedding input_type or dimensions\"}".into()),
+    };
+    let served = match handle.embed_batch_with_options(model.as_deref(), &inputs, options) {
         Ok(s) => s,
         Err(e) => return (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e.to_string())).into()),
     };
@@ -2732,6 +2739,65 @@ mod route_tests {
         }
         for input in [r#"{"input":["ok","fail"]}"#, r#"{"input":["ok","short"]}"#] {
             assert_eq!(route(&post("/v1/embeddings", input), &h, &p).0, 400);
+        }
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn embeddings_options_reach_actor_in_request_order() {
+        use crate::loader::{ModelLoader, Servable, StreamServable};
+        use npu_models::capability::{Request as ModelRequest, Response as ModelResponse};
+        struct Spy;
+        impl Servable for Spy {
+            fn capabilities(&self) -> Capability { Capability::EMBED }
+            fn run(&mut self, req: ModelRequest) -> Result<ModelResponse, npu_models::EngineError> {
+                let ModelRequest::Embeddings { texts, options } = req else { panic!("options were dropped") };
+                assert_eq!(options.input_type, npu_models::api::EmbeddingInputType::Query);
+                assert_eq!(options.dimensions, Some(1024));
+                assert_eq!(texts, ["second", "first", "second"]);
+                Ok(ModelResponse::Vectors(vec![vec![2.], vec![1.], vec![2.]]))
+            }
+        }
+        impl StreamServable for Spy {
+            fn embedding_metadata(&self) -> Option<npu_models::api::EmbeddingMetadata> {
+                Some(npu_models::api::EmbeddingMetadata {
+                    profile: serde_json::json!({"dimension":1024,"model":"fixture-embedding"}),
+                    runtime: serde_json::json!({"backend":"fixture","qualification":"unqualified"}),
+                })
+            }
+        }
+        struct Loader;
+        impl ModelLoader for Loader {
+            fn declared_capability(&self, _: &ModelCfg) -> Option<Capability> { Some(Capability::EMBED) }
+            fn load(&self, _: &ModelCfg) -> Result<Box<dyn StreamServable>, npu_models::EngineError> { Ok(Box::new(Spy)) }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("engine.toml");
+        let cfg = Config { models: vec![ModelCfg { name:"qwen".into(), scenario:"fixture".into(), resident:false }], ..Default::default() };
+        cfg.save(&p).unwrap();
+        let (h,j) = start(cfg, Box::new(Loader)).unwrap();
+        let (code, body) = route(&post("/v1/embeddings", r#"{"input":["second","first","second"],"input_type":"query","dimensions":1024}"#), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        let result: serde_json::Value = serde_json::from_str(&body.text()).unwrap();
+        assert_eq!(result["model"], "qwen");
+        assert_eq!(result["data"][1]["embedding"][0], 1.);
+        assert!(result.get("embedding").is_none(), "standard embedding response shape is unchanged");
+        let (code, body) = route(&get("/v1/models"), &h, &p);
+        assert_eq!(code, 200);
+        let discovery: serde_json::Value = serde_json::from_str(&body.text()).unwrap();
+        assert_eq!(discovery["data"][0]["embedding"]["profile"]["dimension"], 1024);
+        assert_eq!(discovery["data"][0]["embedding"]["runtime"]["qualification"], "unqualified");
+        assert_eq!(discovery["data"][0]["embedding"]["identity_scope"], "last-successful-load");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn embeddings_rejects_invalid_role_and_dimension_types() {
+        let (h, j, _d, p) = mock_handle();
+        for extra in [r#""input_type":"guess""#, r#""input_type":1"#,
+                      r#""dimensions":0"#, r#""dimensions":1.5"#, r#""dimensions":"1024""#] {
+            let request = format!("{{\"input\":\"hi\",{extra}}}");
+            assert_eq!(route(&post("/v1/embeddings", &request), &h, &p).0, 400, "{request}");
         }
         h.shutdown(); j.join().unwrap();
     }

@@ -1022,6 +1022,14 @@ QWEN3_0_6B = LlmSpec(
     sliding_window=None, sw_pattern=None, query_pre_attn_scalar=None,
 )
 
+# Embedding checkpoints use the Qwen3 backbone but have distinct vocabularies and weights.
+# Geometry comes from the separately pinned Qwen/Qwen3-Embedding configs, not generation weights.
+QWEN3_EMBEDDING_0_6B = replace(
+    QWEN3_0_6B, name="qwen3-embedding-0.6b", vocab=151669, weight_prefix="")
+QWEN3_EMBEDDING_4B = replace(
+    QWEN3_0_6B, name="qwen3-embedding-4b", weight_prefix="", d_model=2560, n_layers=36,
+    n_q_heads=32, ffn=9728, vocab=151665)
+
 # Gemma-4-12B-IT (unsloth/gemma-4-12b-it, "unsloth_fixed": true). Every axis below is VERIFIED
 # against the packed dump and the checkpoint header by scripts/check_llm_spec_against_dump.py --
 # nothing here is typed from config.json alone, and the axis facts live on
@@ -1134,8 +1142,55 @@ WHISPER_TURBO = replace(
     WHISPER_SMALL, name="whisper-turbo", d_model=1280, n_layers=4, n_q_heads=20, n_kv_heads=20,
     ffn=5120, vocab=51866)
 
-SPECS = {s.name: s for s in (GEMMA3_270M, QWEN3_0_6B, GEMMA4_12B, QWEN35_4B, S2_PRO_SLOW_AR,
+SPECS = {s.name: s for s in (GEMMA3_270M, QWEN3_0_6B, QWEN3_EMBEDDING_0_6B,
+                           QWEN3_EMBEDDING_4B, GEMMA4_12B, QWEN35_4B, S2_PRO_SLOW_AR,
                              S1_MINI_SLOW_AR, S1_MINI_FAST_AR, WHISPER_SMALL, WHISPER_TURBO)}
+
+
+def pad_vocab_weight(weight, padded_rows, *, dtype=None):
+    """The head's physical row count may exceed the checkpoint's actual vocabulary."""
+    import numpy as np
+
+    if weight.ndim != 2 or padded_rows < weight.shape[0]:
+        raise ValueError("invalid vocabulary head padding")
+    if dtype is None or np.dtype(dtype) == weight.dtype:
+        if padded_rows == weight.shape[0]:
+            return weight
+        return np.pad(weight, ((0, padded_rows - weight.shape[0]), (0, 0)))
+    # Cast bounded slices into final storage, not a second full converted vocabulary table.
+    out = np.zeros((padded_rows, weight.shape[1]), dtype=dtype)
+    for start in range(0, weight.shape[0], 1024):
+        end = min(start + 1024, weight.shape[0])
+        out[start:end] = weight[start:end]
+    return out
+
+
+def embedding_source_metadata(weights_dir, spec_name, layers):
+    """Carry the pinned import receipt into both target artifact writers."""
+    if not spec_name.startswith("qwen3-embedding-"):
+        return None
+    import json
+    from pathlib import Path
+
+    if not weights_dir:
+        raise ValueError("embedding artifacts require a pinned local weight dump")
+    pins = json.loads((Path(__file__).resolve().parents[2] / "scripts/qwen_embedding_pins.json").read_text())
+    pin = pins[spec_name]
+    manifest = json.loads((Path(weights_dir) / "quant.json").read_text())
+    source = manifest.get("embedding_source", {})
+    if (manifest.get("spec") != spec_name or manifest.get("layers") != layers
+            or source.get("model") != pin["repo"] or source.get("revision") != pin["revision"]):
+        raise ValueError("embedding dump spec, depth or pinned source identity mismatch")
+    files = source.get("files", {})
+    if set(files) != set(pin["files"]):
+        raise ValueError("embedding source receipt does not cover the pinned files")
+    for name, expected in pin["files"].items():
+        value = files[name]
+        if (not isinstance(value, str) or len(value) != 64
+                or any(c not in "0123456789abcdef" for c in value)
+                or ("sha256" in expected and value != expected["sha256"])):
+            raise ValueError(f"invalid pinned embedding source digest: {name}")
+    return source
 
 
 def operator_rejects(op_cls, kwargs):

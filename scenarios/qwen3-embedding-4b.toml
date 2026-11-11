@@ -1,0 +1,24 @@
+[scenario]
+kind = "embeddings"
+name = "qwen3-embedding-4b"
+
+[model]
+hidden = 2560
+ff = 9728
+n_heads = 32
+head_dim = 128
+n_layers = 36
+max_seq = 512
+precision = "bf16"
+
+[artifacts]
+decode = "artifacts/qwen3-embedding-4b/decode_s512_t64_bf16"
+prefill = "artifacts/qwen3-embedding-4b/prefill_m256_s512_t64_bf16"
+tokenizer_dir = "artifacts/qwen3-embedding-4b/tokenizer"
+
+[embeddings]
+backbone = "qwen3-embedding-4b"
+pooling = "last"
+normalize = true
+
+[kernels]

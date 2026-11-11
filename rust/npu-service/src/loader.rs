@@ -19,6 +19,8 @@ pub use npu_models::capability::Servable;
 /// Every `Servable` this crate constructs implements this too (the registry stores
 /// `Box<dyn StreamServable>`); the default answers `Unsupported` for a model that cannot generate.
 pub trait StreamServable: Servable {
+    fn embedding_metadata(&self) -> Option<npu_models::api::EmbeddingMetadata> { None }
+
     fn generate_stream(
         &mut self,
         _prompt: &npu_models::Prompt,
@@ -98,6 +100,10 @@ impl Servable for EngineModel {
                 let refs: Vec<_> = texts.iter().map(String::as_str).collect();
                 self.model.embed_batch(&refs).map(Response::Vectors)
             }
+            Request::Embeddings { texts, options } => {
+                let refs: Vec<_> = texts.iter().map(String::as_str).collect();
+                self.model.embed_batch_with_options(&refs, &options).map(Response::Vectors)
+            }
             // Neither engine scenario takes an image, so this is a routing bug rather than a user
             // error -- but still a Result, because the actor must not be panicked by one.
             Request::Image { .. } => Err(EngineError::WrongKind {
@@ -109,6 +115,8 @@ impl Servable for EngineModel {
 }
 
 impl StreamServable for EngineModel {
+    fn embedding_metadata(&self) -> Option<npu_models::api::EmbeddingMetadata> { self.model.embedding_metadata() }
+
     /// `Model::generate` already returns `WrongKind` for a non-Generate scenario, so this is a plain
     /// delegation -- no capability check duplicated here.
     fn generate_stream(&mut self, prompt: &npu_models::Prompt, params: &npu_models::GenerateParams,

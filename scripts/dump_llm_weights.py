@@ -21,6 +21,7 @@ kernel share a byte layout, and nothing else checks it.
 import argparse
 import json
 import os
+from pathlib import Path
 import sys
 
 import numpy as np
@@ -29,7 +30,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "..", "designs", "decode_fused"))
 from llm_decode_spec import SPECS, k_chunks_for  # noqa: E402
 
-HF_REPO = {"qwen3-0.6b": "Qwen/Qwen3-0.6B", "gemma3-270m": "unsloth/gemma-3-270m-it",
+HF_REPO = {"qwen3-0.6b": "Qwen/Qwen3-0.6B",
+           "qwen3-embedding-0.6b": "Qwen/Qwen3-Embedding-0.6B",
+           "qwen3-embedding-4b": "Qwen/Qwen3-Embedding-4B",
+           "gemma3-270m": "unsloth/gemma-3-270m-it",
            "gemma4-12b": "google/gemma-4-12B-it-qat-q4_0-unquantized", "qwen3.5-4b": "Qwen/Qwen3.5-4B",
            "whisper-small": "openai/whisper-small",
            "whisper-turbo": "openai/whisper-large-v3-turbo"}
@@ -101,6 +105,27 @@ def main():
     sp = SPECS[a.spec]
     repo = a.repo or HF_REPO[a.spec]
     NL = a.layers if a.layers is not None else sp.n_layers
+    embedding_source = None
+    embedding_shards = None
+    if a.spec.startswith("qwen3-embedding-"):
+        if not a.checkpoint_dir or a.repo is not None:
+            ap.error("Qwen embedding export requires a pinned local --checkpoint-dir and forbids --repo")
+        from qwen_embedding import model_pin, verify_files
+        pin = model_pin(a.spec)
+        try:
+            hashes = verify_files(Path(a.checkpoint_dir), pin)
+        except ValueError as exc:
+            ap.error(str(exc))
+        embedding_source = {"model": pin["repo"], "revision": pin["revision"], "files": hashes}
+        embedding_shards = [os.path.join(a.checkpoint_dir, name) for name in pin["files"]
+                            if name.endswith(".safetensors")]
+        if not 1 <= NL <= sp.n_layers:
+            ap.error("embedding --layers must be within the pinned backbone depth")
+        if os.path.isdir(a.out) and os.listdir(a.out):
+            if not a.resume:
+                ap.error("embedding output is not empty; use a new directory or identity-checked --resume")
+            if not os.path.isfile(os.path.join(a.out, "_dump_progress.json")):
+                ap.error("embedding --resume requires existing source/format progress metadata")
     os.makedirs(a.out, exist_ok=True)
 
     # HF stores nn.Linear weights as [out, in].
@@ -138,7 +163,8 @@ def main():
     else:
         from huggingface_hub import snapshot_download
         path = snapshot_download(repo, allow_patterns=["*.safetensors", "*.json"])
-    shards = [os.path.join(path, f) for f in sorted(os.listdir(path)) if f.endswith(".safetensors")]
+    shards = embedding_shards if embedding_shards is not None else [
+        os.path.join(path, f) for f in sorted(os.listdir(path)) if f.endswith(".safetensors")]
     index = {}
     for s in shards:
         # framework="pt": these checkpoints are bf16, which safetensors' numpy backend cannot read
@@ -248,12 +274,16 @@ def main():
         return np.concatenate(parts)
 
     prog_path = os.path.join(a.out, "_dump_progress.json")
-    fmt_key = json.dumps({k: getattr(a, k) for k in (
+    fmt = {k: getattr(a, k) for k in (
         "quant", "quant_group", "quant_layout", "quant_scale_dtype", "quant_full_range",
-        "quant_clip_search", "quant_leaves", "layers", "cols")}, sort_keys=True)
+        "quant_clip_search", "quant_leaves", "layers", "cols")}
+    if embedding_source is not None:
+        fmt["embedding_source"] = embedding_source
+    fmt_key = json.dumps(fmt, sort_keys=True)
     done = {}
     if a.resume and os.path.isfile(prog_path):
-        _prev = json.load(open(prog_path))
+        with open(prog_path) as progress_file:
+            _prev = json.load(progress_file)
         if _prev.get("fmt") != fmt_key:
             raise SystemExit(
                 f"[dump] --resume refused: {prog_path} was written under a different format.\n"
@@ -334,6 +364,10 @@ def main():
         "packed": sorted(packed),
         "note": "packed arrays are np.int8 on-wire bytes, NOT values -- never .astype()",
     }
+    if embedding_source is not None:
+        manifest["embedding_source"] = embedding_source
+        manifest["spec"] = a.spec
+        manifest["layers"] = NL
     with open(os.path.join(a.out, "quant.json"), "w") as f:
         json.dump(manifest, f, indent=2)
 

@@ -815,7 +815,14 @@ impl Handle {
         }
     }
     pub fn embed_batch(&self, model: Option<&str>, texts: &[String]) -> Result<Served<Vec<Vec<f32>>>, EngineError> {
-        let s = self.serve(Capability::EMBED, model, Request::Texts(texts.to_vec()))?;
+        self.embed_batch_with_options(model, texts, npu_models::api::EmbeddingOptions::default())
+    }
+    pub fn embed_batch_with_options(&self, model: Option<&str>, texts: &[String], options: npu_models::api::EmbeddingOptions)
+        -> Result<Served<Vec<Vec<f32>>>, EngineError> {
+        let request = if options == npu_models::api::EmbeddingOptions::default() {
+            Request::Texts(texts.to_vec())
+        } else { Request::Embeddings { texts: texts.to_vec(), options } };
+        let s = self.serve(Capability::EMBED, model, request)?;
         match s.value {
             Response::Vectors(v) if v.len() == texts.len() =>
                 Ok(Served { model: s.model, value: v, queue_us: s.queue_us, load_us: s.load_us }),
@@ -1370,6 +1377,7 @@ mod bound_tests {
             busy,
             pinned: false,
             pin_honored: false,
+            embedding: None,
         }
     }
 

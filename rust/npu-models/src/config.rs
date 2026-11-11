@@ -325,6 +325,9 @@ impl Artifacts {
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct EmbeddingsCfg {
+    /// Explicit causal embedding backbone. None preserves the existing BERT/ESM scenarios.
+    #[serde(default)]
+    pub backbone: Option<String>,
     #[serde(default = "default_pooling")]
     pub pooling: String, // mean | cls
     #[serde(default = "default_true")]
@@ -335,7 +338,7 @@ pub struct EmbeddingsCfg {
     pub batch_rows: Option<usize>,
 }
 impl Default for EmbeddingsCfg {
-    fn default() -> Self { EmbeddingsCfg { pooling: default_pooling(), normalize: true, batch_rows: None } }
+    fn default() -> Self { EmbeddingsCfg { backbone: None, pooling: default_pooling(), normalize: true, batch_rows: None } }
 }
 fn default_pooling() -> String { "mean".into() }
 fn default_true() -> bool { true }
@@ -381,6 +384,29 @@ normalize = true
         assert_eq!(c.model.as_ref().unwrap().hidden, 768);
         assert_eq!(c.model.as_ref().unwrap().precision, "bf16"); // default applied
         assert!(c.embeddings.normalize);
+    }
+
+    #[test]
+    fn qwen_embedding_scenario_declares_the_full_bf16_contract() {
+        let config = ScenarioConfig::load(std::path::Path::new(
+            "../../scenarios/qwen3-embedding-4b.toml")).expect("Qwen embedding scenario");
+        assert_eq!(config.scenario.kind, "embeddings");
+        assert_eq!(config.scenario.name, "qwen3-embedding-4b");
+        let model = config.model.as_ref().unwrap();
+        assert_eq!((model.hidden, model.ff, model.n_heads, model.head_dim,
+                    model.n_layers, model.max_seq), (2560, 9728, 32, 128, 36, 512));
+        assert_eq!(model.precision, "bf16");
+        assert_eq!(config.embeddings.backbone.as_deref(), Some("qwen3-embedding-4b"));
+        assert_eq!(config.embeddings.pooling, "last");
+        assert!(config.embeddings.normalize);
+        assert!(config.embeddings.batch_rows.is_none());
+        assert!(config.kernels.as_ref().unwrap().is_empty());
+        for path in [&config.artifacts.decode, &config.artifacts.prefill,
+                     &config.artifacts.tokenizer_dir] {
+            assert!(path.starts_with("artifacts/qwen3-embedding-4b/"), "{path}");
+            assert!(!std::path::Path::new(path).is_absolute());
+        }
+        assert!(config.artifacts.resident.is_empty());
     }
 
     #[test]

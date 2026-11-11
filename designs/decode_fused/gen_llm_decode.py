@@ -47,9 +47,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.p
 from buffer_blob import write_blob  # noqa: E402
 from data_root import XDNA_SCRATCH  # noqa: E402
 from elf_zst import write_elf  # noqa: E402
-from llm_decode_spec import (SPECS, C_TILE_GRANULE, L1_BYTES, L1_RESERVE,  # noqa: E402,F401
+from llm_decode_spec import (SPECS, pad_vocab_weight, C_TILE_GRANULE, L1_BYTES, L1_RESERVE,  # noqa: E402,F401
                              gemv_fits, gemv_tile_output, k_chunks_for, operator_rejects)
 from rope_int_phase import inv_freq_to_turns_u32  # noqa: E402
+from scratchpad_metadata import sequence_scratchpad_metadata  # noqa: E402
 
 # Dataflow switches, read ONCE at module scope. They are consumed in three different functions
 # (graph construction, the runlist, and the meta writer), and defining them next to their first
@@ -2528,6 +2529,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             # No force_header_first: unlike attn_block_dp, this design reads Wq/Wk/Wv as
             # contiguous stock rows (no per-head reorder), so it takes the dump's own layout.
             op_qkv_dp = QKVHeadDataParallel(D=D, HD=hd, Hq=Hq, Hkv=hkv, max_seq=KVA,
+                                            # Append layout follows capacity, not the attention window.
+                                            kv_block_size=None if T == KVA else T,
                                             num_aie_columns=sp.qkv_dp_cols(COLS, n_kv_heads=hkv),
                                             epsilon=sp.eps,
                                             tile_size_input=TSI, context=ctx,
@@ -3872,7 +3875,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         embed_blob = "W_embed"
         host_embed = bf16(embed_f32).reshape(-1)
     else:
-        weights["W_head"] = bf16(head_f32).reshape(-1)
+        weights["W_head"] = pad_vocab_weight(head_f32, VOCAB_M, dtype=BF16).reshape(-1)
     logit_bias = None
     if sp.norm_kind == "layer":
         # The final LayerNorm folds into the head like every other one: the device streams
@@ -4168,6 +4171,9 @@ def main():
     # a-name-that-means-three-things-fails-at-the-site-without-the-comment.
     ap.add_argument("--max-seq", type=int, default=2048, help="KV-cache padded capacity S")
     a = ap.parse_args()
+    from llm_decode_spec import embedding_source_metadata
+    embedding_source = embedding_source_metadata(
+        a.weights, a.spec, a.layers if a.layers is not None else SPECS[a.spec].n_layers)
     os.makedirs(os.path.join(a.out, "buffers"), exist_ok=True)
     sp, fused, weights, md = build_graph(a.spec, a.weights, a.layers, a.max_seq)
     NL, S, T, inputs, cache_names = md["NL"], md["S"], md["T"], md["inputs"], md["cache_names"]
@@ -4203,18 +4209,7 @@ def main():
     if md.get("final_hidden"):
         lay[md["final_hidden"]] = fused.get_layout_for_buffer(md["final_hidden"])
 
-    import glob
-    import shutil
-    # The project dir suffix moved from `.mlir.prj` to `.mlir.d`; match params.txt wherever aiecc
-    # put it under the build tree rather than pinning a suffix that has already changed once.
-    _pp = sorted(glob.glob("**/params.txt", recursive=True), key=os.path.getmtime)
-    scratchpad_params = {}
-    if _pp:
-        shutil.copy(_pp[-1], os.path.join(a.out, "params.txt"))
-        for line in open(_pp[-1]).read().splitlines()[1:]:
-            if line.strip():
-                n_, idx, ty, kind = line.split()
-                scratchpad_params[n_] = {"byte_offset": int(idx) * 4, "kind": kind, "dtype": ty}
+    scratchpad_params = sequence_scratchpad_metadata(fused, a.out)
 
     bdir = os.path.join(a.out, "buffers")
     for n_, arr in weights.items():
@@ -4417,6 +4412,8 @@ def main():
               "(no git checkout resolvable) -- staleness against designs/decode_fused HEAD will "
               "be invisible to any future check", file=sys.stderr)
     meta.update(elf_prov)
+    if embedding_source is not None:
+        meta["embedding_source"] = embedding_source
     json.dump(meta, open(os.path.join(a.out, "meta.json"), "w"), indent=2)
     print(f"\nwrote {NL}-layer {sp.name} decode ELF ({len(elf)}B, scratch {scr/1e6:.1f}MB) to {a.out}")
 
