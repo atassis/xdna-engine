@@ -3302,12 +3302,16 @@ mod tests {
     #[test]
     fn toolchain_stamped_but_unresolvable_pin_loads_with_a_warning_not_an_error() {
         let dir = tempfile::tempdir().unwrap();
-        // Stamped, but no toolchain.lock anywhere above this dir -- the production-install shape
-        // the design constraint requires: a shipped consumer must not need toolchain.lock to exist.
+        // TMPDIR may live under a checkout's toolchain.lock. The descriptor path gives this
+        // fixture an unpinned lexical root without needing a writable directory outside TMPDIR.
+        use std::os::fd::AsRawFd;
+        let directory = std::fs::File::open(dir.path()).unwrap();
+        let unpinned = std::path::PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+        assert_eq!(LlmArtifact::resolve_current_pin_hash(&unpinned).unwrap(), None);
         let mut meta = base_meta(8, 4, serde_json::json!({"rope_global": {"type": "input", "offset": 8, "len": 8}}));
         meta["toolchain"] = serde_json::json!({"hash": "9da6356ac521"});
         write_meta(dir.path(), &meta);
-        let art = LlmArtifact::load(dir.path()).expect("an unresolvable pin must be a warning, not fatal");
+        let art = LlmArtifact::load(&unpinned).expect("an unresolvable pin must be a warning, not fatal");
         assert_eq!(art.toolchain_hash.as_deref(), Some("9da6356ac521"));
     }
 

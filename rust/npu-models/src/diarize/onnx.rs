@@ -232,8 +232,16 @@ mod tests {
         // The point of the setting is that it is NOT the shim's 1 and NOT available_parallelism.
         let cores = physical_cores();
         assert!(cores >= 1, "physical core count must be usable as a thread count");
-        let logical = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-        assert!(cores <= logical, "physical cores {cores} cannot exceed hardware threads {logical}");
+        // A cgroup quota limits available_parallelism, not the hardware topology counted above.
+        let logical = std::fs::read_dir("/sys/devices/system/cpu").ok()
+            .map(|entries| entries.flatten().filter(|e| e.path().join("topology/core_id").is_file()).count())
+            .filter(|&n| n > 0);
+        if let Some(logical) = logical {
+            assert!(cores <= logical, "physical cores {cores} cannot exceed hardware threads {logical}");
+        } else {
+            let available = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+            assert_eq!(cores, (available / 2).max(1), "unreadable topology uses the documented fallback");
+        }
         // An override must win, including one that disagrees with the machine.
         std::env::set_var("NPU_DIARIZE_THREADS", "3");
         assert_eq!(embed_threads(), 3);

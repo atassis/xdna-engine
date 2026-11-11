@@ -1,20 +1,24 @@
 # Qwen3 Embedding verification and delivery candidate
 
 The causal adapter supports the pinned embedding checkpoints below through the existing engine API.
-The full **36-layer 4B BF16 baseline** has passed bounded NPU numerical, ranking and independent-state
-checks with both M1 sequential priming and repaired M256 token-block prefill. The smaller 0.6B M1
-candidate also passed real CLI/HTTP and lifecycle checks; those served-path checks remain outstanding
-for 4B. These results do not establish superiority over BGE or production/index compatibility.
+The full **36-layer 4B BF16 baseline** has passed bounded current-toolchain NPU numerical, ranking,
+independent-state and real source-built CLI/HTTP/lifecycle checks with M256 token-block prefill.
+Historical M1 sequential-priming results and the smaller 0.6B candidate are separate qualifications,
+not fallbacks or evidence transferred to 4B. These results do not establish superiority over BGE or
+production/index compatibility.
 BGE defaults are unchanged. Qwen3 generation artifacts are not embedding weights.
 
 The selectable 4B delivery candidate is `scenarios/qwen3-embedding-4b.toml`. It uses full-dimensional
 BF16 decode/prefill artifacts and relocatable artifact paths. It is not included in the default model
-configuration. The candidate pins clean IRON source containing the QKV scheduling and LUT SiLU fixes.
-Installation remains gated on full-model artifacts compatible with the selected toolchain and real 4B
-CLI/HTTP/lifecycle verification. Retained development images are not release-safe merely because
-their numerical results passed; do not bypass toolchain or IRON provenance checks. The candidate's
-current-toolchain decode builds, but paired prefill is blocked on migrating IRON GEMM to the current
-tap/FIFO APIs. The full recipe is therefore not yet an accepted end-to-end build.
+configuration. The candidate pins clean IRON source containing the QKV scheduling, LUT SiLU and current task/TAP
+GEMM fixes. The complete current-toolchain decode and paired M256/S512/T64 prefill recipe has built
+and passed bounded full-model and real-interface qualification. GEMM repeat dispatch uses the
+supported named repeat parameter; A fill TAPs retain their actual row-group capacity through final
+machine-BD lowering. Intermediate IR alone is not the qualification gate.
+
+These are local development-artifact results, not a supported installation or release-binary claim.
+Retained images are not release-safe merely because their numerical results passed; preserve their
+source, artifact and toolchain identities. Installation, service cutover and adoption remain separate.
 
 ## Pinned model contract
 
@@ -147,12 +151,11 @@ uses the logical vocabulary. Host-only embedding sidecars remain exact logical-s
 not device-head packing. Both artifact writers carry the pinned source receipt, and shared-arena
 prefill rejects a different decode source.
 
-Offline build checks cover a 512-capacity decode artifact and a separate paired decode/prefill
-artifact at physical capacity 2048 with 256 **token rows**, not 256 independent documents.
-The latter reuses existing `seed`/`assumed` GEMM registry entries, not measured performance winners.
-The initial 512-total-token input policy is unchanged. A 32-row prefill violates the 512-capacity
-decode's 64-row KV block; the legal 64-row shape is not in the registry. No guard was disabled or
-registry entry invented to force those configurations through.
+Early offline checks covered a 512-capacity decode artifact and a separate paired artifact at
+physical capacity 2048. The current full recipe instead pairs S512/T64 decode with M256 prefill:
+256 **token rows**, not 256 independent documents. Its GEMM registry choices are baseline schedule
+data, not measured performance winners. The 512-total-token input policy and KV-block constraints
+are unchanged; no guard was disabled to force an incompatible prefill geometry through.
 
 ELF digests, declared weight sizes, shared weight offsets, selected embedding rows, vocabulary
 padding and final-norm representation have been checked offline. Those checks alone are **not
@@ -188,6 +191,11 @@ MODEL_EXPORT_PY="$CPU_PYTHON" MODEL_IRON_PY="$IRON_PYTHON" \
 Python paths to prepared export/IRON environments and the data paths to the intended disk-backed
 roots. After resource/execution admission, `--build` uses the same staged recipe. A completed build
 still needs numerical and real-interface qualification; it does not install or register the model.
+
+Service admission estimates fused decode/prefill from their declared input/output/scratch arena
+sizes: take each arena's maximum across the pair, with the allocator's minimum BO size. The shared
+weight arena is counted once. An empty `artifacts.weights` is not a request to total the engine root.
+Missing metadata remains an unknown estimate, and the existing post-load BO ceiling still applies.
 
 ## Source adapter and API (not deployed)
 
@@ -261,12 +269,10 @@ precision and target errors. A matching profile or artifact hash prefix alone is
 
 ## Bounded qualification and remaining delivery
 
-The explicit M1 BF16 candidate passed full bounded numerical/repeat checks, the real Model API,
-source-built CLI/HTTP validation and cold/unload/failed-reload recovery. Bounded retrieval showed
-no regression against the same Qwen original-FP32 CPU oracle; that is not a BGE comparison or a
-population-level quality/adoption result. The default batched-prefill path still has a retained
-numerical acceptance failure. A controlled replay distinguishes that path/handoff from sequential
-priming, but does not identify an individual operator or prove an intrinsic precision floor.
+The earlier explicit M1 BF16 candidate passed bounded numerical/repeat, Model API and served-path
+checks. Earlier batched-prefill failures remain evidence about those particular artifacts, not a
+failure of the subsequently repaired current-toolchain 4B M256 pair. No result here establishes an
+intrinsic precision floor, a BGE-relative quality win or population-level adoption quality.
 
 M1 uses the existing `NPU_LLM_PREFILL_BATCHED=0` switch on the process loading the model, not merely
 on a client connecting to an already-running service. It is an explicitly selected experimental
@@ -275,12 +281,24 @@ also controls other models using the same prefill primitive. Discovery's `serial
 independent input batching, not attestation of this internal schedule; qualify the actual process
 settings separately. Runtime/index qualification labels intentionally remain unchanged.
 
-The retained 4B BF16 M1 and repaired M256 runs passed numerical acceptance against independent
-original-weight FP32 references on 34 documents and 29 queries. Minimum vector cosine was
+The retained 4B BF16 M1 and the current-toolchain full-depth M256 pair passed numerical acceptance
+against independent original-weight FP32 references on 34 documents and 29 queries. Minimum vector cosine was
 0.9993694 for M1 and 0.9968951 for M256, with exact repeats. Both preserved all relevant-result ranks
 and hard-negative lists, including the reference's two existing hard-negative errors. The sample
 mixes synthetic development and historical cases; it is not an independent population-level quality
-benchmark or evidence that Qwen is better than BGE. M256 denotes token rows, not independent documents.
+benchmark or evidence that Qwen is better than BGE. For current M256, 23 of 29 complete candidate
+orderings differ despite identical relevant ranks, hard-negative lists and case/group metrics; metric
+parity is not full ranking identity or index compatibility. M256 denotes token rows, not documents.
+
+The current-source Model API also passed order/duplicate/neighbor independence, query/prepared-query
+equivalence, long-to-short state isolation, full-dimension validation and error recovery. A separate
+source-built development CLI and private service passed document/query vectors and 512-token
+boundaries, HTTP/CLI rejection and recovery, failed-reload metadata/BO cleanup, idle unload/reload,
+explicit stop, on-demand loading and server restart. CLI checks verify the private actor's loaded
+state and served counters rather than accepting a standalone CLI result as a service result. Parser
+errors exit 2 with usage help and do not advance that counter. BGE remains the default and matches
+the installed control before and after the temporary service windows; installed configuration,
+resources and model inventory are restored.
 
 The baseline still performs unused vocabulary-head computation, host token lookup and host L2
 normalization. The embedding-only fused endpoint is separate unfinished optimization work, not a
@@ -288,8 +306,8 @@ requirement for selectable BF16 delivery. INT8 and mixed INT4 weight-only paths 
 quantized-weight references, paired-kernel correctness, retrieval and measured cost checks; neither
 is qualified for this model. A generic quantization option is not a supported Qwen embedding artifact.
 
-4B CLI/HTTP/lifecycle, BGE-relative retrieval, matched cold/warm and indexing/query costs, reproducible
-release builds and adoption remain open. No 0.6B-to-4B numerical extrapolation or unmeasured speedup
+BGE-relative retrieval, matched cold/warm and indexing/query costs, reproducible release-binary
+qualification, supported installation and adoption remain open. No 0.6B-to-4B numerical extrapolation or unmeasured speedup
 is claimed. No Qwen embedding model is registered in the live service by these source changes.
 Do not assume an installed service implements them or that incompatible vectors can share an index.
 

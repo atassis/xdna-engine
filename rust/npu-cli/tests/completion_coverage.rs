@@ -137,6 +137,7 @@ const FREE_FORM_ARGS: &[(&str, &str)] = &[
     ("wav", "input WAV file path"),
     ("net", "SR net/schedule name -- from the operator's [[model]] list, not a fixed set"),
     ("text", "prose to embed -- arbitrary string"),
+    ("dimensions", "embedding dimension -- positive integer, validated by the selected model"),
     ("prompt", "generation prompt -- arbitrary string"),
     ("temperature", "sampling float -- arbitrary number"),
     ("top_p", "sampling float -- arbitrary number"),
