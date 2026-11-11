@@ -33,6 +33,60 @@ use crate::llm::multimodal::{self, MediaEmbeds};
 use crate::llm::npu_prefill::NpuPrefill;
 use crate::telemetry::ArmProvenance;
 
+#[cfg(test)]
+mod load_profile {
+    use std::{
+        cell::RefCell,
+        collections::BTreeMap,
+        time::{Duration, Instant},
+    };
+    thread_local! {
+        static TIMES: RefCell<Option<BTreeMap<&'static str, (u64, Duration)>>> = const { RefCell::new(None) };
+    }
+    pub(super) fn begin(enabled: bool) {
+        TIMES.with(|t| *t.borrow_mut() = enabled.then(BTreeMap::new));
+    }
+    pub(super) fn start() -> Option<Instant> {
+        TIMES.with(|t| t.borrow().is_some().then(Instant::now))
+    }
+    pub(super) fn finish(name: &'static str, start: Option<Instant>) {
+        if let Some(start) = start {
+            let elapsed = start.elapsed();
+            TIMES.with(|t| {
+                if let Some(times) = t.borrow_mut().as_mut() {
+                    let item = times.entry(name).or_default();
+                    item.0 += 1;
+                    item.1 += elapsed;
+                }
+            });
+        }
+    }
+    pub(super) fn report() {
+        TIMES.with(|t| {
+            if let Some(times) = t.borrow_mut().take() {
+                let times: BTreeMap<_, _> = times.into_iter().map(|(name, (calls, duration))|
+                    (name, serde_json::json!({"calls": calls, "wall_ms": duration.as_secs_f64() * 1000.0}))).collect();
+                eprintln!("source-native load phases: {}", serde_json::json!(times));
+            }
+        });
+    }
+    #[test]
+    fn scopes_are_opt_in_and_accumulate() {
+        assert!(start().is_none());
+        begin(true);
+        finish("probe", start());
+        finish("probe", start());
+        TIMES.with(|t| {
+            let t = t.borrow();
+            let t = t.as_ref().unwrap();
+            assert_eq!(t.len(), 1);
+            assert_eq!(t["probe"].0, 2);
+        });
+        report();
+        assert!(start().is_none());
+    }
+}
+
 pub(crate) fn pack_bf16_bytes(f: &[f32]) -> Vec<u8> {
     let mut bits = vec![0u16; f.len()];
     npu_xrt::pack_f32_to_bf16(f, &mut bits);
@@ -156,8 +210,12 @@ fn check_blob_len(artifact: &LlmArtifact, name: &str) -> Result<(), EngineError>
 }
 
 fn upload_blob(arena: &FusedArena, artifact: &LlmArtifact, name: &str) -> Result<(), EngineError> {
+    #[cfg(test)]
+    let phase = load_profile::start();
     let bytes = std::fs::read(artifact.weight_blob_path(name))
         .map_err(|e| EngineError::Load(format!("read weight buffer {name}.bin: {e}")))?;
+    #[cfg(test)]
+    load_profile::finish("prepared.read", phase);
     let loc = artifact.loc(name);
     if bytes.len() != loc.len {
         return Err(EngineError::Load(format!(
@@ -166,9 +224,14 @@ fn upload_blob(arena: &FusedArena, artifact: &LlmArtifact, name: &str) -> Result
             loc.len
         )));
     }
-    arena
+    #[cfg(test)]
+    let phase = load_profile::start();
+    let result = arena
         .write_at(loc.arena, loc.off, &bytes)
-        .map_err(|e| EngineError::Load(format!("write weight buffer {name}: {e}")))
+        .map_err(|e| EngineError::Load(format!("write weight buffer {name}: {e}")));
+    #[cfg(test)]
+    load_profile::finish("prepared.arena_write", phase);
+    result
 }
 
 /// A resident device backend for one decoder-LLM fused decode ELF. Construction registers the
@@ -440,6 +503,8 @@ struct CheckpointWeights {
 
 fn checkpoint_plan(artifact: &LlmArtifact, prefill: Option<&LlmArtifact>, checkpoint: &Path) -> Result<CheckpointWeights, EngineError> {
     use npu_weights::source_native::{plan::WeightPlan, safetensors::SafetensorsFile, Limits};
+    #[cfg(test)]
+    let phase = load_profile::start();
     let err = |e| EngineError::Load(format!("source-native weights: {e}"));
     let contract = artifact.weight_inputs.as_ref()
         .ok_or_else(|| err("artifact has no graph-owned weight-input contract".into()))?;
@@ -464,23 +529,20 @@ fn checkpoint_plan(artifact: &LlmArtifact, prefill: Option<&LlmArtifact>, checkp
     if plan.embedding().shape != [artifact.vocab.unwrap_or(0), artifact.d_model] {
         return Err(err("embedding shape differs from program geometry".into()));
     }
+    #[cfg(test)]
+    load_profile::finish("source.validate", phase);
+    #[cfg(test)]
+    let phase = load_profile::start();
     let source = plan.embedding().span.source();
-    let mut scratch = vec![0u8; 64 * 1024];
-    let mut hash = Sha256::new();
-    let mut offset = 0;
-    while offset < source.len() {
-        let n = (source.len() - offset).min(scratch.len() as u64) as usize;
-        source.read_exact_at(offset, &mut scratch[..n]).map_err(|e| err(e.to_string()))?;
-        hash.update(&scratch[..n]);
-        offset += n as u64;
-    }
     let provenance = crate::telemetry::WeightSourceProvenance {
         path: source.path().display().to_string(),
-        sha256: format!("{:x}", hash.finalize()),
+        sha256: None,
         config_sha256: format!("{:x}", Sha256::digest(&config)),
         input_contract_sha256: format!("{:x}", Sha256::digest(serde_json::to_vec(contract)
             .map_err(|e| err(e.to_string()))?)),
     };
+    #[cfg(test)]
+    load_profile::finish("source.provenance", phase);
     Ok(CheckpointWeights { plan, provenance })
 }
 
@@ -488,6 +550,7 @@ impl NpuDecodeStep {
     /// Opt-in loader-only path. `checkpoint` contains the selected immutable model.safetensors
     /// and config.json; the artifact must declare its graph-owned weight-input contract.
     /// No prepared-weight fallback, numerical-source selection, or default change is performed.
+    /// Opens validate the source contract but do not compute a full weight-content fingerprint.
     pub fn from_checkpoint(dev: &Rc<Device>, decode_dir: &Path, prefill_dir: Option<&Path>, checkpoint: &Path) -> Result<Self, EngineError> {
         Self::build(dev, decode_dir, prefill_dir, Some(checkpoint))
     }
@@ -515,6 +578,8 @@ impl NpuDecodeStep {
     }
 
     fn build(dev: &Rc<Device>, decode_dir: &Path, prefill_dir: Option<&Path>, checkpoint: Option<&Path>) -> Result<Self, EngineError> {
+        #[cfg(test)]
+        let phase = load_profile::start();
         let artifact = LlmArtifact::load(decode_dir)?;
         // Mirrors this exact loop's writes below (`x_loc`, `rope_loc`) -- an artifact declaring a
         // third per-token input buffer would otherwise leave it unwritten every token, silently.
@@ -534,8 +599,18 @@ impl NpuDecodeStep {
             p.check_per_token_writes(&p.per_dispatch_writes())?;
         }
 
+        #[cfg(test)]
+
+        load_profile::finish("build.metadata", phase);
+        #[cfg(test)]
+        let phase = load_profile::start();
         let source_plan = checkpoint.map(|root| checkpoint_plan(&artifact, pre_art.as_ref(), root)).transpose()?;
 
+        #[cfg(test)]
+
+        load_profile::finish("build.source_plan", phase);
+        #[cfg(test)]
+        let phase = load_profile::start();
         // One arena for both ELFs, sized to the larger of the two. A buffer is addressed by offset
         // within its arena, so a larger arena is transparent to the smaller graph.
         let max2 = |f: fn(&LlmArtifact) -> usize| f(&artifact).max(pre_art.as_ref().map_or(0, f));
@@ -544,6 +619,11 @@ impl NpuDecodeStep {
                 .map_err(|e| EngineError::Load(format!("alloc fused arenas: {e}")))?,
         );
 
+        #[cfg(test)]
+
+        load_profile::finish("build.arena_alloc", phase);
+        #[cfg(test)]
+        let phase = load_profile::start();
         // A cache buffer's blob is not uploaded: the zeroing pass below overwrites that whole
         // region, so reading it would place bytes nothing goes on to observe. Measured across the
         // 115 cache-bearing artifacts on this box (2026-09-11), that read is 0.22 GB per artifact
@@ -557,9 +637,14 @@ impl NpuDecodeStep {
                 if !artifact.cache_buffers.contains(name) {
                     let loc = artifact.loc(name);
                     plan.plan.write_buffer(name, weight_scratch.as_mut().unwrap(), |offset, bytes| {
-                        arena.write_at(loc.arena, loc.off.checked_add(offset)
+                        #[cfg(test)]
+                        let phase = load_profile::start();
+                        let result = arena.write_at(loc.arena, loc.off.checked_add(offset)
                             .ok_or_else(|| anyhow::anyhow!("weight offset overflow"))?, bytes)
-                            .map_err(|e| anyhow::anyhow!(e))
+                            .map_err(|e| anyhow::anyhow!(e));
+                        #[cfg(test)]
+                        load_profile::finish("source.arena_write", phase);
+                        result
                     }).map_err(|e| EngineError::Load(format!("prepare {name}: {e}")))?;
                 }
             } else if artifact.cache_buffers.contains(name) {
@@ -578,6 +663,10 @@ impl NpuDecodeStep {
                 upload_blob(&arena, p, name)?;
             }
         }
+        #[cfg(test)]
+        load_profile::finish("build.weights_read_transform_write", phase);
+        #[cfg(test)]
+        let phase = load_profile::start();
         // Zero every KV-cache buffer EXPLICITLY, never by trusting a shipped blob (a current
         // artifact ships none at all; an older one's is all-zero, but nothing here reads it to
         // check). This is what makes cross-request reuse safe: stale entries past `n_past` are
@@ -592,10 +681,20 @@ impl NpuDecodeStep {
                 .map_err(|e| EngineError::Load(format!("zero cache buffer {name}: {e}")))?;
         }
 
+        #[cfg(test)]
+
+        load_profile::finish("build.cache_zero", phase);
+        #[cfg(test)]
+        let phase = load_profile::start();
         // One bulk sync covers every buffer written above (scratch is never re-synced per token --
         // only `sync_input()` is, mirroring `asr::whisper_decoder::FusedDecoder`'s resident path).
         arena.sync_to_device().map_err(|e| EngineError::Load(format!("sync weights to device: {e}")))?;
 
+        #[cfg(test)]
+
+        load_profile::finish("build.arena_sync", phase);
+        #[cfg(test)]
+        let phase = load_profile::start();
         let elf = artifact.read_elf_bytes()?;
         // Content identity of the literal bytes this instance is about to run -- NOT a
         // reproducibility check (a full-ELF hash is not stable rebuild-to-rebuild, bootgen leaks
@@ -607,15 +706,28 @@ impl NpuDecodeStep {
             h.update(&elf);
             h.finalize().iter().take(6).map(|b| format!("{b:02x}")).collect()
         };
+        #[cfg(test)]
+        load_profile::finish("build.elf_read_hash", phase);
+        #[cfg(test)]
+        let phase = load_profile::start();
         let res = dev
             .open_elf_resident(&elf, Some(&artifact.kernel_name))
             .map_err(|e| EngineError::Load(format!("open_elf_resident (decode): {e}")))?;
         arena.bind_resident(&res).map_err(|e| EngineError::Load(format!("bind resident arena BOs: {e}")))?;
 
+        #[cfg(test)]
+
+        load_profile::finish("build.elf_open_bind", phase);
+        #[cfg(test)]
+        let phase = load_profile::start();
         // Prefill's angle rows are computed from the DECODE artifact's bases -- it is the authority
         // for a model constant and may leave them undeclared, and `check_prefill_pairing` has
         // already refused a pair whose prefill half declares a different one.
         let prefill = pre_art.map(|a| NpuPrefill::open(dev, a, &artifact, &arena)).transpose()?;
+        #[cfg(test)]
+        load_profile::finish("build.prefill_open", phase);
+        #[cfg(test)]
+        let phase = load_profile::start();
         let embed = match &source_plan {
             Some(plan) => EmbedTable::from_source(plan.plan.embedding(), match artifact.embed_scale {
                 None | Some(EmbedScale::None) => 1.0,
@@ -648,6 +760,11 @@ impl NpuDecodeStep {
             ..provenance_extras(&artifact.decode_dir)
         };
 
+        #[cfg(test)]
+
+        load_profile::finish("build.host_companions_provenance", phase);
+        #[cfg(test)]
+        let phase = load_profile::start();
         // The primary is itself a bucket -- the only one unless the artifact declares rungs.
         let mut buckets = vec![];
         // Rungs FIRST, while `res` is still owned here: each is another named control code in the
@@ -671,6 +788,9 @@ impl NpuDecodeStep {
         buckets.sort_by_key(|b| b.window);
         buckets.dedup_by_key(|b| b.window);
 
+        #[cfg(test)]
+
+        load_profile::finish("build.window_rungs", phase);
         Ok(NpuDecodeStep {
             artifact, arena, buckets, embed, rope_writes, prefill, provenance,
             media: MediaEmbeds::default(), greedy: false, pos_rows, logit_bias,
@@ -1250,7 +1370,7 @@ mod tests {
             };
             let mut step = NpuDecodeStep::from_checkpoint(&dev, source_only.path(), pre, &checkpoint).unwrap();
             assert_eq!(step.provenance().artifact_hash, program);
-            assert!(step.provenance().weight_source.is_some());
+            assert!(serde_json::to_value(step.provenance().weight_source.as_ref().unwrap()).unwrap()["sha256"].is_null());
             eprintln!("source-native device source: {:?}", step.provenance().weight_source);
             assert_eq!(step.bo_bytes(), resident_bytes, "source loading must not add a second arena");
             let actual = run(&mut step);
@@ -1278,6 +1398,7 @@ mod tests {
         assert!(matches!(kind.as_str(), "prepared" | "checkpoint"));
         let dev = Rc::new(Device::open(0).unwrap());
         for sample in 0..3 {
+            load_profile::begin(std::env::var_os("NPU_SOURCE_LOAD_PROFILE").is_some());
             let start = std::time::Instant::now();
             let step = match kind.as_str() {
                 "prepared" => NpuDecodeStep::new(&dev, &decode),
@@ -1286,6 +1407,7 @@ mod tests {
             }.unwrap();
             eprintln!("source-native load cost: kind={kind}, sample={sample}, wall_ms={:.3}, BO bytes={}, program={:?}",
                 start.elapsed().as_secs_f64() * 1000.0, step.bo_bytes(), step.provenance().artifact_hash);
+            load_profile::report();
             assert_eq!(step.provenance().weight_source.is_some(), kind == "checkpoint");
             drop(step);
         }
@@ -1301,8 +1423,17 @@ mod tests {
         let baseline = root("NPU_SOURCE_BASELINE");
         let mut shared_prefill = artifact.clone();
         shared_prefill.weights.retain(|n| n != "W_head" && n != "n_final");
+        let read_chars = || {
+            std::fs::read_to_string("/proc/thread-self/io").unwrap().lines()
+                .find_map(|line| line.strip_prefix("rchar:")).unwrap().trim().parse::<u64>().unwrap()
+        };
+        let before = read_chars();
         let prepared = checkpoint_plan(&artifact, Some(&shared_prefill), &checkpoint).unwrap();
-        assert_eq!(prepared.provenance.sha256.len(), 64);
+        let planning_read_bytes = read_chars() - before;
+        assert!(planning_read_bytes < 32 * 1024 * 1024,
+            "checkpoint planning read {planning_read_bytes} bytes; only bounded metadata should be read");
+        assert!(serde_json::to_value(&prepared.provenance).unwrap()["sha256"].is_null());
+        eprintln!("checkpoint planning metadata read bytes: {planning_read_bytes}");
         eprintln!("source provenance: {:?}", prepared.provenance);
         let plan = prepared.plan;
         shared_prefill.weights.push("unsupported_prefill_constant".into());

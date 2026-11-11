@@ -103,9 +103,26 @@ contract. Other graph/encoding combinations do not claim support merely because 
 `npu-models::llm::NpuDecodeStep::from_checkpoint` is an explicit opt-in entry point using that ABI,
 one shared decode/prefill arena, and source-backed host embedding rows. It currently opens a local
 `model.safetensors` plus `config.json`; missing/invalid contracts never select prepared blobs as a
-fallback. Existing constructors/defaults are unchanged. Runtime source/config/contract hashes are
-recorded separately from program identity; obtaining the full source hash adds a bounded read pass.
+fallback. Existing constructors/defaults are unchanged. Runtime records the source path and small
+config/contract hashes separately from program identity. Ordinary opens do not scan the checkpoint
+for a content fingerprint: source provenance reports `sha256: null`. Structural validation is not
+verification against a trusted expected digest, and a path is not a content identity. Sources must
+still remain unchanged while their views are alive. For an explicit offline fingerprint, use
+`sha256sum checkpoint/model.safetensors`; the loader does not cache or silently reuse that result.
 CPU byte comparison is not fresh compiler-emission, device, cold-load or quality acceptance.
+
+The host-only profiling example separates raw reads, source-reader reads, explicit SHA-256,
+contract-driven transformations and prepared-buffer reads. Use an optimized build and control
+page-cache state separately; repeated reads may measure memory rather than storage:
+
+```sh
+cargo run --release -p npu-weights --example profile_source_native -- \
+    read checkpoint artifact/meta.json
+cargo run --release -p npu-weights --example profile_source_native -- \
+    hash checkpoint artifact/meta.json
+```
+
+These probes do not allocate device storage or time a complete model open.
 
 ## Checks
 

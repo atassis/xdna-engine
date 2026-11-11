@@ -205,11 +205,14 @@ pub fn diff_design_breakdown(before: &[DesignCost], after: &[DesignCost]) -> Vec
         .collect()
 }
 
-/// Numerical-source identity is runtime provenance, not part of the compiled program's identity.
+/// Numerical-source provenance is independent of the compiled program's identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WeightSourceProvenance {
     pub path: String,
-    pub sha256: String,
+    /// None means no content fingerprint was computed. A digest alone is not verification
+    /// against a trusted expected value; ordinary checkpoint opens do not scan for one.
+    #[serde(default)]
+    pub sha256: Option<String>,
     pub config_sha256: String,
     pub input_contract_sha256: String,
 }

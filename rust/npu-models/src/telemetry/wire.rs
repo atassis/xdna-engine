@@ -709,7 +709,7 @@ mod tests {
     fn source_weight_provenance_round_trips_separately_from_program_identity() {
         let source = crate::telemetry::WeightSourceProvenance {
             path: "checkpoint/model.safetensors".into(),
-            sha256: "source-sha".into(),
+            sha256: Some("source-sha".into()),
             config_sha256: "config-sha".into(),
             input_contract_sha256: "contract-sha".into(),
         };
@@ -724,6 +724,28 @@ mod tests {
         assert_eq!(back.provenance.artifact_hash.as_deref(), Some("program-sha"));
         line["x_npu"]["provenance"].as_object_mut().unwrap().remove("weight_source");
         assert_eq!(parse_run(&line.to_string()).unwrap().summary.unwrap().provenance.weight_source, None);
+    }
+
+    #[test]
+    fn source_provenance_without_fingerprint_preserves_other_fields() {
+        for omit in [false, true] {
+            let mut line = summary_line(&a_report(), &meta(), FinishReason::Stop);
+            line["x_npu"]["provenance"]["weight_source"] = serde_json::json!({
+                "path": "checkpoint/model.safetensors",
+                "sha256": null,
+                "config_sha256": "config-sha",
+                "input_contract_sha256": "contract-sha",
+            });
+            if omit {
+                line["x_npu"]["provenance"]["weight_source"].as_object_mut().unwrap().remove("sha256");
+            }
+            let back = parse_run(&line.to_string()).unwrap().summary.unwrap();
+            let source = back.provenance.weight_source.expect("unhashed source provenance must not be discarded");
+            assert_eq!(source.path, "checkpoint/model.safetensors");
+            assert_eq!(source.config_sha256, "config-sha");
+            assert_eq!(source.input_contract_sha256, "contract-sha");
+            assert!(serde_json::to_value(source).unwrap()["sha256"].is_null());
+        }
     }
 
     #[test]
