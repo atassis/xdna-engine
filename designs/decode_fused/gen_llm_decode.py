@@ -45,11 +45,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.p
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, os.pardir,
                                 "scripts", "lib"))
 from buffer_blob import write_blob  # noqa: E402
+from weight_inputs import WeightInputs  # noqa: E402
 from data_root import XDNA_SCRATCH  # noqa: E402
 from elf_zst import write_elf  # noqa: E402
 from llm_decode_spec import (SPECS, C_TILE_GRANULE, L1_BYTES, L1_RESERVE,  # noqa: E402,F401
                              gemv_fits, gemv_tile_output, k_chunks_for, operator_rejects)
 from rope_int_phase import inv_freq_to_turns_u32  # noqa: E402
+from scratchpad_metadata import sequence_scratchpad_metadata  # noqa: E402
 
 # Dataflow switches, read ONCE at module scope. They are consumed in three different functions
 # (graph construction, the runlist, and the meta writer), and defining them next to their first
@@ -3208,6 +3210,11 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     op_head = gemv(VOCAB_M, D, ctx, **head_quant_kw, **_w_prologue("on"))
 
     weights, bufsz, cache_names, rl = {}, {}, [], []
+    weight_inputs = WeightInputs(
+        sp.checkpoint_model_type is not None and op_decode_layer is not None
+        and sp.norm_gain == "w" and sp.norm_kind == "rms"
+        and sp.tied_embeddings and not sp.attn_output_gate and not PACKED
+        and all(not _spec(site).quantized for site in ("qkv", "mlp", "attn_o", "head")))
     recurrent_names = []   # the cache buffers a position mask cannot hide; see npu_decode.rs reset()
     cross_names = []       # host-written once per utterance: neither weights nor reset by a new prompt
     if sp.v_norm:
@@ -3329,6 +3336,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 # a whole [Hq, S] elementwise pass. Scaled in f32 before the bf16 round.
                 w = bf16(np.asarray(w, np.float32) * sp.attn_scale)
             weights[p + key] = w
+            weight_inputs.rows(p + key, tensor, [w.size],
+                               scale=sp.attn_scale if key == "n_qn" and scale_in_qnorm else None)
         lin = sp.mixer_for(l) == "linear_attention"
         if lin:
             pl = f"{sp.weight_prefix}layers.{l}.linear_attn."
@@ -3361,6 +3370,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         mlp_keys = {"Wg", "Wu", "Wd"}
         qkv_keys = ("Wq", "Wk", "Wv")
         qkv_parts = []   # filled in Wq, Wk, Wv order below -- the row order op_qkv assumes
+        qkv_sources = []
         mixer_tensors = ((("Wo", "linear_attn.out_proj"),) if lin else
                          (("Wq", "self_attn.q_proj"), ("Wk", "self_attn.k_proj"),
                           ("Wv", "self_attn.v_proj"), ("Wo", "self_attn.o_proj")))
@@ -3436,6 +3446,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 _repack_grid = (_qmf.get("full_range", False), _qmf.get("clip_search", False))
             else:
                 w = npy(hf)  # [M, K], f32
+            weight_inputs.rows(p + key, hf, w.shape)
+            if key in qkv_keys:
+                qkv_sources.append((hf, list(w.shape)))
             if key == "Wq" and sp.attn_output_gate:
                 # HF views q_proj per head as [q | gate]; the gate half is its own GEMV.
                 wq = w.reshape(Hq, 2, g.hd, D)
@@ -3457,6 +3470,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 pad_rows = wo_rows_padded(D, QD, MLP_DP_COLS) - D
                 w_padded = np.pad(w, ((0, pad_rows), (0, 0)))
                 weights[p + key] = _pack(w_padded, "mlp", grid=_repack_grid)
+                weight_inputs.pad(p + key, pad_rows * g.qd * 2)
             elif key == "Wo" and _spec("attn_o").quantized:
                 # AFTER the fuse_o branch, not before it: fused Wo needs the pad, and testing the
                 # dtype first would send a quantized+fused Wo down the unpadded path.
@@ -3510,14 +3524,23 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                     ]
                 wq2, wk2, wv2 = (a.reshape(-1, row_w) for a in qkv_parts)
                 parts = []
+                input_parts = []
                 for c in range(g.hkv):
+                    for j, (source, shape) in enumerate(qkv_sources):
+                        first = c * (gqa_ if j == 0 else 1) * g.hd
+                        count = (gqa_ if j == 0 else 1) * g.hd
+                        part_name = f"{p}Wqkv_input_{c}_{j}"
+                        weight_inputs.rows(part_name, source, shape, first=first, count=count)
+                        input_parts.append(part_name)
                     parts += [wq2[(gqa_ * c + gi) * g.hd:(gqa_ * c + gi + 1) * g.hd]
                               for gi in range(gqa_)]
                     parts += [wk2[c * g.hd:(c + 1) * g.hd], wv2[c * g.hd:(c + 1) * g.hd]]
                 weights[p + "Wqkv"] = _stream_pad_rows(
                     np.concatenate(parts, axis=0), g.op_attn_block).reshape(-1)
+                weight_inputs.concat(p + "Wqkv", input_parts)
             else:
                 weights[p + "Wqkv"] = np.concatenate(qkv_parts)
+                weight_inputs.concat(p + "Wqkv", [p + key for key in qkv_keys])
         # Size is layout-independent (T < S rearranges the same elements) but PER GEOMETRY, and
         # the axis is the CAPACITY, not the window: Gemma-4's global layers are hkv=1/hd=512
         # against sliding 8/256, and under KV_ALLOC a global geometry's capacity exceeds its
@@ -3633,6 +3656,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             # eligibility precondition); `n_pf` stays separate, the MLP half's own argument.
             weights[p + "norms"] = np.concatenate(
                 [weights.pop(p + "n_in"), weights.pop(p + "n_qn"), weights.pop(p + "n_kn")])
+            weight_inputs.concat(p + "norms", [p + key for key in ("n_in", "n_qn", "n_kn")])
             bufsz[p + "kc"] = kv_layout.total_elems * 2
             bufsz[p + "vc"] = kv_layout.total_elems * 2
             bufsz[p + "cx"] = QD * 2
@@ -3845,6 +3869,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
 
     if sp.norm_kind == "rms":
         weights["n_final"] = load_norm(f"{sp.weight_prefix}norm.weight")
+        weight_inputs.rows("n_final", f"{sp.weight_prefix}norm.weight", [D])
     # The DEVICE's lm-head stream and the HOST's embedding-gather table. One tensor on a tied
     # spec, two on an untied one (s1-mini ships `output.weight`), which is why the head is asked
     # for by name rather than assumed to be the table.
@@ -3873,6 +3898,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         host_embed = bf16(embed_f32).reshape(-1)
     else:
         weights["W_head"] = bf16(head_f32).reshape(-1)
+        weight_inputs.rows("W_head", _head_key, head_f32.shape)
     logit_bias = None
     if sp.norm_kind == "layer":
         # The final LayerNorm folds into the head like every other one: the device streams
@@ -4129,7 +4155,17 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                                 buffer_sizes={"xf": D * 2, "logits": VOCAB_M * 2},
                                 context=ctx, extra_flags=placer_flags, share_designs=share)
         head.compile()
+    weight_contract = weight_inputs.finish(
+        {n: int(a.nbytes) for n, a in weights.items()
+         if n not in cache_names and n not in cross_names},
+        f"{sp.weight_prefix}embed_tokens.weight", [VOCAB, D],
+        dict(model_type=sp.checkpoint_model_type, hidden_size=D, intermediate_size=FF,
+             num_attention_heads=Hq, num_key_value_heads=Hkv, head_dim=HD,
+             num_hidden_layers=NL, vocab_size=VOCAB, tie_word_embeddings=sp.tied_embeddings,
+             hidden_act=sp.act, rms_norm_eps=sp.eps, rope_theta=sp.rope_theta_global,
+             rope_scaling=None, attention_bias=False, use_sliding_window=False))
     return sp, fused, weights, dict(NL=NL, S=S, T=T, inputs=inputs, cache_names=cache_names,
+                                        weight_inputs=weight_contract,
                                         recurrent_names=recurrent_names,
                                         cross_names=cross_names,
                                         final_hidden=final_hidden,
@@ -4203,18 +4239,7 @@ def main():
     if md.get("final_hidden"):
         lay[md["final_hidden"]] = fused.get_layout_for_buffer(md["final_hidden"])
 
-    import glob
-    import shutil
-    # The project dir suffix moved from `.mlir.prj` to `.mlir.d`; match params.txt wherever aiecc
-    # put it under the build tree rather than pinning a suffix that has already changed once.
-    _pp = sorted(glob.glob("**/params.txt", recursive=True), key=os.path.getmtime)
-    scratchpad_params = {}
-    if _pp:
-        shutil.copy(_pp[-1], os.path.join(a.out, "params.txt"))
-        for line in open(_pp[-1]).read().splitlines()[1:]:
-            if line.strip():
-                n_, idx, ty, kind = line.split()
-                scratchpad_params[n_] = {"byte_offset": int(idx) * 4, "kind": kind, "dtype": ty}
+    scratchpad_params = sequence_scratchpad_metadata(fused, a.out)
 
     bdir = os.path.join(a.out, "buffers")
     for n_, arr in weights.items():
@@ -4267,6 +4292,7 @@ def main():
         # W_head itself unless the lm-head was quantised, in which case W_head is packed and this
         # names the bf16 sidecar. Absent in older artifacts -- consumers default to "W_head".
         "embed_blob": embed_blob,
+        **({"weight_inputs": md["weight_inputs"]} if md["weight_inputs"] is not None else {}),
         # `kv_param` is the single-slot form every artifact before this carried, kept so an older
         # consumer still loads; `kv_params` is the list the host prefers.
         # window_param mirrors kv_param/mask_param -- the POINTER into scratchpad.params, not the

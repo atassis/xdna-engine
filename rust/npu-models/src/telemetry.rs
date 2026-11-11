@@ -205,6 +205,15 @@ pub fn diff_design_breakdown(before: &[DesignCost], after: &[DesignCost]) -> Vec
         .collect()
 }
 
+/// Numerical-source identity is runtime provenance, not part of the compiled program's identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WeightSourceProvenance {
+    pub path: String,
+    pub sha256: String,
+    pub config_sha256: String,
+    pub input_contract_sha256: String,
+}
+
 /// Which build produced this run's numbers: precision, quantization, the fusion flags baked into
 /// the artifact, and its identity on disk. The fix for the project's most expensive recurring
 /// error -- differencing two absolute numbers from two builds measured hours apart with nothing in
@@ -238,6 +247,8 @@ pub struct ArmProvenance {
     pub prefill_artifact_hash: Option<String>,
     #[serde(default)]
     pub prefill_toolchain_pin_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight_source: Option<WeightSourceProvenance>,
 }
 
 /// Everything one generation measured. Produced by the generation loop; the fields the loop cannot

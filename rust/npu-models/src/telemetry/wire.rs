@@ -112,6 +112,7 @@ fn provenance_json(p: &ArmProvenance) -> Value {
         "prefill_artifact_path": p.prefill_artifact_path,
         "prefill_artifact_hash": p.prefill_artifact_hash,
         "prefill_toolchain_pin_hash": p.prefill_toolchain_pin_hash,
+        "weight_source": p.weight_source,
     })
 }
 
@@ -409,6 +410,7 @@ fn parse_provenance(p: &Value) -> ArmProvenance {
         prefill_artifact_path: p["prefill_artifact_path"].as_str().map(str::to_string),
         prefill_artifact_hash: p["prefill_artifact_hash"].as_str().map(str::to_string),
         prefill_toolchain_pin_hash: p["prefill_toolchain_pin_hash"].as_str().map(str::to_string),
+        weight_source: serde_json::from_value(p["weight_source"].clone()).ok(),
     }
 }
 
@@ -701,6 +703,27 @@ mod tests {
             "eval duration is one quantity in two units"
         );
         assert_eq!(o["prompt_eval_duration"].as_u64().unwrap(), s.prefill_us * 1_000);
+    }
+
+    #[test]
+    fn source_weight_provenance_round_trips_separately_from_program_identity() {
+        let source = crate::telemetry::WeightSourceProvenance {
+            path: "checkpoint/model.safetensors".into(),
+            sha256: "source-sha".into(),
+            config_sha256: "config-sha".into(),
+            input_contract_sha256: "contract-sha".into(),
+        };
+        let r = GenerationReport {
+            provenance: ArmProvenance { artifact_hash: Some("program-sha".into()),
+                weight_source: Some(source.clone()), ..ArmProvenance::default() },
+            ..a_report()
+        };
+        let mut line = summary_line(&r, &meta(), FinishReason::Stop);
+        let back = parse_run(&line.to_string()).unwrap().summary.unwrap();
+        assert_eq!(back.provenance.weight_source, Some(source));
+        assert_eq!(back.provenance.artifact_hash.as_deref(), Some("program-sha"));
+        line["x_npu"]["provenance"].as_object_mut().unwrap().remove("weight_source");
+        assert_eq!(parse_run(&line.to_string()).unwrap().summary.unwrap().provenance.weight_source, None);
     }
 
     #[test]

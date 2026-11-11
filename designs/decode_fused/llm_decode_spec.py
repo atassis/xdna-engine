@@ -452,6 +452,9 @@ class LlmSpec:
     sw_pattern: int | None            # every Nth layer (1-based) is GLOBAL; None = all global
     query_pre_attn_scalar: float | None   # None => scale = head_dim ** -0.5
 
+    # Source-native config binding; absent means no checkpoint compatibility contract yet.
+    checkpoint_model_type: str | None = None
+
     # ---- per-layer attention geometry (Gemma-4) ----
     # Gemma-4-12B is not uniform: its SLIDING layers are head_dim 256 / 8 kv heads and its GLOBAL
     # layers are head_dim 512 / 1 kv head, selected by the same is_global() rule the theta split
@@ -1015,7 +1018,7 @@ GEMMA3_270M = LlmSpec(
 # inputs_embeds through unscaled). sliding_window is null in the config and use_sliding_window
 # is false, so every layer is global and RoPE is single-theta.
 QWEN3_0_6B = LlmSpec(
-    name="qwen3-0.6b", d_model=1024, n_layers=28, n_q_heads=16, n_kv_heads=8, head_dim=128,
+    name="qwen3-0.6b", checkpoint_model_type="qwen3", d_model=1024, n_layers=28, n_q_heads=16, n_kv_heads=8, head_dim=128,
     ffn=3072, vocab=151936, eps=1e-6, act="silu", norm_gain="w",
     sandwich_norms=False, qk_norm=True, embed_scale="none",
     rope_theta_global=1_000_000.0, rope_theta_local=None,

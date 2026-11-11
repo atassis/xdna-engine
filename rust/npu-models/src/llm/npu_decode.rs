@@ -327,6 +327,23 @@ pub(crate) struct EmbedTable {
 }
 
 impl EmbedTable {
+    fn from_source(entry: &npu_weights::source_native::safetensors::TensorEntry, scale: f32) -> Result<Self, EngineError> {
+        use npu_weights::source_native::ScalarType;
+        let err = |e| EngineError::Load(format!("source embedding: {e}"));
+        if entry.dtype != ScalarType::Bf16 || entry.shape.len() != 2 || entry.shape.contains(&0) {
+            return Err(err("requires a positive BF16 matrix".into()));
+        }
+        let len = entry.shape[0].checked_mul(entry.shape[1]).and_then(|n| n.checked_mul(2))
+            .ok_or_else(|| err("extent overflow".into()))?;
+        if u64::try_from(len).ok() != Some(entry.span.len()) || !scale.is_finite() {
+            return Err(err("invalid extent or scale".into()));
+        }
+        // SAFETY: checkpoint sources must remain immutable for the resident instance's lifetime,
+        // just as prepared blobs must in `open`. Map the retained inode, not its mutable path.
+        let map = unsafe { entry.span.mmap() }.map_err(|e| err(e.to_string()))?;
+        Ok(Self { map, scale, d_model: entry.shape[1], vocab: entry.shape[0] })
+    }
+
     fn open(artifact: &LlmArtifact) -> Result<Self, EngineError> {
         // Gate on the BYTE LENGTH the layout declares, not on the file merely existing: a W_head
         // built for another vocab is the failure that would otherwise gather a wrong row quietly.
@@ -415,12 +432,71 @@ impl EmbedTable {
     }
 }
 
+#[derive(Debug)]
+struct CheckpointWeights {
+    plan: npu_weights::source_native::plan::WeightPlan,
+    provenance: crate::telemetry::WeightSourceProvenance,
+}
+
+fn checkpoint_plan(artifact: &LlmArtifact, prefill: Option<&LlmArtifact>, checkpoint: &Path) -> Result<CheckpointWeights, EngineError> {
+    use npu_weights::source_native::{plan::WeightPlan, safetensors::SafetensorsFile, Limits};
+    let err = |e| EngineError::Load(format!("source-native weights: {e}"));
+    let contract = artifact.weight_inputs.as_ref()
+        .ok_or_else(|| err("artifact has no graph-owned weight-input contract".into()))?;
+    if artifact.pos_blob.is_some() || artifact.logit_bias_blob.is_some() || !artifact.cross_buffers.is_empty()
+        || prefill.is_some_and(|p| p.weights.iter().any(|n| !artifact.weights.contains(n))) {
+        return Err(err("unsupported host companion or prefill-only weights".into()));
+    }
+    let expected = artifact.weights.iter().filter(|n| !artifact.cache_buffers.contains(n))
+        .map(|n| (n.clone(), artifact.loc(n).len)).collect();
+    let config_path = checkpoint.join("config.json");
+    let config_source = npu_weights::source_native::FileSource::open(&config_path)
+        .map_err(|e| err(e.to_string()))?;
+    if config_source.len() > Limits::default().max_header_bytes as u64 {
+        return Err(err("checkpoint config exceeds header limit".into()));
+    }
+    let mut config = vec![0; config_source.len() as usize];
+    config_source.read_exact_at(0, &mut config).map_err(|e| err(e.to_string()))?;
+    let source = SafetensorsFile::open(checkpoint.join("model.safetensors"), Limits::default())
+        .map_err(|e| err(e.to_string()))?;
+    let plan = WeightPlan::bind_config_json(contract, source.tensors(), &expected, &config)
+        .map_err(|e| err(e.to_string()))?;
+    if plan.embedding().shape != [artifact.vocab.unwrap_or(0), artifact.d_model] {
+        return Err(err("embedding shape differs from program geometry".into()));
+    }
+    let source = plan.embedding().span.source();
+    let mut scratch = vec![0u8; 64 * 1024];
+    let mut hash = Sha256::new();
+    let mut offset = 0;
+    while offset < source.len() {
+        let n = (source.len() - offset).min(scratch.len() as u64) as usize;
+        source.read_exact_at(offset, &mut scratch[..n]).map_err(|e| err(e.to_string()))?;
+        hash.update(&scratch[..n]);
+        offset += n as u64;
+    }
+    let provenance = crate::telemetry::WeightSourceProvenance {
+        path: source.path().display().to_string(),
+        sha256: format!("{:x}", hash.finalize()),
+        config_sha256: format!("{:x}", Sha256::digest(&config)),
+        input_contract_sha256: format!("{:x}", Sha256::digest(serde_json::to_vec(contract)
+            .map_err(|e| err(e.to_string()))?)),
+    };
+    Ok(CheckpointWeights { plan, provenance })
+}
+
 impl NpuDecodeStep {
+    /// Opt-in loader-only path. `checkpoint` contains the selected immutable model.safetensors
+    /// and config.json; the artifact must declare its graph-owned weight-input contract.
+    /// No prepared-weight fallback, numerical-source selection, or default change is performed.
+    pub fn from_checkpoint(dev: &Rc<Device>, decode_dir: &Path, prefill_dir: Option<&Path>, checkpoint: &Path) -> Result<Self, EngineError> {
+        Self::build(dev, decode_dir, prefill_dir, Some(checkpoint))
+    }
+
     /// `decode_dir` holds `meta.json` + the ELF + `buffers/<name>.bin` (see [`LlmArtifact`]) and is
     /// the ONLY input: the host embedding gather reads the tied `W_head` blob that is already there,
     /// so the checkpoint's dumped `.npy` weights are a build input and no longer a runtime one.
     pub fn new(dev: &Rc<Device>, decode_dir: &Path) -> Result<Self, EngineError> {
-        Self::build(dev, decode_dir, None)
+        Self::build(dev, decode_dir, None, None)
     }
 
     /// Same, plus a batched-prefill ELF sharing this instance's arena.
@@ -435,10 +511,10 @@ impl NpuDecodeStep {
     /// The agreement it rests on is CHECKED here, not assumed: see
     /// [`LlmArtifact::check_shared_layout_agrees`].
     pub fn with_prefill(dev: &Rc<Device>, decode_dir: &Path, prefill_dir: &Path) -> Result<Self, EngineError> {
-        Self::build(dev, decode_dir, Some(prefill_dir))
+        Self::build(dev, decode_dir, Some(prefill_dir), None)
     }
 
-    fn build(dev: &Rc<Device>, decode_dir: &Path, prefill_dir: Option<&Path>) -> Result<Self, EngineError> {
+    fn build(dev: &Rc<Device>, decode_dir: &Path, prefill_dir: Option<&Path>, checkpoint: Option<&Path>) -> Result<Self, EngineError> {
         let artifact = LlmArtifact::load(decode_dir)?;
         // Mirrors this exact loop's writes below (`x_loc`, `rope_loc`) -- an artifact declaring a
         // third per-token input buffer would otherwise leave it unwritten every token, silently.
@@ -458,6 +534,8 @@ impl NpuDecodeStep {
             p.check_per_token_writes(&p.per_dispatch_writes())?;
         }
 
+        let source_plan = checkpoint.map(|root| checkpoint_plan(&artifact, pre_art.as_ref(), root)).transpose()?;
+
         // One arena for both ELFs, sized to the larger of the two. A buffer is addressed by offset
         // within its arena, so a larger arena is transparent to the smaller graph.
         let max2 = |f: fn(&LlmArtifact) -> usize| f(&artifact).max(pre_art.as_ref().map_or(0, f));
@@ -473,8 +551,18 @@ impl NpuDecodeStep {
         // name in `weights` at all (no blob ships -- see gen_llm_decode.py), so this branch only
         // still fires for an artifact built before that: `check_blob_len` stats the shipped blob
         // rather than trust it disappeared.
+        let mut weight_scratch = source_plan.as_ref().map(|_| vec![0u8; 64 * 1024]);
         for name in &artifact.weights {
-            if artifact.cache_buffers.contains(name) {
+            if let Some(plan) = &source_plan {
+                if !artifact.cache_buffers.contains(name) {
+                    let loc = artifact.loc(name);
+                    plan.plan.write_buffer(name, weight_scratch.as_mut().unwrap(), |offset, bytes| {
+                        arena.write_at(loc.arena, loc.off.checked_add(offset)
+                            .ok_or_else(|| anyhow::anyhow!("weight offset overflow"))?, bytes)
+                            .map_err(|e| anyhow::anyhow!(e))
+                    }).map_err(|e| EngineError::Load(format!("prepare {name}: {e}")))?;
+                }
+            } else if artifact.cache_buffers.contains(name) {
                 check_blob_len(&artifact, name)?;
             } else {
                 upload_blob(&arena, &artifact, name)?;
@@ -528,7 +616,13 @@ impl NpuDecodeStep {
         // for a model constant and may leave them undeclared, and `check_prefill_pairing` has
         // already refused a pair whose prefill half declares a different one.
         let prefill = pre_art.map(|a| NpuPrefill::open(dev, a, &artifact, &arena)).transpose()?;
-        let embed = EmbedTable::open(&artifact)?;
+        let embed = match &source_plan {
+            Some(plan) => EmbedTable::from_source(plan.plan.embedding(), match artifact.embed_scale {
+                None | Some(EmbedScale::None) => 1.0,
+                Some(EmbedScale::SqrtDModel) => (artifact.d_model as f32).sqrt(),
+            })?,
+            None => EmbedTable::open(&artifact)?,
+        };
         let pos_rows = artifact.pos_blob.as_deref()
             .map(|n| read_f32_blob(&artifact, n, artifact.d_model)).transpose()?;
         let logit_bias = artifact.logit_bias_blob.as_deref()
@@ -550,6 +644,7 @@ impl NpuDecodeStep {
             prefill_artifact_path,
             prefill_artifact_hash,
             prefill_toolchain_pin_hash,
+            weight_source: source_plan.as_ref().map(|s| s.provenance.clone()),
             ..provenance_extras(&artifact.decode_dir)
         };
 
@@ -1102,6 +1197,170 @@ mod tests {
 
     use super::*;
     use ndarray::Array2;
+
+    #[test]
+    #[ignore = "requires an authorized exclusive NPU window and fresh producer artifacts"]
+    fn device_source_native_matches_prepared_weights() {
+        assert_eq!(std::env::var("NPU_LLM_DEVICE_GATE").as_deref(), Ok("1"),
+            "explicit device gate required");
+        let root = |name| std::path::PathBuf::from(std::env::var(name).expect(name));
+        let decode = root("NPU_SOURCE_ARTIFACT");
+        let checkpoint = root("NPU_SOURCE_CHECKPOINT");
+        let prefill = std::env::var_os("NPU_SOURCE_PREFILL").map(std::path::PathBuf::from);
+        // Source-only loading must work without even a prepared-buffer directory. The temporary
+        // metadata/ELF aliases stay under the same build root and toolchain-lock snapshot.
+        let source_only = tempfile::tempdir_in(decode.parent().unwrap()).unwrap();
+        std::fs::copy(decode.join("meta.json"), source_only.path().join("meta.json")).unwrap();
+        let artifact = LlmArtifact::load(&decode).unwrap();
+        let plain = decode.join(&artifact.elf_name);
+        let elf_name = if plain.exists() { artifact.elf_name.clone() } else { format!("{}.zst", artifact.elf_name) };
+        std::os::unix::fs::symlink(decode.join(&elf_name), source_only.path().join(&elf_name)).unwrap();
+        assert!(!source_only.path().join("buffers").exists());
+        let dev = Rc::new(Device::open(0).expect("open exclusively held NPU"));
+        for use_prefill in [false, true] {
+            if use_prefill && prefill.is_none() { continue; }
+            let pre = if use_prefill { prefill.as_deref() } else { None };
+            let batch = pre.map(|p| LlmArtifact::load_prefill(p).unwrap().batch).unwrap_or(16);
+            let tokens: Vec<u32> = (0..=batch).map(|i| [1, 2, 3, 42, 315, 1234][i % 6]).collect();
+            let run = |step: &mut NpuDecodeStep| {
+                step.reset().unwrap();
+                let mut from = 0;
+                if use_prefill {
+                    assert_eq!(step.prefill_batch(), Some(batch));
+                    from = step.prefill(&tokens[..batch], 0).unwrap();
+                    assert_eq!(from, batch, "real batched prefill must prime the prompt");
+                }
+                let mut outputs = Vec::new();
+                for (pos, &token) in tokens.iter().enumerate().skip(from) {
+                    let logits = step.step(token, pos).unwrap();
+                    assert_eq!(logits.len(), artifact.vocab.unwrap());
+                    assert!(logits.iter().all(|v| v.is_finite()));
+                    assert!(logits.iter().any(|&v| v != logits[0]), "nonconstant logits required");
+                    outputs.push(logits);
+                }
+                outputs
+            };
+            let (expected, program, resident_bytes) = {
+                let mut step = match pre {
+                    Some(p) => NpuDecodeStep::with_prefill(&dev, &decode, p),
+                    None => NpuDecodeStep::new(&dev, &decode),
+                }.unwrap();
+                assert!(step.provenance().weight_source.is_none());
+                (run(&mut step), step.provenance().artifact_hash, step.bo_bytes())
+            };
+            let mut step = NpuDecodeStep::from_checkpoint(&dev, source_only.path(), pre, &checkpoint).unwrap();
+            assert_eq!(step.provenance().artifact_hash, program);
+            assert!(step.provenance().weight_source.is_some());
+            eprintln!("source-native device source: {:?}", step.provenance().weight_source);
+            assert_eq!(step.bo_bytes(), resident_bytes, "source loading must not add a second arena");
+            let actual = run(&mut step);
+            assert_eq!(actual.len(), expected.len());
+            for (i, (a, b)) in actual.iter().zip(&expected).enumerate() {
+                assert!(a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()),
+                    "source/prepared logits differ at output {i}, prefill={use_prefill}");
+            }
+            let mut digest = Sha256::new();
+            for row in &actual {
+                for value in row { digest.update(value.to_bits().to_le_bytes()); }
+            }
+            eprintln!("source-native device parity: prefill={use_prefill}, outputs={}, vocab={}, BO bytes={resident_bytes}, program={program:?}, logits_sha256={:x}", actual.len(), artifact.vocab.unwrap(), digest.finalize());
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an authorized exclusive NPU window and privately controlled weight-cache state"]
+    fn device_source_native_load_cost() {
+        assert_eq!(std::env::var("NPU_LLM_DEVICE_GATE").as_deref(), Ok("1"));
+        let root = |name| std::path::PathBuf::from(std::env::var(name).expect(name));
+        let decode = root("NPU_SOURCE_ARTIFACT");
+        let checkpoint = root("NPU_SOURCE_CHECKPOINT");
+        let kind = std::env::var("NPU_SOURCE_LOAD_KIND").unwrap();
+        assert!(matches!(kind.as_str(), "prepared" | "checkpoint"));
+        let dev = Rc::new(Device::open(0).unwrap());
+        for sample in 0..3 {
+            let start = std::time::Instant::now();
+            let step = match kind.as_str() {
+                "prepared" => NpuDecodeStep::new(&dev, &decode),
+                "checkpoint" => NpuDecodeStep::from_checkpoint(&dev, &decode, None, &checkpoint),
+                _ => unreachable!(),
+            }.unwrap();
+            eprintln!("source-native load cost: kind={kind}, sample={sample}, wall_ms={:.3}, BO bytes={}, program={:?}",
+                start.elapsed().as_secs_f64() * 1000.0, step.bo_bytes(), step.provenance().artifact_hash);
+            assert_eq!(step.provenance().weight_source.is_some(), kind == "checkpoint");
+            drop(step);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires explicit checkpoint, contract-bearing artifact and independent baseline"]
+    fn source_native_real_canary() {
+        use std::io::{Read, Seek, SeekFrom};
+        let root = |name| std::path::PathBuf::from(std::env::var(name).expect(name));
+        let checkpoint = root("NPU_SOURCE_CHECKPOINT");
+        let artifact = LlmArtifact::load(&root("NPU_SOURCE_ARTIFACT")).unwrap();
+        let baseline = root("NPU_SOURCE_BASELINE");
+        let mut shared_prefill = artifact.clone();
+        shared_prefill.weights.retain(|n| n != "W_head" && n != "n_final");
+        let prepared = checkpoint_plan(&artifact, Some(&shared_prefill), &checkpoint).unwrap();
+        assert_eq!(prepared.provenance.sha256.len(), 64);
+        eprintln!("source provenance: {:?}", prepared.provenance);
+        let plan = prepared.plan;
+        shared_prefill.weights.push("unsupported_prefill_constant".into());
+        assert!(checkpoint_plan(&artifact, Some(&shared_prefill), &checkpoint).is_err());
+        let mut scratch = vec![0; 65536];
+        let mut reference = vec![0; 65536];
+        let mut count = 0;
+        let mut total = 0;
+        for name in &artifact.weights {
+            let mut file = std::fs::File::open(baseline.join("buffers").join(format!("{name}.bin"))).unwrap();
+            assert_eq!(file.metadata().unwrap().len(), artifact.loc(name).len as u64);
+            plan.write_buffer(name, &mut scratch, |off, bytes| {
+                assert_eq!(off as u64, file.stream_position()?);
+                file.read_exact(&mut reference[..bytes.len()])?;
+                anyhow::ensure!(bytes == &reference[..bytes.len()], "{name}: byte mismatch at {off}");
+                total += bytes.len();
+                Ok(())
+            }).unwrap();
+            count += 1;
+        }
+        let table = EmbedTable::from_source(plan.embedding(), 1.0).unwrap();
+        let mut head = std::fs::File::open(baseline.join("buffers/W_head.bin")).unwrap();
+        for token in [0, table.vocab() as u32 / 2, table.vocab() as u32 - 1] {
+            let row = table.row(token).unwrap();
+            head.seek(SeekFrom::Start(token as u64 * row.len() as u64)).unwrap();
+            head.read_exact(&mut reference[..row.len()]).unwrap();
+            assert_eq!(&*row, &reference[..row.len()]);
+            assert!(matches!(row, Cow::Borrowed(_)));
+        }
+        let mut incompatible = artifact.clone();
+        incompatible.weight_inputs = None;
+        assert!(checkpoint_plan(&incompatible, None, &checkpoint).unwrap_err().to_string().contains("no graph-owned"));
+        eprintln!("source-native CPU canary: {count} buffers, {total} bytes, scratch=65536; three borrowed embedding rows");
+    }
+
+    #[test]
+    fn source_embedding_borrows_checkpoint_rows_and_preserves_scaling() {
+        use npu_weights::source_native::{safetensors::SafetensorsFile, Limits};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.safetensors");
+        let header = br#"{"embed":{"dtype":"BF16","shape":[2,2],"data_offsets":[0,8]}}"#;
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.extend(pack_bf16_bytes(&[1.0, -2.0, 3.0, 4.0]));
+        std::fs::write(&path, bytes).unwrap();
+        let source = SafetensorsFile::open(&path, Limits::default()).unwrap();
+        let entry = source.get("embed").unwrap().clone();
+        std::fs::rename(&path, dir.path().join("renamed.safetensors")).unwrap();
+        let table = EmbedTable::from_source(&entry, 1.0).unwrap();
+        drop(source); drop(entry);
+        assert!(matches!(table.row(1).unwrap(), Cow::Borrowed(_)));
+        assert_eq!(&*table.row(1).unwrap(), pack_bf16_bytes(&[3.0,4.0]));
+        assert_eq!(table.head_row(0).unwrap(), [1.0,-2.0]);
+        assert!(table.row(2).is_err());
+        let scaled = EmbedTable { scale: 2.0, ..table };
+        assert_eq!(&*scaled.row(0).unwrap(), pack_bf16_bytes(&[2.0,-4.0]));
+        assert_eq!(scaled.head_row(0).unwrap(), [1.0,-2.0]);
+    }
 
     // `scripts/... rope_row` cross-check (designs/decode_fused/verify_llm_decode.py:34-48),
     // theta=1e6, head_dim=8 (half=4): computed independently in Python and pasted as a literal, the

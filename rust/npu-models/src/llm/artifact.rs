@@ -196,6 +196,8 @@ pub struct LlmArtifact {
     pub recurrent_buffers: Vec<String>,
     /// `meta.json`'s `embed_blob`; see [`Self::embed_blob`]. `None` in pre-2026-09-08 artifacts.
     pub embed_blob: Option<String>,
+    /// Graph-owned physical requirements for opt-in source-native preparation.
+    pub weight_inputs: Option<npu_weights::source_native::plan::WeightContract>,
     pub kv_off: ScratchpadParam,
     /// Every KV-append offset slot the artifact declares, paired with the head_dim its layers use
     /// and whether this geometry writes a V slot.
@@ -464,6 +466,10 @@ impl LlmArtifact {
             return Err(ctx(format!("recurrent buffer `{n}` is not one of `cache_buffers`")));
         }
         let embed_blob = meta.get("embed_blob").and_then(|v| v.as_str()).map(str::to_owned);
+        let weight_inputs = if meta.get("weight_inputs").is_some() {
+            npu_weights::source_native::plan::WeightContract::from_metadata_json(&bytes)
+                .map_err(|e| ctx(format!("weight-input contract: {e}")))?
+        } else { None };
         let cross_buffers = meta.get("cross_buffers").map(|_| str_list("cross_buffers")).transpose()?.unwrap_or_default();
         let toolchain_hash = meta
             .get("toolchain")
@@ -1285,6 +1291,7 @@ impl LlmArtifact {
             cache_buffers,
             recurrent_buffers,
             embed_blob,
+            weight_inputs,
             kv_off,
             kv_offs,
             kv_windows,
