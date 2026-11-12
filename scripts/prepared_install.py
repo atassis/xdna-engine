@@ -22,6 +22,7 @@ import tomllib
 import model_artifact_dispatch as dispatch
 from check_iron_artifact_provenance import validate as validate_iron
 from lib import artifact_manifest
+from lib.check_served_artifact_source import check_target
 from lib.artifact_manifest import sha256_file
 from lib.collect_served_artifacts import drop_covered, scenario_artifact_paths
 
@@ -112,6 +113,9 @@ def verify(manifest, repo):
                 target = root / path
                 if not target.exists() or (target.is_dir() and not any(target.iterdir())):
                     raise ValueError(f'prepared scenario artifact missing: {path}')
+                # The staged hop is judged, not just its presence: a prepared deployment must not
+                # become the second install that quietly serves a snapshot or a lane payload.
+                check_target(artifacts, target)
             arts = parsed.get('artifacts', {})
             for key in ('decode', 'prefill', 'resident'):
                 if key not in arts:

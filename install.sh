@@ -178,6 +178,40 @@ ok()   { printf '\033[1;32m[ ok ]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[fail]\033[0m %s\n' "$*" >&2; exit 1; }
 
+# The served-artifact gate. $ENGINE_ARTIFACTS is the single hop the production root is allowed to
+# resolve through, so it is also the hop that can silently reach somebody else's payload: the
+# live install inspected on 2026-11-12 had been staged from a build/ lane root whose model dirs
+# were links into an accepted-run snapshot, and 16 of its 18 served identities still resolved
+# through that snapshot. Every ordinary proof passed (manifest verify, exclusivity, coldness);
+# a storage census of the "cold" lane payload was walking production's own inputs. Stdlib-only,
+# so it runs long before the venvs the rest of this script needs.
+ARTIFACT_GATE="$REPO/scripts/lib/check_served_artifact_source.py"
+ARTIFACT_GATE_PY="${ARTIFACT_GATE_PY:-$(command -v python3 || true)}"
+[ -n "$ARTIFACT_GATE_PY" ] || die "python3 not found -- required for the served-artifact gate"
+[ -f "$ARTIFACT_GATE" ]    || die "served-artifact gate missing: $ARTIFACT_GATE"
+# Exercise the gate on a known-bad root before trusting it to guard this install: a gate that
+# had stopped checking would look exactly like a legal root.
+gate_selftest() {
+  local bad base
+  base="$(mktemp -d)"; bad="$base/artifacts/accepted-cls-baseline-selftest/artifacts"
+  mkdir -p "$bad"
+  if "$ARTIFACT_GATE_PY" "$ARTIFACT_GATE" root "$bad" >/dev/null 2>&1; then
+    rm -rf -- "$base"
+    die "the served-artifact gate accepted a snapshot root -- refusing to install unguarded"
+  fi
+  rm -rf -- "$base"
+  ok "Served-artifact gate rejects its known-bad input (a snapshot root)."
+}
+gate_selftest
+if ! ARTIFACT_ROOT_RESOLVED="$("$ARTIFACT_GATE_PY" "$ARTIFACT_GATE" root "$ENGINE_ARTIFACTS" 2>&1)"; then
+  printf '%s\n' "$ARTIFACT_ROOT_RESOLVED" >&2
+  die "refusing to stage a production root from this artifacts root -- point ENGINE_ARTIFACTS at
+  the canonical generated-data store (default: $XDNA_ARTIFACTS), or build the served artifact
+  into it. See scripts/lib/check_served_artifact_source.py."
+fi
+ENGINE_ARTIFACTS="$ARTIFACT_ROOT_RESOLVED"
+ok "Artifacts root accepted: $ENGINE_ARTIFACTS"
+
 # ---------------------------------------------------------------------------
 # 1. Resolve & sanity-check the repo
 # ---------------------------------------------------------------------------
@@ -623,6 +657,14 @@ stage_served_artifacts() {
       continue
     fi
     mkdir -p "$(dirname "$link")"
+    # Stage only what resolves inside the accepted root. `readlink -f` is the hop that hid the
+    # 2026-11-12 snapshot: a store member that is itself a symlink resolves clean out of the
+    # store, and the install then depended on that payload for as long as it stood. This loop
+    # runs in the parent shell (herestring, not a pipe), so die() really does stop the install.
+    if ! gate_msg="$("$ARTIFACT_GATE_PY" "$ARTIFACT_GATE" target "$ENGINE_ARTIFACTS" "$src" 2>&1)"; then
+      printf '%s\n' "$gate_msg" >&2
+      die "refusing to link served artifact $sub from $src -- see the gate message above"
+    fi
     ln -sfn "$(readlink -f "$src")" "$link"
     ok "  $sub -> $(readlink -f "$src")"
     linked=$((linked + 1))
