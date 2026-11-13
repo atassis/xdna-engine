@@ -395,6 +395,23 @@ _resolve_default_install() {
   echo "$p"
 }
 
+_cleanup_install_stages() {
+  local home path parent base
+  [ -n "${PEANO_LOCAL_HOME:-}" ] && [ -d "$PEANO_LOCAL_HOME" ] || return 0
+  home="$(cd "$PEANO_LOCAL_HOME" && pwd -P)" || return 0
+  for path in "${DEST:-}" "${HEADER_STAGE:-}"; do
+    [ -n "$path" ] || continue
+    parent="$(dirname "$path")"
+    [ -d "$parent" ] || continue
+    parent="$(cd "$parent" && pwd -P)" || continue
+    [ "$parent" = "$home" ] || continue
+    base="$(basename "$path")"
+    case "$base" in
+      .staging-*|.headers-*) rm -rf -- "$path" ;;
+    esac
+  done
+}
+
 # ---------------------------------------------------------------------------------------------
 FROM=""; BUILD=""; TAG=""; MODE="install"; CHECK_DIR=""; KEEP=2; DRY=0; ROOT_NAME=""; ROOT_TGT=""
 while [ $# -gt 0 ]; do
@@ -442,7 +459,39 @@ case "$MODE" in
        named by its own build SHA). Or use --check/--list/--resolve/--gc."
     [ -d "$FROM/lib" ] || die "--from $FROM does not look like a Peano install (no lib/)"
     [ -d "$BUILD/lib" ] || die "--build $BUILD has no lib/ -- did build_peano_fast.sh run?"
+    BUILD="$(cd "$BUILD" && pwd -P)" || die "cannot resolve --build directory"
+    [ -x "$BUILD/bin/clang" ] || die "--build $BUILD has no clang for resource-header qualification"
     mkdir -p "$PEANO_LOCAL_HOME"
+    PEANO_LOCAL_HOME="$(cd "$PEANO_LOCAL_HOME" && pwd -P)" || die "cannot resolve Peano install root"
+    DEST=""; HEADER_STAGE=""
+    trap _cleanup_install_stages EXIT
+    trap 'exit 1' HUP INT TERM
+
+    # Use Clang's supported component install rules: this includes generated headers as well as
+    # source headers. Keep the install isolated from the cp -al seed so no seed hardlink can be
+    # overwritten. Clang targets depend on clang-resource-headers in the pinned CMake graph.
+    RESOURCE_DIR="$("$BUILD/bin/clang" -print-resource-dir 2>/dev/null)" \
+      || die "cannot query resource directory from $BUILD/bin/clang"
+    case "$RESOURCE_DIR" in
+      /*) RESOURCE_DIR_REAL="$(cd "$RESOURCE_DIR" 2>/dev/null && pwd -P)" \
+            || die "build clang resource directory does not exist: $RESOURCE_DIR" ;;
+      *) die "build clang reported a non-absolute resource directory: $RESOURCE_DIR" ;;
+    esac
+    RESOURCE_DIR="$RESOURCE_DIR_REAL"
+    case "$RESOURCE_DIR" in "$BUILD"/lib/clang/*) ;; \
+      *) die "build clang resource directory is not under $BUILD/lib/clang: $RESOURCE_DIR" ;; esac
+    RESOURCE_VERSION="${RESOURCE_DIR#"$BUILD"/lib/clang/}"
+    case "$RESOURCE_VERSION" in
+      ""|.|..|*/*) die "build clang resource directory has an invalid version path: $RESOURCE_DIR" ;;
+    esac
+    HEADER_STAGE="$(mktemp -d "$PEANO_LOCAL_HOME/.headers-XXXXXX")"
+    if ! cmake --install "$BUILD" --component clang-resource-headers --prefix "$HEADER_STAGE"; then
+      rm -rf "$HEADER_STAGE"
+      die "CMake clang-resource-headers install failed; refusing seed headers as fallback"
+    fi
+    HEADER_INCLUDE="$HEADER_STAGE/lib/clang/$RESOURCE_VERSION/include"
+    [ -d "$HEADER_INCLUDE" ] && [ -n "$(find "$HEADER_INCLUDE" -type f -print -quit)" ] \
+      || { rm -rf "$HEADER_STAGE"; die "CMake resource-header component produced no headers at lib/clang/$RESOURCE_VERSION/include"; }
 
     # Stage first: the identity can only be read off the FINISHED artifact (post dylib+driver swap),
     # never off the inputs, so the final directory name is not known until the build is assembled.
@@ -450,6 +499,23 @@ case "$MODE" in
     rmdir "$DEST"
     log "hardlink-copy $FROM -> $DEST"
     cp -al "$FROM" "$DEST"
+
+    # cp -al preserves directory symlinks from the seed. Resolve the destination parent before
+    # touching it: relative links that stay inside this staging tree are safe, but an absolute
+    # seed link must never redirect removal or copying back into the source distribution.
+    DEST_ROOT="$(cd "$DEST" && pwd -P)" || die "cannot resolve owned staging directory $DEST"
+    case "$DEST_ROOT" in "$PEANO_LOCAL_HOME"/.staging-*) ;; \
+      *) die "resource destination is not inside an owned staging directory: $DEST_ROOT" ;; esac
+    RESOURCE_PARENT="$(readlink -m "$DEST/lib/clang/$RESOURCE_VERSION")" \
+      || die "cannot resolve staged resource-header destination"
+    case "$RESOURCE_PARENT" in "$DEST_ROOT"/*) ;; \
+      *) die "seed resource-header destination escapes staging: $RESOURCE_PARENT" ;; esac
+
+    # Replace the resource tree as a unit, after breaking all seed hardlinks in that subtree.
+    # This makes stale seed headers impossible to mask absent candidate files.
+    rm -rf "$DEST/lib/clang/$RESOURCE_VERSION/include"
+    mkdir -p "$DEST/lib/clang/$RESOURCE_VERSION"
+    cp -a "$HEADER_INCLUDE" "$DEST/lib/clang/$RESOURCE_VERSION/include"
 
     # Swap in ONLY the dylibs carrying the new AIE codegen. Copy through a temp name + mv so a
     # half-written dylib can never be left in place, and break the hardlink to $FROM first --
@@ -486,11 +552,17 @@ case "$MODE" in
     ID="$(_peano_identity "$DEST")" || { rm -rf "$DEST"; die "installed tree does not self-report a build SHA"; }
     FINAL="$PEANO_LOCAL_HOME/$ID"
     if [ -e "$FINAL" ]; then
-      rm -rf "$DEST"
-      log "identical build already installed as $ID -- reusing it, nothing new written"
+      if [ ! -d "$FINAL/lib/clang/$RESOURCE_VERSION/include" ] \
+        || ! diff -qr "$HEADER_INCLUDE" "$FINAL/lib/clang/$RESOURCE_VERSION/include" >/dev/null; then
+        rm -rf "$DEST" "$HEADER_STAGE"
+        die "existing $ID has missing or stale clang resource headers; refusing same-ID reuse"
+      fi
+      rm -rf "$DEST" "$HEADER_STAGE"
+      log "identical build and resource headers already installed as $ID -- reusing it, nothing new written"
       DEST="$FINAL"
     else
       mv "$DEST" "$FINAL"; DEST="$FINAL"
+      rm -rf "$HEADER_STAGE"
       log "installed: $DEST"
     fi
     # A --tag is provenance ("why did I build this"), never the key. Kept as an alias symlink.

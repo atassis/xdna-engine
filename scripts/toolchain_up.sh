@@ -61,6 +61,48 @@ PY
 
 if [ "${TOOLCHAIN_RESOLVE_ONLY:-0}" = "1" ]; then
   # Do not adopt, backfill, patch, bind Python, touch the store, or create caches here.
+  want="$MLIR_AIE_FORK_COMMIT"
+  case "$want" in
+    ''|*[!0-9a-f]*)
+      echo "[toolchain_up] read-only resolution: invalid source pin MLIR_AIE_FORK_COMMIT '$want'" >&2
+      exit 1
+      ;;
+  esac
+  [ "${#want}" -ge 7 ] && [ "${#want}" -le 40 ] || {
+    echo "[toolchain_up] read-only resolution: source pin MLIR_AIE_FORK_COMMIT must be 7-40 lowercase hex characters" >&2
+    exit 1
+  }
+  # Ignore ambient Git redirection only for these identity reads; other toolchain setup remains untouched.
+  _source_git() {
+    env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE \
+      -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_NAMESPACE \
+      -u GIT_CONFIG -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT \
+      git -C "$INST/src" "$@"
+  }
+  source_root="$(_source_git rev-parse --show-toplevel 2>/dev/null)" || {
+    echo "[toolchain_up] read-only resolution: cannot read source Git repository at $INST/src" >&2
+    exit 1
+  }
+  source_dir="$(cd "$INST/src" 2>/dev/null && pwd -P)" || {
+    echo "[toolchain_up] read-only resolution: source directory is unavailable at $INST/src" >&2
+    exit 1
+  }
+  [ "$source_root" = "$source_dir" ] || {
+    echo "[toolchain_up] read-only resolution: source at $INST/src is not its own Git worktree (repository root: $source_root)" >&2
+    exit 1
+  }
+  pinned="$(_source_git rev-parse --verify "${want}^{commit}" 2>/dev/null)" || {
+    echo "[toolchain_up] read-only resolution: cannot resolve MLIR_AIE_FORK_COMMIT '$want' in source repository" >&2
+    exit 1
+  }
+  got="$(_source_git rev-parse --verify 'HEAD^{commit}' 2>/dev/null)" || {
+    echo "[toolchain_up] read-only resolution: cannot read source Git HEAD at $INST/src" >&2
+    exit 1
+  }
+  [ "$got" = "$pinned" ] || {
+    echo "[toolchain_up] read-only resolution: source commit $got does not match MLIR_AIE_FORK_COMMIT $want ($pinned)" >&2
+    exit 1
+  }
   for tool in aiecc aie-opt aie-translate aiebu-asm bootgen; do
     [ -x "$INST/bin/$tool" ] || {
       echo "[toolchain_up] read-only resolution: missing $INST/bin/$tool" >&2; exit 1;
