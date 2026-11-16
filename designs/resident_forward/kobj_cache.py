@@ -19,7 +19,7 @@ from pathlib import Path
 
 def kobj_dir(run_dir):
     # One ladder invocation (RF_KOBJ_RUN, set by fwd_ladder.sh) or one process: the key has no
-    # compiler identity or include closure, so objects must never outlive the run that built them.
+    # compiler identity or include closure: retained objects are evidence, never cross-run cache hits.
     run = os.environ.get("RF_KOBJ_RUN") or f"pid{os.getpid()}"
     d = Path(run_dir) / "kobj" / run
     d.mkdir(parents=True, exist_ok=True)

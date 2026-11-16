@@ -99,7 +99,7 @@ from ml_dtypes import bfloat16
 from aie.iron import Buffer, Kernel, ObjectFifo, Program, Runtime, Worker, WorkerRuntimeBarrier
 from aie.iron.device import NPU1, NPU2
 from aie.iron.controlflow import range_
-from aie.helpers.taplib import TensorTiler2D, TensorAccessPattern
+from aie.helpers.taplib import TensorAccessPattern
 # index_cast + types: the exact helpers python/helpers/dialects/scf.py uses to turn
 # a range_ induction Value (index type) into an i32 kernel-scalar operand.
 from aie.extras.dialects.arith import index_cast

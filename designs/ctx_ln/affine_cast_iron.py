@@ -17,7 +17,7 @@ from ml_dtypes import bfloat16
 
 from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
 from aie.iron.device import NPU1, NPU2, from_name
-from aie.helpers.taplib import TensorTiler2D
+from aie.helpers.taplib import TensorAccessPattern
 from aie.iron.controlflow import range_
 
 
@@ -58,8 +58,15 @@ def affine_cast(dev, sequence_length, embedding_dim, trace_size, dtype="f32"):
         [in_chunk, gb_chunk, out_chunk, np.int32],
     )
 
-    taps_in = TensorTiler2D.simple_tiler((sequence_length, embedding_dim), (rows_per_core, embedding_dim))
-    taps_out = TensorTiler2D.simple_tiler((sequence_length, embedding_dim), (rows_per_core, embedding_dim))
+    row_taps = [
+        TensorAccessPattern(
+            (sequence_length, embedding_dim),
+            i * rows_per_core * embedding_dim,
+            (rows_per_core, embedding_dim),
+            (embedding_dim, 1),
+        )
+        for i in range(n_cores)
+    ]
 
     def core_body(of_in, of_gb, of_out, affine):
         egb = of_gb.acquire(1)  # [gamma|beta] acquired ONCE, reused across this core's rows
@@ -82,10 +89,10 @@ def affine_cast(dev, sequence_length, embedding_dim, trace_size, dtype="f32"):
 
     def sequence(x, gb, out, in_prods, gb_prods, out_conses):
         for i in range(n_cores):
-            in_prods[i].fill(x, taps_in[i])
+            in_prods[i].fill(x, row_taps[i])
             gb_prods[i].fill(gb)  # full [gamma|beta] to every core (broadcast)
         for i in range(n_cores):
-            out_conses[i].drain(out, taps_out[i], wait=True)
+            out_conses[i].drain(out, row_taps[i], wait=True)
 
     rt = Runtime(
         sequence,

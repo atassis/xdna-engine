@@ -228,6 +228,17 @@ for mk in "${family[@]}"; do
   rbdir=""
   [ -n "$rbdir_raw" ] && rbdir="$(realpath -m "$rbdir_raw")"
 
+  # CAF groups vendor kernels by family. The current whole_array Makefile resolves
+  # kernels_dir to .../aie_kernels/linalg, while its quoted includes may reach
+  # aie_arch.h / aie_kernel_utils.h in the parent aie_kernels directory. Keep the
+  # older architecture-directory layout below as a supported fallback.
+  vendor_dir="$kdir"
+  vendor_prefix=""
+  if [ "$(basename "$kdir")" = linalg ] && [ -f "$inst/src/aie_kernels/linalg/mm.cc" ]; then
+    vendor_dir="$(dirname "$kdir")"
+    vendor_prefix="linalg/"
+  fi
+
   # --- axis 2: compiler identity (independent of kernel source; see point 3 in the header) ---
   checked=$((checked + 1))
   if [ -z "$cc_raw" ]; then
@@ -292,14 +303,15 @@ $(_peano_remedy)" >&2
   # HOLE 2 (closed): the Makefile NAMES prerequisites, but the compiler READS the transitive closure.
   # `mm.cc` does `#include "zero.cc"`, which appeared in no prerequisite list, so the entire
   # modal/resident family could report green while zero.cc drifted and changed every compiled object.
-  srcs_v=(); srcs_rb=()
-  [ ${#declared_v[@]}  -gt 0 ] && mapfile -t srcs_v  < <(include_closure "$kdir"  "${declared_v[@]}")
+  srcs_v=(); srcs_rb=(); vendor_declared=()
+  for f in "${declared_v[@]}"; do vendor_declared+=("${vendor_prefix}${f}"); done
+  [ ${#vendor_declared[@]} -gt 0 ] && mapfile -t srcs_v < <(include_closure "$vendor_dir" "${vendor_declared[@]}")
   [ ${#declared_rb[@]} -gt 0 ] && mapfile -t srcs_rb < <(include_closure "$rbdir" "${declared_rb[@]}")
 
   for entry in "${srcs_v[@]/#/vendor:}" "${srcs_rb[@]/#/lib:}"; do
     class="${entry%%:*}"; f="${entry#*:}"
     checked=$((checked + 1))
-    if [ "$class" = vendor ]; then dir="$kdir"; else dir="$rbdir"; fi
+    if [ "$class" = vendor ]; then dir="$vendor_dir"; else dir="$rbdir"; fi
     resolved="$dir/$f"
     if [ ! -f "$resolved" ]; then
       echo "[verify_kernel_source] FAIL $mk: $f -- ${class} namespace resolved to $dir but $f is not there" >&2
@@ -314,16 +326,21 @@ $(_peano_remedy)" >&2
         fail=1; continue
       fi
     else
-      if [ -f "$RB_KERNELS/$f" ]; then
-        echo "[verify_kernel_source] FAIL $mk: $f is OURS ($RB_KERNELS/$f) but is declared through \${kernels_dir}
+      ownership_rel="${f#"$vendor_prefix"}"
+      if [ -f "$RB_KERNELS/$ownership_rel" ]; then
+        echo "[verify_kernel_source] FAIL $mk: $f is OURS ($RB_KERNELS/$ownership_rel) but is declared through \${kernels_dir}
   -- it can only resolve there if something copied it into the pinned toolchain store. Declare it
   through \${lib_kernels_dir} instead." >&2
         fail=1; continue
       fi
-      truth="$inst/src/aie_kernels/aie2p/$f"
-      [ -f "$truth" ] || truth="$inst/src/aie_kernels/aie2/$f"
+      if [ -n "$vendor_prefix" ]; then
+        truth="$inst/src/aie_kernels/$f"
+      else
+        truth="$inst/src/aie_kernels/aie2p/$f"
+        [ -f "$truth" ] || truth="$inst/src/aie_kernels/aie2/$f"
+      fi
       if [ ! -f "$truth" ]; then
-        echo "[verify_kernel_source] FAIL $mk: $f -- not found in the pinned instance ($inst/src/aie_kernels/{aie2p,aie2}/$f); cannot establish ground truth" >&2
+        echo "[verify_kernel_source] FAIL $mk: $f -- not found in the pinned instance vendor source tree ($inst/src/aie_kernels); cannot establish ground truth" >&2
         fail=1; continue
       fi
     fi

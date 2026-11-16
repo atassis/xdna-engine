@@ -23,11 +23,24 @@ from pathlib import Path
 from check_iron_artifact_provenance import validate as validate_iron_provenance
 from lib.data_root import XDNA_DATA
 from pyannote_local_inputs import PipelineComponent, pipeline_components, validate_local_pipeline_inputs
+import verified_gemma_data as verified_data
+import verified_gemma4_data as verified_gemma4
 from model_artifact_stages import Stage, StageRunner, View, digest as stage_digest, rebase_stage, source_identity
 
 
 LOCK_ROOT = XDNA_DATA / "locks/model-artifacts"
 PAIRED_LLM_MODELS = {"qwen3.5-4b", "qwen3-embedding-4b"}
+# A verified-data recipe consumes retained bytes instead of quantizing a checkpoint. The step name is
+# also the variant name, so a stage record, a receipt and a prepared manifest all spell it once.
+VERIFIED_DATA_STEP = verified_data.VARIANT
+# Where a model's retained data lives inside the operator's accepted data owner directory, which is
+# itself a runtime argument and never a repository default. This map is what lets a maintained
+# validator check a recipe's argv against its model without trusting that argv.
+VERIFIED_DATA_INPUTS = {"gemma3-270m": ("gemma3-270m/weights_qat_int4g32",)}
+# The one output a data producer may write: the model's declared weights root, named the same way the
+# recipe names it under the candidate artifacts root. Neither an input, nor another program's root.
+VERIFIED_DATA_OUTPUTS = {"gemma3-270m": "gemma3-270m/weights_qat_int4g32"}
+VERIFIED_DATA_FLAGS = ("--model", "--accepted-data-root", "--source", "--witness", "--out")
 
 
 @contextmanager
@@ -421,6 +434,327 @@ def declare_stages(recipe: Recipe, repo: Path, build: Path) -> Recipe:
     return replace(recipe, commands=tuple(result))
 
 
+def verified_data_roots(model: str, accepted_data_root: Path) -> tuple[str, ...]:
+    """The retained data roots a model may consume, relative to its accepted data owner."""
+    owner = verified_data.declared_path(accepted_data_root, "accepted data root")
+    return tuple(str(owner / name) for name in VERIFIED_DATA_INPUTS[model])
+
+
+def _reject_rebased_paths(model: str, values: tuple, artifacts: Path, build: Path) -> None:
+    """Refuse a consumed path that `rebase_recipe` would silently rewrite.
+
+    `rebase_recipe`/`rebase_stage` rewrite every argv or view value at or under the candidate artifacts
+    and build roots. A retained-data leaf or a reviewed witness living there would therefore be
+    pointed at a staged path that never existed, and the failure would surface mid-build instead of at
+    review. An accepted data owner that merely *contains* the candidate root stays legal: what matters
+    is the leaf the stage reads.
+    """
+    roots = [Path(os.path.abspath(str(root))) for root in (artifacts, build)]
+    for label, value in values:
+        for root in roots:
+            if value == root or value.is_relative_to(root):
+                raise RuntimeError(f"{model}: the {VERIFIED_DATA_STEP} {label} {value} lies under the "
+                                   f"rebased root {root}; the stage would read a path the rebase made up")
+
+
+def verified_data_argv(recipe: Recipe, repo: Path) -> dict:
+    """The variant's own declared paths and mode, read against the recipe instead of trusted from argv."""
+    producers = {item.step: item for item in recipe.commands}
+    if VERIFIED_DATA_STEP not in producers:
+        raise ValueError(f"{recipe.model}: not a {VERIFIED_DATA_STEP} recipe")
+    item = producers[VERIFIED_DATA_STEP]
+    argv = list(item.argv)
+    # argparse takes the last repeated option, so validating only the first occurrence would bind
+    # different inputs/outputs from the ones the process consumes. The fixed factory has one grammar.
+    if len(argv) != 3 + 2 * len(VERIFIED_DATA_FLAGS) or argv[2] != "--materialize" \
+            or tuple(argv[3::2]) != VERIFIED_DATA_FLAGS:
+        raise RuntimeError(f"{recipe.model}: the {VERIFIED_DATA_STEP} command must use its fixed "
+                           "--materialize argument grammar, without repeated or extra options")
+    helper = verified_data.declared_path(argv[1], "data verifier helper")
+    if helper != repo / "scripts/verified_gemma_data.py":
+        raise RuntimeError(f"{recipe.model}: the {VERIFIED_DATA_STEP} helper is not the repository's "
+                           f"declared producer: {helper}")
+
+    def flag(name: str) -> str:
+        if name not in argv or argv.index(name) + 1 == len(argv):
+            raise RuntimeError(f"{recipe.model}: the {VERIFIED_DATA_STEP} command lacks {name}")
+        return argv[argv.index(name) + 1]
+
+    if Path(argv[1]).name != "verified_gemma_data.py":
+        raise RuntimeError(f"{recipe.model}: the {VERIFIED_DATA_STEP} helper is not "
+                           f"scripts/verified_gemma_data.py: {argv[1]!r}")
+    if "--materialize" not in argv:
+        raise RuntimeError(f"{recipe.model}: the {VERIFIED_DATA_STEP} helper must run --materialize; "
+                           f"{[arg for arg in argv if arg.startswith('--')]} declare no data write")
+    if flag("--model") != recipe.model:
+        raise RuntimeError(f"{recipe.model}: the {VERIFIED_DATA_STEP} --model flag declares "
+                           f"{flag('--model')!r}")
+    return {"stage": item,
+            "source": verified_data.declared_path(flag("--source"), "--source"),
+            "owner": verified_data.declared_path(flag("--accepted-data-root"), "--accepted-data-root"),
+            "witness": verified_data.declared_path(flag("--witness"), "--witness"),
+            "out": verified_data.declared_path(flag("--out"), "--out")}
+
+
+def verified_data_recipe(model: str, scenario: str, repo: Path, artifacts: Path, inputs: Path,
+                         build: Path, *, witness: Path, data_source: Path,
+                         accepted_data_root: Path, witness_sha256: str | None = None) -> Recipe:
+    """The fixed Gemma-only compile-from-verified-data recipe.
+
+    It reuses `_recipe_for` so the served roots, the decode compile and the tokenizer copy stay the
+    maintained ones, and replaces only the data producer: a witness verifier/copy helper instead of a
+    quantizer. Retained bytes become declared immutable inputs, never an output adopted under the
+    current quantizer's source key. Ordinary source recipes stay reachable only through `recipe_for`,
+    so this factory can never silently fall back to quantizing.
+    """
+    if model == "gemma4-12b":
+        if witness_sha256 is None:
+            raise ValueError("Gemma4 verified-data recipe requires an explicit witness SHA256")
+        return gemma4_verified_recipe(scenario, repo, artifacts, inputs, build, witness=witness,
+                                      witness_sha256=witness_sha256, data_source=data_source,
+                                      accepted_data_root=accepted_data_root)
+    if witness_sha256 is not None:
+        raise ValueError(f"{model}: witness SHA256 pin is only supported for gemma4-12b")
+    spec = verified_data.spec_for(model)
+    source = verified_data.declared_path(data_source, "data source")
+    owner = verified_data.declared_path(accepted_data_root, "accepted data root")
+    reviewed = verified_data.declared_path(witness, "witness")
+    # Fail here rather than in a stage that reads a path the rebase invented under the candidate roots.
+    _reject_rebased_paths(spec.model, (("data source", source), ("witness", reviewed),
+                                       ("witness directory", reviewed.parent)), artifacts, build)
+    if str(source) not in verified_data_roots(spec.model, owner):
+        raise RuntimeError(f"{spec.model}: {source} is not a declared {VERIFIED_DATA_STEP} input; "
+                           f"the data owner is a runtime argument, but its location is not")
+    ordinary = _recipe_for(model, scenario, repo, artifacts, inputs, build)
+    producers = {item.step: item for item in ordinary.commands}
+    weights = next(arg for step, arg in zip(producers["weights"].argv, producers["weights"].argv[1:])
+                   if step == "--out")
+    materialize = command(VERIFIED_DATA_STEP,
+                          [sys.executable, str(repo / "scripts/verified_gemma_data.py"), "--materialize",
+                           "--model", spec.model, "--accepted-data-root", str(owner),
+                           "--source", str(source), "--witness", str(reviewed), "--out", weights])
+    source_recipe = replace(ordinary, commands=tuple(item for item in ordinary.commands
+                                                    if item.step != "weights"))
+    declared = {item.step: item for item in declare_stages(source_recipe, repo, build).commands}
+    # The maintained compiler contract stays byte-identical; only its weight dependency is renamed.
+    declared["decode"] = replace(declared["decode"], stage=replace(declared["decode"].stage,
+                                                                  dependencies=(VERIFIED_DATA_STEP,)))
+    data = Stage(inputs=(View(str(source)), View(str(reviewed.parent), (reviewed.name,))),
+                 outputs=(View(weights),), sources=("scripts/verified_gemma_data.py",))
+    return replace(source_recipe, commands=(Command(VERIFIED_DATA_STEP, materialize.argv,
+                                                    materialize.env, stage=data),
+                                            *declared.values()))
+
+
+def gemma4_verified_recipe(scenario: str, repo: Path, artifacts: Path, inputs: Path, build: Path, *,
+                         witness: Path, witness_sha256: str, data_source: Path,
+                         accepted_data_root: Path) -> Recipe:
+    """Declare, but do not register or execute, Gemma4's pinned verified-data closure."""
+    model = "gemma4-12b"
+    expected_scenario = "scenarios/generate-gemma4-12b-resident-256k.toml"
+    if scenario != expected_scenario:
+        raise ValueError(f"{model} is bound to {expected_scenario}, not {scenario}")
+    if (not isinstance(witness_sha256, str) or len(witness_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in witness_sha256)):
+        raise ValueError("Gemma4 witness SHA256 must be lowercase SHA256")
+    owner = verified_data.declared_path(accepted_data_root, "accepted data root")
+    source = verified_data.declared_path(data_source, "Gemma4 source root")
+    reviewed = verified_data.declared_path(witness, "witness")
+    if source != owner / model:
+        raise ValueError("Gemma4 source root must exactly be accepted_data_root/gemma4-12b")
+    store, rf_stack = source / "store", source / "rf_stack"
+    hf_config, tokenizer = source / "hf_config", source / "tokenizer"
+    _reject_rebased_paths(model, (("data source", source), ("store", store), ("rf stack", rf_stack),
+                                  ("hf config", hf_config), ("tokenizer", tokenizer),
+                                  ("witness", reviewed), ("witness directory", reviewed.parent)),
+                          artifacts, build)
+
+    # This is the maintained ordinary declaration only; it is never passed to build_recipe here.
+    ordinary = recipe_for(model, scenario, repo, artifacts, inputs, build)
+    ordinary_commands = {item.step: item for item in ordinary.commands}
+    native = ordinary_commands["build"]
+    package = ordinary_commands["package"]
+    if native.stage is None or package.stage is None:
+        raise RuntimeError("Gemma4 maintained recipe lacks build/package stage contracts")
+    proof_root = build / model / VERIFIED_DATA_STEP
+    data = Command(
+        VERIFIED_DATA_STEP,
+        (sys.executable, str(repo / "scripts/gemma4_verified_entry.py"), "proof", "--source", str(source),
+         "--accepted-data-root", str(owner), "--witness", str(reviewed),
+         "--expected-witness-sha256", witness_sha256, "--out", str(proof_root)),
+        {},
+        Stage(inputs=(View(str(store)), View(str(rf_stack)), View(str(hf_config), ("config.json",)),
+                      View(str(tokenizer), ("*.json", "*.jinja", "*.model")),
+                      View(str(reviewed.parent), (reviewed.name,))),
+              outputs=(View(str(proof_root), (".verified-data-witness.json",), True),),
+              sources=("scripts/gemma4_verified_entry.py", "scripts/verified_gemma4_data.py",
+                       "scripts/verified_gemma_data.py")),
+    )
+    native_env = native.env | {"RF_STORE": str(store), "RF_HF_CONFIG": str(hf_config / "config.json"),
+                               "KEEP_WORK": native.env["RF_BUILD"]}
+    native_stage = replace(native.stage, inputs=(View(str(hf_config), ("config.json",)),
+                                                  View(str(store), ("manifest.json",))),
+                           outputs=(*native.stage.outputs,
+                                    View(native.env["RF_BUILD"] + "/kobj", ("run-*",), True)),
+                           dependencies=(VERIFIED_DATA_STEP,))
+    native = replace(native, env=native_env, stage=native_stage)
+    package_argv = (sys.executable, str(repo / "scripts/gemma4_verified_entry.py"), "package",
+                    "--source", str(source), "--accepted-data-root", str(owner),
+                    "--proof-root", str(proof_root), "--expected-witness-sha256", witness_sha256,
+                    "--artifacts-root", str(artifacts), "--build-dir", native.env["RF_BUILD"],
+                    "--out", ordinary.outputs[0], "--tokenizer-out", ordinary.outputs[1])
+    package_stage = replace(
+        package.stage,
+        inputs=(View(str(store)), View(str(rf_stack)), View(str(hf_config), ("config.json",)),
+                View(str(tokenizer), ("*.json", "*.jinja", "*.model"))),
+        dependencies=(VERIFIED_DATA_STEP, "build"),
+        outputs=tuple(View(raw) for raw in ordinary.outputs[:3]),
+        sources=("scripts/gemma4_verified_entry.py", "scripts/verified_gemma4_data.py",
+                 "scripts/verified_gemma_data.py", *package.stage.sources),
+        symbols=("package_gemma4", "copy_tokenizer"),
+    )
+    package_env = package.env | {"RF_STORE": str(store), "RF_HF_CONFIG": str(hf_config / "config.json")}
+    packaged = Command("package", package_argv, package_env,
+                       package_stage)
+    return Recipe(model, scenario,
+                  (str(store), str(rf_stack), str(hf_config / "config.json"), str(tokenizer), str(reviewed)),
+                  ordinary.outputs[:3], (data, native, packaged))
+
+
+def _gemma4_declared_path(raw, label: str) -> Path:
+    """Require the lexical path form that the Gemma4 verifier will consume."""
+    if not isinstance(raw, str):
+        raise ValueError(f"Gemma4 {label} must be a string path")
+    return verified_data.declared_path(raw, label)
+
+
+def _gemma4_disjoint(left: Path, right: Path, label: str) -> None:
+    if left == right or left.is_relative_to(right) or right.is_relative_to(left):
+        raise ValueError(f"Gemma4 {label} overlap: {left} and {right}")
+
+
+def _gemma4_input_outside_rebase(path: Path, label: str, artifacts: Path, build: Path) -> None:
+    """An immutable input may neither be rebased nor contain a rebased frontier."""
+    for root in (artifacts, build):
+        if path == root or path.is_relative_to(root) or root.is_relative_to(path):
+            raise ValueError(f"Gemma4 {label} overlaps candidate/build root {root}")
+
+
+def validate_gemma4_verified_recipe(recipe: Recipe, repo: Path, artifacts: Path, build: Path) -> None:
+    """Read-only admission check for the standalone pinned Gemma4 recipe.
+
+    The ordinary-factory ``inputs`` argument is intentionally irrelevant after this closure replaces
+    its producer; reconstruction uses the natural sibling ``model-inputs`` spelling to make that
+    fact explicit rather than blessing an unrelated caller path.
+    """
+    model = "gemma4-12b"
+    scenario = "scenarios/generate-gemma4-12b-resident-256k.toml"
+    if recipe.model != model or recipe.scenario != scenario:
+        raise ValueError("not the fixed Gemma4 verified-data recipe")
+    if len(recipe.commands) != 3 or tuple(item.step for item in recipe.commands) != (
+            VERIFIED_DATA_STEP, "build", "package") or len({item.step for item in recipe.commands}) != 3:
+        raise ValueError("Gemma4 verified recipe must have exactly verified-data, build, package steps")
+    proof_command = _gemma4_verified_data_pin(recipe)
+    if proof_command is None:
+        raise ValueError("Gemma4 verified recipe requires a proof command")
+    data, pin = proof_command
+    argv = data.argv
+    if argv[1] != str(repo / "scripts/gemma4_verified_entry.py"):
+        raise ValueError("Gemma4 proof command is not bound to this repository")
+    source = _gemma4_declared_path(argv[4], "proof --source")
+    proof = _gemma4_declared_path(argv[12], "proof --out")
+    owner = _gemma4_declared_path(argv[6], "proof --accepted-data-root")
+    witness = _gemma4_declared_path(argv[8], "proof --witness")
+    if source != owner / model:
+        raise ValueError("Gemma4 proof source must exactly be accepted_data_root/gemma4-12b")
+    artifacts = _gemma4_declared_path(str(artifacts), "candidate artifacts root")
+    build = _gemma4_declared_path(str(build), "build root")
+    if proof != build / model / VERIFIED_DATA_STEP:
+        raise ValueError("Gemma4 proof output must be build/gemma4-12b/verified-data")
+    if any(name in os.environ for name in ("RF_STORE", "RF_HF_CONFIG")):
+        raise ValueError("Gemma4 verified recipe refuses ambient retained-data overrides")
+    immutable = (source / "store", source / "rf_stack", source / "hf_config", source / "tokenizer",
+                 witness.parent)
+    for label, value in zip(("source", "store", "rf stack", "HF config", "tokenizer", "witness directory"),
+                            (source, *immutable)):
+        _gemma4_input_outside_rebase(value, label, artifacts, build)
+    _reject_rebased_paths(model, (("source", source), ("witness", witness),
+                                  ("witness directory", witness.parent)), artifacts, build)
+    for value in immutable:
+        _gemma4_disjoint(value, proof, "immutable proof input")
+    for index, left in enumerate(immutable):
+        for right in immutable[index + 1:]:
+            _gemma4_disjoint(left, right, "immutable input")
+
+    expected = gemma4_verified_recipe(scenario, repo, artifacts, artifacts.parent / "model-inputs", build,
+                                      witness=witness, witness_sha256=pin, data_source=source,
+                                      accepted_data_root=owner)
+    if stage_digest(asdict(recipe)) != stage_digest(asdict(expected)):
+        raise ValueError("Gemma4 verified recipe differs from its canonical construction")
+
+    raw = verified_gemma4._read(witness, verified_gemma4.MAX_WITNESS_BYTES, "Gemma4 witness")
+    if verified_gemma4.stream_hash_bytes(raw) != pin:
+        raise verified_gemma4.VerifiedDataError("Gemma4 witness SHA256 differs from expected value")
+    document = verified_gemma4._validate_witness(verified_gemma4._json(raw, str(witness)))
+    verified_gemma4.verify_source(source, document, accepted_data_root=owner)
+
+
+def validate_verified_data_inputs(recipes: list[Recipe], artifacts: Path, build: Path, repo: Path) -> None:
+    """Check a variant recipe against its own contract, before anything is written or executed.
+
+    The witness, the data root and the accepted data owner are operator arguments; the model declares
+    which data roots it may consume and which weights root it may write, so a recipe cannot carry a
+    path into the build that its model never declared, publish into an immutable input or another
+    program's root, read through a symlinked root, or name a path the staging rebase rewrites.
+    """
+    for recipe in recipes:
+        if recipe.model == "gemma4-12b":
+            validate_gemma4_verified_recipe(recipe, repo, artifacts, build)
+            continue
+        declared = verified_data_argv(recipe, repo)
+        stage = declared["stage"].stage
+        if stage is None:
+            raise RuntimeError(f"{recipe.model}: the {VERIFIED_DATA_STEP} command declares no stage contract")
+        _reject_rebased_paths(recipe.model, (("data source", declared["source"]),
+                                            ("witness", declared["witness"]),
+                                            ("witness directory", declared["witness"].parent)),
+                              artifacts, build)
+        if str(declared["source"]) not in verified_data_roots(recipe.model, declared["owner"]):
+            raise RuntimeError(f"{recipe.model}: {declared['source']} is not a declared "
+                               f"{VERIFIED_DATA_STEP} input for this model")
+        weights = Path(VERIFIED_DATA_OUTPUTS[recipe.model])
+        if str(declared["out"]) not in recipe.outputs or declared["out"] != artifacts / weights:
+            raise RuntimeError(f"{recipe.model}: the {VERIFIED_DATA_STEP} output {declared['out']} is not "
+                               f"the declared weights root {weights} among {list(recipe.outputs)}")
+        for raw in recipe.inputs:
+            immutable = Path(os.path.abspath(raw))
+            if declared["out"] == immutable or declared["out"].is_relative_to(immutable) \
+                    or immutable.is_relative_to(declared["out"]):
+                raise RuntimeError(f"{recipe.model}: the {VERIFIED_DATA_STEP} output {declared['out']} may "
+                                   f"not overlap the immutable recipe input {raw}")
+        # The stage views are what the maintained StageRunner hashes, fingerprints and rewrites, so an
+        # argv that agrees with the contract while the views point elsewhere would run one thing and
+        # record another.
+        views = {view.root for view in stage.inputs}
+        if views != {str(declared["source"]), str(declared["witness"].parent)}:
+            raise RuntimeError(f"{recipe.model}: the {VERIFIED_DATA_STEP} stage input views {sorted(views)} "
+                               f"are not the declared data source and reviewed witness")
+        if tuple(view.root for view in stage.outputs) != (str(declared["out"]),):
+            raise RuntimeError(f"{recipe.model}: the {VERIFIED_DATA_STEP} stage output views "
+                               f"{[view.root for view in stage.outputs]} are not its declared output")
+        expected = Stage(inputs=(View(str(declared["source"])),
+                                 View(str(declared["witness"].parent), (declared["witness"].name,))),
+                         outputs=(View(str(declared["out"])),), sources=("scripts/verified_gemma_data.py",))
+        if stage != expected:
+            raise RuntimeError(f"{recipe.model}: the {VERIFIED_DATA_STEP} stage contract is not the "
+                               "fixed data verifier contract")
+        # Confine and verify here, so an escape refuses before any stage or publication runs.
+        verified_data.verify_source(declared["source"],
+                                    verified_data.load_witness(declared["witness"]),
+                                    spec=verified_data.spec_for(recipe.model),
+                                    accepted_data_root=declared["owner"])
+
+
 def plan(config: Path, repo: Path, artifacts: Path, inputs: Path, build: Path) -> list[Recipe]:
     recipes = [recipe_for(row["name"], row["scenario"], repo, artifacts, inputs, build)
                for row in configured_models(config)]
@@ -512,8 +846,50 @@ def require_members(recipe: Recipe, root: Path, output: bool) -> None:
             raise FileNotFoundError(f"{recipe.model}: required {kind} missing under {root}: {' or '.join(choices)}")
 
 
-def validate_recipe_inputs(recipes: list[Recipe]) -> None:
+def _gemma4_verified_data_pin(recipe: Recipe) -> tuple[Command, str] | None:
+    """Parse only the fixed G4 proof grammar needed by published-data validation.
+
+    This intentionally does not declare or access historical source, witness, proof, or repository
+    paths: published outputs are independently verifiable after those inputs disappear.
+    """
+    if recipe.model != "gemma4-12b":
+        return None
+    commands = tuple(item for item in recipe.commands if item.step == VERIFIED_DATA_STEP)
+    if not commands:
+        return None
+    if (len(commands) != 1 or tuple(item.step for item in recipe.commands) !=
+            (VERIFIED_DATA_STEP, "build", "package") or len({item.step for item in recipe.commands}) != 3):
+        raise ValueError("Gemma4 verified-data recipe requires fixed verified-data, build, package steps")
+    data = commands[0]
+    argv = data.argv
+    flags = ("--source", "--accepted-data-root", "--witness", "--expected-witness-sha256", "--out")
+    if (not isinstance(argv, tuple) or len(argv) != 13 or argv[0] != sys.executable
+            or argv[2] != "proof" or tuple(argv[3::2]) != flags
+            or any(not isinstance(value, str) for value in argv)):
+        raise ValueError("Gemma4 proof command is not the fixed canonical argv grammar")
+    pin = argv[10]
+    if not verified_gemma4.HEX64.fullmatch(pin):
+        raise ValueError("Gemma4 proof witness pin must be lowercase SHA256")
+    return data, pin
+
+
+def _gemma4_live_proof_command(recipe: Recipe) -> tuple[Command, Path, str] | None:
+    """Add the live proof-root declaration needed only by staged-proof validation."""
+    parsed = _gemma4_verified_data_pin(recipe)
+    if parsed is None:
+        return None
+    data, pin = parsed
+    return data, _gemma4_declared_path(data.argv[12], "proof --out"), pin
+
+
+def validate_recipe_inputs(recipes: list[Recipe], *, repo: Path | None = None,
+                           artifacts: Path | None = None, build: Path | None = None) -> None:
     for recipe in recipes:
+        if recipe.model == "gemma4-12b" and any(item.step == VERIFIED_DATA_STEP for item in recipe.commands):
+            if repo is None or artifacts is None or build is None:
+                raise ValueError("Gemma4 verified-data recipe requires explicit pin context: repo, artifacts, build")
+            validate_gemma4_verified_recipe(recipe, repo, artifacts, build)
+            continue
         for raw in recipe.inputs:
             root = Path(raw)
             if not root.exists():
@@ -522,6 +898,18 @@ def validate_recipe_inputs(recipes: list[Recipe]) -> None:
 
 
 def validate_recipe_outputs(recipe: Recipe, *, references: Recipe | None = None) -> None:
+    verified = _gemma4_verified_data_pin(recipe)
+    if verified is not None:
+        if len(recipe.outputs) != 3:
+            raise ValueError("Gemma4 verified-data recipe must publish exactly three output roots")
+        for raw in recipe.outputs:
+            if not Path(raw).exists():
+                raise FileNotFoundError(f"{recipe.model}: recipe output missing: {raw}")
+        require_members(recipe, Path(recipe.outputs[0]), True)
+        _data, pin = verified
+        verified_gemma4.verify_published_data(*(Path(raw) for raw in recipe.outputs),
+                                              expected_witness_sha256=pin)
+        return
     for raw in recipe.outputs:
         if not Path(raw).exists():
             raise FileNotFoundError(f"{recipe.model}: recipe output missing: {raw}")
@@ -633,7 +1021,19 @@ def validate_qwen_embedding_closure(recipe: Recipe, *, step: str | None = None) 
 
 
 def validate_stage_outputs(recipe: Recipe, step: str) -> None:
-    if recipe.model in PAIRED_LLM_MODELS and step in {"decode", "prefill", "tokenizer"}:
+    verified = _gemma4_live_proof_command(recipe) if step == VERIFIED_DATA_STEP else None
+    if verified is not None and step == VERIFIED_DATA_STEP:
+        _data, proof, pin = verified
+        sidecar = verified_gemma4.declared_path(proof / verified_gemma4.SIDECAR,
+                                                "staged Gemma4 proof sidecar")
+        if not proof.is_dir():
+            raise verified_gemma4.VerifiedDataError("Gemma4 proof root is not a directory")
+        raw = verified_gemma4._read(sidecar, verified_gemma4.MAX_WITNESS_BYTES,
+                                    "staged Gemma4 proof sidecar")
+        if verified_gemma4.stream_hash_bytes(raw) != pin:
+            raise verified_gemma4.VerifiedDataError("Gemma4 proof sidecar SHA256 differs from expected value")
+        verified_gemma4._validate_witness(verified_gemma4._json(raw, str(sidecar)))
+    elif recipe.model in PAIRED_LLM_MODELS and step in {"decode", "prefill", "tokenizer"}:
         validate_paired_llm_closure(recipe, recipe, step=step)
         if recipe.model == "qwen3-embedding-4b":
             validate_qwen_embedding_closure(recipe, step=step)
@@ -653,6 +1053,11 @@ def validate_stage_outputs(recipe: Recipe, step: str) -> None:
         validate(Path(recipe.outputs[0]))
     elif recipe.model == "gemma4-12b" and step == "package":
         validate_recipe_outputs(recipe)
+    elif recipe.model == "gemma3-270m" and step == VERIFIED_DATA_STEP:
+        argv = next(item.argv for item in recipe.commands if item.step == VERIFIED_DATA_STEP)
+        # The staged closure is verified exactly as a later consumer verifies the published one.
+        verified_data.verify_published(Path(argv[argv.index("--out") + 1]),
+                                       spec=verified_data.spec_for(recipe.model), label='staged')
 
 
 def authority_digest(recipe: Recipe, repo: Path) -> str:
@@ -794,22 +1199,91 @@ def copy_tree(source: Path, target: Path) -> None:
     shutil.copytree(source, target, copy_function=link_or_copy, symlinks=False)
 
 
-def package_gemma4(repo: Path, artifacts: Path, build: Path, out: Path, tokenizer_source: Path, tokenizer_out: Path) -> None:
+def package_gemma4(repo: Path, artifacts: Path, build: Path, out: Path, tokenizer_source: Path, tokenizer_out: Path,
+                   *, source_store: Path | None = None, source_rf_stack: Path | None = None) -> None:
     import numpy as np
     from safetensors.numpy import save_file
 
     checkpoint = artifacts / "gemma4-12b-qat/checkpoint"
-    copy_tokenizer(tokenizer_source, checkpoint)
-    store = artifacts / "gemma4-12b/store"
-    manifest = json.loads((store / "manifest.json").read_text())
-    towers = {}
-    for name, entry in manifest["towers"].items():
-        dtype = np.dtype(entry["dtype"])
-        if entry["layout"] != "raw_native" or entry["length"] % dtype.itemsize:
+    store = artifacts / "gemma4-12b/store" if source_store is None else source_store
+    rf_stack = artifacts / "gemma4-12b/rf_stack" if source_rf_stack is None else source_rf_stack
+    explicit_inputs = source_store is not None or source_rf_stack is not None
+    if explicit_inputs:
+        from verified_gemma_data import declared_path
+        store = declared_path(store, "Gemma4 package input")
+        rf_stack = declared_path(rf_stack, "Gemma4 package input")
+        tokenizer_source = declared_path(tokenizer_source, "Gemma4 package input")
+        checkpoint, out, tokenizer_out = (
+            declared_path(path, "Gemma4 package destination")
+            for path in (checkpoint, out, tokenizer_out))
+        sources = (store, rf_stack, tokenizer_source)
+        destinations = (checkpoint, out, tokenizer_out)
+        for source in sources:
+            for destination in destinations:
+                if source == destination or source in destination.parents or destination in source.parents:
+                    raise ValueError(f"Gemma4 package input overlaps destination: {source} and {destination}")
+        for index, left in enumerate(destinations):
+            for right in destinations[index + 1:]:
+                for first, second in ((left, right), (right, left)):
+                    if first == second or first in second.parents:
+                        raise ValueError(f"Gemma4 package destinations overlap: {first} and {second}")
+        for source in sources:
+            if not source.is_dir():
+                raise FileNotFoundError(f"Gemma4 package input is not a directory: {source}")
+
+    manifest_path = store / "manifest.json"
+    if explicit_inputs and manifest_path.is_symlink():
+        raise ValueError(f"Gemma4 package manifest is symlinked: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text())
+    entries = manifest.get("towers") if isinstance(manifest, dict) else None
+    if not isinstance(entries, dict):
+        raise ValueError("Gemma4 package manifest lacks a tower map")
+    blobs = store / "blobs"
+    tower_inputs = []
+    for name, entry in entries.items():
+        if not isinstance(entry, dict) or entry.get("layout") != "raw_native":
             raise ValueError(f"{name}: invalid tower storage layout")
-        towers[name] = np.fromfile(store / "blobs" / f"{entry['blob']}.bin", dtype=dtype,
-                                   count=entry["length"] // dtype.itemsize,
-                                   offset=entry["offset"]).reshape(entry["shape"])
+        try:
+            dtype = np.dtype(entry["dtype"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(f"{name}: invalid tower dtype") from error
+        if dtype.hasobject or dtype.itemsize <= 0:
+            raise ValueError(f"{name}: invalid tower dtype")
+        offset, length, shape, blob = (entry.get(key) for key in ("offset", "length", "shape", "blob"))
+        if any(not isinstance(value, int) or isinstance(value, bool) or value < 0
+               for value in (offset, length)) or length % dtype.itemsize:
+            raise ValueError(f"{name}: invalid tower extent")
+        if not isinstance(shape, list) or any(not isinstance(dimension, int)
+                                              or isinstance(dimension, bool) or dimension < 0
+                                              for dimension in shape):
+            raise ValueError(f"{name}: invalid tower shape")
+        elements = 1
+        for dimension in shape:
+            elements *= dimension
+        if elements * dtype.itemsize != length:
+            raise ValueError(f"{name}: tower shape does not match extent")
+        if not isinstance(blob, str) or not blob or Path(blob).is_absolute() \
+                or any(part in {".", ".."} for part in Path(blob).parts):
+            raise ValueError(f"{name}: invalid tower blob")
+        blob_path = blobs / f"{blob}.bin"
+        ancestor = blob_path
+        while True:
+            if ancestor.is_symlink():
+                raise ValueError(f"{name}: tower blob path is symlinked: {ancestor}")
+            if ancestor == blobs:
+                break
+            ancestor = ancestor.parent
+        if not blob_path.is_file():
+            raise FileNotFoundError(f"{name}: tower blob is not a regular file: {blob_path}")
+        if offset + length > blob_path.stat().st_size:
+            raise ValueError(f"{name}: tower extent exceeds blob size")
+        tower_inputs.append((name, dtype, blob_path, offset, length, shape))
+
+    copy_tokenizer(tokenizer_source, checkpoint)
+    towers = {}
+    for name, dtype, blob_path, offset, length, shape in tower_inputs:
+        towers[name] = np.fromfile(blob_path, dtype=dtype, count=length // dtype.itemsize,
+                                   offset=offset).reshape(shape)
     save_file(towers, checkpoint / "model.safetensors")
     with tempfile.TemporaryDirectory(prefix=".gemma4-package-", dir=build.parent) as temporary:
         metadata = Path(temporary) / "meta.json"
@@ -824,8 +1298,8 @@ def package_gemma4(repo: Path, artifacts: Path, build: Path, out: Path, tokenize
             "--out", str(out),
             "--build", str(build / "rf48C"),
             "--meta", str(metadata),
-            "--weights", str(artifacts / "gemma4-12b/rf_stack"),
-            "--store", str(artifacts / "gemma4-12b/store"),
+            "--weights", str(rf_stack),
+            "--store", str(store),
         ]
         subprocess.run(cmd, check=True, cwd=repo)
     copy_tokenizer(tokenizer_source, tokenizer_out)
@@ -1200,6 +1674,10 @@ def stage_locations(recipe: Recipe, artifacts: Path, build: Path) -> tuple[Path,
 
 
 def build_recipe(recipe: Recipe, repo: Path, config: Path, artifacts: Path, build: Path) -> str:
+    if any(item.step == VERIFIED_DATA_STEP for item in recipe.commands):
+        # The variant's own contract, checked by the maintained entry point before any lock, stage,
+        # output or receipt is touched. Ordinary source recipes carry no such step and are untouched.
+        validate_verified_data_inputs([recipe], artifacts, build, repo)
     authority_before = authority_digest(recipe, repo)
     inputs_before = source_digest(recipe.inputs)
     key = recipe_key(recipe, repo, config, authority=authority_before, inputs=inputs_before)

@@ -76,6 +76,21 @@ npu decide "some text" --question "..."     # typed decision (qwen3.5-4b)
 npu model ls                                # list loaded models
 ```
 
+To install an already-built cohort without Cargo, SDK provisioning, or model export, use an
+operator-reviewed prepared manifest:
+
+```sh
+INSTALL_MODE=prepared PREPARED_MANIFEST=/path/to/prepared-manifest.json ./install.sh
+```
+
+The verifier checks the binaries, versioned ONNX Runtime library, kernel bundle, toolchain lock,
+config, and artifact receipts for every configured model before installation. These inputs must
+already exist locally; the manifest is not a download or a numerical qualification result. Its
+config path becomes the service's config path, so use a durable location rather than a build directory.
+Version 1 supports ordinary receipts; version 2 explicitly binds `verified-data` Gemma variants and
+their reviewed witness hashes. Those variants compile fresh programs against retained, verified data
+without claiming that the current quantizer produced it. Installation still does not start the service.
+
 Weight checkpoints are baked from Hugging Face checkpoints with `npu checkpoint bake` (see
 `rust/npu-weights`). Model export/convert scripts live in `scripts/`.
 

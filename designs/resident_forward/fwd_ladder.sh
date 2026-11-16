@@ -28,7 +28,11 @@ source "$HERE/env.sh"
 export RF_BUILD=${RF_BUILD:-${XDNA_DATA:-$REPO}/build/resident_forward}
 name=$1; flags=$2; shift 2
 export RF_KOBJ_RUN="run-$(date +%s%N)-$$"
-trap 'rm -rf "$RF_BUILD/kobj/$RF_KOBJ_RUN"' EXIT
+if [[ -n ${KEEP_WORK:-} ]]; then
+  echo "[fwd] retaining fresh cache $RF_BUILD/kobj/$RF_KOBJ_RUN"
+else
+  trap 'rm -rf "$RF_BUILD/kobj/$RF_KOBJ_RUN"' EXIT
+fi
 RESERVE_KB=$((4 * 1024 * 1024))
 DEFAULT_PEAK_KB=$((5632 * 1024))  # 5.5 GB, unknown emit list
 

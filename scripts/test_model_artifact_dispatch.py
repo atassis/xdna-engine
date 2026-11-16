@@ -5,12 +5,15 @@ import multiprocessing
 import os
 import subprocess
 import sys
+import shutil
 import tempfile
 import unittest
+from dataclasses import asdict, replace
 from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from test_verified_gemma_data import gemma_dump, witness_file
 from model_artifact_dispatch import (
     Command,
     Recipe,
@@ -818,6 +821,205 @@ class ModelArtifactDispatchPlanTests(unittest.TestCase):
             self.assertEqual(list(saved), ["model.embed_audio.embedding_projection.weight"])
             np.testing.assert_array_equal(next(iter(saved.values())), array)
 
+    def test_gemma4_explicit_retained_inputs_leave_old_roots_untouched(self) -> None:
+        import numpy as np
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            old, staged = root / "retained", root / "staged"
+            source = root / "tokenizer-source"
+            (source).mkdir()
+            (source / "config.json").write_text("{}")
+            (source / "tokenizer.json").write_text("{}")
+            store, weights = old / "store", old / "rf_stack"
+            (store / "blobs").mkdir(parents=True)
+            weights.mkdir()
+            array = np.array([1.25, 2.5], dtype=np.float32)
+            (store / "blobs/tower.bin").write_bytes(array.tobytes())
+            (store / "manifest.json").write_text(json.dumps({"towers": {
+                "tower": {"blob": "tower", "offset": 0, "length": array.nbytes,
+                          "shape": list(array.shape), "dtype": "float32", "layout": "raw_native"}}}))
+            sentinel = (store / "manifest.json").read_bytes()
+            with patch("model_artifact_dispatch.subprocess.run") as run:
+                package_gemma4(REPO, staged, root / "build", root / "package", source,
+                               root / "staged-tokenizer", source_store=store, source_rf_stack=weights)
+            commands = [call.args[0] for call in run.call_args_list]
+            meta, package = commands
+            self.assertEqual(meta[meta.index("--store") + 1], str(store))
+            self.assertEqual(package[package.index("--store") + 1], str(store))
+            self.assertEqual(package[package.index("--weights") + 1], str(weights))
+            self.assertTrue((staged / "gemma4-12b-qat/checkpoint/model.safetensors").is_file())
+            self.assertEqual(package[package.index("--out") + 1], str(root / "package"))
+            self.assertTrue((root / "staged-tokenizer").exists())
+            self.assertEqual((store / "manifest.json").read_bytes(), sentinel)
+            self.assertFalse((old / "gemma4-12b-qat/checkpoint").exists())
+
+    def test_gemma4_explicit_input_destination_alias_fails_before_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store, weights = root / "retained/store", root / "retained/rf_stack"
+            store.mkdir(parents=True)
+            weights.mkdir(parents=True)
+            source = root / "tokenizer-source"
+            source.mkdir()
+            with self.assertRaises(ValueError):
+                package_gemma4(REPO, root / "stage", root / "build", root / "package", source,
+                               root / "tokenizer", source_store=store,
+                               source_rf_stack=root / "stage/gemma4-12b-qat/checkpoint")
+            self.assertFalse((root / "stage").exists())
+
+    def test_gemma4_explicit_input_rejects_checkpoint_inside_tokenizer_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tokenizer = root / "tokenizer"
+            checkpoint = tokenizer / "gemma4-12b-qat/checkpoint"
+            tokenizer.mkdir()
+            (tokenizer / "config.json").write_text("{\"keep\":true}")
+            (tokenizer / "tokenizer.json").write_text("{\"keep\":true}")
+            before = {p.name: p.read_bytes() for p in tokenizer.iterdir()}
+            store, weights = root / "retained/store", root / "retained/rf_stack"
+            (store / "blobs").mkdir(parents=True)
+            weights.mkdir()
+            (store / "manifest.json").write_text('{"towers":{}}')
+            with patch("model_artifact_dispatch.subprocess.run") as run:
+                with self.assertRaises(ValueError):
+                    package_gemma4(REPO, tokenizer, root / "build", root / "package", tokenizer,
+                                   root / "tokenizer-output", source_store=store, source_rf_stack=weights)
+            run.assert_not_called()
+            self.assertFalse(checkpoint.exists())
+            self.assertEqual({p.name: p.read_bytes() for p in tokenizer.iterdir()}, before)
+
+    def test_gemma4_explicit_input_aliases_are_rejected_before_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store, weights = root / "retained/store", root / "retained/rf_stack"
+            store.mkdir(parents=True)
+            weights.mkdir()
+            source = root / "tokenizer-source"
+            source.mkdir()
+            linked = root / "store-link"
+            linked.symlink_to(store, target_is_directory=True)
+            for alias in (root / "retained/../retained/store", linked):
+                with self.subTest(alias=alias):
+                    with self.assertRaises(RuntimeError):
+                        package_gemma4(REPO, root / "stage", root / "build", root / "package", source,
+                                       root / "tokenizer-out", source_store=alias, source_rf_stack=weights)
+                    self.assertFalse((root / "stage").exists())
+
+    def test_gemma4_explicit_package_and_checkpoint_destinations_must_not_overlap(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store, weights = root / "retained/store", root / "retained/rf_stack"
+            (store / "blobs").mkdir(parents=True)
+            weights.mkdir()
+            (store / "manifest.json").write_text('{"towers":{}}')
+            tokenizer = root / "tokenizer-source"
+            tokenizer.mkdir()
+            (tokenizer / "config.json").write_text("{}")
+            (tokenizer / "tokenizer.json").write_text("{}")
+            checkpoint = root / "stage/gemma4-12b-qat/checkpoint"
+            with patch("model_artifact_dispatch.subprocess.run") as run:
+                with self.assertRaises(ValueError):
+                    package_gemma4(REPO, root / "stage", root / "build", checkpoint, tokenizer,
+                                   root / "tokenizer-out", source_store=store, source_rf_stack=weights)
+            run.assert_not_called()
+            self.assertFalse((root / "stage").exists())
+
+    def test_gemma4_explicit_missing_tower_blob_fails_before_any_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store, weights = root / "retained/store", root / "retained/rf_stack"
+            (store / "blobs").mkdir(parents=True)
+            weights.mkdir()
+            (store / "manifest.json").write_text(json.dumps({"towers": {
+                "tower": {"blob": "missing", "offset": 0, "length": 4,
+                          "shape": [1], "dtype": "float32", "layout": "raw_native"}}}))
+            tokenizer = root / "tokenizer-source"
+            tokenizer.mkdir()
+            (tokenizer / "config.json").write_text("{}")
+            (tokenizer / "tokenizer.json").write_text("{}")
+            staged, output, tokenizer_out = root / "stage", root / "package", root / "tokenizer-out"
+            with patch("model_artifact_dispatch.subprocess.run") as run:
+                with self.assertRaises((FileNotFoundError, ValueError)):
+                    package_gemma4(REPO, staged, root / "build", output, tokenizer,
+                                   tokenizer_out, source_store=store, source_rf_stack=weights)
+            run.assert_not_called()
+            self.assertFalse(staged.exists())
+            self.assertFalse(output.exists())
+            self.assertFalse(tokenizer_out.exists())
+
+    def test_gemma4_explicit_blob_reference_cannot_escape_store(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store, weights = root / "retained/store", root / "retained/rf_stack"
+            (store / "blobs").mkdir(parents=True)
+            weights.mkdir()
+            outside = root / "foreign.bin"
+            outside.write_bytes(b"\x00\x00\x80?")
+            (store / "manifest.json").write_text(json.dumps({"towers": {
+                "tower": {"blob": "../../../foreign", "offset": 0, "length": 4,
+                          "shape": [1], "dtype": "float32", "layout": "raw_native"}}}))
+            tokenizer = root / "tokenizer-source"
+            tokenizer.mkdir()
+            (tokenizer / "config.json").write_text("{}")
+            (tokenizer / "tokenizer.json").write_text("{}")
+            with patch("model_artifact_dispatch.subprocess.run") as run:
+                with self.assertRaises((ValueError, FileNotFoundError)):
+                    package_gemma4(REPO, root / "stage", root / "build", root / "package", tokenizer,
+                                   root / "tokenizer-out", source_store=store, source_rf_stack=weights)
+            run.assert_not_called()
+            self.assertFalse((root / "stage").exists())
+            self.assertFalse((root / "tokenizer-out").exists())
+
+    def test_gemma4_explicit_symlinked_tower_blob_fails_before_any_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store, weights = root / "retained/store", root / "retained/rf_stack"
+            (store / "blobs").mkdir(parents=True)
+            weights.mkdir(parents=True)
+            foreign = root / "foreign.bin"
+            foreign.write_bytes(b"\x00\x00\x80?")
+            (store / "blobs/tower.bin").symlink_to(foreign)
+            (store / "manifest.json").write_text(json.dumps({"towers": {
+                "tower": {"blob": "tower", "offset": 0, "length": 4,
+                          "shape": [1], "dtype": "float32", "layout": "raw_native"}}}))
+            tokenizer = root / "tokenizer-source"
+            tokenizer.mkdir()
+            (tokenizer / "config.json").write_text("{}")
+            (tokenizer / "tokenizer.json").write_text("{}")
+            with patch("model_artifact_dispatch.subprocess.run") as run:
+                with self.assertRaises(ValueError):
+                    package_gemma4(REPO, root / "stage", root / "build", root / "package", tokenizer,
+                                   root / "tokenizer-out", source_store=store, source_rf_stack=weights)
+            run.assert_not_called()
+            self.assertFalse((root / "stage").exists())
+            self.assertFalse((root / "tokenizer-out").exists())
+
+    def test_gemma4_explicit_invalid_tower_extent_or_shape_fails_before_any_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store, weights = root / "retained/store", root / "retained/rf_stack"
+            (store / "blobs").mkdir(parents=True)
+            weights.mkdir(parents=True)
+            (store / "blobs/tower.bin").write_bytes(b"\x00\x00\x80?")
+            tokenizer = root / "tokenizer-source"
+            tokenizer.mkdir()
+            (tokenizer / "config.json").write_text("{}")
+            (tokenizer / "tokenizer.json").write_text("{}")
+            for entry in ({"blob": "tower", "offset": 2, "length": 4, "shape": [1],
+                           "dtype": "float32", "layout": "raw_native"},
+                          {"blob": "tower", "offset": 0, "length": 4, "shape": [2],
+                           "dtype": "float32", "layout": "raw_native"}):
+                with self.subTest(entry=entry):
+                    (store / "manifest.json").write_text(json.dumps({"towers": {"tower": entry}}))
+                    with patch("model_artifact_dispatch.subprocess.run") as run:
+                        with self.assertRaises(ValueError):
+                            package_gemma4(REPO, root / "stage", root / "build", root / "package", tokenizer,
+                                           root / "tokenizer-out", source_store=store, source_rf_stack=weights)
+                    run.assert_not_called()
+                    self.assertFalse((root / "stage").exists())
+                    self.assertFalse((root / "package").exists())
+                    self.assertFalse((root / "tokenizer-out").exists())
+
     def test_gemma4_build_consumes_its_staged_store(self) -> None:
         artifacts, build = REPO / "data/artifacts", REPO / "data/build"
         recipe = recipe_for("gemma4-12b", "scenarios/generate-gemma4-12b-resident-256k.toml",
@@ -1497,6 +1699,300 @@ class ModelArtifactDispatchPlanTests(unittest.TestCase):
         self.assertIn("--model-input-root", install)
         self.assertIn("--report", install)
         self.assertIn("$XDNA_LOGS/model-install-report.json", install)
+
+
+class VerifiedDataRecipeTests(unittest.TestCase):
+    """The fixed Gemma3 compile-from-verified-data recipe, and what it must never become."""
+
+    scenario = "scenarios/generate-gemma3-270m.toml"
+
+    def setUp(self):
+        import model_artifact_dispatch as dispatch
+        self.dispatch = dispatch
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.artifacts, self.build = self.root / "candidate", self.root / "build"
+        self.inputs = self.root / "model-inputs"
+        checkpoint = self.inputs / "gemma3-270m/checkpoint"
+        checkpoint.mkdir(parents=True)
+        (checkpoint / "config.json").write_text("{}")
+        (checkpoint / "tokenizer.json").write_text("{}")
+        (checkpoint / "model.safetensors").write_bytes(b"checkpoint")
+        self.owner = self.root / "data-owner"
+        self.dump = self.owner / "gemma3-270m/weights_qat_int4g32"
+        gemma_dump(self.dump)
+        self.witness = witness_file(self.dump, self.root / "evidence/data-witness.json",
+                                    legacy_receipt="e" * 64)
+
+    def variant(self, model="gemma3-270m", scenario=None, **overrides):
+        arguments = {"witness": self.witness, "data_source": self.dump,
+                     "accepted_data_root": self.owner}
+        arguments.update(overrides)
+        return self.dispatch.verified_data_recipe(model, scenario or self.scenario, REPO,
+                                                  self.artifacts, self.inputs, self.build, **arguments)
+
+    def test_variant_rejects_duplicate_flags_and_an_impostor_helper(self):
+        from dataclasses import replace
+        recipe = self.variant()
+        first = recipe.commands[0]
+        impostor = self.root / "impostor/scripts/verified_gemma_data.py"
+        impostor.parent.mkdir(parents=True)
+        impostor.write_text("raise SystemExit('not the declared producer')\n")
+        candidates = [(*first.argv, "--out", str(self.root / "unowned")),
+                      (first.argv[0], str(impostor), *first.argv[2:])]
+        for argv in candidates:
+            with self.subTest(argv=argv):
+                malformed = replace(recipe, commands=(replace(first, argv=argv), *recipe.commands[1:]))
+                with patch.object(self.dispatch, "authority_digest", side_effect=AssertionError("authority reached")):
+                    with self.assertRaises(RuntimeError):
+                        self.dispatch.build_recipe(malformed, REPO, REPO / self.scenario,
+                                                   self.artifacts, self.build)
+                self.assertFalse(self.build.exists())
+
+    def test_fixed_variant_views_and_candidate_root_cannot_be_redeclared(self):
+        recipe = self.variant()
+        first = recipe.commands[0]
+        narrowed = replace(first, stage=replace(first.stage, inputs=(
+            replace(first.stage.inputs[0], patterns=('quant.json',)), *first.stage.inputs[1:])))
+        foreign = self.root / 'foreign/gemma3-270m/weights_qat_int4g32'
+        redirected = replace(first, argv=(*first.argv[:-1], str(foreign)),
+                             stage=replace(first.stage, outputs=(self.dispatch.View(str(foreign)),)))
+        outputs = tuple(str(foreign) if item == first.argv[-1] else item for item in recipe.outputs)
+        candidates = (replace(recipe, commands=(narrowed, *recipe.commands[1:])),
+                      replace(recipe, outputs=outputs, commands=(redirected, *recipe.commands[1:])))
+        for candidate in candidates:
+            with self.subTest(candidate=candidate):
+                with patch.object(self.dispatch, 'authority_digest', side_effect=AssertionError('authority reached')):
+                    with self.assertRaises(RuntimeError):
+                        self.dispatch.build_recipe(candidate, REPO, REPO / self.scenario,
+                                                   self.artifacts, self.build)
+
+    def test_unstaged_variant_cannot_skip_the_automatic_input_gate(self):
+        from dataclasses import replace
+        recipe = self.variant()
+        malformed = replace(recipe, commands=(replace(recipe.commands[0], stage=None), *recipe.commands[1:]))
+        with patch.object(self.dispatch, "authority_digest", side_effect=AssertionError("authority reached")):
+            with self.assertRaisesRegex(RuntimeError, "stage contract"):
+                self.dispatch.build_recipe(malformed, REPO, REPO / self.scenario,
+                                           self.artifacts, self.build)
+        self.assertFalse(self.build.exists())
+
+    def test_ordinary_gemma3_recipe_still_declares_its_quantizer(self):
+        ordinary = recipe_for("gemma3-270m", self.scenario, REPO, self.artifacts, self.inputs, self.build)
+        self.assertEqual([item.step for item in ordinary.commands], ["weights", "decode", "tokenizer"])
+        self.assertIn("dump_llm_weights.py", ordinary.commands[0].argv[1])
+        self.assertIn("--quant", ordinary.commands[0].argv)
+        with tempfile.TemporaryDirectory() as directory:
+            unchanged = recipe_for("gemma3-270m", self.scenario, REPO, Path(directory) / "artifacts",
+                                   Path(directory) / "inputs", Path(directory) / "build")
+            self.assertEqual({item.step for item in unchanged.commands}, {"weights", "decode", "tokenizer"})
+
+    def test_variant_publishes_the_same_three_roots_with_a_verifier_instead_of_a_quantizer(self):
+        ordinary = recipe_for("gemma3-270m", self.scenario, REPO, self.artifacts, self.inputs, self.build)
+        variant = self.variant()
+        self.assertEqual(variant.model, ordinary.model)
+        self.assertEqual(variant.scenario, ordinary.scenario)
+        self.assertEqual(variant.outputs, ordinary.outputs)
+        steps = {item.step: item for item in variant.commands}
+        self.assertEqual(set(steps), {"verified-data", "decode", "tokenizer"})
+        self.assertNotIn("dump_llm_weights.py", json.dumps([list(item.argv) for item in variant.commands]))
+        producer = steps["verified-data"]
+        self.assertEqual(producer.argv[0], sys.executable)
+        self.assertTrue(producer.argv[1].endswith("scripts/verified_gemma_data.py"))
+        for flag in ("--materialize", "--accepted-data-root", "--source", "--witness", "--out"):
+            self.assertIn(flag, producer.argv)
+        self.assertEqual(producer.argv[producer.argv.index("--out") + 1], variant.outputs[1])
+        self.assertEqual(producer.stage.sources, ("scripts/verified_gemma_data.py",))
+        self.assertEqual({view.root for view in producer.stage.inputs},
+                         {str(self.dump.resolve()), str(Path(self.witness).parent)})
+        self.assertFalse(producer.stage.toolchain)
+        self.assertEqual(producer.stage.sdk_python, "")
+        # The compiled root stays a real fresh compile, and it now waits on the materialized data.
+        self.assertEqual(steps["decode"].stage.dependencies, ("verified-data",))
+        self.assertIn("scripts/build_llm_decode.sh", steps["decode"].stage.sources)
+        self.assertTrue(steps["decode"].stage.toolchain)
+        self.assertEqual(steps["tokenizer"].stage.symbols, ("copy_tokenizer", "main"))
+
+    def test_gemma3_verified_data_output_and_stage_validators_remain_positive(self):
+        """G4 proof parsing must not intercept the established G3 verified-data routes."""
+        variant = self.variant()
+        decode, weights, tokenizer = map(Path, variant.outputs)
+        decode.mkdir(parents=True)
+        shutil.copytree(self.dump, weights)
+        shutil.copy2(self.witness, weights / self.dispatch.verified_data.spec_for(variant.model).sidecar)
+        (decode / "meta.json").write_text("{}")
+        tokenizer.mkdir(parents=True)
+        self.dispatch.validate_recipe_outputs(variant)
+        self.dispatch.validate_stage_outputs(variant, self.dispatch.VERIFIED_DATA_STEP)
+
+    def test_variant_binds_the_witness_and_data_root_into_its_declared_command(self):
+        first = [asdict(item) for item in self.variant().commands]
+        rewritten = self.variant(witness=witness_file(self.dump, self.root / "evidence/other.json",
+                                                      legacy_receipt="f" * 64))
+        self.assertNotEqual(first, [asdict(item) for item in rewritten.commands])
+        second = self.root / "second-owner"
+        source = second / "gemma3-270m/weights_qat_int4g32"
+        gemma_dump(source)
+        moved = self.variant(accepted_data_root=second, data_source=source,
+                             witness=witness_file(source, self.root / "evidence/second.json",
+                                                  legacy_receipt="0" * 64))
+        declared = [asdict(item) for item in moved.commands]
+        self.assertNotEqual(first, declared)
+        self.assertIn(str(second.resolve()), json.dumps(moved.commands[0].argv))
+        self.assertNotIn(str(self.owner), json.dumps(declared))
+
+    def test_a_second_gemma_requires_its_explicit_pin_and_non_gemma_models_are_refused(self):
+        with self.assertRaisesRegex(ValueError, "requires an explicit witness SHA256"):
+            self.variant(model="gemma4-12b", scenario="scenarios/generate-gemma4-12b-resident-256k.toml")
+        with self.assertRaisesRegex(RuntimeError, "qwen3-0.6b.*Gemma-only"):
+            self.variant(model="qwen3-0.6b", scenario="scenarios/generate-qwen3-0.6b.toml")
+
+    def tamper(self, recipe, replacements):
+        return replace(recipe, commands=tuple(Command(
+            item.step, [replacements.get(arg, arg) for arg in item.argv], item.env, item.stage)
+            for item in recipe.commands))
+
+    def gate(self, recipe):
+        self.dispatch.validate_verified_data_inputs([recipe], self.artifacts, self.build, REPO)
+
+    def test_the_declared_weights_output_is_the_only_allowed_output(self):
+        """The immutable checkpoint root, another program's root and any child of the weights are not."""
+        variant = self.variant()
+        weights = Path(variant.outputs[1])
+        out = variant.commands[0].argv[-1]
+        for label, bad in (("checkpoint-child", str(Path(variant.inputs[0]) / "unexpected-data-output")),
+                           ("weights-child", str(weights / "nested")),
+                           ("decode-root", variant.outputs[0]),
+                           ("tokenizer-root", variant.outputs[2]),
+                           ("outside", str(self.root / "elsewhere/weights"))):
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(RuntimeError, "is not the declared weights root"):
+                    self.gate(self.tamper(variant, {out: bad}))
+        self.gate(variant)
+
+    def test_declared_inputs_and_the_declared_output_must_be_disjoint(self):
+        variant = self.variant()
+        weights = Path(variant.outputs[1])
+        for label, recipe in (("output-is-input", replace(variant, inputs=(str(weights),))),
+                              ("output-under-input", replace(variant, inputs=(str(weights.parent),)))):
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(RuntimeError, "may not overlap"):
+                    self.gate(recipe)
+
+    def test_paths_the_artifact_or_build_rebase_rewrites_are_refused_early(self):
+        """`rebase_recipe` rewrites argv and views under the candidate roots; consumed paths may not sit there."""
+        variant = self.variant()
+        rebased_source = self.tamper(variant, {str(self.dump.resolve()):
+                                              str(self.artifacts / "gemma3-270m/weights_qat_int4g32")})
+        with self.assertRaisesRegex(RuntimeError, "rebased"):
+            self.gate(rebased_source)
+        in_build = self.tamper(variant, {str(self.dump.resolve()):
+                                        str(self.build / "gemma3-270m/weights_qat_int4g32")})
+        with self.assertRaisesRegex(RuntimeError, "rebased"):
+            self.gate(in_build)
+        moved_witness = self.tamper(variant, {str(self.witness):
+                                             str(self.build / "evidence/data-witness.json")})
+        with self.assertRaisesRegex(RuntimeError, "rebased"):
+            self.gate(moved_witness)
+        # The declared weights output is the one path that legitimately lives under the candidate root.
+        self.gate(variant)
+
+    def test_the_factory_refuses_a_data_root_the_rebase_would_rewrite(self):
+        """An accepted owner may contain both candidate output and retained data, but the leaf may not."""
+        store = self.root / "store"
+        source = store / "gemma3-270m/weights_qat_int4g32"
+        gemma_dump(source)
+        witness = witness_file(source, store / "evidence/data-witness.json", legacy_receipt="9" * 64)
+        with self.assertRaisesRegex(RuntimeError, "rebased"):
+            self.dispatch.verified_data_recipe("gemma3-270m", self.scenario, REPO, source.parent,
+                                               self.inputs, self.build, witness=witness,
+                                               data_source=source, accepted_data_root=store)
+
+    def test_the_accepted_data_owner_may_be_an_ancestor_of_the_candidate_artifacts(self):
+        """The real accepted owner holds both old data and the new candidate root; only the leaf matters."""
+        store = self.root / "store"
+        source = store / "gemma3-270m/weights_qat_int4g32"
+        gemma_dump(source)
+        witness = witness_file(source, store / "evidence/data-witness.json", legacy_receipt="8" * 64)
+        artifacts, build = store / "candidate", store / "candidate-build"
+        recipe = self.dispatch.verified_data_recipe("gemma3-270m", self.scenario, REPO, artifacts,
+                                                   self.inputs, build, witness=witness,
+                                                   data_source=source, accepted_data_root=store)
+        self.dispatch.validate_verified_data_inputs([recipe], artifacts, build, REPO)
+        self.assertIn(str(store), json.dumps(recipe.commands[0].argv))
+
+    def test_the_variant_command_flags_are_bound_to_the_recipe_that_declares_them(self):
+        variant = self.variant()
+        helper = variant.commands[0].argv[1]
+        for label, replacements in (("model", {"gemma3-270m": "gemma4-12b"}),
+                                    ("mode", {"--materialize": "--verify-published"}),
+                                    ("helper", {helper: str(REPO / "scripts/dump_llm_weights.py")}),
+                                    ("owner", {str(self.owner): str(self.owner / "subtree")})):
+            with self.subTest(label=label):
+                with self.assertRaises(RuntimeError):
+                    self.gate(self.tamper(variant, replacements))
+        self.gate(variant)
+
+    def test_the_declared_stage_views_are_the_paths_the_gate_checks(self):
+        variant = self.variant()
+
+        def restage(command):
+            if command.step != self.dispatch.VERIFIED_DATA_STEP:
+                return command
+            return replace(command, stage=replace(command.stage, inputs=(
+                self.dispatch.View(str(self.root / "elsewhere")), *command.stage.inputs[1:])))
+
+        moved = replace(variant, commands=tuple(restage(item) for item in variant.commands))
+        with self.assertRaisesRegex(RuntimeError, "stage input"):
+            self.gate(moved)
+
+    def test_build_recipe_gates_the_variant_before_any_stage_runs(self):
+        variant = self.variant()
+        malformed = self.tamper(variant, {variant.commands[0].argv[-1]:
+                                         str(Path(variant.inputs[0]) / "unexpected-data-output")})
+        with patch.object(self.dispatch, "run_commands", side_effect=AssertionError("build forbidden")), \
+             patch.object(self.dispatch, "LOCK_ROOT", self.root / "locks"):
+            with self.assertRaisesRegex(RuntimeError, "is not the declared weights root"):
+                build_recipe(malformed, REPO, REPO / self.scenario, self.artifacts, self.build)
+            ordinary = recipe_for("gemma3-270m", self.scenario, REPO, self.artifacts, self.inputs,
+                                  self.build)
+            with patch.object(self.dispatch, "validate_verified_data_inputs") as gate:
+                try:
+                    build_recipe(ordinary, REPO, REPO / self.scenario, self.artifacts, self.build)
+                except (AssertionError, FileNotFoundError, RuntimeError, ValueError):
+                    pass
+            gate.assert_not_called()
+
+    def test_variant_input_gate_rejects_an_undeclared_or_escaped_root(self):
+        variant = self.variant()
+        validate_recipe_inputs([variant])
+        validate_command_executables([variant])
+        self.gate(variant)
+        with self.assertRaisesRegex(RuntimeError, "not a declared verified-data input"):
+            self.variant(data_source=self.root / "outside-owner/weights")
+        undeclared = self.tamper(variant, {str(self.dump.resolve()): str(self.root / "outside/weights")})
+        with self.assertRaisesRegex(RuntimeError, "not a declared verified-data input"):
+            self.gate(undeclared)
+        outside_output = self.tamper(variant, {variant.commands[0].argv[-1]: str(self.root / "elsewhere/weights")})
+        with self.assertRaisesRegex(RuntimeError, "is not the declared weights root"):
+            self.gate(outside_output)
+        linked = self.root / "owner-link"
+        linked.symlink_to(self.owner, target_is_directory=True)
+        symlinked = self.tamper(variant, {str(self.owner): str(linked)})
+        with self.assertRaisesRegex(RuntimeError, "symlink in the --accepted-data-root path"):
+            self.gate(symlinked)
+        escaped = self.tamper(variant, {str(self.owner): str(self.root / "owners/..")})
+        with self.assertRaisesRegex(RuntimeError, r"\.\."):
+            self.gate(escaped)
+        stale = self.tamper(variant, {str(self.witness): str(self.root / "evidence/absent.json")})
+        data = stale.commands[0]
+        reviewed = replace(data.stage.inputs[1], patterns=('absent.json',))
+        stale = replace(stale, commands=(replace(data, stage=replace(data.stage, inputs=(
+            data.stage.inputs[0], reviewed))), *stale.commands[1:]))
+        with self.assertRaisesRegex(RuntimeError, "cannot read data witness"):
+            self.gate(stale)
+        self.assertFalse((self.root / "elsewhere").exists())
 
 
 if __name__ == "__main__":

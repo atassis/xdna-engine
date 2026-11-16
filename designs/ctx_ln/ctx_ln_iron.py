@@ -22,7 +22,7 @@ import sys
 
 from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
 from aie.iron.device import NPU1, NPU2, from_name
-from aie.helpers.taplib import TensorTiler2D
+from aie.helpers.taplib import TensorAccessPattern
 from aie.iron.controlflow import range_
 
 
@@ -46,12 +46,15 @@ def ctx_ln(dev, sequence_length, embedding_dim, trace_size):
         "layer_norm_2pass_f32", "ln_2pass.o", [chunk_type, chunk_type, np.int32]
     )
 
-    taps_in = TensorTiler2D.simple_tiler(
-        (sequence_length, embedding_dim), (rows_per_core, embedding_dim)
-    )
-    taps_out = TensorTiler2D.simple_tiler(
-        (sequence_length, embedding_dim), (rows_per_core, embedding_dim)
-    )
+    row_taps = [
+        TensorAccessPattern(
+            (sequence_length, embedding_dim),
+            i * rows_per_core * embedding_dim,
+            (rows_per_core, embedding_dim),
+            (embedding_dim, 1),
+        )
+        for i in range(n_cores)
+    ]
 
     def core_body(of_in, of_out, ln):
         for _ in range_(rows_per_core):
@@ -68,9 +71,9 @@ def ctx_ln(dev, sequence_length, embedding_dim, trace_size):
 
     def sequence(a_in, c_out, in_prods, out_conses):
         for i in range(n_cores):
-            in_prods[i].fill(a_in, taps_in[i])
+            in_prods[i].fill(a_in, row_taps[i])
         for i in range(n_cores):
-            out_conses[i].drain(c_out, taps_out[i], wait=True)
+            out_conses[i].drain(c_out, row_taps[i], wait=True)
 
     rt = Runtime(
         sequence,
