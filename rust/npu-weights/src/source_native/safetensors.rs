@@ -1,4 +1,6 @@
-//! Header-only safetensors views. Integer tensors remain encoded rather than being skipped.
+//! Header-only safetensors views. Integer tensors remain encoded rather than being skipped. I64
+//! is admitted as container metadata only: `DenseTensor` and every codec still refuse it as weight
+//! storage, so accepting its eight-byte elements cannot decode integers as floating weights.
 use super::{FileSource, FileSpan, Limits, ScalarType};
 use anyhow::{bail, ensure, Context, Result};
 use serde::de::{MapAccess, SeqAccess, Visitor};
@@ -252,6 +254,7 @@ impl SafetensorsFile {
                 "F16" => ScalarType::F16,
                 "BF16" => ScalarType::Bf16,
                 "I32" => ScalarType::I32,
+                "I64" => ScalarType::I64,
                 other => bail!("{name}: unsupported safetensors dtype {other}"),
             };
             ensure!(

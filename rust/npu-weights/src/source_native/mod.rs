@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 pub mod awq;
+pub mod ct;
 pub mod gguf;
 pub mod plan;
 pub mod safetensors;
@@ -24,12 +25,16 @@ pub enum ScalarType {
     F16,
     Bf16,
     I32,
+    /// Fixed-width integer metadata storage (for example a safetensors `weight_shape` tensor).
+    /// It is never decoded as a floating weight.
+    I64,
 }
 impl ScalarType {
     pub fn byte_width(self) -> usize {
         match self {
             Self::F32 | Self::I32 => 4,
             Self::F16 | Self::Bf16 => 2,
+            Self::I64 => 8,
         }
     }
 }
@@ -41,6 +46,10 @@ pub enum Encoding {
     GgufQ4_1,
     GgufQ6K,
     AwqGemm {
+        group_size: usize,
+        scale_type: ScalarType,
+    },
+    CtPackQuantized {
         group_size: usize,
         scale_type: ScalarType,
     },
@@ -274,8 +283,8 @@ impl DenseTensor {
             "dense tensor dimensions must be positive"
         );
         ensure!(
-            dtype != ScalarType::I32,
-            "I32 is encoded metadata, not a dense floating tensor"
+            !matches!(dtype, ScalarType::I32 | ScalarType::I64),
+            "integer scalars are encoded metadata, not a dense floating tensor"
         );
         let bytes = rows
             .checked_mul(cols)
@@ -320,7 +329,9 @@ impl WeightTensor for DenseTensor {
                 ScalarType::F32 => f32::from_le_bytes(raw),
                 ScalarType::F16 => f16::from_bits(u16::from_le_bytes([raw[0], raw[1]])).to_f32(),
                 ScalarType::Bf16 => bf16::from_bits(u16::from_le_bytes([raw[0], raw[1]])).to_f32(),
-                ScalarType::I32 => unreachable!(),
+                ScalarType::I32 | ScalarType::I64 => {
+                    unreachable!("the constructor rejects integer dense tensors")
+                }
             };
         }
         Ok(())

@@ -145,3 +145,63 @@ fn sharded_index_rejects_symlinks_outside_source_root() {
         SafetensorsFile::open(root.path().join("shard.safetensors"), Limits::default()).is_ok()
     );
 }
+
+#[test]
+fn admits_i64_metadata_bytes_extents_ranks_and_counts() {
+    // I64 belongs to the container as integer metadata: eight bytes per element, read back
+    // unchanged, with the parser owning byte extent, overflow and rank. Which metadata tensor means
+    // what, and whether a reader accepts rank 1, is the reader's contract, not this one.
+    let metadata = [3i64, 24];
+    let bytes: Vec<u8> = metadata
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    let file = source(
+        r#"{"meta":{"dtype":"I64","shape":[2],"data_offsets":[0,16]}}"#,
+        &bytes,
+    );
+    let parsed = SafetensorsFile::open(file.path(), Limits::default()).unwrap();
+    let entry = parsed.get("meta").unwrap();
+    assert_eq!(entry.dtype, ScalarType::I64);
+    assert_eq!(entry.shape, [2]);
+    assert_eq!(entry.span.len(), 16, "I64 elements are eight bytes");
+    let mut raw = [0u8; 16];
+    entry.span.read_exact_at(0, &mut raw).unwrap();
+    assert_eq!(raw.as_slice(), bytes.as_slice());
+    let mut values = [0i64; 2];
+    for (index, value) in values.iter_mut().enumerate() {
+        let mut element = [0u8; 8];
+        entry
+            .span
+            .read_exact_at((index * 8) as u64, &mut element)
+            .unwrap();
+        *value = i64::from_le_bytes(element);
+    }
+    assert_eq!(values, metadata);
+
+    // Rank stays with the reader: a rank-2 I64 entry with the same extent is a valid container
+    // object. The CT view that requires rank 1 rejects it, tested where that contract lives.
+    let file = source(
+        r#"{"meta":{"dtype":"I64","shape":[1,2],"data_offsets":[0,16]}}"#,
+        &bytes,
+    );
+    assert!(SafetensorsFile::open(file.path(), Limits::default()).is_ok());
+
+    for header in [
+        // Eight bytes per element, not four: the same shape with a four-byte extent is malformed.
+        r#"{"meta":{"dtype":"I64","shape":[2],"data_offsets":[0,8]}}"#,
+        r#"{"meta":{"dtype":"I64","shape":[2],"data_offsets":[0,15]}}"#,
+        r#"{"meta":{"dtype":"I64","shape":[1],"data_offsets":[0,16]}}"#,
+        r#"{"meta":{"dtype":"I64","shape":[3],"data_offsets":[0,16]}}"#,
+        // Count and rank limits stay parser rules for every dtype.
+        r#"{"meta":{"dtype":"I64","shape":[18446744073709551615,2],"data_offsets":[0,16]}}"#,
+        r#"{"meta":{"dtype":"I64","shape":[2,2,2,2,2,2,2,2,2],"data_offsets":[0,4096]}}"#,
+        r#"{"meta":{"dtype":"I64","shape":[-1],"data_offsets":[0,8]}}"#,
+    ] {
+        let file = source(header, &bytes);
+        assert!(
+            SafetensorsFile::open(file.path(), Limits::default()).is_err(),
+            "accepted {header}"
+        );
+    }
+}

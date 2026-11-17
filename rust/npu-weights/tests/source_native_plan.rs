@@ -94,7 +94,7 @@ fn rejects_bad_contract_before_any_write() {
             "shape" => value["buffers"]["out"][0]["shape"] = json!([2, 3]),
             "range" => value["buffers"]["out"][0]["first"] = json!(3),
             "missing" => value["buffers"]["out"][0]["tensor"] = json!("absent"),
-            "version" => value["version"] = json!(2),
+            "version" => value["version"] = json!(3),
             "empty" => value["buffers"] = json!({}),
             "empty_config" => value["config"] = json!({}),
             "overflow" => value["buffers"]["out"][0]["first"] = json!(usize::MAX),

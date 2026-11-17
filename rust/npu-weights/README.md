@@ -6,8 +6,9 @@ another checkpoint or expanding a whole tensor/model into floating-point arrays.
 
 Supported inputs:
 
-- Safetensors F32, F16, BF16 and I32 sections, including local sharded indexes. I32 code/zero-point
-  tensors remain integers. Unsupported dtypes are rejected, not silently skipped.
+- Safetensors F32, F16, BF16, I32 and I64 sections, including local sharded indexes. I32 code/zero-point
+  and I64 metadata tensors remain integers; I64 is admitted as container metadata only, so it is
+  never a dense weight encoding. Unsupported dtypes are rejected, not silently skipped.
 - Explicitly selected AutoAWQ GEMM u4 tensor triples: `qweight[K,N/8]`,
   `qzeros[K/group_size,N/8]`, `scales[K/group_size,N]`. Scale storage may be F16, BF16 or F32.
   The constructor selects this packing contract explicitly; it does not infer compatibility from
@@ -15,6 +16,13 @@ Supported inputs:
 - Little-endian GGUF v3 Q4_0, Q4_1, Q6_K and F32 tensors. The reader validates every tensor's type;
   a nominal Q4_0 filename is not a guarantee that every tensor uses that codec. Higher-rank tensors
   and other GGML encodings require additional declared readers.
+- Explicitly selected compressed-tensors `pack-quantized` symmetric u4 section groups:
+  `weight_packed[rows,cols/8]` of little-endian I32 words holding eight unsigned nibbles each,
+  consecutive along K from the lowest nibble, `weight_shape[2]` I64 metadata holding the logical
+  `[rows,cols]`, and `weight_scale[rows,cols/group_size]` BF16. The signed source code of nibble `c`
+  is `c - 8`, so no zero point is stored, and scale bits are preserved exactly. A declared zero
+  point, a group index map, another strategy, bit width, symmetry, scale type or packing order is
+  rejected rather than guessed at.
 
 All views implement `WeightTensor`. Its descriptor is logical `[output_rows, input_columns]`;
 `decode_row` reconstructs only a caller-requested row slice into the caller's buffer. It is a CPU
@@ -47,6 +55,54 @@ For GGUF, open `source_native::gguf::GgufFile` with the same limits, then select
 `get(name)`. Floating safetensors entries can be wrapped with `DenseTensor::new`; shape/byte lengths
 are checked rather than reinterpreted based on size alone.
 
+## Declare compressed-tensors parameters explicitly
+
+```rust,no_run
+use npu_weights::source_native::{
+    ct::{PackQuantizedFormat, PackQuantizedTensor, WeightSections},
+    safetensors::SafetensorsFile, Limits, ScalarType, WeightTensor,
+};
+
+# fn example() -> anyhow::Result<()> {
+let source = SafetensorsFile::open("model.safetensors", Limits::default())?;
+let prefix = "model.layers.0.self_attn.q_proj";
+let codec = PackQuantizedFormat::declared(
+    "group", // From the reviewed source config, never inferred from names or shapes.
+    4,
+    true,
+    128,
+    ScalarType::Bf16,
+)?;
+let weight = PackQuantizedTensor::new(
+    prefix,
+    WeightSections {
+        weight_packed: source.get(&format!("{prefix}.weight_packed"))?.clone(),
+        weight_shape: source.get(&format!("{prefix}.weight_shape"))?.clone(),
+        weight_scale: source.get(&format!("{prefix}.weight_scale"))?.clone(),
+        weight_zero_point: None,
+        weight_g_idx: None,
+    },
+    codec,
+)?;
+let mut values = [0.0; 32];
+weight.decode_row(0, 0, &mut values)?;
+# Ok(())
+# }
+```
+
+`PackQuantizedFormat::declared` records a caller claim, and because its fields are public,
+`PackQuantizedTensor::new` revalidates the group size and the BF16 scale type it can actually decode.
+The declared column count and the scale section's width do constrain a group size - one that does not
+divide the columns or does not match the scale width is rejected - but they cannot prove which size
+the publisher recorded, and safetensors discards `__metadata__`, so nothing at this layer ties a
+declaration to a file's own `quantization_config` or revision: importers must verify strategy, bit
+width, symmetry, group size and scale type against the selected source config before constructing a
+view, and route the companion sections themselves. The reader owns bit-exact codes and scale bits
+plus the exact product, not value, payload, model or device admission: a non-finite or huge scale
+propagates instead of being rejected, saturated or dropped, which stays the higher boundary's concern
+(as `plan`'s scaled-BF16 gate is). No local requantization, code rebase or scale reselection happens
+here.
+
 ## Stream into caller-owned storage
 
 ```rust,no_run
@@ -65,7 +121,8 @@ fn copy_weight(weight: &dyn WeightTensor, destination: &mut dyn Write)
 ```
 
 The writer copies encoded bytes unchanged: GGUF blocks or AWQ words, zero points and stored scale
-bytes. It does not quantize, clip, replace zero points, cast scales or allocate an unpacked tensor.
+bytes, or the packed words, `weight_shape` metadata and scale bytes of a compressed-tensors view. It
+does not quantize, clip, replace zero points, cast scales or allocate an unpacked tensor.
 Transformation scratch is the caller's buffer; parsed header/schema memory is separately bounded
 by `Limits`. A caller that writes into a `Vec` still owns the resulting output allocation. The
 codec reference decoders use fixed-size word/block scratch, apart from the requested output.
@@ -128,8 +185,8 @@ These probes do not allocate device storage or time a complete model open.
 
 ```sh
 cargo test -p npu-weights --test source_native --test source_native_safetensors \
-    --test source_native_awq --test source_native_gguf --test source_native_shared \
-    --test source_native_plan
+    --test source_native_awq --test source_native_ct --test source_native_gguf \
+    --test source_native_shared --test source_native_plan
 ```
 
 Fixtures use hand-built encoded bytes and independent expected values, including group/word/block

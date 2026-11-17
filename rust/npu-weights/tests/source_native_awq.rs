@@ -24,7 +24,7 @@ fn scale_bytes(dtype: ScalarType, values: &[f32]) -> Vec<u8> {
                 bytes.extend_from_slice(&bf16::from_f32(value).to_bits().to_le_bytes())
             }
             ScalarType::F32 => bytes.extend_from_slice(&value.to_le_bytes()),
-            ScalarType::I32 => panic!("scales must be floating point"),
+            ScalarType::I32 | ScalarType::I64 => panic!("scales must be floating point"),
         }
     }
     bytes
@@ -183,7 +183,7 @@ fn accepts_f16_bf16_and_f32_scales_without_lossy_conversion() -> Result<()> {
             ScalarType::F16 => f16::from_f32(f16_scale).to_f32(),
             ScalarType::Bf16 => bf16::from_f32(f16_scale).to_f32(),
             ScalarType::F32 => f16_scale,
-            ScalarType::I32 => unreachable!(),
+            ScalarType::I32 | ScalarType::I64 => unreachable!(),
         };
         assert_eq!(decoded, [expected]);
     }

@@ -144,7 +144,9 @@ impl AwqTensor {
             ScalarType::F16 => f16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).to_f32(),
             ScalarType::Bf16 => bf16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).to_f32(),
             ScalarType::F32 => f32::from_le_bytes(bytes),
-            ScalarType::I32 => unreachable!("AWQ constructor rejects I32 scales"),
+            ScalarType::I32 | ScalarType::I64 => {
+                unreachable!("AWQ constructor accepts only floating scales")
+            }
         })
     }
 }
